@@ -145,10 +145,14 @@ impl DownloadEngine {
         std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
 
         // Send-safe shared state, created on the caller's thread.
-        let cache_manager = Arc::new(Mutex::new(CacheManager::new(
-            cache_dir,
-            1024 * 1024 * 1024,
-        )?));
+        // Read cache_size from config, falling back to 1 GiB when unset or
+        // non-positive (matches the historical default).
+        let cache_size = config
+            .cache
+            .cache_size
+            .map(|v| if v > 0 { v as u64 } else { 1024 * 1024 * 1024 })
+            .unwrap_or(1024 * 1024 * 1024);
+        let cache_manager = Arc::new(Mutex::new(CacheManager::new(cache_dir, cache_size)?));
         let store = PieceStore::new(cache_manager.clone());
         let scheduler = PieceScheduler::new(PiecePriorityConfig::from_toml(&config.piece_priority));
 

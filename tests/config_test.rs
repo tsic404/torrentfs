@@ -228,3 +228,57 @@ fn test_config_to_settings_json_default_is_empty() {
     // Default config with all None should produce empty JSON object
     assert_eq!(json, "{}");
 }
+
+/// Regression test for TSI-2297: the config `cache.cache_size` value is
+/// plumbed through to the CacheManager (previously hardcoded 1 GiB).
+#[test]
+fn test_engine_passes_cache_size_to_cache_manager() {
+    use torrentfs::download::DownloadEngine;
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = TorrentfsConfig::default_config();
+    config.dht.enabled = Some(false);
+    config.performance.aio_threads = Some(2);
+    config.cache.cache_size = Some(67_108_864); // 64 MiB
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    let cm = engine.cache_manager();
+    let cm = cm.lock().unwrap();
+    assert_eq!(cm.max_cache_size(), 67_108_864);
+    drop(cm);
+    engine.shutdown();
+}
+
+/// Default config (cache_size unset) falls back to 1 GiB.
+#[test]
+fn test_engine_cache_size_defaults_to_1gib() {
+    use torrentfs::download::DownloadEngine;
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = TorrentfsConfig::default_config();
+    config.dht.enabled = Some(false);
+    config.performance.aio_threads = Some(2);
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    let cm = engine.cache_manager();
+    let cm = cm.lock().unwrap();
+    assert_eq!(cm.max_cache_size(), 1024 * 1024 * 1024);
+    drop(cm);
+    engine.shutdown();
+}
+
+/// Non-positive cache_size falls back to 1 GiB (guard against misconfig).
+#[test]
+fn test_engine_cache_size_non_positive_falls_back() {
+    use torrentfs::download::DownloadEngine;
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = TorrentfsConfig::default_config();
+    config.dht.enabled = Some(false);
+    config.performance.aio_threads = Some(2);
+    config.cache.cache_size = Some(0);
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    let cm = engine.cache_manager();
+    let cm = cm.lock().unwrap();
+    assert_eq!(cm.max_cache_size(), 1024 * 1024 * 1024);
+    drop(cm);
+    engine.shutdown();
+}
