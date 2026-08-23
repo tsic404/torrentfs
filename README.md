@@ -70,3 +70,22 @@ podman exec torrentfs ls /mnt/metadata/
 - Run torrentfs directly on the host without a container
 
 The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
+
+## Filesystem Semantics
+
+### rename — refusal to overwrite (non-POSIX)
+
+torrentfs diverges from POSIX `rename(2)` overwrite semantics. Renaming a `.torrent` file or metadata directory onto an **existing** target path returns `EEXIST` and leaves both entries untouched — it does **not** atomically replace the destination the way POSIX `rename` does.
+
+| `rename(old, new)` where `new` exists | POSIX | torrentfs |
+|---|---|---|
+| `new` is a file, `old` is a file | overwrites `new` | `EEXIST` (refused) |
+| `new` is a directory, `old` is a directory | replaces empty dir / `ENOTEMPTY` | `EEXIST` (refused) |
+| `new` resolves to the same inode as `old` | no-op (`0`) | no-op (`0`) |
+
+Rationale: a `.torrent` file is the durable handle to a downloaded swarm; a silent overwrite would discard the replaced entry's cached pieces, seeding state, and database record without warning. Forcing the caller to remove the destination first makes the destructive step explicit. To replace `B` with `A`:
+
+- **`.torrent` file**: `unlink B && rename A B` (`unlink` only accepts `*.torrent` names; any other name returns `EACCES`, a directory returns `EISDIR`).
+- **metadata directory**: `rmdir B && rename A B` (`rmdir` requires `B` to be empty; a non-empty directory returns `ENOTEMPTY`, so unlink its `.torrent` contents first).
+
+Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists` (`EEXIST`) when the destination name already resolves to a different inode.
