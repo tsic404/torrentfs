@@ -1221,6 +1221,43 @@ impl FsService {
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
 
                 ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
+
+                // TSI-2373: a cross-directory move orphans the metadata
+                // directories at the old source_path — the DB rows survive,
+                // so the data/ mirror keeps exposing a ghost tree for a path
+                // that no longer holds any torrent. Prune them the same way
+                // unlink does, and evict the stale cached SourcePathDir /
+                // TorrentRoot entries so later lookups re-resolve from the
+                // DB at the new location. Cleanup failure is non-fatal: the
+                // directories stay in the DB, so the cached entries remain
+                // valid.
+                if old_source_path != new_source_path {
+                    if !old_source_path.is_empty() {
+                        let cleaned = ts
+                            .cleanup_orphaned_metadata_directories(&old_source_path)
+                            .unwrap_or_default();
+
+                        self.inode_mgr
+                            .data_inodes
+                            .retain(|_, data_inode| match data_inode {
+                                DataInode::SourcePathDir { path } => !cleaned.contains(path),
+                                _ => true,
+                            });
+                    }
+
+                    // Evict cached TorrentRoot entries bound to the old
+                    // location so later lookups re-resolve from the DB at the
+                    // new one.
+                    self.inode_mgr
+                        .data_inodes
+                        .retain(|_, data_inode| match data_inode {
+                            DataInode::TorrentRoot { source_path, .. } => {
+                                source_path != &old_source_path
+                            }
+                            _ => true,
+                        });
+                }
+
                 info!(
                     "Renamed torrent '{}' to '{}' (source_path: '{}' -> '{}')",
                     old_name, newname, old_source_path, new_source_path
@@ -2174,6 +2211,225 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
+    /// TSI-2373: a cross-directory mv of a `.torrent` must prune the
+    /// metadata directories orphaned at the old source_path, so the data/
+    /// mirror stops exposing the ghost tree.
+    #[test]
+    fn cross_directory_mv_prunes_orphaned_old_source_path_dirs() {
+        let mut svc = service_with_db();
+
+        // mkdir cat-b under metadata/ (persisted via ensure_metadata_directories).
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        // Simulate a torrent previously added at the root: a DB row with
+        // source_path == "" plus the restored File inode in metadata/.
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("", "ubuntu-iso", "ubuntu.iso.torrent", 16, "hash-2373", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: METADATA_INO,
+                name: "ubuntu.iso.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Warm the data/ cache so eviction is actually exercised.
+        svc.inode_mgr.data_inodes.insert(
+            InodeManager::make_torrent_root_ino(1),
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: String::new(),
+                name: "ubuntu-iso".to_string(),
+                filename: "ubuntu.iso.torrent".to_string(),
+            },
+        );
+
+        // Cross-directory move: metadata/ubuntu.iso.torrent → metadata/cat-b/.
+        svc.rename(
+            METADATA_INO,
+            "ubuntu.iso.torrent",
+            cat_b_ino,
+            "ubuntu.iso.torrent",
+        )
+        .expect("cross-directory rename");
+
+        // The DB row moved to cat-b; nothing references the old location.
+        {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            assert!(
+                db.get_torrent_by_filename_and_source_path("ubuntu.iso.torrent", "")
+                    .unwrap()
+                    .is_none(),
+                "old location must be empty after the move"
+            );
+            assert!(
+                db.get_torrent_by_filename_and_source_path("ubuntu.iso.torrent", "cat-b")
+                    .unwrap()
+                    .is_some(),
+                "torrent must live at cat-b after the move"
+            );
+        }
+
+        // The stale TorrentRoot cached for the old (root) source_path must be
+        // evicted — a later lookup re-resolves from the DB under cat-b.
+        assert!(
+            !svc.inode_mgr
+                .data_inodes
+                .contains_key(&InodeManager::make_torrent_root_ino(1)),
+            "stale TorrentRoot cache entry for the old source_path must be evicted"
+        );
+    }
+
+    /// TSI-2373: same contract for a torrent nested in a subdirectory — the
+    /// emptied directory chain (cat-a and its parents) must vanish from both
+    /// the DB and the cached SourcePathDir entries.
+    #[test]
+    fn cross_directory_mv_from_subdir_removes_ghost_dir_chain() {
+        let mut svc = service_with_db();
+
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "t1", "t1.torrent", 16, "hash-a1", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "t1.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Warm the data/ caches for both paths before the move.
+        svc.inode_mgr.data_inodes.insert(
+            InodeManager::make_source_path_dir_ino("cat-a"),
+            DataInode::SourcePathDir {
+                path: "cat-a".to_string(),
+            },
+        );
+        svc.inode_mgr.data_inodes.insert(
+            InodeManager::make_torrent_root_ino(1),
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: "cat-a".to_string(),
+                name: "t1".to_string(),
+                filename: "t1.torrent".to_string(),
+            },
+        );
+
+        // Cross-directory move: metadata/cat-a/t1.torrent → metadata/cat-b/t1.torrent.
+        svc.rename(cat_a_ino, "t1.torrent", cat_b_ino, "t1.torrent")
+            .expect("cross-directory rename");
+
+        // DB: no torrent left under cat-a, and its mirror directory row is gone.
+        {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            assert!(db
+                .get_torrent_by_filename_and_source_path("t1.torrent", "cat-a")
+                .unwrap()
+                .is_none());
+            assert!(db
+                .get_torrent_by_filename_and_source_path("t1.torrent", "cat-b")
+                .unwrap()
+                .is_some());
+            assert!(
+                !db.get_source_path_prefixes("")
+                    .unwrap()
+                    .contains(&"cat-a".to_string()),
+                "ghost cat-a directory must be pruned from metadata_directories"
+            );
+            assert!(
+                db.get_source_path_prefixes("")
+                    .unwrap()
+                    .contains(&"cat-b".to_string()),
+                "destination directory must survive"
+            );
+        }
+
+        // Cached SourcePathDir and TorrentRoot entries bound to the dead
+        // source_path must be evicted — later lookups re-resolve from the DB.
+        assert!(
+            !svc.inode_mgr
+                .data_inodes
+                .contains_key(&InodeManager::make_source_path_dir_ino("cat-a")),
+            "stale SourcePathDir cache entry for cat-a must be evicted"
+        );
+        assert!(
+            !svc.inode_mgr
+                .data_inodes
+                .contains_key(&InodeManager::make_torrent_root_ino(1)),
+            "stale TorrentRoot cache entry for cat-a must be evicted"
+        );
+    }
+
+    /// TSI-2373 guard: an intra-directory rename (same parent) must NOT run
+    /// orphan cleanup — only the filename changes.
+    #[test]
+    fn intra_directory_rename_skips_orphan_cleanup() {
+        let mut svc = service_with_db();
+
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "t1", "old.torrent", 16, "hash-r1", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "old.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        svc.rename(cat_a_ino, "old.torrent", cat_a_ino, "new.torrent")
+            .expect("intra-directory rename");
+
+        // Same source_path: the directory must remain — it still holds t1.
+        let db = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db.get_source_path_prefixes("")
+                .unwrap()
+                .contains(&"cat-a".to_string()),
+            "intra-directory rename must not prune the still-populated directory"
+        );
+    }
+
     #[test]
     fn data_namespace_inodes_correctly_identified() {
         // Unit-test the helper itself.
@@ -3065,5 +3321,4 @@ mod tests {
         // Empty data, zero size → ok (legitimate EOF).
         assert!(guard_empty_read(&[], 0).is_ok());
     }
-
 }
