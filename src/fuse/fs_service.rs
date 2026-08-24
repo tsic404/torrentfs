@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use tracing::{error, info, warn};
@@ -48,6 +48,11 @@ use super::stats::{generate_directory_stats, generate_global_stats, generate_tor
 /// clearing it only causes a few L2 disk re-reads.
 const MAX_L1_ENTRIES: usize = 256;
 
+/// TSI-2378: how long `rename` waits for a concurrently in-flight
+/// `add_torrent` (spawned detached by `release`, TSI-2247) to settle its DB
+/// insert before giving up and failing the rename.
+const PENDING_ADD_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// TSI-2293: guard against a silent 0-byte EOF from `read_file_range`.
 ///
 /// When `pieces_on_disk` (using `info.files()` summed sizes) and the
@@ -80,6 +85,10 @@ pub struct FsService {
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
     pub processing_torrents: Arc<Mutex<HashMap<(String, String), ()>>>,
+    /// TSI-2378: signalled whenever an entry is removed from
+    /// `processing_torrents`, so a `rename` blocked on an in-flight
+    /// `add_torrent` wakes immediately instead of polling.
+    pub processing_torrents_cv: Arc<Condvar>,
     pub download_service: Option<Arc<DownloadService>>,
     pub seeding_manager: Option<Arc<SeedingManager>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -138,6 +147,7 @@ impl FsService {
         Self {
             inode_mgr: InodeManager::new(creation_time),
             db: None,
+            processing_torrents_cv: Arc::new(Condvar::new()),
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service,
@@ -819,6 +829,7 @@ impl FsService {
                     if let Some(ts) = &self.torrent_service {
                         let ts = ts.clone();
                         let processing = self.processing_torrents.clone();
+                        let processing_cv = self.processing_torrents_cv.clone();
                         let key = dedup_key.clone();
                         let fname = name.clone();
                         std::thread::spawn(move || {
@@ -833,6 +844,8 @@ impl FsService {
                             if let Ok(mut guard) = processing.lock() {
                                 guard.remove(&key);
                             }
+                            // TSI-2378: wake a rename blocked on this pending add.
+                            processing_cv.notify_one();
                         });
                     } else {
                         info!(
@@ -842,6 +855,8 @@ impl FsService {
                         if let Ok(mut guard) = self.processing_torrents.lock() {
                             guard.remove(&dedup_key);
                         }
+                        // TSI-2378: wake any waiter (defensive; no-DB path).
+                        self.processing_torrents_cv.notify_one();
                     }
                 }
             }
@@ -1081,6 +1096,20 @@ impl FsService {
         newparent: u64,
         newname: &str,
     ) -> FsResult<()> {
+        self.rename_with_pending_timeout(parent, name, newparent, newname, PENDING_ADD_TIMEOUT)
+    }
+
+    /// TSI-2378 (review): the pending-add wait timeout is injectable so
+    /// tests can exercise the timeout/rollback path in milliseconds instead
+    /// of hard-waiting out the 5s production deadline.
+    pub(crate) fn rename_with_pending_timeout(
+        &mut self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        pending_timeout: Duration,
+    ) -> FsResult<()> {
         // TSI-2228: data/ is a read-only namespace — renames into or out
         // of it must return `EROFS`, not `ENOENT` or `EPERM`. Check this
         // before parent existence: an inode number in the data range is
@@ -1212,13 +1241,40 @@ impl FsService {
                 InodeData::File {
                     parent: newparent,
                     name: newname.to_string(),
-                    data: file_data,
+                    data: file_data.clone(),
                     unlinked: was_unlinked,
                 },
             );
+
             if let Some(ref ts) = self.torrent_service {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
+
+                // TSI-2378: a fast `cp` followed immediately by `mv` races
+                // with the detached `add_torrent` thread spawned by
+                // `release` (TSI-2247): the DB row may not exist yet, so
+                // `rename_torrent` silently no-ops (`Ok(None)`) and the row
+                // later lands at the OLD name — the data/ mirror then keeps
+                // serving the stale filename and the rename is lost on
+                // restart. Wait (bounded) for the pending add to settle
+                // first; on timeout fail so the caller retries.
+                let dedup_key = (old_source_path.clone(), old_name.clone());
+                // On timeout the helper returns Err and the inode is rolled
+                // back to the pre-rename name below — a bare `?` would leave
+                // metadata/ showing the new name while the still-pending
+                // background add lands the DB row at the OLD one,
+                if let Err(e) = self.wait_for_pending_add(&dedup_key, pending_timeout) {
+                    self.inode_mgr.inodes.insert(
+                        source_ino,
+                        InodeData::File {
+                            parent,
+                            name: old_name.clone(),
+                            data: file_data.clone(),
+                            unlinked: was_unlinked,
+                        },
+                    );
+                    return Err(e);
+                }
 
                 ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
 
@@ -1256,8 +1312,24 @@ impl FsService {
                             }
                             _ => true,
                         });
+                } else {
+                    // TSI-2378 (review): an intra-directory rename keeps the
+                    // source_path but changes the filename — a cached
+                    // TorrentRoot entry still carries the old `filename`, so
+                    // data/ would keep listing the stale name (and the DB row
+                    // under the new one would be shadowed) until restart.
+                    // Evict it so later lookups re-resolve from the DB.
+                    self.inode_mgr
+                        .data_inodes
+                        .retain(|_, data_inode| match data_inode {
+                            DataInode::TorrentRoot {
+                                source_path,
+                                filename,
+                                ..
+                            } => !(source_path == &old_source_path && filename == &old_name),
+                            _ => true,
+                        });
                 }
-
                 info!(
                     "Renamed torrent '{}' to '{}' (source_path: '{}' -> '{}')",
                     old_name, newname, old_source_path, new_source_path
@@ -1265,9 +1337,52 @@ impl FsService {
             } else {
                 info!("Renamed file '{}' to '{}' (no database)", old_name, newname);
             }
-
             Ok(())
         }
+    }
+
+    /// TSI-2378: wait (bounded by `timeout`) for a pending `add_torrent` at
+    /// `dedup_key` to clear. The background add signals
+    /// `processing_torrents_cv` when it removes its entry, so this sleeps on
+    /// the Condvar instead of polling the map. On timeout the caller has
+    /// already rolled back any inode state and must fail the operation.
+    /// `timeout` is a parameter so tests can use a short deadline instead of
+    /// the production 5s.
+    fn wait_for_pending_add(
+        &self,
+        dedup_key: &(String, String),
+        timeout: Duration,
+    ) -> FsResult<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self
+            .processing_torrents
+            .lock()
+            .map_err(|_| FsError::LockPoisoned)?;
+        while guard.contains_key(dedup_key) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                error!(
+                    "Timed out waiting for pending add of '{:?}' before rename",
+                    dedup_key
+                );
+                return Err(FsError::Internal(
+                    "torrent is still being processed; retry the rename".to_string(),
+                ));
+            }
+            let (g, timed_out) = self
+                .processing_torrents_cv
+                .wait_timeout(guard, deadline - now)
+                .map_err(|_| {
+                    error!("Condvar poisoned in rename() pending-add wait");
+                    FsError::LockPoisoned
+                })?;
+            guard = g;
+            if timed_out.timed_out() && guard.contains_key(dedup_key) {
+                continue;
+            }
+        }
+        drop(guard);
+        Ok(())
     }
 
     // ── Data namespace (read-only: local / remote) ──────────────────────────
@@ -1926,6 +2041,7 @@ mod tests {
             db: Some(db_arc.clone()),
             torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            processing_torrents_cv: Arc::new(Condvar::new()),
             download_service: None,
             seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -1978,6 +2094,7 @@ mod tests {
         FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: None,
+            processing_torrents_cv: Arc::new(Condvar::new()),
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
@@ -2430,6 +2547,229 @@ mod tests {
         );
     }
 
+    /// TSI-2378: a fast `cp` (release → detached add_torrent) followed
+    /// immediately by a rename must wait for the pending add to settle, so
+    /// the DB row lands at the NEW name instead of the old one. Simulate the
+    /// race by inserting a pending entry in `processing_torrents` before
+    /// calling rename; the rename must block until it clears and then move
+    /// the row.
+    #[test]
+    fn intra_directory_rename_waits_for_pending_add() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+
+        // The .torrent file exists as an inode but NOT yet in the DB —
+        // exactly the window between release() spawning add_torrent and
+        // insert_torrent_with_files committing.
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "t1.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Mark the add as pending, and clear it from another thread after a
+        // short delay — mimicking the background insert committing. The
+        // notify_one is essential: it exercises the same wake path
+        // `release`'s background add uses, so this test verifies the
+        // Condvar wakeup instead of falling through to the timeout.
+        {
+            let processing = svc.processing_torrents.clone();
+            let processing_cv = svc.processing_torrents_cv.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(mut guard) = processing.lock() {
+                    guard.remove(&("cat-a".to_string(), "t1.torrent".to_string()));
+                }
+                processing_cv.notify_one();
+            });
+            svc.processing_torrents
+                .lock()
+                .unwrap()
+                .insert(("cat-a".to_string(), "t1.torrent".to_string()), ());
+        }
+
+        let started = std::time::Instant::now();
+
+        svc.rename(cat_a_ino, "t1.torrent", cat_a_ino, "renamed.torrent")
+            .expect("rename must wait for the pending add and succeed");
+
+        // The rename must return via the Condvar wakeup, not by waiting out
+        // the 5s production timeout.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "rename must be woken by notify_one promptly, took {:?}",
+            started.elapsed()
+        );
+
+        // The pending entry was consumed by the simulated add; nothing is
+        // left behind.
+        assert!(
+            svc.processing_torrents.lock().unwrap().is_empty(),
+            "pending-add map must be drained"
+        );
+    }
+
+    /// TSI-2378: while the add is still pending past the timeout, the rename
+    /// must FAIL rather than silently no-op the DB update (which would leave
+    /// the data/ mirror on the stale filename).
+    #[test]
+    fn intra_directory_rename_fails_when_add_stays_pending() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+
+        let t1_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            t1_ino,
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "t1.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Pending forever — no background thread will clear it.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(("cat-a".to_string(), "t1.torrent".to_string()), ());
+
+        // Inject a short deadline: exercising the full rename timeout path
+        // must not hard-wait out the 5s production constant.
+        let started = std::time::Instant::now();
+        let result = svc.rename_with_pending_timeout(
+            cat_a_ino,
+            "t1.torrent",
+            cat_a_ino,
+            "renamed.torrent",
+            Duration::from_millis(100),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path must honor the injected deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result.is_err(),
+            "rename over a stuck pending add must fail instead of losing the rename"
+        );
+
+        match svc.inode_mgr.inodes.get(&t1_ino) {
+            Some(InodeData::File { name, .. }) if name == "t1.torrent" => {}
+            other => panic!(
+                "inode must be rolled back to old name 't1.torrent' after rename timeout, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+    }
+
+    /// TSI-2378 (review suggestion): the 5s production timeout must not be
+    /// baked into the wait loop — exercise the timeout path with a short
+    /// injected deadline so this test stays fast.
+    #[test]
+    fn wait_for_pending_add_times_out_with_short_deadline() {
+        let svc = service_with_db();
+        let key = ("cat-a".to_string(), "t1.torrent".to_string());
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        let started = std::time::Instant::now();
+        let err = svc
+            .wait_for_pending_add(&key, Duration::from_millis(100))
+            .expect_err("short timeout must fail");
+        assert!(
+            matches!(err, FsError::Internal(_)),
+            "timeout must surface as Internal error, got {:?}",
+            err
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout must honor the injected deadline, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// TSI-2378: an intra-directory rename must evict the cached TorrentRoot
+    /// carrying the OLD filename — otherwise data/ keeps listing the stale
+    /// name until restart even though the DB row is updated.
+    #[test]
+    fn intra_directory_rename_evicts_stale_torrent_root_cache() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "t1", "old.torrent", 16, "hash-2378", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "old.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Warm the data/ cache with the pre-rename TorrentRoot entry.
+        svc.inode_mgr.data_inodes.insert(
+            InodeManager::make_torrent_root_ino(1),
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: "cat-a".to_string(),
+                name: "t1".to_string(),
+                filename: "old.torrent".to_string(),
+            },
+        );
+
+        svc.rename(cat_a_ino, "old.torrent", cat_a_ino, "new.torrent")
+            .expect("intra-directory rename");
+
+        // The stale cached entry (old filename) must be evicted so later
+        // lookups re-resolve from the DB at the new filename.
+        assert!(
+            !svc.inode_mgr
+                .data_inodes
+                .contains_key(&InodeManager::make_torrent_root_ino(1)),
+            "stale TorrentRoot cache entry with the old filename must be evicted"
+        );
+
+        // And the DB row must now carry the new filename at the same path.
+        {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            assert!(
+                db.get_torrent_by_filename_and_source_path("new.torrent", "cat-a")
+                    .unwrap()
+                    .is_some(),
+                "DB row must be renamed in place"
+            );
+        }
+    }
+
     #[test]
     fn data_namespace_inodes_correctly_identified() {
         // Unit-test the helper itself.
@@ -2748,6 +3088,7 @@ mod tests {
             torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
+            processing_torrents_cv: Arc::new(Condvar::new()),
             seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
