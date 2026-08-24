@@ -95,11 +95,6 @@ impl DownloadService {
         self.engine.read_file_range(info, file_index, offset, size)
     }
 
-    /// Get session-level stats.
-    pub fn get_session_stats(&self) -> TorrentResult<SessionStats> {
-        self.engine.get_session_stats()
-    }
-
     /// Snapshot cached session stats — safe to call from FUSE handlers
     /// without blocking on the libtorrent session FFI.
     pub fn snapshot_stats(&self) -> SessionStats {

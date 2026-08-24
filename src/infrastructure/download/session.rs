@@ -5,7 +5,7 @@ use std::ptr;
 use crate::config::TorrentfsConfig;
 use crate::error::{error_from_c, TorrentError, TorrentResult};
 
-use super::types::{FilePieceInfo, SessionStats, TorrentState, TorrentStatus};
+use super::types::{FilePieceInfo, TorrentState, TorrentStatus};
 
 pub struct Session {
     pub(crate) inner: libtorrent_sys::lt_session_t,
@@ -219,38 +219,11 @@ impl Session {
         self.inner
     }
 
-    /// Get session-level statistics (rates, connections, DHT nodes).
-    pub fn get_stats(&self) -> TorrentResult<SessionStats> {
-        let mut stats = libtorrent_sys::lt_session_stats_t {
-            download_rate: 0,
-            upload_rate: 0,
-            total_downloaded: 0,
-            total_uploaded: 0,
-            dht_nodes: 0,
-            peers_connected: 0,
-            half_open_connections: 0,
-        };
-        let mut status: i32 = -1;
-
-        let result =
-            unsafe { libtorrent_sys::lt_session_get_stats(self.inner, &mut stats, &mut status) };
-
-        if result != 0 {
-            Err(TorrentError::Unknown {
-                code: result,
-                message: "Failed to get session stats".to_string(),
-            })
-        } else {
-            Ok(SessionStats {
-                download_rate: stats.download_rate,
-                upload_rate: stats.upload_rate,
-                total_downloaded: stats.total_downloaded,
-                total_uploaded: stats.total_uploaded,
-                dht_nodes: stats.dht_nodes,
-                peers_connected: stats.peers_connected,
-                half_open_connections: stats.half_open_connections,
-            })
-        }
+    /// TSI-2344: request a fresh session-stats sample. The resulting
+    /// `session_stats_alert` is drained by the alert-consumer thread, which
+    /// updates the shared stats snapshot. Fire-and-forget and never blocks.
+    pub fn post_stats(&self) {
+        unsafe { libtorrent_sys::lt_session_post_session_stats(self.inner) };
     }
 }
 

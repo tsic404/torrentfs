@@ -54,7 +54,7 @@ impl Default for SharedSessionStats {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-enum AlertType {
+pub(crate) enum AlertType {
     ReadPiece,
     SessionStats,
     TorrentFinished,
@@ -65,10 +65,26 @@ enum AlertType {
 impl From<i32> for AlertType {
     fn from(value: i32) -> Self {
         match value {
-            0 => AlertType::ReadPiece,
-            1 => AlertType::SessionStats,
-            2 => AlertType::TorrentFinished,
-            3 => AlertType::TorrentRemoved,
+            // Patterns bind to the bindgen-generated constants of
+            // `lt_alert_type_t` (libtorrent_wrapper.h), not hand-written
+            // literals. TSI-2145 drifted this mapping to 0-based and every
+            // alert was dispatched one slot early — `session_stats_alert`
+            // never reached the `SessionStats` branch, leaving root
+            // `.stats` Total DL/UL at zero (TSI-2344). Deriving from the
+            // generated constants makes any future header enum change a
+            // compile error here instead of silent runtime misdispatch.
+            x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_READ_PIECE as i32 => {
+                AlertType::ReadPiece
+            }
+            x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_SESSION_STATS as i32 => {
+                AlertType::SessionStats
+            }
+            x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_FINISHED as i32 => {
+                AlertType::TorrentFinished
+            }
+            x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_REMOVED as i32 => {
+                AlertType::TorrentRemoved
+            }
             other => AlertType::Other(other),
         }
     }
@@ -291,7 +307,7 @@ fn drain_alerts(
     true
 }
 
-fn dispatch(
+pub(crate) fn dispatch(
     alert_type: AlertType,
     alert: &libtorrent_sys::lt_alert_data_t,
     stats: &SharedSessionStats,
@@ -405,5 +421,78 @@ mod tests {
             start.elapsed() >= Duration::from_millis(50),
             "wait should block for at least the timeout when not notified"
         );
+    }
+
+    #[test]
+    fn alert_type_mapping_matches_ffi_enum() {
+        // TSI-2344: the mapping must dispatch on the bindgen-generated
+        // `lt_alert_type_t` constants (libtorrent_wrapper.h). A previous
+        // off-by-one sent `session_stats_alert` to `TorrentFinished`, so
+        // the shared session-stats snapshot never updated and root `.stats`
+        // showed Total DL/UL = 0 B.
+        assert!(matches!(
+            AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_READ_PIECE as i32),
+            AlertType::ReadPiece
+        ));
+        assert!(matches!(
+            AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_SESSION_STATS as i32),
+            AlertType::SessionStats
+        ));
+        assert!(matches!(
+            AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_FINISHED as i32),
+            AlertType::TorrentFinished
+        ));
+        assert!(matches!(
+            AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_REMOVED as i32),
+            AlertType::TorrentRemoved
+        ));
+    }
+
+    #[test]
+    fn alert_type_other_fallback_preserves_value() {
+        // Unmapped values (e.g. LT_ALERT_OTHER = 99) must round-trip into
+        // `Other` with their raw value intact.
+        let other = libtorrent_sys::lt_alert_type_t_LT_ALERT_OTHER as i32;
+        match AlertType::from(other) {
+            AlertType::Other(v) => assert_eq!(v, other),
+            other_variant => panic!("expected Other({other}), got {other_variant:?}"),
+        }
+    }
+
+    #[test]
+    fn session_stats_alert_updates_shared_snapshot() {
+        // TSI-2344 integration-level assertion: a `session_stats_alert`
+        // (type = LT_ALERT_SESSION_STATS) flowing through dispatch must make
+        // the shared snapshot readable with non-zero values — this is what
+        // root `.stats` Global Rates renders. The engine's per-tick
+        // `post_session_stats` request is the alert's producer.
+        let shared = SharedSessionStats::new();
+        let metrics = Metrics::new();
+        let alert = libtorrent_sys::lt_alert_data_t {
+            type_: libtorrent_sys::lt_alert_type_t_LT_ALERT_SESSION_STATS as i32,
+            info_hash: [0; 41],
+            piece_index: 0,
+            error_code: 0,
+            piece_data: std::ptr::null_mut(),
+            piece_data_size: 0,
+            download_rate: 2048,
+            upload_rate: 1024,
+            total_downloaded: 439_871_233, // ≈ 419 MB, as observed in QA
+            total_uploaded: 4096,
+            dht_nodes: 300,
+            peers_connected: 7,
+            half_open_connections: 2,
+            message: std::ptr::null(),
+            category: 0,
+        };
+        dispatch(AlertType::from(alert.type_), &alert, &shared, &metrics);
+
+        let ss = shared.snapshot();
+        assert_eq!(ss.total_downloaded, 439_871_233);
+        assert!(ss.total_downloaded > 0, "snapshot must read non-zero DL");
+        assert_eq!(ss.download_rate, 2048);
+        assert_eq!(ss.upload_rate, 1024);
+        assert_eq!(ss.dht_nodes, 300);
+        assert_eq!(ss.peers_connected, 7);
     }
 }

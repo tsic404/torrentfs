@@ -29,16 +29,6 @@ typedef struct {
 } lt_torrent_metadata_t;
 
 typedef struct {
-    int64_t download_rate;
-    int64_t upload_rate;
-    int64_t total_downloaded;
-    int64_t total_uploaded;
-    int32_t dht_nodes;
-    int32_t peers_connected;
-    int32_t half_open_connections;
-} lt_session_stats_t;
-
-typedef struct {
     const char* message;
     int code;
 } lt_error_t;
@@ -134,7 +124,11 @@ void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
 
-int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_t* error);
+// TSI-2344: request a `session_stats_alert`. The alert is delivered through
+// the normal alert queue and must be drained by the single alert-consumer
+// thread (`lt_session_pop_alerts`), which fills the shared stats snapshot.
+// This call is fire-and-forget and never blocks.
+void lt_session_post_session_stats(lt_session_t session);
 lt_alert_list_t* lt_session_pop_alerts(lt_session_t session);
 void lt_alert_list_destroy(lt_alert_list_t* list);
 // Set (or clear) the alert notify callback. `callback` is invoked on one of

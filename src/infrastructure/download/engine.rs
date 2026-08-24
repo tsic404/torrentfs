@@ -53,10 +53,6 @@ pub enum Command {
         size: u32,
         reply: SyncSender<TorrentResult<Vec<u8>>>,
     },
-    /// Session-level statistics.
-    GetSessionStats {
-        reply: SyncSender<TorrentResult<SessionStats>>,
-    },
     /// Piece status for a torrent (used by `.stats`).
     GetPiecesStatus {
         info_hash: String,
@@ -175,14 +171,14 @@ impl DownloadEngine {
 
         // Clones moved into the engine thread; the originals remain for the
         // returned handle.
-        let thread_shared_stats = shared_stats.clone();
         let thread_snapshot = snapshot.clone();
         let thread_stopping = stopping.clone();
         let thread_metrics = metrics.clone();
 
+        let thread_shared_stats = shared_stats.clone();
         let handle = std::thread::Builder::new()
-            .name("download-engine".into())
             .spawn(move || {
+                let shared_stats = thread_shared_stats;
                 let session = match Session::new_with_custom_storage(&config, &pieces_dir) {
                     Ok(s) => s,
                     Err(e) => {
@@ -201,7 +197,7 @@ impl DownloadEngine {
                 let alert_consumer = unsafe {
                     AlertConsumer::spawn(
                         session.inner(),
-                        thread_shared_stats.clone(),
+                        shared_stats.clone(),
                         thread_metrics.clone(),
                     )
                 };
@@ -236,7 +232,7 @@ impl DownloadEngine {
             stopping,
             join: Arc::new(Mutex::new(Some(handle))),
             cache_manager,
-            shared_stats,
+            shared_stats: shared_stats.clone(),
             snapshot,
             metrics,
             read_timeout_secs,
@@ -380,13 +376,6 @@ impl DownloadEngine {
         rx.recv().map_err(|_| Self::disconnected())?
     }
 
-    /// Session-level statistics (synchronous FFI on the engine thread).
-    pub fn get_session_stats(&self) -> TorrentResult<SessionStats> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.send(Command::GetSessionStats { reply: tx })?;
-        rx.recv().map_err(|_| Self::disconnected())?
-    }
-
     /// Piece status for a torrent (synchronous).
     pub fn get_pieces_status(
         &self,
@@ -430,9 +419,11 @@ impl Drop for DownloadEngine {
 /// libtorrent `torrent_flags::upload_mode` numeric value (`1 << 1`).
 const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 
-/// Snapshot refresh interval. Alerts are no longer drained here — a dedicated
-/// consumer thread handles them event-driven via `set_alert_notify` — so this
-/// interval only bounds `.stats` staleness for per-torrent status/pieces.
+/// Snapshot refresh interval. Alerts are drained by a dedicated consumer
+/// thread (`set_alert_notify`), so this interval bounds `.stats` staleness
+/// for per-torrent status/pieces and also drives the session-stats sample
+/// request (TSI-2344): each tick fires `post_session_stats`, whose alert
+/// the consumer drains into the shared stats snapshot.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
@@ -450,6 +441,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                state.refresh_session_stats();
                 state.publish_snapshot();
                 state.flush_cache_metadata();
             }
@@ -467,6 +459,14 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
 }
 
 impl EngineState {
+    /// TSI-2344: request a fresh session-stats sample. Fire-and-forget —
+    /// libtorrent answers with a `session_stats_alert` on the normal alert
+    /// queue, which the alert-consumer thread drains into `shared_stats`.
+    /// This is the sole producer for the `.stats` Global Rates counters.
+    fn refresh_session_stats(&self) {
+        self.session.post_stats();
+    }
+
     /// Handle one command; returns `true` when the engine should stop.
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
@@ -484,9 +484,6 @@ impl EngineState {
                 reply,
             } => {
                 let _ = reply.send(self.read_file_range(&info, file_index, offset, size));
-            }
-            Command::GetSessionStats { reply } => {
-                let _ = reply.send(self.session.get_stats());
             }
             Command::GetPiecesStatus {
                 info_hash,

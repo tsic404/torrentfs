@@ -1120,59 +1120,20 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
 // Include session_stats_alert header
 #include <libtorrent/session_stats.hpp>
 
-int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_t* status) {
-    if (!session || !stats) return -1;
-    
+// TSI-2344: fire-and-forget `post_session_stats()`. The resulting
+// `session_stats_alert` is drained exclusively by the alert-consumer thread
+// (`lt_session_pop_alerts`), preserving the single-consumer invariant — the
+// previous `lt_session_get_stats` polled `pop_alerts` inline and could steal
+// alerts from the consumer.
+void lt_session_post_session_stats(lt_session_t session) {
+    if (!session) return;
     auto wrapper = static_cast<lt_session_wrapper*>(session);
-    
     try {
-        // Post session stats request
+        std::lock_guard<std::mutex> lock(wrapper->mutex);
         wrapper->session->post_session_stats();
-        
-        // Wait for the session_stats_alert
-        auto start = std::chrono::steady_clock::now();
-        auto timeout = std::chrono::seconds(5);
-        
-        while (true) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - start > timeout) {
-                return -1;
-            }
-            
-            std::vector<lt::alert*> alerts;
-            {
-                std::lock_guard<std::mutex> lock(wrapper->mutex);
-                wrapper->session->pop_alerts(&alerts);
-            }
-            
-            for (auto* alert : alerts) {
-                if (auto* sa = lt::alert_cast<lt::session_stats_alert>(alert)) {
-                    lt::span<std::int64_t const> counters = sa->counters();
-                    
-                    // Find metric indices by name
-                    lt::span<lt::stats_metric const> metrics = lt::session_stats_metrics();
-                    for (auto const& m : metrics) {
-                        int idx = m.value_index;
-                        if (idx < 0 || idx >= static_cast<int>(counters.size())) continue;
-                        
-                        std::string name(m.name);
-                        if (name == "net.recv_rate") stats->download_rate = counters[idx];
-                        else if (name == "net.sent_rate") stats->upload_rate = counters[idx];
-                        else if (name == "net.recv_bytes") stats->total_downloaded = counters[idx];
-                        else if (name == "net.sent_bytes") stats->total_uploaded = counters[idx];
-                        else if (name == "dht.dht_nodes") stats->dht_nodes = static_cast<int32_t>(counters[idx]);
-                        else if (name == "peer.num_peers_connected") stats->peers_connected = static_cast<int32_t>(counters[idx]);
-                        else if (name == "peer.num_peers_half_open") stats->half_open_connections = static_cast<int32_t>(counters[idx]);
-                    }
-                    if (status) *status = 0;
-                    return 0;
-                }
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
     } catch (const std::exception&) {
-        return -1;
+        // Fire-and-forget: a failed stats request is not an error the
+        // caller can act on; the next tick retries.
     }
 }
 // ── Helper: convert sha1_hash to hex string ──
