@@ -888,14 +888,14 @@ impl EngineState {
         std::thread::sleep(Duration::from_millis(100));
 
         // ── Slow path: peer discovery + piece-wait ─────────────────────
-        // TSI-2246: when the swarm has no available seeder we fail fast with
-        // `NoPeers` instead of falling through to the full `piece_wait_timeout`
-        // (which would surface as a `Timeout` → EIO, a misleading "I/O error"
-        // for what is really "no seeder").  We already passed the
-        // all-pieces-local fast path above, so reaching here means at least one
-        // piece is missing and only the network could supply it — which it
-        // cannot with zero peers/seeds.
-        let peer_wait_timeout = Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
+        // TSI-2358: previously we failed fast with `NoPeers` after the
+        // peer-wait probe (≤ min(read_timeout, 9s)).  Now we fall through
+        // to the piece-wait loop below, so a cold torrent's total wait is
+        // peer-wait(≤9s) + piece-wait(read_timeout_secs).  This avoids
+        // returning 0 bytes (ENODATA) for cold torrents whose peers may
+        // appear later.  Cost: reads are synchronous on the engine thread,
+        // so concurrent cold-torrent reads now serialize for up to
+        // read_timeout_secs each instead of ≤9s.
         {
             let handle = self
                 .handles
@@ -903,6 +903,8 @@ impl EngineState {
                 .ok_or_else(|| Self::missing())?;
             if status.num_peers == 0 && status.num_seeds == 0 {
                 let peer_wait_start = Instant::now();
+                let peer_wait_timeout =
+                    Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
                 loop {
                     if self.stopping.load(Ordering::Relaxed) {
                         self.release_reader(&info_hash);
@@ -922,9 +924,8 @@ impl EngineState {
                             }
                         }
                         // TSI-2246 review: `handle.status()` failed — return
-                        // the actual error instead of falling through to the
-                        // `NoPeers` check below, which would mask the real
-                        // cause behind a misleading "no seeder" message.
+                        // the actual error instead of masking it behind a
+                        // misleading "no seeder" message.
                         Err(e) => {
                             self.release_reader(&info_hash);
                             return Err(e);
@@ -932,17 +933,6 @@ impl EngineState {
                     }
                 }
             }
-            if status.num_peers == 0 && status.num_seeds == 0 {
-                self.release_reader(&info_hash);
-                return Err(TorrentError::NoPeers(format!(
-                    "No peers or seeders connected for info_hash {} after {}s; \
-                     the swarm has no available seeder. Check tracker health or \
-                     try again later.",
-                    info_hash,
-                    peer_wait_timeout.as_secs()
-                )));
-            }
-            let _ = handle.status();
         }
 
         // ── Set piece deadlines ────────────────────────────────────────

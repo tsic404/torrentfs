@@ -275,6 +275,206 @@ fn test_read_file_range_no_peers_error() {
     }
 }
 
+/// TSI-2358 contract: with no peers at all, a read must NOT return early
+/// (the old ≤9s fast-fail) — it must block for the full
+/// `read_timeout_secs` and only then return `NoPeers`.
+///
+/// Deterministic: tracker exists but returns an empty peer list for the
+/// whole run, so no peer can ever appear; DHT/LSD disabled.
+#[test]
+fn test_no_peers_read_blocks_full_timeout_then_errors() {
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
+    // Tracker is running but has NO peers registered — every announce
+    // returns an empty peer list for the entire duration of the read.
+    let tracker = common::MiniTracker::start();
+
+    let (torrent_data, file_content) =
+        common::create_test_torrent_with_tracker(&tracker.announce_url());
+    assert_eq!(file_content.len(), 16384);
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = common::local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    // Short but non-trivial timeout so the elapsed-time assertion below
+    // can distinguish "waited the full timeout" from any fast-fail path.
+    config.timeouts.read_timeout_secs = Some(4);
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    let start = std::time::Instant::now();
+    let result = engine.read_file_range(info, 0, 0, 50);
+    let elapsed = start.elapsed();
+
+    match &result {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {
+            println!("NoPeers after {:.2}s", elapsed.as_secs_f64());
+        }
+        Err(e) => panic!(
+            "Expected NoPeers, got {:?} after {:.2}s",
+            e,
+            elapsed.as_secs_f64()
+        ),
+        Ok(data) => panic!(
+            "Unexpectedly got {} bytes with zero peers in the swarm",
+            data.len()
+        ),
+    }
+
+    // Contract: the read must have blocked for the full read_timeout_secs
+    // (peer-wait ≤9s + piece-wait 4s), NOT returned after the old ~≤9s
+    // fast-fail.  Allow generous slack for CI scheduling jitter while
+    // still failing on any early-return path (< read_timeout_secs).
+    assert!(
+        elapsed >= Duration::from_millis(3900),
+        "Read returned NoPeers too early ({:.2}s): the old fast-fail path \
+         must not trigger; expected blocking for the full read_timeout_secs",
+        elapsed.as_secs_f64()
+    );
+}
+
+/// TSI-2358 contract: if a peer appears mid-read (while the engine is
+/// still inside peer-wait/piece-wait), the read must return the correct
+/// data instead of erroring out.
+///
+/// Deterministic: seeder announces to its own tracker AFTER the read has
+/// already started, so the swarm is empty at t=0 and populated later.
+#[test]
+fn test_peer_appearing_mid_read_returns_data() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
+    // Tracker + torrent, but NO seeder yet — the downloader's first
+    // announces see an empty swarm.
+    let mut harness_seed: Option<common::TestHarness> = None;
+    let tracker = common::MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    let (torrent_data, file_content_shared) =
+        common::create_test_torrent_with_tracker(&announce_url);
+
+    let info_hash = {
+        let info = torrentfs::TorrentInfo::from_bytes(torrent_data.clone())
+            .expect("Failed to parse torrent");
+        hex::encode(info.info_hash().expect("Failed to get info hash"))
+    };
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = common::local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    config.timeouts.read_timeout_secs = Some(30);
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    // Start the read in a background thread.  At this moment the tracker
+    // has zero peers for our info_hash, so the read enters peer-wait.
+    let engine_reader = Arc::clone(&engine);
+    let info_reader = Arc::clone(&info);
+    let read_started = Arc::new(AtomicBool::new(false));
+    let started = Arc::clone(&read_started);
+    let reader = thread::spawn(move || {
+        started.store(true, Ordering::SeqCst);
+        engine_reader.read_file_range(info_reader, 0, 0, 50)
+    });
+
+    // Give the read time to get past the empty-swarm probe: wait until it
+    // started, then hold the swarm empty long enough that under the OLD
+    // behavior the peer-wait would expire with 0 peers.  Then drop in a
+    // full seeder via TestHarness (its own tracker session announcing to
+    // OUR tracker URL).
+    while !read_started.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_secs(6));
+
+    eprintln!("mid-read: introducing seeder into the swarm");
+    let seed_torrent_data = {
+        // Build a fresh torrent pointing at the same announce URL so the
+        // info_hash matches what the downloader announced with.
+        let (t, _) = common::create_test_torrent_with_tracker(&announce_url);
+        t
+    };
+    debug_assert_eq!(
+        hex::encode(
+            torrentfs::TorrentInfo::from_bytes(seed_torrent_data.clone())
+                .unwrap()
+                .info_hash()
+                .unwrap()
+        ),
+        info_hash,
+        "seeder torrent must have identical info_hash"
+    );
+
+    // Spawn the seeder manually (not via TestHarness::new, which creates
+    // its own tracker) so it joins OUR MiniTracker's swarm.
+    let seeder_handle = {
+        let file_content = file_content_shared.clone();
+        thread::spawn(move || {
+            let seed_dir = tempfile::TempDir::new().expect("seed dir");
+            std::fs::write(
+                seed_dir.path().join("final_verification.txt"),
+                &file_content,
+            )
+            .expect("write seed file");
+            let cfg = common::local_test_config();
+            let mut session = torrentfs::download::Session::new(&cfg).expect("seeder session");
+            let si = torrentfs::TorrentInfo::from_bytes(seed_torrent_data).expect("seeder parse");
+            let h = session.add_torrent(&si, seed_dir.path()).expect("add");
+            loop {
+                if let Ok(s) = h.status() {
+                    if matches!(
+                        s.state,
+                        torrentfs::download::TorrentState::Seeding
+                            | torrentfs::download::TorrentState::Finished
+                    ) {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            // Keep the session alive for the remainder of the test.
+            loop {
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+
+    // The read must now succeed within its remaining budget.
+    let result = reader.join().expect("reader thread panicked");
+
+    // The seeder thread parks forever; the test process exits after this
+    // test, tearing it down — nothing to join.
+    drop(seeder_handle);
+
+    match result {
+        Ok(data) => {
+            assert_eq!(&data[..50], &file_content_shared[..50]);
+            println!("Read succeeded after seeder appeared mid-read");
+        }
+        Err(e) => panic!(
+            "Read failed ({:?}) even though a seeder appeared mid-read — \
+             the engine gave up before the peer could serve pieces",
+            e
+        ),
+    }
+
+    drop(harness_seed);
+}
+
 /// Build a structurally valid single-file `.torrent` whose piece hashes are
 /// all zero.  Parsing and handle creation only need valid structure (not
 /// correct hashes); distinct `name`s yield distinct info hashes.
