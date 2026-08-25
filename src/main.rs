@@ -48,7 +48,7 @@ fn install_shutdown_signal_handlers() {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "torrentfs")]
+#[command(name = "torrentfs", version)]
 #[command(about = "A FUSE filesystem for torrent management")]
 struct Args {
     #[arg(help = "Mount point path")]
