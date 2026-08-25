@@ -90,6 +90,34 @@ Rationale: a `.torrent` file is the durable handle to a downloaded swarm; a sile
 
 Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists` (`EEXIST`) when the destination name already resolves to a different inode.
 
+## Troubleshooting
+
+### `cp` to the mountpoint fails with EIO (Input/output error)
+
+A sporadic `EIO` on `cp` (or any I/O) into the mountpoint usually means a
+previous torrentfs instance was not fully cleaned up: the old mount is still
+lazily attached (or the old process still holds the FUSE device), so writes
+race against a half-torn-down mount.
+
+Clean up the environment before retrying:
+
+```bash
+# 1. Force-detach any stale mount (-u unmount, -z also detach a busy mount).
+fusermount -uz /path/to/mountpoint
+
+# 2. Confirm no leftover torrentfs process still holds the mount, then kill it.
+ps aux | grep -E '[t]orrentfs'
+pkill -f 'torrentfs.*<mountpoint>'   # only if a stale instance is listed above
+
+# 3. Verify the mountpoint is really gone before re-mounting.
+mountpoint -q /path/to/mountpoint && echo "still mounted" || echo "clean"
+```
+
+Retry the operation only after step 3 reports the mountpoint clean. If the
+mountpoint lives inside a container with bind propagation (see Container
+Deployment), run the same steps on the host as well — a stale mount can
+persist on both sides of the bind.
+
 ## Offline QA: self-seeding test swarm
 
 Public sample torrents (e.g. the Ubuntu/Debian `.torrent` files commonly used in
