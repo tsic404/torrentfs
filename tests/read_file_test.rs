@@ -36,7 +36,13 @@ fn test_read_file_range_with_local_seeder() {
 
     // ── Create DownloadEngine pointing at the tracker ──────────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
-    let config = local_test_config();
+    let mut config = local_test_config();
+    // TSI-2383: force the downloader onto a distinct listen port so the
+    // MiniTracker can distinguish it from the seeder (which defaults to
+    // 6881 via Session::new with NULL listen_interfaces).  When both
+    // sessions collide on the same port the tracker deduplicates by
+    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -635,7 +641,13 @@ fn test_concurrent_reads_during_download_are_consistent() {
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
-    let config = local_test_config();
+    let mut config = local_test_config();
+    // TSI-2383: force the downloader onto a distinct listen port so the
+    // MiniTracker can distinguish it from the seeder (which defaults to
+    // 6881 via Session::new with NULL listen_interfaces).  When both
+    // sessions collide on the same port the tracker deduplicates by
+    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
 
     let engine = Arc::new(
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
