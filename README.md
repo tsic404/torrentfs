@@ -89,3 +89,24 @@ Rationale: a `.torrent` file is the durable handle to a downloaded swarm; a sile
 - **metadata directory**: `rmdir B && rename A B` (`rmdir` requires `B` to be empty; a non-empty directory returns `ENOTEMPTY`, so unlink its `.torrent` contents first).
 
 Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists` (`EEXIST`) when the destination name already resolves to a different inode.
+
+## Offline QA: self-seeding test swarm
+
+Public sample torrents (e.g. the Ubuntu/Debian `.torrent` files commonly used in
+QA) often have **no reachable seeders** on a given network. Reads through the
+mount then fail with `ENODATA` ("No data available") — this is correct,
+healthy-warn behavior, not a bug. To exercise real on-demand downloads without
+external infrastructure, run the bundled self-seed environment:
+
+```bash
+./ci/run_self_seed_env.sh                 # builds + starts tracker & seeder
+# in another shell / container:
+cp ci/selfseed/output/selfseed.torrent <mountpoint>/metadata/
+cat <mountpoint>/data/selfseed/selfseed    # served by the local seeder
+```
+
+- The payload (`ci/selfseed/output/payload.txt`) is deterministic; diff it
+  against what you read through the mount to verify integrity.
+- The swarm is loopback-only (tracker `127.0.0.1:16969`, no DHT/LSD/UPnP), so
+  it never touches public trackers.
+- Source: `ci/selfseed_env.rs` (cargo example `torrentfs-selfseed-env`).

@@ -1,0 +1,4 @@
+# Self-seed environment runtime artifacts (TSI-2418)
+output/
+seed_data/
+*.log

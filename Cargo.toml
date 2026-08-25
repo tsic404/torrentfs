@@ -25,3 +25,8 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.10"
+parking_lot = "0.12"
+
+[[example]]
+name = "torrentfs-selfseed-env"
+path = "ci/selfseed_env.rs"
