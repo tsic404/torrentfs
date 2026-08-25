@@ -197,6 +197,119 @@ impl Database {
         Ok(InsertTorrentResult::Inserted(torrent_id))
     }
 
+    /// Replace the content of an existing torrent row in place (TSI-2381).
+    ///
+    /// Used when a `.torrent` file is overwritten with different content
+    /// under the same `(source_path, filename)`: the row keeps its id and
+    /// location, but its name, info_hash, size, file list, and raw bytes are
+    /// re-pointed at the new torrent. Atomic: the row and its files are
+    /// updated inside one transaction so a crash cannot leave a torrent
+    /// without matching file entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_torrent_content(
+        &mut self,
+        torrent_id: i64,
+        name: &str,
+        info_hash: &str,
+        total_size: i64,
+        file_count: i64,
+        files: &[FileEntry],
+        data: &[u8],
+    ) -> Result<(), DbError> {
+        let tx = self.conn.transaction()?;
+
+        tx.execute(
+            "UPDATE torrents SET name = ?, info_hash = ?, total_size = ?, file_count = ?, \
+             torrent_data = ?, status = 'pending', resume_data = NULL WHERE id = ?",
+            params![name, info_hash, total_size, file_count, data, torrent_id],
+        )?;
+
+        // Rebuild the file/directory tree from scratch for this torrent.
+        tx.execute(
+            "DELETE FROM directory_closure WHERE descendant_id IN \
+             (SELECT id FROM torrent_directories WHERE torrent_id = ?1) \
+             OR ancestor_id IN (SELECT id FROM torrent_directories WHERE torrent_id = ?1)",
+            params![torrent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM torrent_directories WHERE torrent_id = ?",
+            params![torrent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM torrent_files WHERE torrent_id = ?",
+            params![torrent_id],
+        )?;
+
+        let mut dir_cache: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+
+        for file_entry in files {
+            let path_parts: Vec<&str> = file_entry.path.split('/').collect();
+            if path_parts.is_empty() {
+                continue;
+            }
+
+            let mut current_parent_id: Option<i64> = None;
+
+            for (i, part) in path_parts.iter().enumerate() {
+                let is_file = i == path_parts.len() - 1;
+                let current_path = path_parts[..=i].join("/");
+
+                if is_file {
+                    tx.execute(
+                        "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
+                        params![torrent_id, current_parent_id, part, &file_entry.path, file_entry.size],
+                    )?;
+                } else {
+                    if let Some(&cached_id) = dir_cache.get(&current_path) {
+                        current_parent_id = Some(cached_id);
+                        continue;
+                    }
+
+                    let existing_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
+                            params![torrent_id, current_parent_id, part],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+
+                    if let Some(id) = existing_id {
+                        dir_cache.insert(current_path.clone(), id);
+                        current_parent_id = Some(id);
+                        continue;
+                    }
+
+                    tx.execute(
+                        "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?, ?, ?)",
+                        params![torrent_id, current_parent_id, part],
+                    )?;
+                    let dir_id = tx.last_insert_rowid();
+
+                    tx.execute(
+                        "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
+                        params![dir_id, dir_id],
+                    )?;
+
+                    if let Some(parent_id) = current_parent_id {
+                        tx.execute(
+                            "INSERT INTO directory_closure (ancestor_id, descendant_id, depth)
+                             SELECT ancestor_id, ?, depth + 1 FROM directory_closure WHERE descendant_id = ?",
+                            params![dir_id, parent_id],
+                        )?;
+                    }
+
+                    dir_cache.insert(current_path.clone(), dir_id);
+                    current_parent_id = Some(dir_id);
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get_torrent_by_source_path(
         &self,
         source_path: &str,

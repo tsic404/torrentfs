@@ -56,7 +56,7 @@ impl TorrentService {
         let info = Arc::new(info);
         let info_hash_hex = hex::encode(metadata.info_hash);
 
-        let is_new = {
+        let (is_new, stale_info_hash) = {
             let mut db_guard = self.db.lock().map_err(|_| {
                 error!("Database lock poisoned");
                 FsError::LockPoisoned
@@ -86,7 +86,7 @@ impl TorrentService {
                     FsError::from(e)
                 })?;
 
-            let is_new = match result {
+            let (is_new, stale_info_hash) = match result {
                 InsertTorrentResult::Inserted(torrent_id) => {
                     db_guard.set_torrent_data(torrent_id, data).map_err(|e| {
                         error!("Failed to store torrent data for {}: {:?}", filename, e);
@@ -104,19 +104,80 @@ impl TorrentService {
                             source_path
                         }
                     );
-                    true
+                    (true, None)
                 }
                 InsertTorrentResult::Duplicate(existing_id) => {
-                    info!(
-                        "Torrent '{}' already exists (id={}), duplicate recorded",
-                        metadata.name, existing_id
-                    );
-                    false
+                    // TSI-2381: a `cp` over an existing metadata torrent
+                    // releases a NEW info-hash under the SAME
+                    // `(source_path, filename)` key. The Duplicate branch
+                    // used to keep the stale row untouched, so a rename
+                    // right after the overwrite looked up the NEW name,
+                    // found no row, and silently no-op'd — on restart the
+                    // OLD torrent resurfaced and metadata/ + data/ showed
+                    // unexpected duplicates. The file content changed, so
+                    // re-point the existing row at the new torrent: update
+                    // name/info_hash/size/file list and store the new bytes.
+
+                    // Review #3: same-content re-copy must stay a cheap
+                    // no-op — skip the full directory-tree rebuild when the
+                    // incoming info-hash matches the stored one.
+                    let old_info_hash = db_guard
+                        .get_torrent_by_id(existing_id)
+                        .map_err(|e| {
+                            error!("Failed to load overwritten torrent {}: {:?}", filename, e);
+                            FsError::from(e)
+                        })?
+                        .map(|t| t.info_hash)
+                        .unwrap_or_default();
+
+                    let replaced = old_info_hash != info_hash_hex;
+
+                    if replaced {
+                        db_guard
+                            .replace_torrent_content(
+                                existing_id,
+                                &metadata.name,
+                                &info_hash_hex,
+                                metadata.total_size as i64,
+                                metadata.num_files as i64,
+                                &files,
+                                data,
+                            )
+                            .map_err(|e| {
+                                error!(
+                                    "Failed to replace overwritten torrent {}: {:?}",
+                                    filename, e
+                                );
+                                FsError::from(e)
+                            })?;
+
+                        info!(
+                            "Torrent '{}' at ({}, {}) was overwritten with different \
+                             content; existing row updated in place",
+                            metadata.name, source_path, filename
+                        );
+                    } else {
+                        info!(
+                            "Torrent '{}' at ({}, {}) re-copied with identical content; \
+                             keeping existing row",
+                            metadata.name, source_path, filename
+                        );
+                    }
+                    (false, replaced.then_some(old_info_hash))
                 }
             };
             // db_guard dropped here (end of block scope)
-            is_new
+            (is_new, stale_info_hash)
         };
+
+        // TSI-2381 (review): the overwrite orphaned the OLD info-hash's
+        // engine handle, scheduler, private_torrents entry, and on-disk
+        // `cache/pieces/<old>/` — release them AFTER the DB guard is
+        // dropped (no I/O under the DB lock), mirroring `remove_torrent`.
+        if let Some(old) = stale_info_hash {
+            self.purge_pieces_cache(&old);
+            self.release_engine_and_seeding(&old);
+        }
 
         // Create upload_mode handle so peer/seed info is visible immediately
         // without triggering any data download (all pieces at priority 0).
@@ -666,6 +727,105 @@ mod tests {
             trackers_before.len(),
             "tracker count must not change (merge was skipped)"
         );
+    }
+
+    /// TSI-2381 (review): overwriting a metadata torrent with DIFFERENT
+    /// content must release the OLD info-hash's engine state — the pieces
+    /// cache for `cache/pieces/<old>/` must be purged, not leaked. (The
+    /// engine handle itself is released via the same
+    /// `release_engine_and_seeding` call; here we assert the observable
+    /// on-disk/metadata effect.)
+    #[test]
+    fn add_torrent_overwrite_purges_old_info_hash_pieces() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+
+        // Two distinct torrents with distinct info-hashes.
+        let old_bytes = build_torrent_bencode("http://old.example.com/announce", 32, 16, false);
+        let new_bytes = build_torrent_bencode("http://new.example.com/announce", 48, 16, false);
+        let old_hash = hex::encode(
+            crate::metadata::TorrentInfo::from_bytes(old_bytes.clone())
+                .unwrap()
+                .info_hash()
+                .unwrap(),
+        );
+        let new_hash = hex::encode(
+            crate::metadata::TorrentInfo::from_bytes(new_bytes.clone())
+                .unwrap()
+                .info_hash()
+                .unwrap(),
+        );
+        assert_ne!(old_hash, new_hash);
+
+        let config = TorrentfsConfig::default_config();
+        let download_service = Arc::new(DownloadService::new(&cache_dir, &config).unwrap());
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let svc = TorrentService::new(db.clone(), Some(download_service.clone()), None);
+
+        // First add: creates the handle + registers a piece for the OLD hash.
+        svc.add_torrent(&old_bytes, "src", "foo.torrent").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            download_service
+                .try_query_torrent_status(&old_hash)
+                .is_some(),
+            "old handle exists after first add"
+        );
+
+        {
+            let cache = download_service.get_cache_manager().unwrap();
+            let mut guard = cache.lock().unwrap();
+            let piece_key = format!("{}:piece:0", old_hash);
+            let path = guard.ensure_piece_dir(&piece_key).unwrap();
+            std::fs::write(&path, b"stale-piece").unwrap();
+            guard.add_piece(&piece_key, 12).unwrap();
+        }
+        assert!(
+            download_service
+                .get_cache_manager()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .has_piece(&format!("{}:piece:0", old_hash)),
+            "old piece registered"
+        );
+
+        // Overwrite with different content under the same name.
+        svc.add_torrent(&new_bytes, "src", "foo.torrent").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // The OLD info-hash's engine handle must be released. The engine
+        // drops it asynchronously — poll briefly (mirrors the sleep-based
+        // PT isolation tests).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while download_service
+            .try_query_torrent_status(&old_hash)
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "old info-hash handle must be released after overwrite"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !download_service
+                .get_cache_manager()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .has_piece(&format!("{}:piece:0", old_hash)),
+            "old info-hash pieces cache must be purged after overwrite"
+        );
+
+        // And the DB row must carry the NEW content.
+        let row = db
+            .lock()
+            .unwrap()
+            .get_torrent_by_filename_and_source_path("foo.torrent", "src")
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(row.info_hash, new_hash, "row must carry new info-hash");
     }
 
     /// PT isolation test: two public torrents with the same info_hash but

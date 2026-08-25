@@ -2770,6 +2770,70 @@ mod tests {
         }
     }
 
+    /// TSI-2381: `cp` over an existing metadata torrent, then a fast `mv`.
+    ///
+    /// The `cp` releases a NEW info-hash under the OLD filename while a DB
+    /// row still exists at `(source_path, old_filename)` from the previous
+    /// content — so the background `add_torrent` takes the `Duplicate`
+    /// branch and keeps that stale row (old name/info_hash) instead of
+    /// inserting anything. The immediate rename then finds no row at the
+    /// new name and silently no-ops; on restart the OLD torrent is
+    /// restored and metadata/ + data/ show unexpected duplicates.
+    #[test]
+    fn rename_after_overwrite_syncs_stale_row() {
+        let mut svc = service_with_db();
+
+        // A previous torrent already persisted at (root, "a.torrent").
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("", "stale", "a.torrent", 16, "hash-old", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+
+        // `cp` overwrites it with different torrent bytes and closes the
+        // handle. The inode now carries the NEW bytes but keeps the name.
+        let (ino, fh) = create_torrent_file(&mut svc, "a.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write ok");
+        svc.release(fh).expect("release ok");
+
+        // Simulate the background add_torrent having settled via the
+        // Duplicate branch (row id 1 kept as-is) — drain the pending map
+        // like the real thread would after its insert attempt.
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The fast `mv`: the row at the new name does not exist yet, so the
+        // pre-fix rename no-ops and the stale row survives at "a.torrent".
+        svc.rename(METADATA_INO, "a.torrent", METADATA_INO, "b.torrent")
+            .expect("rename ok");
+
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let row = db_guard
+            .get_torrent_by_filename_and_source_path("b.torrent", "")
+            .unwrap()
+            .expect("row must exist at the new name");
+
+        // The overwritten row must reflect the NEW torrent content — the
+        // pre-fix Duplicate branch kept the stale info-hash/bytes, so the
+        // restart restored the old torrent and data/ served its file tree.
+        let expected = {
+            let info = TorrentInfo::from_bytes(minimal_torrent_bytes()).unwrap();
+            hex::encode(info.info_hash().unwrap())
+        };
+        assert_eq!(
+            row.info_hash, expected,
+            "row must carry the NEW info-hash after overwrite+rename, got {}",
+            row.info_hash
+        );
+    }
+
     #[test]
     fn data_namespace_inodes_correctly_identified() {
         // Unit-test the helper itself.
