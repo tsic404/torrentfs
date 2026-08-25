@@ -51,14 +51,21 @@ fn install_shutdown_signal_handlers() {
 #[command(name = "torrentfs", version)]
 #[command(about = "A FUSE filesystem for torrent management")]
 struct Args {
-    #[arg(help = "Mount point path")]
-    mountpoint: PathBuf,
+    #[arg(
+        required_unless_present = "config_check",
+        help = "Mount point path (not required with --config-check)"
+    )]
+    mountpoint: Option<PathBuf>,
     #[arg(long, help = "Database path")]
     db: Option<PathBuf>,
     #[arg(long, help = "Cache directory for downloaded pieces")]
     cache: Option<PathBuf>,
     #[arg(long, help = "Configuration file path (TOML)")]
     config: Option<PathBuf>,
+    /// Validate the config file and exit (0 = valid, non-zero = invalid).
+    #[arg(long, conflicts_with_all = ["mountpoint", "db", "cache"], requires = "config",
+          help = "Validate a configuration file and exit")]
+    config_check: bool,
 }
 
 fn fuse_allow_other_enabled() -> io::Result<bool> {
@@ -226,6 +233,24 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     let args = Args::parse();
+
+    // --config-check: validate the TOML file and exit. No FUSE, no DB, no mount.
+    if args.config_check {
+        let path = args
+            .config
+            .as_ref()
+            .expect("config-check requires --config");
+        match TorrentfsConfig::from_file(path) {
+            Ok(_) => {
+                info!("Configuration file {:?} is valid", path);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                error!("Invalid configuration file {:?}: {}", path, e);
+                std::process::exit(1);
+            }
+        }
+    }
     install_shutdown_signal_handlers();
 
     // Load configuration from TOML file if provided
@@ -254,8 +279,14 @@ fn main() {
         std::process::exit(3);
     }
 
-    if !args.mountpoint.exists() {
-        std::fs::create_dir_all(&args.mountpoint).expect("Failed to create mountpoint");
+    // Unreachable as Option::None: clap enforces `required_unless_present`
+    // so mountpoint is guaranteed present on this path.
+    let mountpoint = args
+        .mountpoint
+        .unwrap_or_else(|| unreachable!("clap: mountpoint required without --config-check"));
+
+    if !mountpoint.exists() {
+        std::fs::create_dir_all(&mountpoint).expect("Failed to create mountpoint");
     }
 
     let cache_path = args.cache.clone().unwrap_or_else(|| {
@@ -263,7 +294,6 @@ fn main() {
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("torrentfs/cache")
     });
-
     if !cache_path.exists() {
         if let Err(e) = std::fs::create_dir_all(&cache_path) {
             warn!("Failed to create cache directory {:?}: {:?}", cache_path, e);
@@ -320,10 +350,10 @@ fn main() {
         let worker_pool = fs.worker_pool();
         let download_service = fs.download_service().cloned();
 
-        match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
+        match fuser::spawn_mount2(fs, &mountpoint, &options) {
             Ok(bg) => {
                 info!("torrentfs mounted");
-                wait_for_shutdown(worker_pool, download_service, bg, &args.mountpoint);
+                wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
                 return;
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -368,10 +398,10 @@ fn main() {
     let worker_pool = fs.worker_pool();
     let download_service = fs.download_service().cloned();
 
-    match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
+    match fuser::spawn_mount2(fs, &mountpoint, &options) {
         Ok(bg) => {
             info!("torrentfs mounted");
-            wait_for_shutdown(worker_pool, download_service, bg, &args.mountpoint);
+            wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
             info!("torrentfs unmounted successfully");
         }
         Err(e) => {

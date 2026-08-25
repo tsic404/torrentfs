@@ -200,6 +200,56 @@ fn test_load_config_nonexistent_file_returns_error() {
     assert!(result.is_err(), "Nonexistent file should return error");
 }
 
+/// TSI-2394: the CLI must expose `--config-check` so the container entrypoint
+/// can fail fast on an invalid --config instead of reaching the FUSE mount
+/// stage. Exit code contract: 0 = valid, non-zero = invalid/missing.
+#[test]
+fn test_config_check_flag_rejects_invalid_toml() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("bad.toml");
+    std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "invalid TOML must exit non-zero via --config-check"
+    );
+}
+
+#[test]
+fn test_config_check_flag_accepts_valid_toml() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("good.toml");
+    std::fs::write(&config_path, "[timeouts]\nread_timeout_secs = 60\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        out.status.success(),
+        "valid TOML must exit 0 via --config-check: {}",
+        out.status
+    );
+}
+
+#[test]
+fn test_config_check_flag_requires_config_option() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .arg("--config-check")
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "--config-check without --config must be a usage error"
+    );
+}
+
 #[test]
 fn test_config_to_settings_json() {
     let toml = r#"

@@ -26,6 +26,39 @@ needs_fuse() {
     return 0  # needs FUSE
 }
 
+# Config errors are fatal: torrentfs exits non-zero on a bad --config, and
+# we surface that immediately instead of failing later at the FUSE mount
+# stage with a misleading diagnostic.
+
+# Validate one --config value via the CLI's --config-check. Exits non-zero
+# (propagating torrentfs's own exit code) on an invalid or unreadable file.
+# The `|| rc=$?` pattern keeps the failure reachable under `set -e`.
+validate_config() {
+    local config_path="$1" rc=0
+    torrentfs --config-check --config "$config_path" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[entrypoint] ERROR: invalid config file '$config_path' (torrentfs exit code $rc)" >&2
+        exit "$rc"
+    fi
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --config)
+            config_flag_next=1
+            ;;
+        --config=*)
+            validate_config "${arg#--config=}"
+            ;;
+        *)
+            if [ "${config_flag_next:-0}" -eq 1 ]; then
+                validate_config "$arg"
+                config_flag_next=0
+            fi
+            ;;
+    esac
+done
+
 in_container() {
     # Heuristics: cgroup mount, /.dockerenv, /run/.containerenv (podman)
     grep -q ':/docker/' /proc/1/cgroup 2>/dev/null && return 0
