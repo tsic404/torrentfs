@@ -368,6 +368,26 @@ fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
     cached * piece_length
 }
 
+/// Render the `.stats` health alert line for a single torrent.
+///
+/// The alert fires when the torrent has **no connected peers or seeds**
+/// (`num_peers == 0 && num_seeds == 0`). The counts come from the
+/// libtorrent session — they reflect live peer connections, not tracker
+/// reachability. A tracker can be reachable and have returned seeder
+/// entries, yet show zero connected peers during the window before the
+/// first peer handshake completes (TSI-2442).
+///
+/// The wording therefore describes the **observed connection state** and
+/// avoids the prior text ("tracker may be unreachable") which coupled the
+/// alert to a cause the data cannot establish.
+fn health_alert(num_peers: i32, num_seeds: i32) -> Option<&'static str> {
+    if num_peers == 0 && num_seeds == 0 {
+        Some("  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n")
+    } else {
+        None
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Generate global stats (no per-torrent details, no per-infohash cache breakdown).
@@ -530,8 +550,9 @@ pub fn generate_torrent_stats(
     // -- Peers --
     output.push_str("\n-- Peers --\n");
     output.push_str(&format!("  Peers: {}  Seeds: {}\n", num_peers, num_seeds));
-    if num_peers == 0 && num_seeds == 0 {
-        output.push_str("  ⚠ Health: 0 peers / 0 seeds — tracker may be unreachable\n");
+    let health = health_alert(num_peers, num_seeds);
+    if let Some(line) = health {
+        output.push_str(line);
     }
 
     // -- Pieces -- visualised piece lifecycle (GitHub commit-record grid).
@@ -1365,5 +1386,49 @@ mod tests {
             },
         ];
         assert_eq!(piece_downloaded(&pieces, 262144), 262144);
+    }
+
+    #[test]
+    fn test_health_alert_zero_peers_zero_seeds() {
+        // TSI-2442: the alert fires on zero connected peers/seeds but must
+        // not claim the tracker is unreachable — connected-peer count is not
+        // a tracker-reachability signal.
+        let line = health_alert(0, 0).expect("alert should fire at 0/0");
+        assert!(
+            !line.contains("tracker may be unreachable"),
+            "must not claim tracker unreachable: {line}"
+        );
+        assert!(
+            line.contains("no connected peers"),
+            "should describe the observed state: {line}"
+        );
+        assert!(
+            line.contains("tracker may be reachable"),
+            "should acknowledge tracker may be reachable: {line}"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_with_peers() {
+        assert!(
+            health_alert(3, 0).is_none(),
+            "no alert when peers > 0"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_with_seeds() {
+        assert!(
+            health_alert(0, 2).is_none(),
+            "no alert when seeds > 0"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_both_present() {
+        assert!(
+            health_alert(5, 1).is_none(),
+            "no alert when peers and seeds > 0"
+        );
     }
 }
