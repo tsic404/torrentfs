@@ -308,9 +308,13 @@ impl FsService {
 
         if parent == DATA_INO || InodeManager::is_data_ino(parent) {
             if let Some(db) = &self.db {
-                if let Some((ino, kind, size)) =
-                    DataResolver::lookup_data_inode(&mut self.inode_mgr, db, parent, name)
-                {
+                if let Some((ino, kind, size)) = DataResolver::lookup_data_inode(
+                    &mut self.inode_mgr,
+                    db,
+                    &self.processing_torrents,
+                    parent,
+                    name,
+                ) {
                     let attr = match kind {
                         FileKind::Directory => self.inode_mgr.attr_for_dir(ino, false),
                         FileKind::RegularFile => self.inode_mgr.attr_for_file(ino, size),
@@ -406,9 +410,13 @@ impl FsService {
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
             if let Some(db) = &self.db {
-                if let Some(entries) =
-                    DataResolver::readdir_data(&mut self.inode_mgr, db, ino, offset)
-                {
+                if let Some(entries) = DataResolver::readdir_data(
+                    &mut self.inode_mgr,
+                    db,
+                    &self.processing_torrents,
+                    ino,
+                    offset,
+                ) {
                     return Ok(entries
                         .into_iter()
                         .map(|(entry_ino, entry_offset, kind, name)| DirEntry {

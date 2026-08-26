@@ -24,6 +24,7 @@ pub const DATA_TORRENT_INO_BASE: u64 = 1_000_000;
 pub const DATA_DIR_INO_BASE: u64 = 2_000_000;
 pub const DATA_FILE_INO_BASE: u64 = 3_000_000;
 pub const SOURCE_PATH_DIR_INO_BASE: u64 = 4_000_000;
+pub const PENDING_TORRENT_INO_BASE: u64 = 5_000_000;
 pub const STATS_INO_OFFSET: u64 = 10_000_000;
 
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
@@ -145,6 +146,18 @@ impl InodeManager {
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         SOURCE_PATH_DIR_INO_BASE + (hasher.finish() % 1_000_000)
+    }
+
+    /// TSI-2443: deterministic inode for a pending torrent (background
+    /// add_torrent in-flight, no DB row yet).  Hashes `(source_path,
+    /// filename)` into the `PENDING_TORRENT_INO_BASE` range so each
+    /// pending torrent gets a unique inode — two simultaneous cp's of
+    /// different .torrent files must not collide.
+    pub fn make_pending_torrent_ino(source_path: &str, filename: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        source_path.hash(&mut hasher);
+        filename.hash(&mut hasher);
+        PENDING_TORRENT_INO_BASE + (hasher.finish() % 1_000_000)
     }
 
     pub fn is_data_ino(ino: u64) -> bool {
