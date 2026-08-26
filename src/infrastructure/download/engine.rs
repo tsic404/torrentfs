@@ -896,15 +896,31 @@ impl EngineState {
         // appear later.  Cost: reads are synchronous on the engine thread,
         // so concurrent cold-torrent reads now serialize for up to
         // read_timeout_secs each instead of ≤9s.
+        //
+        // TSI-2417: with zero connected peers/seeds, kick the swarm
+        // immediately instead of waiting for libtorrent's own announce
+        // schedule.  After delete + re-add of the same info_hash, the fresh
+        // handle's first announce can land outside the tracker's
+        // min-interval window (or after an LSD cycle), leaving this read to
+        // time out even though the swarm is healthy.  A forced announce at
+        // peer-wait start (and once more mid-wait) pulls peers in within one
+        // tracker round-trip; failures are non-fatal.
         {
             let handle = self
                 .handles
                 .get(&info_hash)
                 .ok_or_else(|| Self::missing())?;
             if status.num_peers == 0 && status.num_seeds == 0 {
+                if !handle.force_reannounce() {
+                    tracing::debug!(
+                        "read_file_range {}: force_reannounce rejected (non-fatal)",
+                        info_hash
+                    );
+                }
                 let peer_wait_start = Instant::now();
                 let peer_wait_timeout =
                     Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
+                let mut reannounced_mid_wait = false;
                 loop {
                     if self.stopping.load(Ordering::Relaxed) {
                         self.release_reader(&info_hash);
@@ -930,6 +946,13 @@ impl EngineState {
                             self.release_reader(&info_hash);
                             return Err(e);
                         }
+                    }
+                    // Half the peer-wait budget gone and still nobody
+                    // connected — force one more announce before the piece
+                    // deadline path takes over.
+                    if !reannounced_mid_wait && peer_wait_start.elapsed() >= peer_wait_timeout / 2 {
+                        reannounced_mid_wait = true;
+                        handle.force_reannounce();
                     }
                 }
             }

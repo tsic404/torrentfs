@@ -174,9 +174,12 @@ impl TorrentService {
         // engine handle, scheduler, private_torrents entry, and on-disk
         // `cache/pieces/<old>/` — release them AFTER the DB guard is
         // dropped (no I/O under the DB lock), mirroring `remove_torrent`.
+        // TSI-2417: same ordering as remove_torrent — handle released before
+        // pieces purged, so libtorrent never checks a torrent whose files
+        // are vanishing underneath it.
         if let Some(old) = stale_info_hash {
-            self.purge_pieces_cache(&old);
             self.release_engine_and_seeding(&old);
+            self.purge_pieces_cache(&old);
         }
 
         // Create upload_mode handle so peer/seed info is visible immediately
@@ -282,10 +285,19 @@ impl TorrentService {
                 }
             }
         };
-
         if purge_pieces {
-            self.purge_pieces_cache(&info_hash);
+            // TSI-2417: release the libtorrent handle BEFORE purging the
+            // piece files.  `remove_torrent(handle)` is asynchronous inside
+            // libtorrent — while the old handle is still alive its custom
+            // storage can observe the piece files vanishing mid-check, and a
+            // same-info_hash re-add racing the pending removal inherits the
+            // stale have-piece bitmap (pieces "complete" but files gone).
+            // That state forces the recheck path and, if no peer has
+            // connected yet, surfaces as NoPeers after read_timeout_secs.
+            // Releasing first lets libtorrent tear down the old torrent
+            // against intact files; the subsequent purge is uncontended.
             self.release_engine_and_seeding(&info_hash);
+            self.purge_pieces_cache(&info_hash);
         }
 
         Ok(torrent_id.map(|id| (id, info_hash)))

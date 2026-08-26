@@ -46,7 +46,23 @@ fn bencode_bytes(b: &[u8]) -> Vec<u8> {
 struct Peer {
     ip: [u8; 4],
     port: u16,
+    /// Bytes remaining to download (0 = seeder).  Part of the peer identity:
+    /// two distinct clients can share the same IP:port when a downloader runs
+    /// behind pasta/slirp NAT while the seeder runs on the host — both then
+    /// appear to the tracker as `127.0.0.1:<same listen port>` (TSI-2417).
+    left: u64,
+    /// Last announce time (Instant::now at registration).  Entries not
+    /// re-announced within [`PEER_EXPIRY`] are dropped — without expiry, every
+    /// delete + re-add of the same info_hash leaves the previous handle's
+    /// entry behind, and the new handle's peer list fills with stale
+    /// self-referential entries (`127.0.0.1:<own listen port>`) that it then
+    /// wastes its connection attempts on (TSI-2417).
+    seen: std::time::Instant,
 }
+
+/// Drop peers that have not re-announced within this window.  The tracker
+/// advertises `interval=5`, so a live client announces well inside 30s.
+const PEER_EXPIRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct TrackerState {
     /// info_hash → registered peers.
@@ -112,8 +128,8 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         Some(p) => p,
         None => return,
     };
-    // Unknown `left` ⇒ treat as incomplete (leecher); either way we register it.
-    let _left: u64 = query_param(&raw_query, "left")
+    // `left` is part of the peer identity (see `Peer::left`, TSI-2417).
+    let left: u64 = query_param(&raw_query, "left")
         .and_then(|v| v.parse().ok())
         .unwrap_or(u64::MAX);
 
@@ -122,15 +138,40 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         _ => return,
     };
 
-    {
+    // `event`: BEP-3 announce events.  Only `stopped` matters here —
+    // libtorrent sends it when a handle is removed (delete/replace), and
+    // pre-TSI-2417 this tracker ignored it, so the stopped announce *refreshed*
+    // the leaving peer's `seen` timer instead of deleting the entry.  The
+    // ghost entry (e.g. the previous handle's `left=0` self-reference at
+    // `127.0.0.1:<own listen port>`) then survived long enough to be handed
+    // back to a freshly re-added handle as a peer, and under libtorrent's
+    // default `allow_multiple_connections_per_ip=false` that self-target
+    // consumed the single per-IP connection slot — blocking the real seeder
+    // and surfacing as a 30s NoPeers timeout (TSI-2417).
+    let event = query_param(&raw_query, "event").unwrap_or_default();
+
+    // `event=stopped`: the announcing peer is leaving the swarm.  Delete its
+    // entry immediately and reply with an empty peer list — a stopped peer
+    // never wants peers, and returning them would only risk re-registering a
+    // ghost.  Match by (ip, port) (not `left`): a `stopped` announce carries
+    // the handle's final `left`, which can differ from the `left` it
+    // registered with if its download state changed between announces.
+    if event == "stopped" {
         let mut peers = state.peers.lock();
-        let entry = peers.entry(info_hash).or_default();
-        entry.retain(|p| !(p.ip == ip && p.port == peer_port));
-        entry.push(Peer {
-            ip,
-            port: peer_port,
-        });
+        if let Some(entry) = peers.get_mut(&info_hash) {
+            entry.retain(|p| !(p.ip == ip && p.port == peer_port));
+        }
+        let body = b"d8:intervali5e5:peers0:e".to_vec();
+        let response = format!(
+            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(&body);
+        return;
     }
+
+    register_peer(&state, info_hash, ip, peer_port, left);
 
     let compact: Vec<u8> = {
         let peers = state.peers.lock();
@@ -138,7 +179,11 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
             .get(&info_hash)
             .map(|list| {
                 list.iter()
-                    .filter(|p| !(p.ip == ip && p.port == peer_port))
+                    // Exclude only the requester's own (ip, port, left)
+                    // identity — same IP:port with a different `left` is a
+                    // different client and must stay in the response
+                    // (TSI-1977 / TSI-2417).
+                    .filter(|p| !(p.ip == ip && p.port == peer_port && p.left == left))
                     .flat_map(|p| {
                         [
                             p.ip[0],
@@ -168,12 +213,40 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
     let _ = stream.write_all(&body);
 }
 
-fn start_tracker(port: u16) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+/// Register (or refresh) a peer in the swarm, applying the stale-entry
+/// expiry pass `handle_announce` runs before each registration.  Extracted so
+/// the unit tests can drive the same logic without a live TCP socket.
+fn register_peer(
+    state: &TrackerState,
+    info_hash: [u8; 20],
+    ip: [u8; 4],
+    peer_port: u16,
+    left: u64,
+) {
+    let mut peers = state.peers.lock();
+    let entry = peers.entry(info_hash).or_default();
+    // Expire stale entries first: handles from deleted torrents whose
+    // `event=stopped` was lost (network blip, tracker restart) still get
+    // reaped here, so a delete + re-add cycle cannot accumulate dead
+    // self-referential entries.
+    entry.retain(|p| p.seen.elapsed() < PEER_EXPIRY);
+    // Update any existing entry for the same (ip, port, left) triple so a
+    // re-announce refreshes in place instead of duplicating.
+    entry.retain(|p| !(p.ip == ip && p.port == peer_port && p.left == left));
+    entry.push(Peer {
+        ip,
+        port: peer_port,
+        left,
+        seen: std::time::Instant::now(),
+    });
+}
+
+fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind((bind_addr, port))?;
     let state = Arc::new(TrackerState {
         peers: Mutex::new(HashMap::new()),
     });
-    eprintln!("[tracker] listening on 127.0.0.1:{}", port);
+    eprintln!("[tracker] listening on {}:{}", bind_addr, port);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -189,7 +262,13 @@ fn start_tracker(port: u16) -> std::io::Result<()> {
 
 struct Args {
     payload: PathBuf,
+    /// Address the HTTP tracker binds ("127.0.0.1" by default; use "0.0.0.0"
+    /// when the downloader runs in a container and reaches the host via a
+    /// routable address).
+    tracker_bind: String,
     tracker_port: u16,
+    /// Host placed into the .torrent announce URL (default "127.0.0.1").
+    announce_host: String,
     torrent_out: PathBuf,
     url_out: PathBuf,
 }
@@ -197,7 +276,9 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         payload: PathBuf::from("payload.txt"),
+        tracker_bind: "127.0.0.1".to_string(),
         tracker_port: 16969,
+        announce_host: "127.0.0.1".to_string(),
         torrent_out: PathBuf::from("selfseed.torrent"),
         url_out: PathBuf::from("tracker.url"),
     };
@@ -215,6 +296,8 @@ fn parse_args() -> Args {
             "--tracker-port" => {
                 args.tracker_port = value_for!("--tracker-port").parse().expect("bad port")
             }
+            "--tracker-bind" => args.tracker_bind = value_for!("--tracker-bind"),
+            "--announce-host" => args.announce_host = value_for!("--announce-host"),
             "--torrent-out" => args.torrent_out = value_for!("--torrent-out").into(),
             "--url-out" => args.url_out = value_for!("--url-out").into(),
             other => panic!("unknown argument: {}", other),
@@ -227,8 +310,11 @@ fn main() {
     let args = parse_args();
 
     // 1. Tracker first — the announce URL must be live before we bencode.
-    start_tracker(args.tracker_port).expect("failed to start local tracker");
-    let announce_url = format!("http://127.0.0.1:{}/announce", args.tracker_port);
+    start_tracker(&args.tracker_bind, args.tracker_port).expect("failed to start local tracker");
+    let announce_url = format!(
+        "http://{}:{}/announce",
+        args.announce_host, args.tracker_port
+    );
     std::fs::write(&args.url_out, &announce_url).expect("failed to write tracker.url");
 
     // 2. Deterministic single-file torrent over the fixed payload.
@@ -336,5 +422,142 @@ fn main() {
         // never expires for long-running QA sessions.
         std::thread::sleep(Duration::from_secs(3600));
         handle.force_reannounce();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// TSI-2417 regression: a downloader whose (ip, port) collides with the
+    /// seeder's (pasta/slirp NAT shares the host IP and both default to port
+    /// 6881 in separate network namespaces) must NOT evict the seeder from
+    /// the swarm.  Identity is (ip, port, left): the seeder announces left=0,
+    /// the leecher left>0, so both entries coexist and every announce returns
+    /// the seeder.  Mirrors the TSI-1977 fix in tests/common/mod.rs.
+    #[test]
+    fn same_ip_port_different_left_keeps_seeder_entry() {
+        let state = Arc::new(TrackerState {
+            peers: parking_lot_stub(),
+        });
+        let ih = [0u8; 20];
+        let host = [127, 0, 0, 1];
+
+        // Seeder registers: 127.0.0.1:6881, left=0.
+        register_peer(&state, ih, host, 6881, 0);
+
+        // Downloader announces from the SAME ip:port with left=4 MiB —
+        // pre-fix logic wiped the whole (ip, port) slot here, dropping the
+        // seeder and leaving an empty peer list on every later announce.
+        let leecher_left = 4 * 1024 * 1024u64;
+        register_peer(&state, ih, host, 6881, leecher_left);
+
+        let list = state.peers.lock().get(&ih).cloned().unwrap_or_default();
+        assert_eq!(list.len(), 2, "seeder + leecher must both be registered");
+        assert!(
+            list.iter()
+                .any(|p| p.ip == host && p.port == 6881 && p.left == 0),
+            "seeder entry must survive a colliding leecher announce"
+        );
+
+        // The leecher's compact response excludes only its own identity, so
+        // it still sees the seeder.
+        let visible: Vec<_> = list
+            .iter()
+            .filter(|p| !(p.ip == host && p.port == 6881 && p.left == leecher_left))
+            .collect();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].left, 0, "the seeder must remain visible");
+    }
+
+    /// TSI-2417 regression: peers that stop re-announcing (handles from
+    /// deleted torrents whose `event=stopped` was lost) must be expired,
+    /// otherwise delete + re-add cycles accumulate stale self-referential
+    /// entries that crowd the downloader's peer list.
+    #[test]
+    fn stale_peer_entries_expire() {
+        let state = Arc::new(TrackerState {
+            peers: parking_lot_stub(),
+        });
+        let ih = [0u8; 20];
+        let host = [127, 0, 0, 1];
+        let now = std::time::Instant::now();
+
+        // Seed the swarm the way a long QA session looks after a few
+        // delete + re-add rounds: a live seeder, a fresh handle's entry,
+        // and two entries from handles deleted >PEER_EXPIRY ago.
+        let mut peers = state.peers.lock();
+        let entry = peers.entry(ih).or_default();
+        let make = |port: u16, left: u64, age: std::time::Duration| Peer {
+            ip: host,
+            port,
+            left,
+            seen: now.checked_sub(age).unwrap_or_else(std::time::Instant::now),
+        };
+        entry.push(make(6883, 0, std::time::Duration::from_secs(2))); // seeder, live
+        entry.push(make(6881, 4_194_304, std::time::Duration::from_secs(1))); // current handle
+        entry.push(make(6881, 4_194_305, PEER_EXPIRY * 3)); // deleted handle A
+        entry.push(make(6882, 4_194_306, PEER_EXPIRY * 3)); // deleted handle B
+        drop(peers);
+
+        // The next register_peer call runs the same expiry pass
+        // handle_announce runs before registering, reaping the stale entries.
+        register_peer(&state, ih, host, 6881, 4_194_304);
+        let entry = state.peers.lock();
+        let list = entry.get(&ih).cloned().unwrap_or_default();
+        assert_eq!(list.len(), 2, "stale entries must be dropped");
+        assert!(list.iter().all(|p| p.seen.elapsed() < PEER_EXPIRY));
+    }
+
+    /// TSI-2417 core fix: a `event=stopped` announce (the one libtorrent
+    /// sends when a handle is removed on delete/replace) must delete the
+    /// leaving peer's entry immediately, not refresh it.  Pre-fix the
+    /// tracker ignored `event` and the stopped announce *refreshed* the
+    /// leaving handle's `left=0` self-reference at `127.0.0.1:<own port>`,
+    /// so it survived long enough to be returned to the freshly re-added
+    /// handle as a peer — and under libtorrent's default
+    /// `allow_multiple_connections_per_ip=false` that self-target consumed
+    /// the single per-IP connection slot, blocking the real seeder and
+    /// surfacing as a 30s NoPeers timeout (Verity QA_FAILED).
+    #[test]
+    fn stopped_event_deletes_peer_entry() {
+        let state = Arc::new(TrackerState {
+            peers: parking_lot_stub(),
+        });
+        let ih = [0u8; 20];
+        let host = [127, 0, 0, 1];
+
+        // Swarm: a real seeder at 127.0.0.1:6883 (left=0) plus the
+        // downloader's own handle entry at 127.0.0.1:6881 (left>0).
+        register_peer(&state, ih, host, 6883, 0);
+        register_peer(&state, ih, host, 6881, 4_194_304);
+        assert_eq!(
+            state.peers.lock().get(&ih).map(|l| l.len()),
+            Some(2),
+            "seeder + downloader registered"
+        );
+
+        // The downloader's handle is removed (delete + re-add).  libtorrent
+        // sends `event=stopped` from 127.0.0.1:6881 — handle_announce deletes
+        // the (ip, port) entry.  It must NOT touch the seeder at 6883.
+        // Reproduce the deletion branch verbatim (a stopped announce carries
+        // the handle's final `left`, which can differ from the registered
+        // `left`, so the match is (ip, port) only).
+        {
+            let mut peers = state.peers.lock();
+            if let Some(entry) = peers.get_mut(&ih) {
+                entry.retain(|p| !(p.ip == host && p.port == 6881));
+            }
+        }
+
+        let list = state.peers.lock().get(&ih).cloned().unwrap_or_default();
+        assert_eq!(list.len(), 1, "downloader entry deleted, seeder kept");
+        assert_eq!(list[0].port, 6883, "the seeder must survive");
+        assert_eq!(list[0].left, 0);
+    }
+
+    fn parking_lot_stub() -> Mutex<HashMap<[u8; 20], Vec<Peer>>> {
+        Mutex::new(HashMap::new())
     }
 }
