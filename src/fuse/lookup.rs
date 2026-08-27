@@ -13,6 +13,10 @@ use super::fs_types::FileKind;
 
 pub struct DataResolver;
 
+/// TSI-2448: alias for the readdir entry tuple returned by
+/// `readdir_pending_torrent` — avoids clippy `type_complexity` lint.
+type ReaddirEntries = (Vec<(u64, i64, FileKind, String)>, Vec<(u64, DataInode)>);
+
 impl DataResolver {
     /// Resolve a child lookup within the data/ subtree.
     /// Returns (ino, DataInode) if found.
@@ -26,17 +30,53 @@ impl DataResolver {
             return Self::resolve_data_root_lookup(db, name);
         }
 
-        let data_inode = inode_mgr.data_inodes.get(&parent)?;
+        let data_inode = inode_mgr.data_inodes.get(&parent)?.clone();
         match data_inode {
             DataInode::SourcePathDir { path } => {
-                Self::resolve_source_path_dir_lookup(db, path, name)
+                Self::resolve_source_path_dir_lookup(db, &path, name)
             }
-            DataInode::TorrentRoot { torrent_id, .. } => {
-                Self::resolve_torrent_root_lookup(db, *torrent_id, name)
+            DataInode::TorrentRoot {
+                torrent_id,
+                source_path,
+                filename,
+                ..
+            } => {
+                // TSI-2448: when torrent_id is 0 (pending — background
+                // add_torrent in-flight, no DB row yet), resolve internal
+                // files/dirs from the .torrent bencode instead of the DB.
+                if torrent_id == 0 {
+                    Self::resolve_pending_torrent_children(
+                        inode_mgr,
+                        &source_path,
+                        &filename,
+                        "",
+                        name,
+                    )
+                } else {
+                    Self::resolve_torrent_root_lookup(db, torrent_id, name)
+                }
             }
             DataInode::TorrentDir {
-                torrent_id, dir_id, ..
-            } => Self::resolve_torrent_dir_lookup(db, *torrent_id, Some(*dir_id), name),
+                torrent_id,
+                dir_id,
+                dir_path,
+                torrent_source_path,
+                torrent_filename,
+                ..
+            } => {
+                // TSI-2448: same pending fallback for subdirectories.
+                if torrent_id == 0 {
+                    Self::resolve_pending_torrent_children(
+                        inode_mgr,
+                        &torrent_source_path,
+                        &torrent_filename,
+                        &dir_path,
+                        name,
+                    )
+                } else {
+                    Self::resolve_torrent_dir_lookup(db, torrent_id, Some(dir_id), name)
+                }
+            }
             DataInode::TorrentFile { .. } => None,
         }
     }
@@ -135,6 +175,9 @@ impl DataResolver {
                     torrent_id,
                     dir_id: dir.id,
                     name: dir.name,
+                    dir_path: String::new(),
+                    torrent_source_path: String::new(),
+                    torrent_filename: String::new(),
                 },
             ));
         }
@@ -155,6 +198,8 @@ impl DataResolver {
                         file_id: file.id,
                         name: file.name,
                         size: file.size,
+                        torrent_source_path: String::new(),
+                        torrent_filename: String::new(),
                     },
                 ));
             }
@@ -189,9 +234,10 @@ impl DataResolver {
 
         // DB miss — check if a background add_torrent is pending for this
         // (source_path, filename).  Only torrent-root lookups (data/ root
-        // and SourcePathDir parents) can be pending; TorrentRoot /
-        // TorrentDir / TorrentFile parents query the DB by id and have no
-        // pending fallback.
+        // and SourcePathDir parents) can be pending here; TorrentRoot /
+        // TorrentDir / TorrentFile parents with torrent_id == 0 are
+        // already handled by `resolve_data_lookup` above via the bencode
+        // file-list fallback (TSI-2448).
         let source_path = if parent == super::inodes::DATA_INO {
             String::new()
         } else {
@@ -262,6 +308,112 @@ impl DataResolver {
         filename.trim_end_matches(".torrent").to_string()
     }
 
+    /// TSI-2448: scan the metadata inode table for the `.torrent` file
+    /// at `(source_path, filename)` whose `add_torrent` is pending.
+    /// Returns a reference to the raw torrent bytes if found.
+    ///
+    /// This is the same inode scan used by `parse_pending_torrent_name`
+    /// but returns the full buffer so the bencode file list can be
+    /// extracted for internal file/directory resolution.
+    fn find_pending_torrent_data<'a>(
+        inode_mgr: &'a InodeManager,
+        source_path: &str,
+        filename: &str,
+    ) -> Option<&'a [u8]> {
+        for data in inode_mgr.inodes.values() {
+            if let crate::fuse::inodes::InodeData::File {
+                name,
+                data: file_data,
+                unlinked,
+                parent,
+            } = data
+            {
+                if *unlinked || name != filename || file_data.is_empty() {
+                    continue;
+                }
+                let inode_sp = inode_mgr.extract_source_path(*parent);
+                if inode_sp != source_path {
+                    continue;
+                }
+                return Some(file_data);
+            }
+        }
+        None
+    }
+
+    /// TSI-2448: resolve a child (directory or file) inside a pending
+    /// torrent root by parsing the bencode file list.
+    ///
+    /// `dir_path` is the directory path relative to the torrent root
+    /// (empty for root-level lookups).  `name` is the child being
+    /// looked up.  Returns a `DataInode` with a pending inode (stable
+    /// hash of `(source_path, filename, child_path)`) if the child
+    /// exists in the torrent's file structure.
+    fn resolve_pending_torrent_children(
+        inode_mgr: &InodeManager,
+        source_path: &str,
+        filename: &str,
+        dir_path: &str,
+        name: &str,
+    ) -> Option<(u64, DataInode)> {
+        let torrent_data = Self::find_pending_torrent_data(inode_mgr, source_path, filename)?;
+        let (_torrent_name, files) = extract_bencode_files(torrent_data)?;
+
+        // Build the full path prefix for this directory.
+        let prefix = if dir_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir_path)
+        };
+
+        // Check if `name` is a subdirectory: any file whose path starts
+        // with `prefix + name + "/"`.
+        let sub_prefix = format!("{}{}/", prefix, name);
+        let has_subdir = files.iter().any(|f| f.path.starts_with(&sub_prefix));
+        if has_subdir {
+            let child_path = if dir_path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", dir_path, name)
+            };
+            let ino =
+                InodeManager::make_pending_torrent_dir_ino(source_path, filename, &child_path);
+            return Some((
+                ino,
+                DataInode::TorrentDir {
+                    torrent_id: 0,
+                    dir_id: 0,
+                    name: name.to_string(),
+                    dir_path: child_path,
+                    torrent_source_path: source_path.to_string(),
+                    torrent_filename: filename.to_string(),
+                },
+            ));
+        }
+
+        // Check if `name` is a file in this directory.
+        let file_path = format!("{}{}", prefix, name);
+        for file in &files {
+            if file.path == file_path {
+                let ino =
+                    InodeManager::make_pending_torrent_file_ino(source_path, filename, &file_path);
+                return Some((
+                    ino,
+                    DataInode::TorrentFile {
+                        torrent_id: 0,
+                        file_id: 0,
+                        name: name.to_string(),
+                        size: file.size as i64,
+                        torrent_source_path: source_path.to_string(),
+                        torrent_filename: filename.to_string(),
+                    },
+                ));
+            }
+        }
+
+        None
+    }
+
     /// TSI-2443: collect pending torrent entries for a given `source_path`
     /// that have a background `add_torrent` in-flight but no DB row yet.
     /// Returns `(ino, DataInode, filename)` triples for injection into
@@ -298,30 +450,165 @@ impl DataResolver {
         result
     }
 
-    /// TSI-2443 (review): evict stale pending `TorrentRoot(id=0)` entries
-    /// from `data_inodes` whose `(source_path, filename)` now has a DB
-    /// row.  Called after `readdir_data` lists DB-sourced torrents so the
-    /// stale pending inodes don't linger past the 1s FUSE TTL.
+    /// TSI-2443 (review): evict stale pending entries from `data_inodes`
+    /// whose `(source_path, filename)` now has a DB row.  Called after
+    /// `readdir_data` lists DB-sourced torrents so the stale pending
+    /// inodes don't linger past the 1s FUSE TTL.
+    ///
+    /// TSI-2448 (review): also evicts pending `TorrentDir` (6M range)
+    /// and `TorrentFile` (7M range) entries cached during the pending
+    /// window.  All three pending types (`TorrentRoot`, `TorrentDir`,
+    /// `TorrentFile`) store `torrent_source_path`/`torrent_filename`,
+    /// so eviction matches on those fields uniformly.
     fn evict_stale_pending(inode_mgr: &mut InodeManager, source_path: &str, db_filenames: &[&str]) {
-        // If a filename is in the DB, its pending inode (if any) is stale.
-        let stale_inos: Vec<u64> = db_filenames
+        let db_fn_set: std::collections::HashSet<&str> = db_filenames.iter().copied().collect();
+
+        // Collect all stale pending inodes in one pass: TorrentRoot (5M),
+        // TorrentDir (6M), and TorrentFile (7M) whose torrent identity
+        // matches a DB-landed (source_path, filename).
+        let stale_inos: Vec<u64> = inode_mgr
+            .data_inodes
             .iter()
-            .filter_map(|fname| {
-                let ino = InodeManager::make_pending_torrent_ino(source_path, fname);
-                // Only evict if the entry actually exists and is a pending root.
-                if matches!(
-                    inode_mgr.data_inodes.get(&ino),
-                    Some(DataInode::TorrentRoot { torrent_id: 0, .. })
-                ) {
-                    Some(ino)
+            .filter_map(|(ino, data)| {
+                let (tsp, tfn) = match data {
+                    DataInode::TorrentRoot {
+                        torrent_id: 0,
+                        source_path,
+                        filename,
+                        ..
+                    } => (source_path.as_str(), filename.as_str()),
+                    DataInode::TorrentDir {
+                        torrent_id: 0,
+                        torrent_source_path,
+                        torrent_filename,
+                        ..
+                    } => (torrent_source_path.as_str(), torrent_filename.as_str()),
+                    DataInode::TorrentFile {
+                        torrent_id: 0,
+                        torrent_source_path,
+                        torrent_filename,
+                        ..
+                    } => (torrent_source_path.as_str(), torrent_filename.as_str()),
+                    _ => return None,
+                };
+
+                if tsp == source_path && db_fn_set.contains(tfn) {
+                    Some(*ino)
                 } else {
                     None
                 }
             })
             .collect();
+
         for ino in stale_inos {
             inode_mgr.data_inodes.remove(&ino);
         }
+    }
+
+    /// TSI-2448: generate readdir entries for a pending torrent root or
+    /// subdirectory by parsing the bencode file list instead of querying
+    /// the DB.  `dir_path` is the directory path relative to the torrent
+    /// root (empty string = root).  Returns `(entries, cache_entries)`
+    /// so the caller can merge them into the `readdir_data` flow.
+    ///
+    /// The entry set includes `.` and `..` plus one entry per immediate
+    /// child directory and file.  Directories are detected by scanning
+    /// for files whose path has the directory as a prefix.
+    fn readdir_pending_torrent(
+        inode_mgr: &mut InodeManager,
+        source_path: &str,
+        filename: &str,
+        dir_path: &str,
+        _self_ino: u64,
+    ) -> Option<ReaddirEntries> {
+        let torrent_data = Self::find_pending_torrent_data(inode_mgr, source_path, filename)?;
+        let (_name, files) = extract_bencode_files(torrent_data)?;
+
+        let prefix = if dir_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir_path)
+        };
+
+        let mut entries: Vec<(u64, i64, FileKind, String)> = Vec::new();
+        let mut cache_entries: Vec<(u64, DataInode)> = Vec::new();
+
+        // Collect immediate children: directories (unique first-level
+        // path components after the prefix) and files (exact prefix
+        // match with no remaining `/`).
+        let mut seen_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let mut offset_counter = 3i64;
+
+        for file in &files {
+            if !file.path.starts_with(&prefix) {
+                continue;
+            }
+            let remainder = &file.path[prefix.len()..];
+            if remainder.is_empty() {
+                continue;
+            }
+
+            if let Some(slash_pos) = remainder.find('/') {
+                // This file is inside a subdirectory — extract the dir name.
+                let dir_name = &remainder[..slash_pos];
+                if seen_dirs.insert(dir_name.to_string()) {
+                    let child_dir_path = if dir_path.is_empty() {
+                        dir_name.to_string()
+                    } else {
+                        format!("{}/{}", dir_path, dir_name)
+                    };
+                    let dir_ino = InodeManager::make_pending_torrent_dir_ino(
+                        source_path,
+                        filename,
+                        &child_dir_path,
+                    );
+                    cache_entries.push((
+                        dir_ino,
+                        DataInode::TorrentDir {
+                            torrent_id: 0,
+                            dir_id: 0,
+                            name: dir_name.to_string(),
+                            dir_path: child_dir_path,
+                            torrent_source_path: source_path.to_string(),
+                            torrent_filename: filename.to_string(),
+                        },
+                    ));
+                    entries.push((
+                        dir_ino,
+                        offset_counter,
+                        FileKind::Directory,
+                        dir_name.to_string(),
+                    ));
+                    offset_counter += 1;
+                }
+            } else {
+                // A file directly in this directory.
+                let file_name = remainder;
+                let file_ino =
+                    InodeManager::make_pending_torrent_file_ino(source_path, filename, &file.path);
+                cache_entries.push((
+                    file_ino,
+                    DataInode::TorrentFile {
+                        torrent_id: 0,
+                        file_id: 0,
+                        name: file_name.to_string(),
+                        size: file.size as i64,
+                        torrent_source_path: source_path.to_string(),
+                        torrent_filename: filename.to_string(),
+                    },
+                ));
+                entries.push((
+                    file_ino,
+                    offset_counter,
+                    FileKind::RegularFile,
+                    file_name.to_string(),
+                ));
+                offset_counter += 1;
+            }
+        }
+
+        Some((entries, cache_entries))
     }
 
     /// Generate readdir entries for a data/ inode.
@@ -521,6 +808,7 @@ impl DataResolver {
             DataInode::TorrentRoot {
                 torrent_id,
                 source_path,
+                filename,
                 ..
             } => {
                 entries.push((ino, 1, FileKind::Directory, ".".to_string()));
@@ -538,113 +826,216 @@ impl DataResolver {
                 };
                 entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
 
-                {
-                    let db_guard = db.lock().ok()?;
+                // TSI-2448: for pending torrents (torrent_id == 0),
+                // list internal files/dirs from the bencode instead of
+                // the DB.
+                if torrent_id == 0 {
+                    if let Some((mut p_entries, p_cache)) =
+                        Self::readdir_pending_torrent(inode_mgr, &source_path, &filename, "", ino)
+                    {
+                        entries.append(&mut p_entries);
 
-                    let mut offset_counter = 3i64;
-
-                    let root_dirs = db_guard
-                        .get_torrent_directories_by_parent(None, torrent_id)
-                        .ok()?;
-                    for dir in root_dirs {
-                        let dir_ino = InodeManager::make_torrent_dir_ino(dir.id);
-                        cache_entries.push((
-                            dir_ino,
-                            DataInode::TorrentDir {
-                                torrent_id,
-                                dir_id: dir.id,
-                                name: dir.name.clone(),
-                            },
+                        // Inject .stats virtual file for torrent root
+                        let stats_ino = InodeManager::make_stats_ino(ino);
+                        let next_offset = entries.last().map(|(_, o, _, _)| *o).unwrap_or(2) + 1;
+                        entries.push((
+                            stats_ino,
+                            next_offset,
+                            FileKind::RegularFile,
+                            ".stats".to_string(),
                         ));
-                        entries.push((dir_ino, offset_counter, FileKind::Directory, dir.name));
-                        offset_counter += 1;
+
+                        for (cache_ino, cache_inode) in p_cache {
+                            inode_mgr.data_inodes.insert(cache_ino, cache_inode);
+                        }
+                    }
+                } else {
+                    {
+                        let db_guard = db.lock().ok()?;
+
+                        let mut offset_counter = 3i64;
+
+                        let root_dirs = db_guard
+                            .get_torrent_directories_by_parent(None, torrent_id)
+                            .ok()?;
+                        for dir in root_dirs {
+                            let dir_ino = InodeManager::make_torrent_dir_ino(dir.id);
+                            cache_entries.push((
+                                dir_ino,
+                                DataInode::TorrentDir {
+                                    torrent_id,
+                                    dir_id: dir.id,
+                                    name: dir.name.clone(),
+                                    dir_path: String::new(),
+                                    torrent_source_path: String::new(),
+                                    torrent_filename: String::new(),
+                                },
+                            ));
+                            entries.push((dir_ino, offset_counter, FileKind::Directory, dir.name));
+                            offset_counter += 1;
+                        }
+
+                        let root_files = db_guard.get_root_files(torrent_id).ok()?;
+                        for file in root_files {
+                            let file_ino = InodeManager::make_torrent_file_ino(file.id);
+                            cache_entries.push((
+                                file_ino,
+                                DataInode::TorrentFile {
+                                    torrent_id,
+                                    file_id: file.id,
+                                    name: file.name.clone(),
+                                    size: file.size,
+                                    torrent_source_path: String::new(),
+                                    torrent_filename: String::new(),
+                                },
+                            ));
+                            entries.push((
+                                file_ino,
+                                offset_counter,
+                                FileKind::RegularFile,
+                                file.name,
+                            ));
+                            offset_counter += 1;
+                        }
+
+                        // Inject .stats virtual file for torrent root
+                        let stats_ino = InodeManager::make_stats_ino(ino);
+                        entries.push((
+                            stats_ino,
+                            offset_counter,
+                            FileKind::RegularFile,
+                            ".stats".to_string(),
+                        ));
                     }
 
-                    let root_files = db_guard.get_root_files(torrent_id).ok()?;
-                    for file in root_files {
-                        let file_ino = InodeManager::make_torrent_file_ino(file.id);
-                        cache_entries.push((
-                            file_ino,
-                            DataInode::TorrentFile {
-                                torrent_id,
-                                file_id: file.id,
-                                name: file.name.clone(),
-                                size: file.size,
-                            },
-                        ));
-                        entries.push((file_ino, offset_counter, FileKind::RegularFile, file.name));
-                        offset_counter += 1;
+                    for (cache_ino, cache_inode) in cache_entries {
+                        inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                     }
-
-                    // Inject .stats virtual file for torrent root
-                    let stats_ino = InodeManager::make_stats_ino(ino);
-                    entries.push((
-                        stats_ino,
-                        offset_counter,
-                        FileKind::RegularFile,
-                        ".stats".to_string(),
-                    ));
-                }
-
-                for (cache_ino, cache_inode) in cache_entries {
-                    inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                 }
             }
             DataInode::TorrentDir {
-                torrent_id, dir_id, ..
+                torrent_id,
+                dir_id,
+                dir_path,
+                torrent_source_path,
+                torrent_filename,
+                ..
             } => {
                 entries.push((ino, 1, FileKind::Directory, ".".to_string()));
 
-                {
-                    let db_guard = db.lock().ok()?;
-
-                    let parent_ino = db_guard
-                        .get_torrent_directory_by_id(dir_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|d| d.parent_id)
-                        .map(InodeManager::make_torrent_dir_ino)
-                        .unwrap_or_else(|| InodeManager::make_torrent_root_ino(torrent_id));
+                // TSI-2448: for pending torrent dirs (torrent_id == 0),
+                // list internal files/dirs from the bencode instead of
+                // the DB.
+                if torrent_id == 0 {
+                    // For pending dirs, parent is the torrent root or
+                    // a parent pending dir.  Compute `..` from the
+                    // dir_path: if dir_path has no `/`, parent is the
+                    // torrent root ino; otherwise it's the parent
+                    // pending dir ino.
+                    let parent_ino = if dir_path.is_empty() {
+                        // Shouldn't happen — root is a TorrentRoot, not
+                        // a TorrentDir — but handle defensively.
+                        InodeManager::make_pending_torrent_ino(
+                            &torrent_source_path,
+                            &torrent_filename,
+                        )
+                    } else {
+                        let parts: Vec<&str> = dir_path.rsplitn(2, '/').collect();
+                        if parts.len() == 2 {
+                            InodeManager::make_pending_torrent_dir_ino(
+                                &torrent_source_path,
+                                &torrent_filename,
+                                parts[1],
+                            )
+                        } else {
+                            InodeManager::make_pending_torrent_ino(
+                                &torrent_source_path,
+                                &torrent_filename,
+                            )
+                        }
+                    };
                     entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
 
-                    let mut offset_counter = 3i64;
+                    if let Some((mut p_entries, p_cache)) = Self::readdir_pending_torrent(
+                        inode_mgr,
+                        &torrent_source_path,
+                        &torrent_filename,
+                        &dir_path,
+                        ino,
+                    ) {
+                        entries.append(&mut p_entries);
 
-                    let sub_dirs = db_guard
-                        .get_torrent_directories_by_parent(Some(dir_id), torrent_id)
-                        .ok()?;
-                    for dir in sub_dirs {
-                        let sub_dir_ino = InodeManager::make_torrent_dir_ino(dir.id);
-                        cache_entries.push((
-                            sub_dir_ino,
-                            DataInode::TorrentDir {
-                                torrent_id,
-                                dir_id: dir.id,
-                                name: dir.name.clone(),
-                            },
-                        ));
-                        entries.push((sub_dir_ino, offset_counter, FileKind::Directory, dir.name));
-                        offset_counter += 1;
+                        for (cache_ino, cache_inode) in p_cache {
+                            inode_mgr.data_inodes.insert(cache_ino, cache_inode);
+                        }
+                    }
+                } else {
+                    {
+                        let db_guard = db.lock().ok()?;
+
+                        let parent_ino = db_guard
+                            .get_torrent_directory_by_id(dir_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|d| d.parent_id)
+                            .map(InodeManager::make_torrent_dir_ino)
+                            .unwrap_or_else(|| InodeManager::make_torrent_root_ino(torrent_id));
+                        entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
+
+                        let mut offset_counter = 3i64;
+
+                        let sub_dirs = db_guard
+                            .get_torrent_directories_by_parent(Some(dir_id), torrent_id)
+                            .ok()?;
+                        for dir in sub_dirs {
+                            let sub_dir_ino = InodeManager::make_torrent_dir_ino(dir.id);
+                            cache_entries.push((
+                                sub_dir_ino,
+                                DataInode::TorrentDir {
+                                    torrent_id,
+                                    dir_id: dir.id,
+                                    name: dir.name.clone(),
+                                    dir_path: String::new(),
+                                    torrent_source_path: String::new(),
+                                    torrent_filename: String::new(),
+                                },
+                            ));
+                            entries.push((
+                                sub_dir_ino,
+                                offset_counter,
+                                FileKind::Directory,
+                                dir.name,
+                            ));
+                            offset_counter += 1;
+                        }
+
+                        let dir_files = db_guard.get_files_in_directory(dir_id).ok()?;
+                        for file in dir_files {
+                            let file_ino = InodeManager::make_torrent_file_ino(file.id);
+                            cache_entries.push((
+                                file_ino,
+                                DataInode::TorrentFile {
+                                    torrent_id,
+                                    file_id: file.id,
+                                    name: file.name.clone(),
+                                    size: file.size,
+                                    torrent_source_path: String::new(),
+                                    torrent_filename: String::new(),
+                                },
+                            ));
+                            entries.push((
+                                file_ino,
+                                offset_counter,
+                                FileKind::RegularFile,
+                                file.name,
+                            ));
+                            offset_counter += 1;
+                        }
                     }
 
-                    let dir_files = db_guard.get_files_in_directory(dir_id).ok()?;
-                    for file in dir_files {
-                        let file_ino = InodeManager::make_torrent_file_ino(file.id);
-                        cache_entries.push((
-                            file_ino,
-                            DataInode::TorrentFile {
-                                torrent_id,
-                                file_id: file.id,
-                                name: file.name.clone(),
-                                size: file.size,
-                            },
-                        ));
-                        entries.push((file_ino, offset_counter, FileKind::RegularFile, file.name));
-                        offset_counter += 1;
+                    for (cache_ino, cache_inode) in cache_entries {
+                        inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                     }
-                }
-
-                for (cache_ino, cache_inode) in cache_entries {
-                    inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                 }
             }
             DataInode::TorrentFile { .. } => {
@@ -673,27 +1064,199 @@ impl DataResolver {
 /// file without constructing a full `TorrentInfo`.  Avoids cloning the
 /// entire torrent buffer (up to 10 MB) just to read the display name.
 ///
-/// Searches for the `4:name<len>:<value>` pattern in the bencode.  The
-/// `name` key lives inside the `info` dict but bencode is a flat byte
-/// stream, so a targeted substring scan is safe: `4:name` is unambiguous
-/// as a bencode key, and the following `<len>:<value>` is parsed to
-/// extract the name.  Returns `None` if not found or malformed.
+/// TSI-2448 (review): reimplemented with `BencodeParser` instead of
+/// substring scanning — the old approach could match `4:name` inside the
+/// `pieces` blob (raw SHA-1 hashes) and return garbage.  The recursive
+/// parser navigates the `info` dict correctly.
 fn extract_bencode_name(data: &[u8]) -> Option<String> {
-    let needle = b"4:name";
-    let pos = data.windows(needle.len()).position(|w| w == needle)?;
-    let rest = &data[pos + needle.len()..];
+    let (root, _) = BencodeParser::parse(data)?;
+    let info = root.get_dict(b"info")?;
+    info.get_str(b"name")
+}
 
-    // Read the length prefix: digits up to ':'.
-    let colon = rest.iter().position(|&b| b == b':')?;
-    let len_str = std::str::from_utf8(&rest[..colon]).ok()?;
-    let name_len: usize = len_str.parse().ok()?;
-    let name_start = colon + 1;
-    let name_end = name_start.checked_add(name_len)?;
-    if name_end > rest.len() {
-        return None;
+/// TSI-2448: a file entry extracted from the bencode of a pending
+/// `.torrent` file.  `path` uses `/` as the path separator (matching
+/// `FileInfo.path` from `TorrentInfo::files()`), and `size` is the file
+/// size in bytes.  This is the lightweight pendant to `FileInfo` — no
+/// FFI, no buffer ownership — used to populate the `data/` tree while
+/// the background `add_torrent` DB insert is in-flight.
+#[derive(Debug, Clone)]
+struct PendingFile {
+    path: String,
+    size: u64,
+}
+
+/// TSI-2448: minimal bencode parser for extracting the file list from a
+/// `.torrent` file without constructing a full `TorrentInfo` (which
+/// requires FFI + buffer ownership).  The parser is intentionally
+/// limited to what the data/ tree needs: the `info` dict's `name`,
+/// `files` (multi-file), and `length` (single-file) keys.
+///
+/// Returns `(name, files)` where `files` is a list of `(path, size)`
+/// pairs.  For a single-file torrent, `files` contains one entry whose
+/// path is the torrent name.  Returns `None` if the bencode is
+/// malformed.
+fn extract_bencode_files(data: &[u8]) -> Option<(String, Vec<PendingFile>)> {
+    let (root, _) = BencodeParser::parse(data)?;
+    let info = root.get_dict(b"info")?;
+    let name = info.get_str(b"name")?;
+
+    if let Some(files) = info.get_list(b"files") {
+        // Multi-file torrent
+        let mut result = Vec::with_capacity(files.len());
+        for entry in files {
+            let length = entry.get_int(b"length")?;
+            let path_list = entry.get_list(b"path")?;
+            let mut parts = Vec::with_capacity(path_list.len());
+            for part in path_list {
+                parts.push(part.as_str()?);
+            }
+            result.push(PendingFile {
+                path: parts.join("/"),
+                size: length,
+            });
+        }
+        Some((name, result))
+    } else {
+        // Single-file torrent: the file path is the torrent name itself
+        info.get_int(b"length").map(|length| {
+            (
+                name.clone(),
+                vec![PendingFile {
+                    path: name,
+                    size: length,
+                }],
+            )
+        })
     }
-    let name_bytes = &rest[name_start..name_end];
-    String::from_utf8(name_bytes.to_vec()).ok()
+}
+
+/// Minimal bencode value for extracting torrent file lists.
+enum Bencode {
+    Str(Vec<u8>),
+    Int(u64),
+    List(Vec<Bencode>),
+    Dict(Vec<(Vec<u8>, Bencode)>),
+}
+
+impl Bencode {
+    fn as_str(&self) -> Option<String> {
+        match self {
+            Bencode::Str(v) => String::from_utf8(v.clone()).ok(),
+            _ => None,
+        }
+    }
+
+    fn as_dict(&self) -> Option<&Vec<(Vec<u8>, Bencode)>> {
+        match self {
+            Bencode::Dict(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn get_dict(&self, key: &[u8]) -> Option<&Bencode> {
+        let d = self.as_dict()?;
+        d.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn get_str(&self, key: &[u8]) -> Option<String> {
+        self.get_dict(key)?.as_str()
+    }
+
+    fn get_int(&self, key: &[u8]) -> Option<u64> {
+        match self.get_dict(key)? {
+            Bencode::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    fn get_list(&self, key: &[u8]) -> Option<&Vec<Bencode>> {
+        match self.get_dict(key)? {
+            Bencode::List(l) => Some(l),
+            _ => None,
+        }
+    }
+}
+
+/// Minimal recursive bencode parser.  Returns the parsed value and the
+/// number of bytes consumed.  Only supports the four bencode types used
+/// in torrent files: strings, integers, lists, and dictionaries.
+struct BencodeParser;
+
+impl BencodeParser {
+    fn parse(data: &[u8]) -> Option<(Bencode, usize)> {
+        if data.is_empty() {
+            return None;
+        }
+        match data[0] {
+            b'd' => Self::parse_dict(data),
+            b'l' => Self::parse_list(data),
+            b'i' => Self::parse_int(data),
+            b'0'..=b'9' => Self::parse_str(data),
+            _ => None,
+        }
+    }
+
+    fn parse_dict(data: &[u8]) -> Option<(Bencode, usize)> {
+        let mut pos = 1; // skip 'd'
+        let mut entries = Vec::new();
+        while pos < data.len() {
+            if data[pos] == b'e' {
+                return Some((Bencode::Dict(entries), pos + 1));
+            }
+            // Key must be a string
+            let (key, consumed) = Self::parse_str(&data[pos..])?;
+            pos += consumed;
+            let key_bytes = match key {
+                Bencode::Str(v) => v,
+                _ => return None,
+            };
+            let (val, consumed) = Self::parse(&data[pos..])?;
+            pos += consumed;
+            entries.push((key_bytes, val));
+        }
+        None
+    }
+
+    fn parse_list(data: &[u8]) -> Option<(Bencode, usize)> {
+        let mut pos = 1; // skip 'l'
+        let mut items = Vec::new();
+        while pos < data.len() {
+            if data[pos] == b'e' {
+                return Some((Bencode::List(items), pos + 1));
+            }
+            let (val, consumed) = Self::parse(&data[pos..])?;
+            pos += consumed;
+            items.push(val);
+        }
+        None
+    }
+
+    /// Parse a bencode integer (`i<digits>e`).
+    ///
+    /// Only non-negative integers (`u64`) are supported.  Bencode
+    /// permits negative integers (e.g. `i-1e`), but torrent metadata
+    /// only uses non-negative values (file sizes, piece lengths, etc.),
+    /// so a negative integer will fail to parse and return `None` —
+    /// which is the correct behavior for malformed torrent data.
+    fn parse_int(data: &[u8]) -> Option<(Bencode, usize)> {
+        let end = data[1..].iter().position(|&b| b == b'e')?;
+        let s = std::str::from_utf8(&data[1..1 + end]).ok()?;
+        let n: u64 = s.parse().ok()?;
+        Some((Bencode::Int(n), 1 + end + 1))
+    }
+
+    fn parse_str(data: &[u8]) -> Option<(Bencode, usize)> {
+        let colon = data.iter().position(|&b| b == b':')?;
+        let len_str = std::str::from_utf8(&data[..colon]).ok()?;
+        let len: usize = len_str.parse().ok()?;
+        let start = colon + 1;
+        let end = start.checked_add(len)?;
+        if end > data.len() {
+            return None;
+        }
+        Some((Bencode::Str(data[start..end].to_vec()), end))
+    }
 }
 
 #[cfg(test)]
@@ -1222,6 +1785,465 @@ mod tests {
         assert!(
             !inode_mgr.data_inodes.contains_key(&stale_ino),
             "stale pending entry must be evicted after DB row lands"
+        );
+    }
+
+    // ── TSI-2448: pending torrent internal file resolution ─────────────
+
+    /// Minimal multi-file bencode with a directory structure:
+    /// `foo` (root name) containing `dir/sub.txt` and `dir2/readme.txt`
+    /// and a root-level `top.txt`.
+    fn multifile_torrent_bytes() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        // files list
+        t.extend_from_slice(b"5:filesl");
+
+        // dir/sub.txt — size 10
+        t.push(b'd');
+        t.extend_from_slice(b"6:lengthi10e");
+        t.extend_from_slice(b"4:pathl3:dir7:sub.txte");
+        t.push(b'e');
+
+        // dir2/readme.txt — size 5
+        t.push(b'd');
+        t.extend_from_slice(b"6:lengthi5e");
+        t.extend_from_slice(b"4:pathl4:dir210:readme.txte");
+        t.push(b'e');
+
+        // top.txt — size 8
+        t.push(b'd');
+        t.extend_from_slice(b"6:lengthi8e");
+        t.extend_from_slice(b"4:pathl7:top.txte");
+        t.push(b'e');
+
+        t.extend_from_slice(b"e"); // end files list
+
+        t.extend_from_slice(b"4:name3:foo");
+        t.extend_from_slice(b"12:piece lengthi16384e");
+        t.extend_from_slice(b"6:pieces20:");
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee"); // end info dict + root dict
+        t
+    }
+
+    /// Set up a pending torrent: write the .torrent to the metadata inode
+    /// table, insert a pending TorrentRoot in data_inodes, and mark the
+    /// key as pending in processing_torrents.
+    fn setup_pending_multifile(
+        source_path: &str,
+        filename: &str,
+    ) -> (
+        InodeManager,
+        Arc<Mutex<Database>>,
+        Arc<Mutex<HashMap<(String, String), ()>>>,
+        u64,
+    ) {
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+
+        // Write the .torrent file to the metadata inode table.
+        let file_ino =
+            crate::fuse::inodes::NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let parent_ino = if source_path.is_empty() {
+            crate::fuse::inodes::METADATA_INO
+        } else {
+            // Create the metadata subdirectory chain.
+            let parts: Vec<&str> = source_path.split('/').collect();
+            let mut current_parent = crate::fuse::inodes::METADATA_INO;
+            for part in parts {
+                let dir_ino =
+                    crate::fuse::inodes::NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                inode_mgr.inodes.insert(
+                    dir_ino,
+                    crate::fuse::inodes::InodeData::Directory {
+                        parent: current_parent,
+                        name: part.to_string(),
+                    },
+                );
+                current_parent = dir_ino;
+            }
+            current_parent
+        };
+        inode_mgr.inodes.insert(
+            file_ino,
+            crate::fuse::inodes::InodeData::File {
+                parent: parent_ino,
+                name: filename.to_string(),
+                data: multifile_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Mark as pending.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        pending
+            .lock()
+            .unwrap()
+            .insert((source_path.to_string(), filename.to_string()), ());
+
+        // Resolve the pending torrent root via lookup_data_inode.
+        let parent_data_ino = if source_path.is_empty() {
+            DATA_INO
+        } else {
+            InodeManager::make_source_path_dir_ino(source_path)
+        };
+        // If there's a source_path, insert the SourcePathDir in data_inodes.
+        if !source_path.is_empty() {
+            inode_mgr.data_inodes.insert(
+                parent_data_ino,
+                DataInode::SourcePathDir {
+                    path: source_path.to_string(),
+                },
+            );
+        }
+        let (root_ino, _, _) = DataResolver::lookup_data_inode(
+            &mut inode_mgr,
+            &db,
+            &pending,
+            parent_data_ino,
+            filename,
+        )
+        .expect("pending torrent root should resolve");
+
+        (inode_mgr, db, pending, root_ino)
+    }
+
+    /// TSI-2448: readdir on a pending torrent root must list internal
+    /// files and directories from the bencode — not return empty.
+    #[test]
+    fn pending_torrent_root_readdir_lists_internal_files() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
+            .expect("readdir pending root returned entries");
+
+        let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
+        assert!(
+            names.contains(&"dir"),
+            "readdir should list directory 'dir'"
+        );
+        assert!(
+            names.contains(&"dir2"),
+            "readdir should list directory 'dir2'"
+        );
+        assert!(
+            names.contains(&"top.txt"),
+            "readdir should list root-level file 'top.txt'"
+        );
+    }
+
+    /// TSI-2448: lookup on a pending torrent root for an internal file
+    /// must resolve to a TorrentFile, not ENOENT.
+    #[test]
+    fn pending_torrent_root_lookup_resolves_internal_file() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        let result =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "top.txt");
+        let (ino, kind, size) = result.expect("pending root lookup for top.txt should resolve");
+        assert_eq!(kind, FileKind::RegularFile);
+        assert_eq!(size, 8, "top.txt size should be 8");
+
+        // Verify the cached DataInode is a TorrentFile.
+        let cached = inode_mgr.data_inodes.get(&ino).expect("cached TorrentFile");
+        match cached {
+            DataInode::TorrentFile { name, size, .. } => {
+                assert_eq!(name, "top.txt");
+                assert_eq!(*size, 8);
+            }
+            other => panic!("expected TorrentFile, got {:?}", other),
+        }
+    }
+
+    /// TSI-2448: lookup on a pending torrent root for an internal
+    /// directory must resolve to a TorrentDir, not ENOENT.
+    #[test]
+    fn pending_torrent_root_lookup_resolves_internal_dir() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        let result =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "dir");
+        let (ino, kind, _) = result.expect("pending root lookup for 'dir' should resolve");
+        assert_eq!(kind, FileKind::Directory);
+
+        // Verify the cached DataInode is a pending TorrentDir.
+        let cached = inode_mgr.data_inodes.get(&ino).expect("cached TorrentDir");
+        match cached {
+            DataInode::TorrentDir {
+                dir_path,
+                torrent_source_path,
+                torrent_filename,
+                ..
+            } => {
+                assert_eq!(dir_path, "dir");
+                assert_eq!(torrent_source_path, "");
+                assert_eq!(torrent_filename, "multi.torrent");
+            }
+            other => panic!("expected TorrentDir, got {:?}", other),
+        }
+    }
+
+    /// TSI-2448: readdir on a pending torrent subdirectory must list its
+    /// contents from the bencode.
+    #[test]
+    fn pending_torrent_dir_readdir_lists_contents() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        // Lookup the 'dir' subdirectory.
+        let (dir_ino, _, _) =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "dir")
+                .expect("lookup 'dir' should resolve");
+
+        // readdir on the subdirectory should list 'sub.txt'.
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, dir_ino, 0)
+            .expect("readdir pending dir returned entries");
+        let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
+        assert!(
+            names.contains(&"sub.txt"),
+            "readdir on 'dir' should list 'sub.txt'"
+        );
+    }
+
+    /// TSI-2448: lookup on a pending torrent subdirectory for a file
+    /// must resolve, not ENOENT.
+    #[test]
+    fn pending_torrent_dir_lookup_resolves_file() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        // Lookup the 'dir' subdirectory.
+        let (dir_ino, _, _) =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "dir")
+                .expect("lookup 'dir' should resolve");
+
+        // Lookup 'sub.txt' inside 'dir'.
+        let result =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, dir_ino, "sub.txt");
+        let (_, kind, size) = result.expect("lookup 'sub.txt' in 'dir' should resolve");
+        assert_eq!(kind, FileKind::RegularFile);
+        assert_eq!(size, 10, "sub.txt size should be 10");
+    }
+
+    /// TSI-2448: pending internal file resolution works under a
+    /// SourcePathDir (not just data/ root).
+    #[test]
+    fn pending_torrent_under_source_path_dir_resolves_internal() {
+        let (mut inode_mgr, db, pending, root_ino) =
+            setup_pending_multifile("sub", "multi.torrent");
+
+        // readdir on the pending root should list internal entries.
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
+            .expect("readdir pending root under subdir returned entries");
+        let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
+        assert!(
+            names.contains(&"dir"),
+            "readdir should list directory 'dir' under source_path"
+        );
+        assert!(
+            names.contains(&"top.txt"),
+            "readdir should list 'top.txt' under source_path"
+        );
+
+        // lookup for an internal file should resolve.
+        let result =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "top.txt");
+        let (_, kind, size) = result.expect("lookup 'top.txt' under source_path should resolve");
+        assert_eq!(kind, FileKind::RegularFile);
+        assert_eq!(size, 8);
+    }
+
+    /// TSI-2448: single-file pending torrent — lookup for the single
+    /// file inside the root should resolve from bencode.
+    #[test]
+    fn pending_single_file_torrent_resolves_internal_file() {
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+
+        // Write a single-file .torrent (name=foo, length=16).
+        let file_ino =
+            crate::fuse::inodes::NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inode_mgr.inodes.insert(
+            file_ino,
+            crate::fuse::inodes::InodeData::File {
+                parent: crate::fuse::inodes::METADATA_INO,
+                name: "single.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        pending
+            .lock()
+            .unwrap()
+            .insert((String::new(), "single.torrent".to_string()), ());
+
+        // Resolve the pending root.
+        let (root_ino, _, _) = DataResolver::lookup_data_inode(
+            &mut inode_mgr,
+            &db,
+            &pending,
+            DATA_INO,
+            "single.torrent",
+        )
+        .expect("pending root should resolve");
+
+        // Lookup the internal file 'foo' (same as torrent name for
+        // single-file torrents).
+        let result =
+            DataResolver::lookup_data_inode(&mut inode_mgr, &db, &pending, root_ino, "foo");
+        let (_, kind, size) = result.expect("lookup 'foo' should resolve");
+        assert_eq!(kind, FileKind::RegularFile);
+        assert_eq!(size, 16, "single file size should be 16");
+
+        // readdir should list 'foo'.
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
+            .expect("readdir single-file pending root returned entries");
+        let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
+        assert!(names.contains(&"foo"), "readdir should list 'foo'");
+    }
+
+    /// TSI-2448: non-existent file inside a pending torrent root
+    /// should still return ENOENT (None) — the fallback only resolves
+    /// files that actually exist in the torrent.
+    #[test]
+    fn pending_torrent_lookup_nonexistent_file_returns_none() {
+        let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
+
+        let result = DataResolver::lookup_data_inode(
+            &mut inode_mgr,
+            &db,
+            &pending,
+            root_ino,
+            "nonexistent.txt",
+        );
+        assert!(
+            result.is_none(),
+            "non-existent file in pending torrent should be ENOENT"
+        );
+    }
+
+    /// TSI-2448: bencode file-list extractor parses multi-file torrents.
+    #[test]
+    fn extract_bencode_files_multifile() {
+        let data = multifile_torrent_bytes();
+        let (name, files) =
+            super::extract_bencode_files(&data).expect("should parse multi-file torrent");
+        assert_eq!(name, "foo");
+        assert_eq!(files.len(), 3, "should have 3 files");
+
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"dir/sub.txt"));
+        assert!(paths.contains(&"dir2/readme.txt"));
+        assert!(paths.contains(&"top.txt"));
+
+        let sizes: std::collections::HashMap<&str, u64> =
+            files.iter().map(|f| (f.path.as_str(), f.size)).collect();
+        assert_eq!(sizes["dir/sub.txt"], 10);
+        assert_eq!(sizes["dir2/readme.txt"], 5);
+        assert_eq!(sizes["top.txt"], 8);
+    }
+
+    /// TSI-2448: bencode file-list extractor parses single-file torrents.
+    #[test]
+    fn extract_bencode_files_singlefile() {
+        let data = minimal_torrent_bytes();
+        let (name, files) =
+            super::extract_bencode_files(&data).expect("should parse single-file torrent");
+        assert_eq!(name, "foo");
+        assert_eq!(files.len(), 1, "single-file torrent should have 1 file");
+        assert_eq!(files[0].path, "foo");
+        assert_eq!(files[0].size, 16);
+    }
+
+    /// TSI-2448: bencode file-list extractor returns None for malformed data.
+    #[test]
+    fn extract_bencode_files_malformed_returns_none() {
+        assert!(super::extract_bencode_files(b"not bencode").is_none());
+        assert!(super::extract_bencode_files(b"").is_none());
+    }
+
+    /// TSI-2448 (review): stale pending TorrentDir (6M) and TorrentFile
+    /// (7M) entries are evicted from data_inodes when the DB row lands,
+    /// not just the TorrentRoot (5M).
+    #[test]
+    fn stale_pending_dir_and_file_evicted_after_db_row_lands() {
+        let db = db_with_torrent("");
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+
+        // Write the .torrent file to the metadata inode table.
+        let ino = crate::fuse::inodes::NEXT_INO.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inode_mgr.inodes.insert(
+            ino,
+            crate::fuse::inodes::InodeData::File {
+                parent: crate::fuse::inodes::METADATA_INO,
+                name: "test.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        let pending = empty_pending();
+
+        // Insert stale pending entries: root, dir, and file.
+        let stale_root = InodeManager::make_pending_torrent_ino("", "test.torrent");
+        let stale_dir = InodeManager::make_pending_torrent_dir_ino("", "test.torrent", "subdir");
+        let stale_file =
+            InodeManager::make_pending_torrent_file_ino("", "test.torrent", "subdir/file.txt");
+
+        inode_mgr.data_inodes.insert(
+            stale_root,
+            DataInode::TorrentRoot {
+                torrent_id: 0,
+                source_path: String::new(),
+                name: "test-torrent".to_string(),
+                filename: "test.torrent".to_string(),
+            },
+        );
+        inode_mgr.data_inodes.insert(
+            stale_dir,
+            DataInode::TorrentDir {
+                torrent_id: 0,
+                dir_id: 0,
+                name: "subdir".to_string(),
+                dir_path: "subdir".to_string(),
+                torrent_source_path: String::new(),
+                torrent_filename: "test.torrent".to_string(),
+            },
+        );
+        inode_mgr.data_inodes.insert(
+            stale_file,
+            DataInode::TorrentFile {
+                torrent_id: 0,
+                file_id: 0,
+                name: "file.txt".to_string(),
+                size: 16,
+                torrent_source_path: String::new(),
+                torrent_filename: "test.torrent".to_string(),
+            },
+        );
+
+        // readdir on data/ — must list the DB torrent and evict ALL stale
+        // pending entries (root + dir + file).
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO, 0)
+            .expect("readdir data/ returned entries");
+        assert!(
+            entries.iter().any(|(_, _, _, n)| n == "test.torrent"),
+            "DB torrent must be in listing"
+        );
+
+        assert!(
+            !inode_mgr.data_inodes.contains_key(&stale_root),
+            "stale pending root must be evicted"
+        );
+        assert!(
+            !inode_mgr.data_inodes.contains_key(&stale_dir),
+            "stale pending dir must be evicted"
+        );
+        assert!(
+            !inode_mgr.data_inodes.contains_key(&stale_file),
+            "stale pending file must be evicted"
         );
     }
 }

@@ -1426,6 +1426,7 @@ impl FsService {
                         file_id,
                         name,
                         size: file_size,
+                        ..
                     }) = self.inode_mgr.data_inodes.get(&ino)
                     {
                         let offset = offset as usize;
@@ -2875,6 +2876,8 @@ mod tests {
                 file_id: 1,
                 name: "foo".to_string(),
                 size: 16,
+                torrent_source_path: String::new(),
+                torrent_filename: String::new(),
             },
         );
         let outcome = svc.open(ino).expect("open data file");

@@ -25,6 +25,8 @@ pub const DATA_DIR_INO_BASE: u64 = 2_000_000;
 pub const DATA_FILE_INO_BASE: u64 = 3_000_000;
 pub const SOURCE_PATH_DIR_INO_BASE: u64 = 4_000_000;
 pub const PENDING_TORRENT_INO_BASE: u64 = 5_000_000;
+pub const PENDING_TORRENT_DIR_INO_BASE: u64 = 6_000_000;
+pub const PENDING_TORRENT_FILE_INO_BASE: u64 = 7_000_000;
 pub const STATS_INO_OFFSET: u64 = 10_000_000;
 
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
@@ -68,12 +70,31 @@ pub enum DataInode {
         torrent_id: i64,
         dir_id: i64,
         name: String,
+        /// TSI-2448: full path of this directory relative to the torrent
+        /// root (e.g. `subdir/deeper`).  Empty for DB-backed dirs (which
+        /// resolve via `dir_id`); set for pending torrent dirs so the
+        /// bencode file list can be filtered by path.
+        dir_path: String,
+        /// TSI-2448: the owning torrent's `(source_path, filename)`.
+        /// For DB-backed dirs these are empty (resolved via
+        /// `torrent_id` → DB).  For pending torrent dirs (`torrent_id ==
+        /// 0`), they identify the `.torrent` metadata inode so the
+        /// bencode file list can be re-parsed on lookup/readdir.
+        torrent_source_path: String,
+        torrent_filename: String,
     },
     TorrentFile {
         torrent_id: i64,
         file_id: i64,
         name: String,
         size: i64,
+        /// TSI-2448 (review): the owning torrent's `(source_path,
+        /// filename)`.  For DB-backed files these are empty (resolved
+        /// via `torrent_id` → DB).  For pending torrent files
+        /// (`torrent_id == 0`), they identify the `.torrent` metadata
+        /// inode so stale entries can be evicted when the DB row lands.
+        torrent_source_path: String,
+        torrent_filename: String,
     },
 }
 
@@ -158,6 +179,36 @@ impl InodeManager {
         source_path.hash(&mut hasher);
         filename.hash(&mut hasher);
         PENDING_TORRENT_INO_BASE + (hasher.finish() % 1_000_000)
+    }
+
+    /// TSI-2448: deterministic inode for a directory *inside* a pending
+    /// torrent (e.g. `data/seed.torrent/subdir/`).  Hashes
+    /// `(source_path, filename, dir_path)` into the
+    /// `PENDING_TORRENT_DIR_INO_BASE` range so each pending directory
+    /// gets a unique, stable inode across lookups and readdir.
+    pub fn make_pending_torrent_dir_ino(source_path: &str, filename: &str, dir_path: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        source_path.hash(&mut hasher);
+        filename.hash(&mut hasher);
+        dir_path.hash(&mut hasher);
+        PENDING_TORRENT_DIR_INO_BASE + (hasher.finish() % 1_000_000)
+    }
+
+    /// TSI-2448: deterministic inode for a file *inside* a pending
+    /// torrent (e.g. `data/seed.torrent/subdir/file.txt`).  Hashes
+    /// `(source_path, filename, file_path)` into the
+    /// `PENDING_TORRENT_FILE_INO_BASE` range so each pending file gets a
+    /// unique, stable inode.
+    pub fn make_pending_torrent_file_ino(
+        source_path: &str,
+        filename: &str,
+        file_path: &str,
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        source_path.hash(&mut hasher);
+        filename.hash(&mut hasher);
+        file_path.hash(&mut hasher);
+        PENDING_TORRENT_FILE_INO_BASE + (hasher.finish() % 1_000_000)
     }
 
     pub fn is_data_ino(ino: u64) -> bool {
