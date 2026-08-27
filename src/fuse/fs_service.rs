@@ -9,10 +9,14 @@
 //! See the architecture design doc §5.2 for the namespace × operation table.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+use fuser::Notifier;
 
 use tracing::{error, info, warn};
 
@@ -95,6 +99,55 @@ pub struct FsService {
     pub torrent_info_cache: Arc<Mutex<HashMap<String, Arc<TorrentInfo>>>>,
     pub listen_addr: String,
     pub metrics: Arc<Metrics>,
+    /// TSI-2454: kernel cache invalidation handle.  Set once after
+    /// `fuser::spawn_mount2` returns (main wires `bg.notifier()` into
+    /// here).  When set, `unlink`/`rmdir`/`rename` call
+    /// `Notifier::inval_entry` to immediately purge the kernel dentry
+    /// cache for removed `data/` entries, so the stale mirror vanishes
+    /// at once instead of lingering for the 1s FUSE TTL.
+    pub notifier: Arc<OnceLock<Option<Notifier>>>,
+}
+
+// ── Kernel cache invalidation (TSI-2454) ─────────────────────────────────
+//
+// `fuser::Notifier::inval_entry(parent, name)` sends `FUSE_NOTIFY_INVAL_ENTRY`
+// to the kernel, immediately purging its cached dentry for `name` under
+// `parent`.  Without this, the kernel serves its cached `data/` mirror entry
+// for the full 1s TTL (`const TTL` in `fuse/mod.rs`), so the user sees a stale
+// directory after `rm metadata/foo.torrent` until the TTL expires.
+//
+// The `Notifier` is obtained from `BackgroundSession::notifier()` *after*
+// `spawn_mount2` returns — `TorrentFs` is moved into the session, so `main`
+// extracts the `Arc<OnceLock<Option<Notifier>>>` handle before the move and
+// sets it once the session is live.  All calls are best-effort: a failure
+// (kernel already evicted, ENOENT) is swallowed by `Notifier::send_inval`.
+impl FsService {
+    /// Invalidate the kernel's cached dentry for `name` under `parent` in the
+    /// `data/` subtree.  No-op when the notifier isn't wired (tests).
+    fn inval_data_entry(&self, parent: u64, name: &str) {
+        if let Some(Some(notifier)) = self.notifier.get() {
+            if let Err(e) = notifier.inval_entry(parent, &OsStr::new(name)) {
+                warn!(
+                    "inval_entry(parent={}, name={}) failed: {}",
+                    parent, name, e
+                );
+            }
+        }
+    }
+
+    /// Split a `data/` source-path directory into its `(parent_ino, name)`
+    /// for `inval_entry`.  A top-level path like `"cat-a"` has parent
+    /// `DATA_INO` and name `"cat-a"`.  A nested path like `"cat-a/sub"`
+    /// has parent `make_source_path_dir_ino("cat-a")` and name `"sub"`.
+    fn split_data_dir_parent(path: &str) -> (u64, String) {
+        match path.rsplit_once('/') {
+            Some((parent_path, name)) => (
+                InodeManager::make_source_path_dir_ino(parent_path),
+                name.to_string(),
+            ),
+            None => (DATA_INO, path.to_string()),
+        }
+    }
 }
 
 impl FsService {
@@ -156,6 +209,7 @@ impl FsService {
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr,
             metrics,
+            notifier: Arc::new(OnceLock::new()),
         }
     }
 
@@ -969,6 +1023,12 @@ impl FsService {
                         _ => true,
                     });
 
+                // TSI-2454: purge the kernel dentry cache for the removed
+                // `data/` SourcePathDir so the stale mirror vanishes at
+                // once instead of lingering for the 1s FUSE TTL.
+                let (dir_parent, dir_name) = Self::split_data_dir_parent(&source_path);
+                self.inval_data_entry(dir_parent, &dir_name);
+
                 if let Some(ref ts) = self.torrent_service {
                     let _ = ts.delete_metadata_directory(&source_path);
                 }
@@ -1052,6 +1112,30 @@ impl FsService {
                                     DataInode::SourcePathDir { path } => !cleaned.contains(path),
                                 });
 
+                            // TSI-2454: purge the kernel dentry cache so the
+                            // removed torrent vanishes from `data/` at once
+                            // instead of lingering for the 1s FUSE TTL.  The
+                            // parent in `data/` is `DATA_INO` for root-level
+                            // torrents or the `SourcePathDir` inode for a
+                            // subdirectory.
+                            let data_parent = if source_path.is_empty() {
+                                DATA_INO
+                            } else {
+                                InodeManager::make_source_path_dir_ino(&source_path)
+                            };
+                            self.inval_data_entry(data_parent, &filename);
+
+                            // Invalidate each cleaned source-path directory
+                            // (leaf-first) so empty parent dirs vanish from
+                            // `data/` too.  A cleaned path's parent is
+                            // `DATA_INO` (top-level) or the SourcePathDir
+                            // inode of its parent path.
+                            for cleaned_path in &cleaned {
+                                let (dir_parent, dir_name) =
+                                    Self::split_data_dir_parent(cleaned_path);
+                                self.inval_data_entry(dir_parent, &dir_name);
+                            }
+
                             let mut processing = self.processing_torrents.lock().map_err(|e| {
                                 error!("Mutex poisoned in unlink() processing_torrents: {}", e);
                                 FsError::LockPoisoned
@@ -1077,6 +1161,17 @@ impl FsService {
                         Ok(None) => {
                             // TSI-2234: same deferred-destruction logic.
                             self.inode_mgr.unlink_file(ino);
+                            // TSI-2454: the file was not yet in the DB but
+                            // `data/` may still show a pending TorrentRoot
+                            // cached from a prior lookup.  The filename is
+                            // the directory name the data/ mirror uses for
+                            // the torrent root, so invalidate it.
+                            let data_parent = if source_path.is_empty() {
+                                DATA_INO
+                            } else {
+                                InodeManager::make_source_path_dir_ino(&source_path)
+                            };
+                            self.inval_data_entry(data_parent, &filename);
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
@@ -1307,6 +1402,15 @@ impl FsService {
                                 DataInode::SourcePathDir { path } => !cleaned.contains(path),
                                 _ => true,
                             });
+
+                        // TSI-2454: purge the kernel dentry cache for each
+                        // cleaned source-path directory so the stale mirror
+                        // vanishes at once instead of lingering for the 1s
+                        // FUSE TTL.
+                        for cleaned_path in &cleaned {
+                            let (dir_parent, dir_name) = Self::split_data_dir_parent(cleaned_path);
+                            self.inval_data_entry(dir_parent, &dir_name);
+                        }
                     }
 
                     // Evict cached TorrentRoot entries bound to the old
@@ -1320,6 +1424,16 @@ impl FsService {
                             }
                             _ => true,
                         });
+
+                    // TSI-2454: purge the kernel dentry cache for the old
+                    // data/ location so the stale name vanishes at once
+                    // instead of lingering for the 1s FUSE TTL.
+                    let old_data_parent = if old_source_path.is_empty() {
+                        DATA_INO
+                    } else {
+                        InodeManager::make_source_path_dir_ino(&old_source_path)
+                    };
+                    self.inval_data_entry(old_data_parent, &old_name);
                 } else {
                     // TSI-2378 (review): an intra-directory rename keeps the
                     // source_path but changes the filename — a cached
@@ -1337,6 +1451,16 @@ impl FsService {
                             } => !(source_path == &old_source_path && filename == &old_name),
                             _ => true,
                         });
+
+                    // TSI-2454: purge the kernel dentry cache for the old
+                    // filename so the stale name vanishes from `data/` at
+                    // once instead of lingering for the 1s FUSE TTL.
+                    let data_parent = if old_source_path.is_empty() {
+                        DATA_INO
+                    } else {
+                        InodeManager::make_source_path_dir_ino(&old_source_path)
+                    };
+                    self.inval_data_entry(data_parent, &old_name);
                 }
                 info!(
                     "Renamed torrent '{}' to '{}' (source_path: '{}' -> '{}')",
@@ -2057,6 +2181,7 @@ mod tests {
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
             metrics: metrics.clone(),
+            notifier: Arc::new(OnceLock::new()),
         };
         (svc, info_hash, torrent_id, metrics)
     }
@@ -2112,6 +2237,7 @@ mod tests {
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
             metrics,
+            notifier: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3169,6 +3295,7 @@ mod tests {
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
             metrics,
+            notifier: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3736,5 +3863,35 @@ mod tests {
         assert!(guard_empty_read(b"data", 4).is_ok());
         // Empty data, zero size → ok (legitimate EOF).
         assert!(guard_empty_read(&[], 0).is_ok());
+    }
+
+    /// TSI-2454: `split_data_dir_parent` maps a top-level source-path to
+    /// `DATA_INO` and a nested path to its parent's `SourcePathDir` inode.
+    #[test]
+    fn split_data_dir_parent_maps_correctly() {
+        // Top-level: parent is data/ root.
+        let (parent, name) = FsService::split_data_dir_parent("cat-a");
+        assert_eq!(parent, DATA_INO);
+        assert_eq!(name, "cat-a");
+
+        // Nested: parent is the SourcePathDir inode of the parent path.
+        let (parent, name) = FsService::split_data_dir_parent("cat-a/sub");
+        assert_eq!(parent, InodeManager::make_source_path_dir_ino("cat-a"));
+        assert_eq!(name, "sub");
+
+        // Deeply nested.
+        let (parent, name) = FsService::split_data_dir_parent("a/b/c");
+        assert_eq!(parent, InodeManager::make_source_path_dir_ino("a/b"));
+        assert_eq!(name, "c");
+    }
+
+    /// TSI-2454: `inval_data_entry` is a no-op when no `Notifier` is wired
+    /// (the test/constructor path — `OnceLock` is empty).  The call must
+    /// not panic.
+    #[test]
+    fn inval_data_entry_noop_without_notifier() {
+        let svc = bare_service();
+        // No notifier set — this must be a silent no-op.
+        svc.inval_data_entry(DATA_INO, "foo.torrent");
     }
 }

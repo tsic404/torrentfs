@@ -381,6 +381,14 @@ impl TorrentFs {
         self.worker_pool.clone()
     }
 
+    /// TSI-2454: clone the `Arc<OnceLock<Option<Notifier>>>` handle before
+    /// `spawn_mount2` moves `self`.  After the session is live, `main`
+    /// calls `notifier.set(Some(bg.notifier()))` on this handle to wire
+    /// the kernel invalidation channel.
+    pub fn notifier_handle(&self) -> Arc<std::sync::OnceLock<Option<fuser::Notifier>>> {
+        self.service.notifier.clone()
+    }
+
     /// Get the CacheManager shared with DownloadService.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
         self.service.get_cache_manager()

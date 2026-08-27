@@ -349,9 +349,14 @@ fn main() {
         };
         let worker_pool = fs.worker_pool();
         let download_service = fs.download_service().cloned();
+        let notifier = fs.notifier_handle();
 
         match fuser::spawn_mount2(fs, &mountpoint, &options) {
             Ok(bg) => {
+                // TSI-2454: wire the kernel cache invalidation channel so
+                // `unlink`/`rmdir`/`rename` can immediately purge stale
+                // `data/` dentries instead of waiting for the 1s TTL.
+                notifier.set(Some(bg.notifier())).ok();
                 info!("torrentfs mounted");
                 wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
                 return;
@@ -397,9 +402,14 @@ fn main() {
     };
     let worker_pool = fs.worker_pool();
     let download_service = fs.download_service().cloned();
+    let notifier = fs.notifier_handle();
 
     match fuser::spawn_mount2(fs, &mountpoint, &options) {
         Ok(bg) => {
+            // TSI-2454: wire the kernel cache invalidation channel so
+            // `unlink`/`rmdir`/`rename` can immediately purge stale
+            // `data/` dentries instead of waiting for the 1s TTL.
+            notifier.set(Some(bg.notifier())).ok();
             info!("torrentfs mounted");
             wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
             info!("torrentfs unmounted successfully");
