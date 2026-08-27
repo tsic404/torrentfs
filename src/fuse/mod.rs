@@ -32,7 +32,7 @@ use fuser::{
     consts::FOPEN_DIRECT_IO, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
@@ -544,7 +544,7 @@ impl Filesystem for TorrentFs {
                 let deadline = Instant::now() + Duration::from_secs(self.read_timeout_secs + 5);
                 let id = self.pending_table.insert(reply, torrent_id, deadline);
                 self.service.metrics.pending_reads_inc();
-                warn!(
+                debug!(
                     "Deferred read queued (ticket={}, info_hash={}, torrent_id={})",
                     id, info_hash, torrent_id
                 );
