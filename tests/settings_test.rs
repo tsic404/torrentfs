@@ -62,6 +62,10 @@ fn settings_work_with_custom_storage_session() {
         let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
         assert_setting(&session, "allow_multiple_connections_per_ip", true);
         assert_setting(&session, "enable_dht", false);
+        // TSI-2467: close_redundant_connections must be false in custom
+        // storage sessions to prevent seed peer disconnection when
+        // torrent_finished fires prematurely during selective downloading.
+        assert_setting(&session, "close_redundant_connections", false);
     });
 }
 
@@ -91,5 +95,20 @@ fn custom_storage_readonly_dir_rejected() {
             result.is_err(),
             "Expected Session::new_with_custom_storage to fail when a path component is a regular file"
         );
+    });
+}
+
+/// TSI-2467: When the user explicitly sets close_redundant_connections=true
+/// in config, the custom storage session must respect it instead of
+/// forcing false. The default (unset) injects false to prevent seed
+/// peer disconnection during premature torrent_finished.
+#[test]
+fn close_redundant_connections_user_override_respected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    with_large_stack(move || {
+        let mut config = TorrentfsConfig::default_config();
+        config.misc.close_redundant_connections = Some(true);
+        let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
+        assert_setting(&session, "close_redundant_connections", true);
     });
 }

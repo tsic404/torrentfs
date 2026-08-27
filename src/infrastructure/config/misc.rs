@@ -28,6 +28,7 @@ pub struct MiscConfig {
     pub read_job_every: Option<i64>,
     pub strict_super_seeding: Option<bool>,
     pub enable_os_cache: Option<bool>,
+    pub close_redundant_connections: Option<bool>,
 }
 
 impl WriteJson for MiscConfig {
@@ -50,5 +51,6 @@ impl WriteJson for MiscConfig {
         json_field_int!(map, self, read_job_every);
         json_field_bool!(map, self, strict_super_seeding);
         json_field_bool!(map, self, enable_os_cache);
+        json_field_bool!(map, self, close_redundant_connections);
     }
 }

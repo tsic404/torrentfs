@@ -344,7 +344,18 @@ pub(crate) fn dispatch(
         }
         AlertType::TorrentFinished => {
             let info_hash = cstr(&alert.info_hash);
-            tracing::info!("alert: torrent_finished (info_hash={})", info_hash);
+            // TSI-2467: With selective piece priorities (priority 0 for
+            // non-read-range pieces), libtorrent fires torrent_finished
+            // prematurely when all non-filtered pieces in the current read
+            // range have passed hash check. This is expected behavior —
+            // close_redundant_connections is disabled to prevent seed peer
+            // disconnection, and the next read's priority changes trigger
+            // resume_download() to return to downloading state.
+            tracing::debug!(
+                "alert: torrent_finished (info_hash={}, \
+                 likely premature — selective download with filtered pieces)",
+                info_hash
+            );
         }
         AlertType::TorrentRemoved => {
             let info_hash = cstr(&alert.info_hash);

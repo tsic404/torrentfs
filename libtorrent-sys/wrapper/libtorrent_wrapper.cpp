@@ -1011,6 +1011,8 @@ static void apply_bool_setting(lt::settings_pack& pack, const std::string& key, 
         // libtorrent 2.0: strict_super_seeding removed, silently ignored
     } else if (key == "enable_os_cache") {
         pack.set_bool(lt::settings_pack::enable_os_cache, val);
+    } else if (key == "close_redundant_connections") {
+        pack.set_bool(lt::settings_pack::close_redundant_connections, val);
     }
     // Unknown keys are silently ignored
 }
@@ -1098,6 +1100,11 @@ static bool get_session_bool_setting_impl(lt::settings_pack const& settings, con
     } else if (key == "smooth_connects") {
         if (settings.has_val(lt::settings_pack::smooth_connects)) {
             *out = settings.get_bool(lt::settings_pack::smooth_connects) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "close_redundant_connections") {
+        if (settings.has_val(lt::settings_pack::close_redundant_connections)) {
+            *out = settings.get_bool(lt::settings_pack::close_redundant_connections) ? 1 : 0;
             return true;
         }
     }
@@ -1878,11 +1885,15 @@ public:
     }
 
     // disk_interface: async_clear_piece
+    // TSI-2467: Fixed to pass actual piece index instead of hardcoded
+    // piece_index_t(0). No dedicated test: this is a pure C++ disk_interface
+    // callback with no FFI exposure or Rust call path, and libtorrent uses
+    // the handler only as a completion signal (does not validate the index).
     void async_clear_piece(lt::storage_index_t /*storage*/,
-        lt::piece_index_t /*index*/,
+        lt::piece_index_t index,
         std::function<void(lt::piece_index_t)> handler) override
     {
-        if (handler) handler(lt::piece_index_t(0));
+        if (handler) handler(index);
     }
 
     // disk_interface: update_stats_counters
@@ -1978,6 +1989,25 @@ lt_session_t lt_session_create_with_custom_storage(
                     lt::alert_category::error | lt::alert_category::status);
             }
         }
+        // TSI-2467: Disable close_redundant_connections by default. torrentfs
+        // uses selective piece priorities (priority 0 = dont_download for
+        // non-read-range pieces). When the last piece in a read range passes
+        // hash check, libtorrent's is_finished() returns true (because all
+        // non-filtered pieces are "have"), triggering torrent_finished
+        // prematurely. With the default close_redundant_connections=true,
+        // finished() disconnects all seed peers, causing download rate to
+        // drop to zero until peers reconnect on the next read. Disabling it
+        // keeps peers connected through the transient finished state, so the
+        // next read's resume_download() can immediately resume downloading.
+        // Respect explicit user configuration (close_redundant_connections in
+        // the JSON settings) — only inject the default when unset.
+        bool user_set_close_redundant = settings_json
+            && strstr(settings_json, "\"close_redundant_connections\"") != nullptr;
+        if (!user_set_close_redundant) {
+            params.settings.set_bool(
+                lt::settings_pack::close_redundant_connections, false);
+        }
+
         std::string cache_dir(piece_cache_dir);
         params.disk_io_constructor = [cache_dir](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
