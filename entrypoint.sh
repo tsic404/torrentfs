@@ -1,7 +1,6 @@
 #!/bin/bash
 # torrentfs container entrypoint — handles FUSE device setup and mount visibility.
 #
-# Key behaviors:
 #   1. Detects container + FUSE availability
 #   2. Attempts to create /dev/fuse when running as root
 #   3. Provides actionable diagnostics when FUSE is unavailable
@@ -9,6 +8,11 @@
 #      bind-mounts to the container-facing path for host visibility via
 #      shared mount propagation (rshared).
 #      See: https://docs.docker.com/engine/storage/bind-mounts/#configure-bind-propagation
+#   5. Rootless podman detection: shared propagation is unsupported in user
+#      namespaces, so the two-stage bind mount is skipped and torrentfs mounts
+#      directly on the container path. When the mountpoint is a bind mount
+#      (e.g. -v /host:/mnt:shared), an explicit warning is emitted that the
+#      ':shared' flag is ineffective and the host will not see the FUSE mount.
 
 set -euo pipefail
 
@@ -89,6 +93,17 @@ is_rootless_podman() {
         fi
     fi
     return 1
+}
+
+# Check whether $1 is a bind mount (root field != "/" in /proc/self/mountinfo).
+# Used to detect `-v <host>:<container>:shared` style bind mounts so we can
+# warn that shared propagation is ineffective under rootless podman.
+is_bind_mount() {
+    local target="$1"
+    # Field 4 is the root within the source filesystem; "/" means it is the
+    # root of that filesystem (not a subpath bind). Field 5 is the mount point.
+    awk -v mp="$target" '$5 == mp && $4 != "/" { found=1 } END { exit !found }' \
+        /proc/self/mountinfo 2>/dev/null
 }
 
 fuse_device_exists() {
@@ -196,6 +211,17 @@ start_torrentfs_rootless() {
     shift
 
     mkdir -p "$mountpoint"
+
+    # If the mountpoint is a bind mount (e.g. -v /host:/mnt:shared), warn
+    # explicitly that shared propagation cannot work under rootless podman —
+    # the host will NOT see the FUSE filesystem even though the bind mount
+    # itself is present.
+    if is_bind_mount "$mountpoint"; then
+        echo "[entrypoint] WARNING: $mountpoint is a bind mount, but rootless podman cannot propagate" >&2
+        echo "[entrypoint]   FUSE mounts to the host — ':shared' / 'rshared' is ineffective here." >&2
+        echo "[entrypoint]   The FUSE filesystem will only be visible inside the container." >&2
+        echo "[entrypoint]   For host-visible mounts, use rootful podman (sudo podman) or Docker." >&2
+    fi
 
     echo "[entrypoint] rootless podman detected — FUSE mount will only be visible inside the container" >&2
     echo "[entrypoint] starting torrentfs directly on $mountpoint" >&2

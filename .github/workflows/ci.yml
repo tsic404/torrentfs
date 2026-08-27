@@ -58,6 +58,15 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --no-fail-fast
 
+  entrypoint-test:
+    name: Entrypoint Shell Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run entrypoint detection tests
+        run: ./ci/tests/entrypoint_test.sh
+
   docker-build-amd64:
     name: Docker Build (amd64)
     if: github.event_name == 'pull_request'

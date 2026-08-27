@@ -64,7 +64,7 @@ podman run -d --name torrentfs \
 podman exec torrentfs ls /mnt/metadata/
 ```
 
-**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. If you need host-visible FUSE mounts:
+**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. Passing `-v /host:/mnt:shared` or `--mount ...,bind-propagation=rshared` is silently ineffective — rootless user namespaces cannot create shared mounts, so no mount event reaches the host. The entrypoint detects bind mounts on the mountpoint in rootless mode and emits an explicit warning at startup. If you need host-visible FUSE mounts:
 
 - Use rootful podman (`sudo podman run ...`) or Docker
 - Run torrentfs directly on the host without a container
