@@ -435,6 +435,14 @@ fn test_config_check_rejects_over_i32_download_rate_limit() {
 }
 
 #[test]
+fn test_config_check_rejects_over_i32_upload_rate_limit() {
+    assert_rejected(
+        &run_config_check("[rate_limits]\nupload_rate_limit = 2147483648\n"),
+        "upload_rate_limit over i32::MAX",
+    );
+}
+
+#[test]
 fn test_config_check_accepts_zero_download_rate_limit() {
     // libtorrent semantics: 0 = unlimited (settings_pack.hpp).
     assert_accepted(
@@ -464,6 +472,14 @@ fn test_config_check_accepts_i32_max_download_rate_limit() {
     assert_accepted(
         &run_config_check("[rate_limits]\ndownload_rate_limit = 2147483647\n"),
         "download_rate_limit = i32::MAX",
+    );
+}
+
+#[test]
+fn test_config_check_accepts_i32_max_connections() {
+    assert_accepted(
+        &run_config_check("[connections]\nmax_connections = 2147483647\n"),
+        "max_connections = i32::MAX",
     );
 }
 
