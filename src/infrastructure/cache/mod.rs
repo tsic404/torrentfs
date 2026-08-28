@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{TorrentError, TorrentResult};
 
 const CACHE_METADATA_FILE: &str = "cache_metadata.txt";
+const INCOMPLETE_SUFFIX: &str = ".incomplete";
 
 #[derive(Debug, Clone)]
 pub struct PieceMetadata {
@@ -23,6 +24,11 @@ pub struct CacheManager {
     pub miss_count: u64,
     pub hit_count: u64,
     evict_callbacks: Vec<Box<dyn Fn(String, i32) + Send + Sync>>,
+    /// TSI-2491: pieces with an on-disk `.incomplete` marker — written by the
+    /// C++ `PieceStorage::write_piece` while a piece is still being filled.
+    /// Rebuilt by `scan_pieces_subdirectory` on restart and cleared by
+    /// `add_piece` / `remove_piece` / `mark_verified`.
+    incomplete_piece_keys: HashSet<String>,
     /// TSI-2048: pieces whose integrity was verified via add_piece
     /// (called after a successful libtorrent read_piece).  Pieces
     /// registered solely by scan_pieces_subdirectory at startup are
@@ -42,7 +48,6 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
 impl CacheManager {
     pub fn new(cache_dir: &Path, max_cache_size: u64) -> TorrentResult<Self> {
         let cache_dir = cache_dir.to_path_buf();
@@ -59,6 +64,7 @@ impl CacheManager {
             miss_count: 0,
             hit_count: 0,
             evict_callbacks: Vec::new(),
+            incomplete_piece_keys: HashSet::new(),
             verified_piece_keys: HashSet::new(),
             metadata_dirty: false,
         };
@@ -235,6 +241,13 @@ impl CacheManager {
                     continue;
                 }
 
+                // TSI-2491: `.incomplete` files are markers, not piece data.
+                // They are consumed below to tag their sibling piece as
+                // incomplete; never register them as pieces themselves.
+                if filename.ends_with(INCOMPLETE_SUFFIX) {
+                    continue;
+                }
+
                 let piece_key = filename.to_string();
 
                 let metadata = fs::metadata(&path).map_err(|e| {
@@ -254,6 +267,14 @@ impl CacheManager {
                     .get(&piece_key)
                     .map(|m| m.hit_count)
                     .unwrap_or(0);
+
+                // TSI-2491: a sibling `<piece_key>.incomplete` marker means
+                // the C++ write path is still filling this piece. Keep it in
+                // metadata (so has_piece/size stay consistent) but exclude it
+                // from background SHA-1 verification.
+                if self.piece_marker_path(&piece_key).exists() {
+                    self.incomplete_piece_keys.insert(piece_key.clone());
+                }
 
                 self.metadata.insert(
                     piece_key.clone(),
@@ -334,16 +355,14 @@ impl CacheManager {
         // only for the size delta instead of re-adding the full size,
         // which would inflate current_size and cause premature LRU
         // eviction of other torrents' valid cache pieces.
-        let prev = self
-            .metadata
-            .insert(
-                piece_key.to_string(),
-                PieceMetadata {
-                    last_accessed: now,
-                    size,
-                    hit_count: 0,
-                },
-            );
+        let prev = self.metadata.insert(
+            piece_key.to_string(),
+            PieceMetadata {
+                last_accessed: now,
+                size,
+                hit_count: 0,
+            },
+        );
 
         let is_new = prev.is_none();
 
@@ -357,6 +376,20 @@ impl CacheManager {
         // a successful libtorrent read_piece, which is the authoritative
         // proof of piece completeness.
         self.verified_piece_keys.insert(piece_key.to_string());
+
+        // TSI-2491: the piece is now provably complete — clear any
+        // in-progress marker left by the C++ write path.
+        self.incomplete_piece_keys.remove(piece_key);
+        let marker = self.piece_marker_path(piece_key);
+        if marker.exists() {
+            if let Err(e) = fs::remove_file(&marker) {
+                tracing::warn!(
+                    "Failed to remove incomplete marker {}: {}",
+                    marker.display(),
+                    e
+                );
+            }
+        }
 
         self.current_size += size.saturating_sub(old_size);
 
@@ -424,10 +457,23 @@ impl CacheManager {
             })?;
         }
 
+        // TSI-2491: drop the in-progress marker alongside the piece file so
+        // a stale marker never tags a future re-download of the same piece.
+        let marker_path = self.piece_marker_path(piece_key);
+        if marker_path.exists() {
+            if let Err(e) = fs::remove_file(&marker_path) {
+                tracing::warn!(
+                    "Failed to remove incomplete marker {}: {}",
+                    marker_path.display(),
+                    e
+                );
+            }
+        }
         self.current_size = self.current_size.saturating_sub(registered_size);
 
         self.metadata.remove(piece_key);
         self.verified_piece_keys.remove(piece_key);
+        self.incomplete_piece_keys.remove(piece_key);
 
         // TSI-2274: mark dirty instead of fsyncing on every removal.
         self.metadata_dirty = true;
@@ -458,6 +504,12 @@ impl CacheManager {
         let info_hash = self.extract_info_hash(piece_key);
         let pieces_dir = self.cache_dir.join("pieces").join(info_hash);
         pieces_dir.join(piece_key)
+    }
+    /// TSI-2491: path of the `.incomplete` marker for a piece.
+    fn piece_marker_path(&self, piece_key: &str) -> PathBuf {
+        let mut os = self.piece_path(piece_key).into_os_string();
+        os.push(INCOMPLETE_SUFFIX);
+        PathBuf::from(os)
     }
 
     pub fn ensure_piece_dir(&self, piece_key: &str) -> TorrentResult<PathBuf> {
@@ -522,7 +574,10 @@ impl CacheManager {
     /// Get the registered hit count (access count) for a piece from cache metadata.
     /// Returns 0 if the piece is not in metadata.
     pub fn piece_hit_count(&self, piece_key: &str) -> u64 {
-        self.metadata.get(piece_key).map(|m| m.hit_count).unwrap_or(0)
+        self.metadata
+            .get(piece_key)
+            .map(|m| m.hit_count)
+            .unwrap_or(0)
     }
 
     /// TSI-2048: whether a piece's metadata was registered via add_piece
@@ -537,18 +592,24 @@ impl CacheManager {
     /// These are candidates for background SHA-1 verification after a restart
     /// (TSI-2199): pieces discovered by `scan_pieces_subdirectory` that may be
     /// complete, or may be incomplete/corrupt files left by a crash.
+    /// TSI-2491: pieces tagged with an `.incomplete` marker are excluded —
+    /// the C++ write path is still filling them, so verifying them now would
+    /// always fail and purge a piece that was never corrupt.
     pub fn unverified_pieces(&self) -> Vec<String> {
         self.metadata
             .keys()
-            .filter(|key| !self.verified_piece_keys.contains(*key))
+            .filter(|key| {
+                !self.verified_piece_keys.contains(*key)
+                    && !self.incomplete_piece_keys.contains(*key)
+            })
             .cloned()
             .collect()
     }
-
     /// Mark a piece as verified after its on-disk content passed SHA-1
     /// verification against the torrent's expected piece hash (TSI-2199).
     pub fn mark_verified(&mut self, piece_key: &str) {
         self.verified_piece_keys.insert(piece_key.to_string());
+        self.incomplete_piece_keys.remove(piece_key);
         // TSI-2274: mark dirty so the periodic flush persists the
         // verified flag without fsyncing on every verification.
         self.metadata_dirty = true;
@@ -624,11 +685,13 @@ impl CacheManager {
             .sum()
     }
 
-    /// Drop metadata + verified-set entries for a given info_hash.
+    /// Drop metadata + verified/incomplete-set entries for a given info_hash.
     fn remove_infohash_metadata(&mut self, info_hash: &str) {
         let prefix = format!("{}:", info_hash);
         self.metadata.retain(|key, _| !key.starts_with(&prefix));
         self.verified_piece_keys
+            .retain(|key| !key.starts_with(&prefix));
+        self.incomplete_piece_keys
             .retain(|key| !key.starts_with(&prefix));
     }
 
@@ -1564,6 +1627,112 @@ mod tests {
             "drop must have flushed dirty metadata so restart sees the piece"
         );
         assert_eq!(cache.piece_metadata_size(piece_key), Some(64));
+        Ok(())
+    }
+
+    // ── TSI-2491 regression: incomplete-marker exclusion ─────────────
+    //
+    // The C++ write path drops `<piece_key>.incomplete` next to the piece
+    // file while blocks are still being written.  On restart, those pieces
+    // must stay in metadata (so `has_piece`/size stay consistent) but must
+    // NOT be candidates for background SHA-1 verification — verifying a
+    // half-written piece always fails and wrongly purges it.
+
+    #[test]
+    fn test_incomplete_marker_excludes_piece_from_verification() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+
+        let info_hash = "tsi2491_incomplete";
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let pieces_dir = temp_dir.path().join("pieces").join(info_hash);
+        std::fs::create_dir_all(&pieces_dir)?;
+        let piece_path = pieces_dir.join(&piece_key);
+        let marker_path = pieces_dir.join(format!("{}.incomplete", piece_key));
+
+        // Partial piece file + marker, exactly as the C++ write path leaves it.
+        std::fs::write(&piece_path, vec![0xABu8; 32768])?;
+        std::fs::write(&marker_path, b"")?;
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        // Still registered so has_piece / size stay consistent.
+        assert!(cache.has_piece(&piece_key));
+        assert_eq!(cache.piece_metadata_size(&piece_key), Some(32768));
+
+        // Marker file is not itself registered as a piece.
+        assert_eq!(cache.piece_count(), 1);
+
+        // Excluded from verification candidates — this is the fix.
+        assert!(
+            cache.unverified_pieces().is_empty(),
+            "incomplete-marked piece must not be a verification candidate"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_piece_clears_incomplete_marker() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi2491_addpiece:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        let marker_path = piece_path.with_extension("incomplete");
+        std::fs::write(&piece_path, vec![0xCDu8; 262144])?;
+        std::fs::write(&marker_path, b"")?;
+
+        // add_piece is the authoritative complete-piece registration point.
+        cache.add_piece(piece_key, 262144)?;
+
+        assert!(!marker_path.exists(), "marker must be cleared by add_piece");
+        assert!(cache.is_piece_verified(piece_key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_piece_clears_incomplete_marker() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi2491_delete:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        let marker_path = piece_path.with_extension("incomplete");
+        std::fs::write(&piece_path, vec![0xEFu8; 64])?;
+        std::fs::write(&marker_path, b"")?;
+
+        cache.add_piece(piece_key, 64)?;
+        cache.delete_piece(piece_key)?;
+
+        assert!(
+            !marker_path.exists(),
+            "marker must be removed with the piece"
+        );
+        assert!(!cache.has_piece(piece_key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_unmarked_scan_piece_still_verification_candidate() -> TorrentResult<()> {
+        // Regression guard for the pre-existing behavior: a scanned piece
+        // WITHOUT a marker remains an unverified verification candidate.
+        let temp_dir = TempDir::new().unwrap();
+
+        let info_hash = "tsi2491_unmarked";
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let pieces_dir = temp_dir.path().join("pieces").join(info_hash);
+        std::fs::create_dir_all(&pieces_dir)?;
+        std::fs::write(pieces_dir.join(&piece_key), vec![0x11u8; 100])?;
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        assert_eq!(
+            cache.unverified_pieces(),
+            vec![piece_key.to_string()],
+            "unmarked scanned piece must still be verified"
+        );
         Ok(())
     }
 

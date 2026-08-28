@@ -1924,6 +1924,10 @@ impl FsService {
 /// cache), mismatches and incomplete pieces (wrong size / sparse partial
 /// write) are purged so they can be re-downloaded on demand (TSI-2257).
 ///
+/// TSI-2491: pieces still being written carry a `.incomplete` marker and are
+/// excluded from the candidate list by `CacheManager::unverified_pieces` —
+/// only pieces that are actually possibly-complete are verified here.
+///
 /// Runs on a detached background thread so it never blocks FUSE mount
 /// readiness.
 fn spawn_cache_verification(

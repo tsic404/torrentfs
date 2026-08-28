@@ -1370,6 +1370,12 @@ public:
         return pieces_dir() + "/" + m_info_hash_hex + ":piece:" + std::to_string(piece_index);
     }
 
+    // TSI-2491: per-piece in-progress marker, written by `write_piece` after
+    // the piece data reaches disk and cleared once the piece is known complete.
+    std::string piece_marker_path(int piece_index) const {
+        return piece_path(piece_index) + ".incomplete";
+    }
+
     bool read_piece(int piece_index, int offset, char* buf, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string path = piece_path(piece_index);
@@ -1441,6 +1447,19 @@ public:
                         path.c_str(), strerror(errno));
             }
             ::close(fd);
+        }
+        // TSI-2491: mark the piece as in-progress/incomplete. The piece file
+        // may be partially written (blocks arrive at arbitrary offsets), so
+        // the restart scan must not treat it as a complete candidate for
+        // background SHA-1 verification. The marker is removed by the Rust
+        // cache layer once `add_piece` proves the piece is complete.
+        int mfd = ::open(piece_marker_path(piece_index).c_str(),
+                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (mfd < 0) {
+            fprintf(stderr, "[DIAG] write_piece: create marker failed for %s: %s\n",
+                    piece_marker_path(piece_index).c_str(), strerror(errno));
+        } else {
+            ::close(mfd);
         }
         return true;
     }
