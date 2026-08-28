@@ -47,6 +47,22 @@ setup_mountinfo() {
             "$MOUNTINFO_FAKE" 2>/dev/null
     }
 }
+
+# Define a fake `stat` shell function for mountpoint_enotconn tests. `stat`
+# is a shell builtin in this environment, so a PATH stub is never consulted;
+# a function shadows the builtin instead.
+# $1 = exit code (integer), $2 = stderr text (verbatim).
+setup_stat() {
+    # `stat` is a shell builtin here, so a PATH stub is never consulted. A
+    # shell function shadows the builtin; it reads globals because a nested
+    # function cannot see `local`s after the defining function returns.
+    STAT_FAKE_EXIT="$1"
+    STAT_FAKE_STDERR="$2"
+    stat() {
+        printf '%s\n' "$STAT_FAKE_STDERR" >&2
+        return "$STAT_FAKE_EXIT"
+    }
+}
 EOF
 
 # ── test harness ─────────────────────────────────────────────────────────────
@@ -126,6 +142,19 @@ run_test "is_bind_mount returns false for non-existent mountpoint" \
 
 run_test "is_bind_mount returns false for empty mountinfo" \
     'setup_mountinfo ""; if is_bind_mount /mnt; then exit 1; else exit 0; fi'
+
+# --- mountpoint_enotconn ---
+# setup_stat defines a fake `stat` function (a shell builtin here, so a PATH
+# stub would never be consulted) with the given exit code and stderr text.
+
+run_test "mountpoint_enotconn true on ENOTCONN stderr" \
+    'setup_stat 1 "stat: cannot stat '\''/mnt'\'': Transport endpoint is not connected"; if mountpoint_enotconn /mnt; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_enotconn false when stat succeeds" \
+    'setup_stat 0 ""; if mountpoint_enotconn /mnt; then exit 1; else exit 0; fi'
+
+run_test "mountpoint_enotconn false on ENOENT" \
+    'setup_stat 1 "stat: cannot stat '\''/mnt'\'': No such file or directory"; if mountpoint_enotconn /mnt; then exit 1; else exit 0; fi'
 
 # --- fuse_device_exists (just verify it doesn't crash) ---
 

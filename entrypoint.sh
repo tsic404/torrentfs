@@ -127,6 +127,73 @@ ensure_fuse_device() {
     return 1
 }
 
+# Try a metadata-only stat on $1 and report whether it fails with ENOTCONN.
+# Used to detect a stale FUSE mount left behind by a previous container run
+# (the kernel reports ENOTCONN — "Transport endpoint is not connected" — when
+# the FUSE daemon that owned the mount is gone).
+mountpoint_enotconn() {
+    local target="$1" err
+    if stat -c '%f' "$target" >/dev/null 2>&1; then
+        return 1
+    fi
+    # stat failed — distinguish ENOTCONN (stale FUSE mount) from other errors
+    # (ENOENT, EACCES, …) via stderr. `|| true` keeps the failing stat from
+    # tripping `set -e`; a stat|grep pipeline would report the stat failure
+    # under `pipefail` even when grep matched.
+    err="$(stat -c '%f' "$target" 2>&1 >/dev/null || true)"
+    case "$err" in
+        *'Transport endpoint is not connected'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# print an actionable recovery note. Returns 0 when the path is usable
+# (never ENOTCONN again), 1 when it remains a dead mount we cannot reclaim.
+recover_stale_mountpoint() {
+    local target="$1"
+
+    if ! mountpoint_enotconn "$target"; then
+        return 0
+    fi
+
+    echo "[entrypoint] WARNING: $target is a stale FUSE mount (ENOTCONN)" >&2
+    echo "[entrypoint]   This happens when a previous container was SIGKILLed before" >&2
+    echo "[entrypoint]   torrentfs could unmount cleanly." >&2
+    echo "[entrypoint]   Attempting lazy unmount (umount -l) and retrying…" >&2
+
+    if ! umount -l "$target" 2>/dev/null; then
+        echo "[entrypoint] ERROR: could not lazy-unmount stale mountpoint $target" >&2
+        cat >&2 <<'RECOVERY'
+╔══════════════════════════════════════════════════════════════════════╗
+║  Stale FUSE mount detected at the mountpoint and it could not be     ║
+║  reclaimed automatically.                                            ║
+║                                                                      ║
+║  Recover manually, then start the container again:                   ║
+║                                                                      ║
+║  1. Inside the container (or on the host that owns the mount):       ║
+║       fusermount -uz /mnt                                            ║
+║       umount -l /mnt                                                 ║
+║                                                                      ║
+║  2. Verify the mountpoint is gone:                                   ║
+║       mountpoint -q /mnt && echo "still mounted" || echo "clean"     ║
+║                                                                      ║
+║  3. Start the container again.                                       ║
+╚══════════════════════════════════════════════════════════════════════╝
+RECOVERY
+        return 1
+    fi
+
+    # Give the lazy detach a moment, then confirm the path no longer fails
+    # with ENOTCONN before we let mkdir/torrentfs touch it.
+    sleep 0.2
+    if mountpoint_enotconn "$target"; then
+        echo "[entrypoint] ERROR: $target still reports ENOTCONN after lazy unmount" >&2
+        return 1
+    fi
+
+    echo "[entrypoint] stale mount reclaimed — $target is usable again" >&2
+    return 0
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 echo "[entrypoint] torrentfs container startup" >&2
@@ -197,6 +264,15 @@ fi
 start_torrentfs() {
     local mountpoint="$1"
     shift
+
+    # A previous run that was SIGKILLed (stop_timeout too short) can leave a
+    # stale FUSE mount on $mountpoint: the kernel reports ENOTCONN because the
+    # FUSE daemon that owned the mount is gone. mkdir -p would then fail with
+    # ENOTCONN and podman start never recovers. Probe and reclaim before
+    # mounting so a restart self-heals.
+    if ! recover_stale_mountpoint "$mountpoint"; then
+        exit 100
+    fi
 
     if is_rootless_podman; then
         start_torrentfs_rootless "$mountpoint" "$@"

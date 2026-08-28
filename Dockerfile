@@ -76,5 +76,9 @@ RUN touch /etc/fuse.conf \
 COPY --from=builder /torrentfs /usr/local/bin/torrentfs
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
+# stop_timeout must be raised at the runtime layer (see README Container
+# Deployment): the image cannot override podman/docker's default 10s
+# SIGTERM→SIGKILL grace period, and a forced kill leaves a stale ENOTCONN
+# mount that blocks the next `podman start`.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/mnt"]

@@ -71,6 +71,42 @@ podman exec torrentfs ls /mnt/metadata/
 
 The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
 
+### Shutdown and restart (`stop_timeout`)
+
+`podman stop` / `docker stop` send SIGTERM and then SIGKILL after a grace
+period. The container engine default is **10 seconds**, which is not enough
+for torrentfs to stop the download engine, drain its worker queue, flush the
+cache, and unmount the FUSE filesystem. The forced SIGKILL then leaves a stale
+FUSE mount that reports `ENOTCONN` ("Transport endpoint is not connected") on
+the next start, and `mkdir /mnt` in the entrypoint would fail.
+
+The image cannot raise that timeout — the grace period is a container-runtime
+setting, not an image property — so raise it at runtime:
+
+```bash
+# podman
+podman run --stop-timeout 30 ... ghcr.io/tsip404/torrentfs
+
+# docker
+docker run --stop-timeout 30 ... ghcr.io/tsip404/torrentfs
+
+# compose (both engines)
+services:
+  torrentfs:
+    image: ghcr.io/tsip404/torrentfs
+    stop_grace_period: 30s
+
+# quadlet / systemd
+[Container]
+TimeoutStopSec=30
+```
+
+Even with a sufficient timeout, an externally killed container (or a host
+crash) can still leave a stale mount. The entrypoint now probes the mountpoint
+for `ENOTCONN` at startup and, when it finds one, lazy-unmounts it
+(`umount -l`) and retries automatically — printing recovery steps only if the
+auto-recovery itself fails.
+
 ## Filesystem Semantics
 
 ### rename — refusal to overwrite (non-POSIX)
