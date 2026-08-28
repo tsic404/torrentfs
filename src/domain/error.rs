@@ -12,6 +12,9 @@ pub enum TorrentError {
     #[error("Failed to parse torrent: {0}")]
     ParseError(String),
 
+    #[error("invalid configuration: {0}")]
+    ConfigError(String),
+
     #[error("IO error: {0}")]
     IoError(String),
 
@@ -398,6 +401,7 @@ mod tests {
             | TorrentError::Unknown { .. } => true,
             TorrentError::InvalidFile(_)
             | TorrentError::ParseError(_)
+            | TorrentError::ConfigError(_)
             | TorrentError::NullPointer => false,
         }
     }
@@ -417,6 +421,7 @@ mod tests {
             },
             TorrentError::InvalidFile("f".into()),
             TorrentError::ParseError("p".into()),
+            TorrentError::ConfigError("c".into()),
             TorrentError::NullPointer,
         ];
 

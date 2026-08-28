@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::error::{TorrentError, TorrentResult};
+use crate::infrastructure::config::enums::EnumValidator;
 
 // ---- config sub-modules ----
 pub mod active_limits;
@@ -14,6 +15,7 @@ pub mod connections;
 pub mod dht;
 pub mod disk_io;
 pub mod encryption;
+pub mod enums;
 pub mod local_discovery;
 pub mod misc;
 pub mod performance;
@@ -127,7 +129,8 @@ impl TorrentfsConfig {
         Ok(())
     }
 
-    /// Load configuration from a TOML file.
+    /// Load configuration from a TOML file, then validate numeric and enum
+    /// value domains.
     pub fn from_file(path: &Path) -> TorrentResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
             TorrentError::ParseError(format!("Failed to read config file {:?}: {}", path, e))
@@ -136,7 +139,28 @@ impl TorrentfsConfig {
             TorrentError::ParseError(format!("Invalid config TOML in {:?}: {}", path, e))
         })?;
         config.validate()?;
+        config.validate_enum_ranges()?;
         Ok(config)
+    }
+
+    /// Validate the value domain of libtorrent-backed enum fields.
+    ///
+    /// Numeric range validation lives in `validate()` (TSI-2494); `from_file`
+    /// calls both so neither check can silently drop the other.
+    pub fn validate_enum_ranges(&self) -> TorrentResult<()> {
+        let errs = [
+            EnumValidator::choking_algorithm(self.algorithms.choking_algorithm),
+            EnumValidator::seed_choking_algorithm(self.algorithms.seed_choking_algorithm),
+            EnumValidator::mixed_mode_algorithm(self.algorithms.mixed_mode_algorithm),
+            EnumValidator::suggest_mode(self.algorithms.suggest_mode),
+            EnumValidator::encryption_policy(self.encryption.encryption_policy),
+            EnumValidator::allowed_encryption_level(self.encryption.allowed_encryption_level),
+        ];
+
+        match errs.into_iter().flatten().next() {
+            Some(e) => Err(TorrentError::ConfigError(e.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// Default configuration (all libtorrent defaults).

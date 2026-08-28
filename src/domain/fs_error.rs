@@ -101,6 +101,7 @@ impl From<TorrentError> for FsError {
         match e {
             TorrentError::InvalidFile(msg) => FsError::CorruptTorrent(msg),
             TorrentError::ParseError(msg) => FsError::CorruptTorrent(msg),
+            TorrentError::ConfigError(msg) => FsError::Internal(msg),
             TorrentError::IoError(msg) => FsError::Io(msg),
             TorrentError::NullPointer => FsError::Internal("null pointer".to_string()),
             TorrentError::NoPeers(msg) => FsError::NoPeers(msg),

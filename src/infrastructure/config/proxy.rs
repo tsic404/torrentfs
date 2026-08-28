@@ -14,6 +14,11 @@ use crate::json_field_str;
 pub struct ProxyConfig {
     pub host: Option<String>,
     pub port: Option<i64>,
+    /// libtorrent `proxy_type` is 0..=7 (`none`/`socks4`/`socks5`/`socks5_pw`/
+    /// `http`/`http_pw`/`i2p_proxy`/`crypto`) but the Rust config models it as
+    /// a free-form string (TOML `type = "socks5"`) and `apply_str_setting`
+    /// in the C wrapper does not map it — the value is silently dropped there.
+    /// No enum-domain validation is applied here on purpose (TSI-2496).
     #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,
     pub proxy_hostnames: Option<bool>,

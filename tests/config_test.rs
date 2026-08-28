@@ -381,6 +381,192 @@ fn assert_accepted(out: &std::process::Output, case: &str) {
     );
 }
 
+/// TSI-2496: enum fields must reject out-of-domain integers (e.g.
+/// `choking_algorithm = 999`) via `--config-check` instead of silently
+/// forwarding them to libtorrent. Exit code 1, and the error must name the
+/// offending field plus its legal value domain.
+#[test]
+fn test_config_check_flag_rejects_out_of_range_choking_algorithm() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("choking-999.toml");
+    std::fs::write(&config_path, "[algorithms]\nchoking_algorithm = 999\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "out-of-range enum must exit non-zero via --config-check"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(logs.contains("choking_algorithm"), "logs: {}", logs);
+    assert!(
+        logs.contains("legal values are {0, 2, 3}"),
+        "logs: {}",
+        logs
+    );
+}
+
+#[test]
+fn test_config_check_flag_rejects_out_of_range_suggest_mode() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("suggest-7.toml");
+    std::fs::write(&config_path, "[algorithms]\nsuggest_mode = 7\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "out-of-range enum must exit non-zero"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(logs.contains("suggest_mode"), "logs: {}", logs);
+    assert!(logs.contains("legal values are {0, 1}"), "logs: {}", logs);
+}
+
+#[test]
+fn test_config_check_flag_rejects_out_of_range_encryption_policy() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("enc-policy-9.toml");
+    std::fs::write(&config_path, "[encryption]\nencryption_policy = 9\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "out-of-range enum must exit non-zero"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(logs.contains("encryption_policy"), "logs: {}", logs);
+    assert!(
+        logs.contains("legal values are {0, 1, 2}"),
+        "logs: {}",
+        logs
+    );
+}
+
+#[test]
+fn test_config_check_flag_rejects_out_of_range_encryption_level() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("enc-level-0.toml");
+    std::fs::write(&config_path, "[encryption]\nallowed_encryption_level = 0\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "out-of-range enum must exit non-zero"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(logs.contains("allowed_encryption_level"), "logs: {}", logs);
+    assert!(
+        logs.contains("legal values are {1, 2, 3}"),
+        "logs: {}",
+        logs
+    );
+}
+
+#[test]
+fn test_config_check_flag_accepts_choking_algorithm_deprecated_value() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("choking-3.toml");
+    std::fs::write(&config_path, "[algorithms]\nchoking_algorithm = 3\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        out.status.success(),
+        "deprecated_bittyrant_choker (3) is legal under ABI v2: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_config_check_flag_accepts_enum_boundary_values() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("enum-boundary.toml");
+    std::fs::write(
+        &config_path,
+        concat!(
+            "[algorithms]\n",
+            "choking_algorithm = 2\n",
+            "seed_choking_algorithm = 2\n",
+            "mixed_mode_algorithm = 1\n",
+            "suggest_mode = 1\n",
+            "[encryption]\n",
+            "encryption_policy = 2\n",
+            "allowed_encryption_level = 3\n",
+        ),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        out.status.success(),
+        "boundary enum values must exit 0: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn test_config_check_flag_accepts_legal_enum_combo() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("enum-legal.toml");
+    std::fs::write(
+        &config_path,
+        "[algorithms]\nchoking_algorithm = 2\n[encryption]\nencryption_policy = 1\n",
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        out.status.success(),
+        "legal enum combo must exit 0: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn test_config_check_rejects_negative_max_connections() {
     assert_rejected(
