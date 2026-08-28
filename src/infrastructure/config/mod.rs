@@ -112,6 +112,21 @@ pub struct TorrentfsConfig {
 }
 
 impl TorrentfsConfig {
+    /// Validate numeric value ranges for the small set of fields where a
+    /// value is unambiguously invalid — negative counts, negative rate limits,
+    /// and values that would be truncated at the i32 FFI boundary. All other
+    /// numeric fields are intentionally left to libtorrent clamp/default
+    /// semantics (see each section's `validate` doc for rationale).
+    fn validate(&self) -> TorrentResult<()> {
+        self.connections
+            .validate()
+            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
+        self.rate_limits
+            .validate()
+            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
+        Ok(())
+    }
+
     /// Load configuration from a TOML file.
     pub fn from_file(path: &Path) -> TorrentResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
@@ -120,6 +135,7 @@ impl TorrentfsConfig {
         let config: TorrentfsConfig = toml::from_str(&content).map_err(|e| {
             TorrentError::ParseError(format!("Invalid config TOML in {:?}: {}", path, e))
         })?;
+        config.validate()?;
         Ok(config)
     }
 
