@@ -112,6 +112,41 @@ file_pool_size = 40
 }
 
 #[test]
+fn test_load_config_with_proxy_type() {
+    let toml = r#"
+[proxy]
+type = "socks5"
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load proxy config");
+    assert_eq!(cfg.proxy.proxy_type, Some("socks5".to_string()));
+}
+
+#[test]
+fn test_load_config_with_proxy_type_alias() {
+    let toml = r#"
+[proxy]
+proxy_type = "socks5"
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load proxy alias config");
+    assert_eq!(cfg.proxy.proxy_type, Some("socks5".to_string()));
+}
+
+#[test]
+fn test_proxy_type_serializes_to_settings_pack_key() {
+    let toml = r#"
+[proxy]
+type = "socks5"
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load proxy config");
+    let json = cfg.to_settings_json();
+    assert!(
+        json.contains("\"proxy_type\":\"socks5\""),
+        "settings JSON must use libtorrent key proxy_type, got: {}",
+        json
+    );
+}
+
+#[test]
 fn test_load_config_with_multiple_sections() {
     let toml = r#"
 [connections]

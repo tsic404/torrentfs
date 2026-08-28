@@ -14,7 +14,7 @@ use crate::json_field_str;
 pub struct ProxyConfig {
     pub host: Option<String>,
     pub port: Option<i64>,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,
     pub proxy_hostnames: Option<bool>,
     pub proxy_peer_connections: Option<bool>,

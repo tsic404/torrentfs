@@ -27,6 +27,13 @@ main → fuse → services → domain/infrastructure
 
 Dependency direction: `domain` has no dependency on `infrastructure`; `infrastructure` implements `domain` traits.
 
+### `[proxy]` key naming
+
+The `[proxy]` section accepts both `type` and `proxy_type` for the proxy
+kind (e.g. `socks5`). `type` matches libtorrent's `settings_pack` key and is
+the canonical name; `proxy_type` is accepted as an alias for users who find
+it more intuitive. Both set the same value.
+
 ## Container Deployment
 
 torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility.
