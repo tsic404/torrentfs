@@ -9,6 +9,7 @@ use crate::json_field_str;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UserAgentConfig {
     pub user_agent: Option<String>,
     pub peer_fingerprint: Option<String>,

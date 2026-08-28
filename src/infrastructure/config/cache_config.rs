@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     pub cache_size: Option<i64>,
     pub cache_expiry: Option<i64>,

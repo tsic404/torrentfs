@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// back to [`crate::infrastructure::download::PiecePriorityConfig::default`]
 /// when converted via `PiecePriorityConfig::from_toml`.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PiecePriorityToml {
     /// Access window in MiB (default 4096 = 4 GB).  Pieces within this window
     /// of an active read are "wanted"; everything outside stays at 0.

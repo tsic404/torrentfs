@@ -8,6 +8,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
     pub aio_threads: Option<i64>,
     pub network_threads: Option<i64>,

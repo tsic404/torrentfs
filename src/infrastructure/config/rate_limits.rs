@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitsConfig {
     pub download_rate_limit: Option<i64>,
     pub upload_rate_limit: Option<i64>,

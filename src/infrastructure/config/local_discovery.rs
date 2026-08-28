@@ -7,6 +7,7 @@ use crate::infrastructure::config::WriteJson;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LocalDiscoveryConfig {
     pub lsd_enabled: Option<bool>,
     pub upnp_enabled: Option<bool>,

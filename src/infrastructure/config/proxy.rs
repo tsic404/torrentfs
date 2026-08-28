@@ -10,6 +10,7 @@ use crate::json_field_str;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     pub host: Option<String>,
     pub port: Option<i64>,

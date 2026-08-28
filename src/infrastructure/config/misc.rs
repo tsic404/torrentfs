@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MiscConfig {
     pub ignore_resume_timestamps: Option<bool>,
     pub no_recheck_incomplete_resume: Option<bool>,

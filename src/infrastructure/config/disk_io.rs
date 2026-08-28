@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DiskIoConfig {
     pub disk_io_write_mode: Option<i64>,
     pub disk_io_read_mode: Option<i64>,

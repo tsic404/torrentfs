@@ -250,6 +250,59 @@ fn test_config_check_flag_requires_config_option() {
     );
 }
 
+/// TSI-2490: `--config-check` must reject unknown keys and sections instead
+/// of silently ignoring them (rc=0 with "config is valid").
+#[test]
+fn test_config_check_flag_rejects_unknown_section() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("unknown-section.toml");
+    std::fs::write(&config_path, "[bogus_section]\nfoo = 1\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "unknown section must exit non-zero via --config-check"
+    );
+}
+
+#[test]
+fn test_config_check_flag_rejects_unknown_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("unknown-key.toml");
+    std::fs::write(&config_path, "[cache]\nmax_size = \"not-a-size\"\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "unknown key in known section must exit non-zero via --config-check"
+    );
+}
+
+#[test]
+fn test_config_check_flag_rejects_invalid_value_type() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("bad-value.toml");
+    std::fs::write(&config_path, "[cache]\ncache_size = \"not-a-size\"\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "invalid value type must exit non-zero via --config-check"
+    );
+}
+
 #[test]
 fn test_config_to_settings_json() {
     let toml = r#"

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 /// from `to_settings_json()` — it is a torrentfs-level knob, not a libtorrent
 /// `settings_pack` key.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {
     /// Number of download worker threads in the bounded pool. When unset,
     /// defaults to the number of logical CPUs (at least 1).

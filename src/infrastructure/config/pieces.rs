@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PiecesConfig {
     pub whole_pieces_threshold: Option<i64>,
     pub prioritize_partial_pieces: Option<bool>,

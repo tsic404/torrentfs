@@ -8,6 +8,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveLimitsConfig {
     pub active_downloads: Option<i64>,
     pub active_seeds: Option<i64>,

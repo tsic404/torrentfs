@@ -9,6 +9,7 @@ use crate::json_field_int;
 // ============================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TrackerConfig {
     pub announce_to_all_trackers: Option<bool>,
     pub announce_to_all_tiers: Option<bool>,

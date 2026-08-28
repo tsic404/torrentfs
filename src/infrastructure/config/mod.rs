@@ -49,6 +49,7 @@ pub use user_agent::UserAgentConfig;
 /// Top-level TOML configuration for torrentfs.
 /// All fields are optional — missing values use libtorrent defaults.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TorrentfsConfig {
     #[serde(default)]
     pub connections: ConnectionsConfig,
@@ -355,6 +356,46 @@ read_timeout_secs = 10
         let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.read_timeout_secs, Some(10));
     }
+    #[test]
+    fn test_config_rejects_unknown_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("unknown_section.toml");
+        std::fs::write(&config_path, "[bogus_section]\nfoo = 1\n").unwrap();
+
+        let result = TorrentfsConfig::from_file(&config_path);
+        assert!(result.is_err(), "unknown top-level section must fail");
+        match result {
+            Err(TorrentError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("unknown field") || msg.contains("bogus_section"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ParseError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_key_in_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("unknown_key.toml");
+        std::fs::write(&config_path, "[cache]\nmax_size = \"not-a-size\"\n").unwrap();
+
+        let result = TorrentfsConfig::from_file(&config_path);
+        assert!(result.is_err(), "unknown key in known section must fail");
+        match result {
+            Err(TorrentError::ParseError(msg)) => {
+                assert!(
+                    msg.contains("unknown field") && msg.contains("max_size"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ParseError, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_piece_priority_config_section() {
         let toml_str = r#"
