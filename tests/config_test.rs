@@ -494,6 +494,23 @@ fn test_config_check_flag_rejects_out_of_range_encryption_level() {
 }
 
 #[test]
+fn test_config_check_flag_rejects_removed_ssl_listen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let config_path = dir.path().join("ssl-listen.toml");
+    std::fs::write(&config_path, "[encryption]\nssl_listen = 99\n").unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
+        .args(["--config-check", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run torrentfs");
+    assert!(
+        !out.status.success(),
+        "ssl_listen was removed with the libtorrent 2.1.1 wrapper; must be rejected as unknown"
+    );
+}
+
+#[test]
 fn test_config_check_flag_accepts_choking_algorithm_deprecated_value() {
     let dir = tempfile::TempDir::new().unwrap();
     let config_path = dir.path().join("choking-3.toml");

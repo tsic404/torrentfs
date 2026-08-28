@@ -883,8 +883,6 @@ static void apply_int_setting(lt::settings_pack& pack, const std::string& key, i
         pack.set_int(lt::settings_pack::out_enc_policy, val);
     } else if (key == "allowed_encryption_level") {
         pack.set_int(lt::settings_pack::allowed_enc_level, val);
-    } else if (key == "ssl_listen") {
-        // libtorrent 2.0: ssl_listen removed, silently ignored
     } else if (key == "proxy_port") {
         pack.set_int(lt::settings_pack::proxy_port, val);
     } else if (key == "alert_mask") {
