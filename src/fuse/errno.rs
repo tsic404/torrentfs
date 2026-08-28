@@ -34,15 +34,14 @@ impl From<FsError> for libc::c_int {
             // ── persistence ──
             FsError::Database(_) | FsError::Migration(_) => EIO,
             // ── remote / network (BitTorrent domain) ──
-            // TSI-2246: NoPeers maps to ENODATA ("No data available") so the
-            // user sees a meaningful error ("no available seeder") instead of
-            // the generic EIO ("Input/output error") when the swarm has no
-            // seeder. Other download errors (timeout, failure, corrupt piece)
-            // still map to EIO.
-            FsError::NoPeers(_) => ENODATA,
-            FsError::PieceNotReady(_)
-            | FsError::DownloadTimeout(_)
-            | FsError::DownloadFailed(_) => EIO,
+            // TSI-2246/TSI-2483: NoPeers and DownloadTimeout map to ENODATA
+            // ("No data available") so the user sees a meaningful error
+            // ("no available seeder" / "waiting for a seeder timed out")
+            // instead of the generic EIO ("Input/output error") when the
+            // swarm has no seeder. Other download errors (failure, corrupt
+            // piece) still map to EIO.
+            FsError::NoPeers(_) | FsError::DownloadTimeout(_) => ENODATA,
+            FsError::PieceNotReady(_) | FsError::DownloadFailed(_) => EIO,
             // ── internal / system ──
             FsError::Io(_) => EIO,
             FsError::NoSpace(_) => ENOSPC,
@@ -63,10 +62,14 @@ mod tests {
         assert_ne!(e, libc::EIO);
     }
 
+    /// TSI-2483: `DownloadTimeout` ("waiting for a seeder timed out") maps to
+    /// ENODATA so a read that blocks out the piece-wait limit surfaces as
+    /// "no data available", not the generic EIO.
     #[test]
-    fn download_timeout_still_maps_to_eio() {
+    fn download_timeout_maps_to_enodata_not_eio() {
         let e: libc::c_int = FsError::DownloadTimeout("slow".to_string()).into();
-        assert_eq!(e, libc::EIO);
+        assert_eq!(e, libc::ENODATA);
+        assert_ne!(e, libc::EIO);
     }
 
     #[test]

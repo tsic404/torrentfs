@@ -80,7 +80,8 @@ struct PendingEntry<R: PendingReply> {
 ///   or the deadline checker removes an entry — the design §9 backpressure
 ///   model: block briefly, never error and never return truncated data.
 /// * Each entry carries a deadline; a background thread expires overdue entries
-///   with EIO.
+///   with ENODATA ("no data available" — the piece-wait limit elapsed with no
+///   seeder to serve it).
 /// * `unlink` / `remove_torrent` cancels in-flight reads for the removed
 ///   torrent and resolves their tickets with EIO.
 /// * Every reply is consumed exactly once (ok or error), zero leak.
@@ -191,8 +192,11 @@ impl<R: PendingReply> PendingTable<R> {
         count
     }
 
-    /// Expire all entries whose deadline has passed.  Resolves them with EIO.
-    /// Returns the number of entries expired.
+    /// Expire all entries whose deadline has passed.  Resolves them with
+    /// `ENODATA` ("no data available"): a deferred read only expires when the
+    /// piece-wait limit elapsed without the data arriving, i.e. the swarm has
+    /// no seeder to serve it (TSI-2483).  Returns the number of entries
+    /// expired.
     fn expire(&self) -> usize {
         let now = Instant::now();
         let removed: Vec<R> = {
@@ -212,7 +216,7 @@ impl<R: PendingReply> PendingTable<R> {
         };
         let count = removed.len();
         for reply in removed {
-            reply.resolve_error(libc::EIO);
+            reply.resolve_error(libc::ENODATA);
         }
         if count > 0 {
             self.slot_freed.notify_all();
@@ -285,9 +289,8 @@ impl TorrentFs {
             .filter(|&v| v > 0)
             .unwrap_or(256)
     }
-
     /// Spawn a background thread that expires overdue pending replies every
-    /// second, resolving each with EIO and decrementing the pending-reads
+    /// second, resolving each with ENODATA and decrementing the pending-reads
     /// metric once per expired entry.
     fn spawn_deadline_checker(pending_table: Arc<PendingTable>, metrics: Arc<Metrics>) {
         std::thread::spawn(move || {
@@ -891,16 +894,15 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 3);
     }
 
+    /// TSI-2483: an expired (piece-wait-elapsed) deferred read resolves with
+    /// ENODATA, not EIO, so `dd`/`cat` see "no data available" instead of
+    /// "input/output error" when the swarm has no seeder.
     #[test]
-    fn expire_resolves_overdue_tickets_only() {
+    fn expire_resolves_overdue_tickets_with_enodata() {
         let table: PendingTable<MockReply> = PendingTable::new();
-        let resolves = Arc::new(AtomicUsize::new(0));
+        let (reply, resolves, last_errno, _got_data) = MockReply::tracked();
 
-        let overdue = table.insert(
-            MockReply::tracking(resolves.clone()),
-            7,
-            deadline_in(std::time::Duration::from_secs(0)),
-        );
+        let overdue = table.insert(reply, 7, deadline_in(std::time::Duration::from_secs(0)));
         let future = table.insert(
             MockReply::tracking(resolves.clone()),
             7,
@@ -910,6 +912,11 @@ mod pending_tests {
         let expired = table.expire();
         assert_eq!(expired, 1);
         assert_eq!(resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            last_errno.load(Ordering::Relaxed),
+            libc::ENODATA,
+            "expired deferred read must resolve as ENODATA"
+        );
 
         // The future entry is unaffected.
         table.resolve(future, b"ok");

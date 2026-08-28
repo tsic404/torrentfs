@@ -1057,14 +1057,13 @@ impl EngineState {
 
                 if piece_start.elapsed() >= piece_wait_timeout {
                     self.release_reader(&info_hash);
-                    // TSI-2261: when the piece-wait times out, distinguish
-                    // "no seeder available" from "slow download". If the
-                    // torrent has zero connected seeders after the full
-                    // timeout, the swarm has no seeder — return NoPeers
-                    // (→ ENODATA, "no data available") instead of Timeout
-                    // (→ EIO, "input/output error") so the user sees a
-                    // meaningful error. Seeders present but slow still
-                    // returns Timeout → EIO.
+                    // TSI-2261/TSI-2483: when the piece-wait times out,
+                    // distinguish "no seeder available" from "slow download".
+                    // If the torrent has zero connected seeders after the
+                    // full timeout, the swarm has no seeder — return NoPeers
+                    // (→ ENODATA). Seeders present but slow return Timeout,
+                    // which also maps to ENODATA ("waiting for a seeder timed
+                    // out") at the FUSE layer.
                     //
                     // If status is unavailable (handle gone or status()
                     // failed), fall back to Timeout — do NOT fabricate a
