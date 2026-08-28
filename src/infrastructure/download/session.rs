@@ -225,6 +225,14 @@ impl Session {
     pub fn post_stats(&self) {
         unsafe { libtorrent_sys::lt_session_post_session_stats(self.inner) };
     }
+
+    /// TSI-2468: fire-and-forget request for libtorrent to refresh per-torrent
+    /// statistics (num_peers, num_seeds, etc.). Without this, `status()` may
+    /// return stale peer counts — the internal peer list is only refreshed
+    /// when the session processes a tick or `post_torrent_updates`.
+    pub fn post_torrent_updates(&self) {
+        unsafe { libtorrent_sys::lt_session_post_torrent_updates(self.inner) };
+    }
 }
 
 impl Drop for Session {

@@ -1143,6 +1143,22 @@ void lt_session_post_session_stats(lt_session_t session) {
         // caller can act on; the next tick retries.
     }
 }
+
+// TSI-2468: fire-and-forget `post_torrent_updates()`. Requests libtorrent
+// to refresh per-torrent statistics (num_peers, num_seeds, etc.) and emit
+// `torrent_update_alert` for each torrent. Without this, `torrent_handle::
+// status()` may return stale peer counts — the internal peer list is only
+// refreshed when the session processes a tick or `post_torrent_updates`.
+void lt_session_post_torrent_updates(lt_session_t session) {
+    if (!session) return;
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+    try {
+        std::lock_guard<std::mutex> lock(wrapper->mutex);
+        wrapper->session->post_torrent_updates();
+    } catch (const std::exception&) {
+        // Fire-and-forget
+    }
+}
 // ── Helper: convert sha1_hash to hex string ──
 static std::string alert_info_hash_to_hex(const lt::sha1_hash& h) {
     char buf[41];

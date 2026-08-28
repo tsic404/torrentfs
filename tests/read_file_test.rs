@@ -397,6 +397,41 @@ fn test_peer_appearing_mid_read_returns_data() {
         engine_reader.read_file_range(info_reader, 0, 0, 50)
     });
 
+    // TSI-2468: poll the shared snapshot from a separate thread while the
+    // engine is blocked in peer-wait. The snapshot must be refreshed by
+    // `publish_snapshot` during peer-wait so that `.stats` shows the live
+    // download state — not stale zeros from before upload_mode was cleared.
+    //
+    // We assert that `try_torrent_status` returns `Some` with state
+    // `Downloading`. Before the fix, `publish_snapshot` was not called
+    // during peer-wait, so the snapshot stayed stale from the pre-download
+    // `publish_snapshot` at reader_added — which would show `Allocating`
+    // or `CheckingFiles`, never `Downloading`.
+    //
+    // Note: `num_peers`/`num_seeds` from `status()` are not asserted here
+    // because libtorrent's per-torrent peer list is not refreshed
+    // synchronously by `status()` — the internal session tick updates it
+    // asynchronously, and a single-piece torrent's peer connection is too
+    // brief to catch. The state transition to `Downloading` is the reliable
+    // signal that the snapshot is fresh.
+    let engine_poller = Arc::clone(&engine);
+    let info_hash_poll = info_hash.clone();
+    let snapshot_fresh = thread::spawn(move || {
+        let poll_timeout = Duration::from_secs(30);
+        let poll_start = std::time::Instant::now();
+        loop {
+            if poll_start.elapsed() >= poll_timeout {
+                return false;
+            }
+            if let Some(status) = engine_poller.try_torrent_status(&info_hash_poll) {
+                if matches!(status.state, torrentfs::download::TorrentState::Downloading) {
+                    return true;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
     // Give the read time to get past the empty-swarm probe: wait until it
     // started, then hold the swarm empty long enough that under the OLD
     // behavior the peer-wait would expire with 0 peers.  Then drop in a
@@ -459,6 +494,16 @@ fn test_peer_appearing_mid_read_returns_data() {
         })
     };
 
+    // TSI-2468: assert the snapshot was refreshed during peer-wait.
+    // The poller thread (started above, before the seeder) polls
+    // `try_torrent_status` and returns true once the state transitions
+    // to Downloading — proving `publish_snapshot` ran after upload_mode
+    // was cleared (the pre-download snapshot would show Allocating).
+    assert!(
+        snapshot_fresh.join().expect("poller thread panicked"),
+        "Snapshot never showed Downloading state during peer-wait — \
+         publish_snapshot is not refreshing after upload_mode clear"
+    );
     // The read must now succeed within its remaining budget.
     let result = reader.join().expect("reader thread panicked");
 

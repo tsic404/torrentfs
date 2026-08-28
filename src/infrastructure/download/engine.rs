@@ -884,6 +884,13 @@ impl EngineState {
             }
         }
 
+        // TSI-2468: publish the snapshot after switching to download mode so
+        // `.stats` reflects the state change immediately. Without this, the
+        // snapshot published at reader_added (line 822) is the last refresh
+        // before the engine blocks in the peer-wait / piece-wait loops —
+        // `.stats` shows stale Peers: 0 / Seeds: 0 even after peers connect.
+        self.publish_snapshot();
+
         // Settle sleep for libtorrent state transitions.
         std::thread::sleep(Duration::from_millis(100));
 
@@ -932,9 +939,20 @@ impl EngineState {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
+                    // TSI-2468: also refresh session stats so the global
+                    // `Connected:` counter (SharedSessionStats) stays
+                    // fresh during the blocked read.
+                    self.refresh_session_stats();
                     match handle.status() {
                         Ok(s) => {
                             status = s;
+                            // TSI-2468: refresh the shared snapshot so
+                            // `.stats` shows peers/seeds as they connect
+                            // during the peer-wait phase. Without this,
+                            // the snapshot stays stale from the upload_mode
+                            // publish above, and `.stats` shows Peers: 0
+                            // / Seeds: 0 even while peers are connected.
+                            self.publish_snapshot();
                             if status.num_peers > 0 || status.num_seeds > 0 {
                                 break;
                             }
@@ -1086,6 +1104,8 @@ impl EngineState {
                 // Refresh the snapshot so `.stats` shows pieces becoming
                 // cached and priority changes during long reads (TSI-2224).
                 self.publish_snapshot();
+                // TSI-2468: refresh session stats for global counters.
+                self.refresh_session_stats();
 
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -1455,9 +1475,14 @@ impl EngineState {
     }
 
     /// Publish the current engine state into the shared snapshot.
-    fn publish_snapshot(&mut self) {
+    fn publish_snapshot(&self) {
         let mut statuses = HashMap::new();
         let mut pieces = HashMap::new();
+        // TSI-2468: request libtorrent to refresh per-torrent statistics
+        // before reading status. Without this, `status().num_peers` can
+        // return 0 even when peers are connected — the internal peer list
+        // is only refreshed on session tick or post_torrent_updates.
+        self.session.post_torrent_updates();
         for (info_hash, handle) in &self.handles {
             if let Ok(status) = handle.status() {
                 statuses.insert(info_hash.clone(), status);

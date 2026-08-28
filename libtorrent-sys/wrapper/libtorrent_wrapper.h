@@ -129,6 +129,7 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
 // thread (`lt_session_pop_alerts`), which fills the shared stats snapshot.
 // This call is fire-and-forget and never blocks.
 void lt_session_post_session_stats(lt_session_t session);
+void lt_session_post_torrent_updates(lt_session_t session);
 lt_alert_list_t* lt_session_pop_alerts(lt_session_t session);
 void lt_alert_list_destroy(lt_alert_list_t* list);
 // Set (or clear) the alert notify callback. `callback` is invoked on one of
