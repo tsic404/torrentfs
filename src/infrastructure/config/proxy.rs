@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::infrastructure::config::WriteJson;
 use crate::json_field_bool;
-use crate::json_field_int;
-use crate::json_field_str;
 
 // ============================================================
 // Proxy
@@ -78,9 +76,26 @@ impl ProxyConfig {
 
 impl WriteJson for ProxyConfig {
     fn write_json(&self, map: &mut serde_json::Map<String, serde_json::Value>) {
-        json_field_str!(map, self, host);
-        json_field_int!(map, self, port);
-        if let Some(ref val) = self.proxy_type {
+        // `host`/`port` are the user-facing TOML keys; libtorrent's real
+        // settings_pack names are `proxy_hostname`/`proxy_port`. The wrapper
+        // only recognizes the latter — emitting `host`/`port` made both values
+        // silently dropped (TSI-2538). The other fields already use their
+        // libtorrent names verbatim, so only these two need explicit keys.
+        if let Some(val) = &self.host {
+            if !val.is_empty() {
+                map.insert(
+                    "proxy_hostname".to_string(),
+                    serde_json::Value::String(val.clone()),
+                );
+            }
+        }
+        if let Some(val) = self.port {
+            map.insert(
+                "proxy_port".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(val)),
+            );
+        }
+        if let Some(val) = &self.proxy_type {
             if !val.is_empty() {
                 map.insert(
                     "proxy_type".to_string(),

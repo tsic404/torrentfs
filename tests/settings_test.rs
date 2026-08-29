@@ -75,6 +75,37 @@ fn proxy_type_maps_to_libtorrent_proxy_type() {
 }
 
 #[test]
+fn proxy_host_port_reach_libtorrent() {
+    let mut config = TorrentfsConfig::default_config();
+    config.proxy.proxy_type = Some("socks5".to_string());
+    config.proxy.host = Some("127.0.0.1".to_string());
+    config.proxy.port = Some(1080);
+    let session = Session::new(&config).unwrap();
+    assert_int_setting(&session, "proxy_port", 1080);
+    assert_eq!(
+        session
+            .get_str_setting("proxy_hostname")
+            .expect("proxy_hostname must be readable"),
+        "127.0.0.1"
+    );
+}
+
+#[test]
+fn peer_fingerprint_still_reaches_libtorrent() {
+    // TSI-2538 regression: restoring the proxy_hostname branch must not
+    // clobber the existing peer_fingerprint mapping (wrapper apply_str_setting).
+    let mut config = TorrentfsConfig::default_config();
+    config.user_agent.peer_fingerprint = Some("TS".to_string());
+    let session = Session::new(&config).unwrap();
+    assert_eq!(
+        session
+            .get_str_setting("peer_fingerprint")
+            .expect("peer_fingerprint must be readable"),
+        "TS"
+    );
+}
+
+#[test]
 fn settings_work_with_custom_storage_session() {
     let dir = tempfile::TempDir::new().unwrap();
     with_large_stack(move || {

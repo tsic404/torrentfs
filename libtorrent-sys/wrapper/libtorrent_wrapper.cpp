@@ -788,6 +788,10 @@ static void apply_str_setting(lt::settings_pack& pack, const std::string& key, c
         pack.set_str(lt::settings_pack::user_agent, val);
     } else if (key == "peer_fingerprint") {
         pack.set_str(lt::settings_pack::peer_fingerprint, val);
+    } else if (key == "proxy_hostname" || key == "host") {
+        // Canonical key is `proxy_hostname`; `host` is accepted as a legacy
+        // alias so any already-serialized config keeps working.
+        pack.set_str(lt::settings_pack::proxy_hostname, val);
     } else if (key == "proxy_type") {
         // `proxy_type` is an int_types setting in libtorrent; the config
         // models it as a free-form string (TSI-2529). Convert it here so
@@ -921,7 +925,8 @@ static void apply_int_setting(lt::settings_pack& pack, const std::string& key, i
         pack.set_int(lt::settings_pack::out_enc_policy, val);
     } else if (key == "allowed_encryption_level") {
         pack.set_int(lt::settings_pack::allowed_enc_level, val);
-    } else if (key == "proxy_port") {
+    } else if (key == "proxy_port" || key == "port") {
+        // Canonical key is `proxy_port`; `port` is accepted as a legacy alias.
         pack.set_int(lt::settings_pack::proxy_port, val);
     } else if (key == "alert_mask") {
         pack.set_int(lt::settings_pack::alert_mask, val);
@@ -1153,6 +1158,11 @@ static bool get_session_int_setting_impl(lt::settings_pack const& settings, cons
             *out = settings.get_int(lt::settings_pack::proxy_type);
             return true;
         }
+    } else if (key == "proxy_port") {
+        if (settings.has_val(lt::settings_pack::proxy_port)) {
+            *out = settings.get_int(lt::settings_pack::proxy_port);
+            return true;
+        }
     }
     return false;
 }
@@ -1165,6 +1175,36 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
         auto settings = wrapper->session->get_settings();
         if (get_session_bool_setting_impl(settings, std::string(key), out)) {
             return 0;
+        }
+    } catch (const std::exception&) {}
+    return -1;
+}
+
+static bool get_session_str_setting_impl(lt::settings_pack const& settings, const std::string& key, std::string& out) {
+    if (key == "proxy_hostname") {
+        if (settings.has_val(lt::settings_pack::proxy_hostname)) {
+            out = settings.get_str(lt::settings_pack::proxy_hostname);
+            return true;
+        }
+    } else if (key == "peer_fingerprint") {
+        if (settings.has_val(lt::settings_pack::peer_fingerprint)) {
+            out = settings.get_str(lt::settings_pack::peer_fingerprint);
+            return true;
+        }
+    }
+    return false;
+}
+
+int lt_session_get_str_setting(lt_session_t session, const char* key, char** out) {
+    if (!session || !key || !out) return -1;
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+    std::lock_guard<std::mutex> lock(wrapper->mutex);
+    try {
+        auto settings = wrapper->session->get_settings();
+        std::string val;
+        if (get_session_str_setting_impl(settings, std::string(key), val)) {
+            *out = strdup(val.c_str());
+            return *out ? 0 : -1;
         }
     } catch (const std::exception&) {}
     return -1;

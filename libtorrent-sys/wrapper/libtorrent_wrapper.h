@@ -123,6 +123,8 @@ int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle);
 void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
+
+int lt_session_get_str_setting(lt_session_t session, const char* key, char** out);
 int lt_session_get_int_setting(lt_session_t session, const char* key, int* out);
 
 // TSI-2547: report whether the libtorrent build compiled I2P support in

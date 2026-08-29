@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use std::ptr;
 
@@ -109,6 +109,30 @@ impl Session {
         };
         if result == 0 {
             Ok(out != 0)
+        } else {
+            Err(TorrentError::Unknown {
+                code: result,
+                message: format!("Setting '{}' not found or session unavailable", key),
+            })
+        }
+    }
+
+    /// Read a string setting from the live libtorrent session.
+    pub fn get_str_setting(&self, key: &str) -> TorrentResult<String> {
+        let key_c = CString::new(key).map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Setting key contains null byte".to_string(),
+        })?;
+        let mut out: *mut c_char = ptr::null_mut();
+        let result = unsafe {
+            libtorrent_sys::lt_session_get_str_setting(self.inner, key_c.as_ptr(), &mut out)
+        };
+        if result == 0 && !out.is_null() {
+            let val = unsafe { CStr::from_ptr(out) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { libtorrent_sys::lt_string_free(out) };
+            Ok(val)
         } else {
             Err(TorrentError::Unknown {
                 code: result,

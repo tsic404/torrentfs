@@ -146,6 +146,40 @@ type = "socks5"
     );
 }
 
+#[test]
+fn test_proxy_host_port_serialize_to_libtorrent_keys() {
+    let toml = r#"
+[proxy]
+type = "socks5"
+host = "127.0.0.1"
+port = 1080
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load proxy config");
+    let json = cfg.to_settings_json();
+    // TSI-2538: the TOML keys `host`/`port` must reach libtorrent under its
+    // real settings_pack names — emitting `host`/`port` was silently dropped.
+    assert!(
+        json.contains("\"proxy_hostname\":\"127.0.0.1\""),
+        "settings JSON must use libtorrent key proxy_hostname, got: {}",
+        json
+    );
+    assert!(
+        json.contains("\"proxy_port\":1080"),
+        "settings JSON must use libtorrent key proxy_port, got: {}",
+        json
+    );
+    assert!(
+        !json.contains("\"host\""),
+        "settings JSON must not emit non-libtorrent key host, got: {}",
+        json
+    );
+    assert!(
+        !json.contains("\"port\""),
+        "settings JSON must not emit non-libtorrent key port, got: {}",
+        json
+    );
+}
+
 // TSI-2510: `proxy_type` (canonical `type` / alias `proxy_type`) must be
 // validated once present — including the empty string, which used to be
 // silently dropped and fall back to libtorrent's default.
