@@ -461,16 +461,33 @@ impl FsService {
         }
     }
 
-    /// `setattr` (chmod/chown/truncate/utimens) on the read-only `data/`
-    /// namespace must return `EROFS` — never a silent success. `getattr`
-    /// alone cannot tell the difference between "attributes are virtual and
-    /// immutable" (metadata/stats) and "this inode exists but is not
-    /// writable", so a `chmod` on `data/` previously returned the current
-    /// attributes (exit 0) while leaving the mode untouched. This guard makes
-    /// `data/` match `write`/`rmdir`/`unlink`/`rename` (TSI-2533).
+    /// `setattr` (chmod/chown/truncate/utimens) on any namespace whose
+    /// attributes are virtual and immutable must never silently succeed.
+    ///
+    /// `getattr` alone cannot tell the difference between "attributes are
+    /// virtual and immutable" (metadata, `.stats`, root) and "this inode exists
+    /// but is not writable", so a `chmod` on `data/` (or on a `metadata/`
+    /// file whose mode is fixed at 0o444) previously returned the current
+    /// attributes (exit 0) while leaving the mode untouched.
+    ///
+    /// The errno differs by namespace: `data/` is genuinely read-only and
+    /// returns `EROFS` (matching `write`/`rmdir`/`unlink`/`rename`,
+    /// TSI-2533); `metadata/`, the `.stats` virtual files and the root
+    /// directory have virtual, immutable attributes, so `setattr` there
+    /// returns `EPERM` (TSI-2536).
     pub fn setattr(&mut self, ino: u64) -> FsResult<Attr> {
+        // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
+        // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
+        // be classified as stats *before* the data/ guard — otherwise they
+        // would wrongly return EROFS instead of EPERM.
+        if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
+            return Err(FsError::NotPermitted);
+        }
         if InodeManager::is_data_namespace(ino) {
             return Err(FsError::ReadOnlyFileSystem);
+        }
+        if self.inode_mgr.is_metadata_child(ino) || ino == ROOT_INO {
+            return Err(FsError::NotPermitted);
         }
         self.getattr(ino)
     }
@@ -2304,6 +2321,53 @@ mod tests {
         let err = svc.setattr(data_file_ino).unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
+
+    /// TSI-2536: `setattr` (chmod/chown/truncate/utimens) on the `metadata/`
+    /// namespace must return `EPERM` — never a silent success. `metadata/`
+    /// is writable (create/write/rename/unlink work), so `EROFS` would be
+    /// misleading; `EPERM` reflects "attributes are virtual and immutable".
+    #[test]
+    fn metadata_namespace_setattr_returns_eperm() {
+        let mut svc = bare_service();
+
+        let err = svc.setattr(METADATA_INO).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        // A metadata/ file (writable .torrent buffer, but attributes are
+        // virtual and immutable) must also reject setattr.
+        let ino = svc
+            .create(METADATA_INO, "ubuntu.iso.torrent")
+            .expect("create metadata file")
+            .attr
+            .ino;
+        let err = svc.setattr(ino).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+    }
+
+    /// TSI-2536: the root directory and the `.stats` virtual files have
+    /// fixed modes (0o555 / 0o444) just like `metadata/`, so `setattr` on
+    /// them must also return `EPERM` instead of silently returning the
+    /// current attributes (exit 0) while leaving the mode untouched.
+    #[test]
+    fn root_and_stats_setattr_return_eperm() {
+        let mut svc = bare_service();
+
+        let err = svc.setattr(ROOT_INO).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        let err = svc.setattr(STATS_INO).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        // Derived stats inode (`dir_ino + STATS_INO_OFFSET`) falls inside the
+        // `is_data_ino` range (>= DATA_TORRENT_INO_BASE), so it must be
+        // classified as stats *before* the data/ guard, otherwise it would
+        // wrongly return EROFS (Radian 💭3).
+        let stats_ino = InodeManager::make_stats_ino(DATA_INO);
+        assert!(InodeManager::is_stats_ino(stats_ino));
+        let err = svc.setattr(stats_ino).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+    }
+
     /// Helper: create an empty writable `.torrent` inode via the public
     /// `create()` path (not direct `inodes` manipulation) and return its
     /// ino. Using the real path keeps the test honest about the
