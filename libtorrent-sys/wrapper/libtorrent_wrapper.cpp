@@ -749,6 +749,35 @@ static int64_t parse_json_int(const char*& p) {
     return negative ? -val : val;
 }
 
+// Map a config `proxy_type` string to libtorrent's `proxy_type_t` enum value.
+// Returns true and writes the value when `val` names a real proxy kind;
+// false when it does not. Enum values mirror `proxy_type_t`
+// (none=0/socks4=1/socks5=2/socks5_pw=3/http=4/http_pw=5/i2p_proxy=6).
+// Rust `ProxyConfig::validate()` already rejects unknown kinds, but the
+// wrapper stays defensive so a bad JSON key can never assert or misroute.
+static bool proxy_type_from_string(const std::string& val, int* out) {
+    if (val == "none") {
+        *out = lt::settings_pack::none;
+    } else if (val == "socks4") {
+        *out = lt::settings_pack::socks4;
+    } else if (val == "socks5") {
+        *out = lt::settings_pack::socks5;
+    } else if (val == "socks5_pw") {
+        *out = lt::settings_pack::socks5_pw;
+    } else if (val == "http") {
+        *out = lt::settings_pack::http;
+    } else if (val == "http_pw") {
+        *out = lt::settings_pack::http_pw;
+#if TORRENT_USE_I2P
+    } else if (val == "i2p_proxy") {
+        *out = lt::settings_pack::i2p_proxy;
+#endif
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void apply_str_setting(lt::settings_pack& pack, const std::string& key, const std::string& val) {
     // Phase 1: core string settings
     if (key == "listen_interfaces") {
@@ -760,28 +789,14 @@ static void apply_str_setting(lt::settings_pack& pack, const std::string& key, c
     } else if (key == "peer_fingerprint") {
         pack.set_str(lt::settings_pack::peer_fingerprint, val);
     } else if (key == "proxy_type") {
-        // TSI-2535: map the config string ("socks4"…"i2p_proxy") to the
-        // libtorrent proxy_type_t integer. Rust-side validate() restricts
-        // the value to this exact domain and (TSI-2547) gates "i2p_proxy" on
-        // lt_torrent_i2p_enabled(), so any other string reaching here means a
-        // C++/Rust contract drift — a programming bug, never user input —
-        // abort loudly instead of silently misconfiguring the session to
-        // `none`.
-        int proxy;
-        if (val == "socks4") proxy = static_cast<int>(lt::settings_pack::socks4);
-        else if (val == "socks5") proxy = static_cast<int>(lt::settings_pack::socks5);
-        else if (val == "socks5_pw") proxy = static_cast<int>(lt::settings_pack::socks5_pw);
-        else if (val == "http") proxy = static_cast<int>(lt::settings_pack::http);
-        else if (val == "http_pw") proxy = static_cast<int>(lt::settings_pack::http_pw);
-#if TORRENT_USE_I2P
-        else if (val == "i2p_proxy") proxy = static_cast<int>(lt::settings_pack::i2p_proxy);
-#endif
-        else {
-            fprintf(stderr, "[proxy] unknown proxy_type %s (TORRENT_USE_I2P=%d) — aborting\n",
-                    val.c_str(), TORRENT_USE_I2P);
-            std::abort();
+        // `proxy_type` is an int_types setting in libtorrent; the config
+        // models it as a free-form string (TSI-2529). Convert it here so
+        // `type = "socks5"` actually reaches the session instead of being
+        // silently dropped as an unknown string key.
+        int proxy_type = 0;
+        if (proxy_type_from_string(val, &proxy_type)) {
+            pack.set_int(lt::settings_pack::proxy_type, proxy_type);
         }
-        pack.set_int(lt::settings_pack::proxy_type, proxy);
     }
     // Unknown keys are silently ignored
 }
@@ -1132,6 +1147,16 @@ static bool get_session_bool_setting_impl(lt::settings_pack const& settings, con
     return false;
 }
 
+static bool get_session_int_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
+    if (key == "proxy_type") {
+        if (settings.has_val(lt::settings_pack::proxy_type)) {
+            *out = settings.get_int(lt::settings_pack::proxy_type);
+            return true;
+        }
+    }
+    return false;
+}
+
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out) {
     if (!session || !key || !out) return -1;
     auto wrapper = static_cast<lt_session_wrapper*>(session);
@@ -1143,16 +1168,6 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
         }
     } catch (const std::exception&) {}
     return -1;
-}
-
-static bool get_session_int_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
-    if (key == "proxy_type") {
-        if (settings.has_val(lt::settings_pack::proxy_type)) {
-            *out = settings.get_int(lt::settings_pack::proxy_type);
-            return true;
-        }
-    }
-    return false;
 }
 
 int lt_session_get_int_setting(lt_session_t session, const char* key, int* out) {

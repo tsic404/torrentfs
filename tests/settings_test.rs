@@ -132,3 +132,32 @@ fn close_redundant_connections_user_override_respected() {
         assert_setting(&session, "close_redundant_connections", true);
     });
 }
+
+/// TSI-2529: a configured `proxy_type` string must survive the C wrapper's
+/// `apply_str_setting` mapping and land in the live session as the matching
+/// `proxy_type_t` value — not be silently dropped as an unknown string key.
+#[test]
+fn proxy_type_applies_to_session() {
+    let mut cases: Vec<(&str, i32)> = vec![
+        ("socks4", 1),
+        ("socks5", 2),
+        ("socks5_pw", 3),
+        ("http", 4),
+        ("http_pw", 5),
+    ];
+    if unsafe { libtorrent_sys::lt_torrent_i2p_enabled() } != 0 {
+        cases.push(("i2p_proxy", 6));
+    }
+    for (kind, expected) in cases {
+        let mut config = TorrentfsConfig::default_config();
+        config.proxy.proxy_type = Some(kind.to_string());
+        let session = Session::new(&config).unwrap();
+        let actual = session
+            .get_int_setting("proxy_type")
+            .unwrap_or_else(|e| panic!("get_int_setting(proxy_type) failed: {e:?}"));
+        assert_eq!(
+            actual, expected,
+            "proxy_type={kind} must map to {expected}, got {actual}"
+        );
+    }
+}

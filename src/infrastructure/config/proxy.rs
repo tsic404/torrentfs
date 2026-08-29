@@ -17,8 +17,8 @@ pub struct ProxyConfig {
     /// libtorrent 2.1.1 `proxy_type_t` is 0..=6 (`none`/`socks4`/`socks5`/
     /// `socks5_pw`/`http`/`http_pw`/`i2p_proxy`); `none` is expressed on the
     /// Rust side as `None`. The config models the kind as a free-form string
-    /// (TOML `type = "socks5"`); `apply_str_setting` in the C wrapper maps it
-    /// to the matching `settings_pack::proxy_type_t` integer (TSI-2535).
+    /// (TOML `type = "socks5"`) and `apply_str_setting` in the C wrapper
+    /// converts it to the `proxy_type` int_types setting (TSI-2529).
     /// Enum-domain validation is applied in `ProxyConfig::validate()`.
     #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,
@@ -41,9 +41,9 @@ impl ProxyConfig {
     /// The accepted domain also tracks the wrapper's compile-time capability:
     /// `i2p_proxy` is only legal when libtorrent was built with
     /// `TORRENT_USE_I2P=1`. On I2P-disabled builds the C++ wrapper's
-    /// `apply_str_setting` has no `i2p_proxy` branch and `std::abort()`s
-    /// (SIGABRT) on the value, so rejecting it here turns that runtime crash
-    /// into a config-time error (TSI-2547).
+    /// `apply_str_setting` has no `i2p_proxy` branch and silently ignores the
+    /// value, so rejecting it here turns that silent drop into a config-time
+    /// error (TSI-2547).
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.validate_with(crate::infrastructure::config::i2p_enabled())
     }

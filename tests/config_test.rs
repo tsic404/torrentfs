@@ -179,14 +179,11 @@ proxy_type = "socks99"
 
 #[test]
 fn test_load_config_accepts_all_legal_proxy_types() {
-    for kind in [
-        "socks4",
-        "socks5",
-        "socks5_pw",
-        "http",
-        "http_pw",
-        "i2p_proxy",
-    ] {
+    let mut kinds = vec!["socks4", "socks5", "socks5_pw", "http", "http_pw"];
+    if unsafe { libtorrent_sys::lt_torrent_i2p_enabled() } != 0 {
+        kinds.push("i2p_proxy");
+    }
+    for kind in kinds {
         let toml = format!("[proxy]\ntype = {:?}\n", kind);
         let cfg = load_config_from_str(&toml)
             .unwrap_or_else(|e| panic!("legal proxy_type {} must pass, got: {}", kind, e));

@@ -270,7 +270,7 @@ pub(crate) trait WriteJson {
 /// Whether the linked libtorrent build compiled I2P support in
 /// (`TORRENT_USE_I2P=1`). Mirrors the C++ wrapper capability so config
 /// validation can reject `i2p_proxy` on I2P-disabled builds instead of
-/// letting `apply_str_setting` abort the process (TSI-2547).
+/// letting `apply_str_setting` silently drop it (TSI-2547).
 pub(crate) fn i2p_enabled() -> bool {
     unsafe { libtorrent_sys::lt_torrent_i2p_enabled() != 0 }
 }

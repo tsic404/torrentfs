@@ -123,13 +123,13 @@ int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle);
 void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
-
 int lt_session_get_int_setting(lt_session_t session, const char* key, int* out);
 
 // TSI-2547: report whether the libtorrent build compiled I2P support in
 // (libtorrent/config.hpp `TORRENT_USE_I2P`). Rust config validation gates the
 // `i2p_proxy` proxy_type value on this flag so I2P-disabled builds reject the
-// value at config time instead of aborting inside apply_str_setting.
+// value at config time instead of silently dropping it inside
+// apply_str_setting.
 int lt_torrent_i2p_enabled(void);
 
 // TSI-2344: request a `session_stats_alert`. The alert is delivered through

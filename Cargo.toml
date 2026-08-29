@@ -24,6 +24,7 @@ serde_json = "1"
 toml = "0.8"
 
 [dev-dependencies]
+libtorrent-sys = { path = "libtorrent-sys" }
 tempfile = "3.10"
 parking_lot = "0.12"
 
