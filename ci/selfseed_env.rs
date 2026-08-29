@@ -103,6 +103,16 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
+/// Write a minimal `400 Bad Request` response and close the connection.
+///
+/// Malformed announces used to fall through to a silent `return`, which
+/// closed the socket with no response at all — libtorrent only saw
+/// `End of file` and retried, hiding the reason (TSI-2582).
+fn write_bad_request(stream: &mut std::net::TcpStream) {
+    let _ = stream
+        .write_all(b"HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
 /// Handle one `/announce`: register the peer, reply with a compact peer list
 /// excluding the requester itself.
 fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
@@ -114,7 +124,10 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
     let request_target = request.lines().next().unwrap_or_default();
     let raw_query = match request_target.split_once('?') {
         Some((_, q)) => q.split(' ').next().unwrap_or(q).to_string(),
-        None => return,
+        None => {
+            write_bad_request(&mut stream);
+            return;
+        }
     };
 
     let info_hash: [u8; 20] = match query_param(&raw_query, "info_hash")
@@ -122,11 +135,17 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         .and_then(|v| <[u8; 20]>::try_from(v.as_slice()).ok())
     {
         Some(h) => h,
-        None => return,
+        None => {
+            write_bad_request(&mut stream);
+            return;
+        }
     };
     let peer_port: u16 = match query_param(&raw_query, "port").and_then(|v| v.parse().ok()) {
         Some(p) => p,
-        None => return,
+        None => {
+            write_bad_request(&mut stream);
+            return;
+        }
     };
     // `left` is part of the peer identity (see `Peer::left`, TSI-2417).
     let left: u64 = query_param(&raw_query, "left")
@@ -135,7 +154,10 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
 
     let ip = match stream.peer_addr() {
         Ok(std::net::SocketAddr::V4(v4)) => v4.ip().octets(),
-        _ => return,
+        _ => {
+            write_bad_request(&mut stream);
+            return;
+        }
     };
 
     // `event`: BEP-3 announce events.  Only `stopped` matters here —
@@ -555,6 +577,32 @@ mod tests {
         assert_eq!(list.len(), 1, "downloader entry deleted, seeder kept");
         assert_eq!(list[0].port, 6883, "the seeder must survive");
         assert_eq!(list[0].left, 0);
+    }
+
+    /// TSI-2582: a malformed announce must get an explicit `400 Bad Request`
+    /// instead of a silent close, so libtorrent logs the reason rather than
+    /// a bare `End of file`.
+    #[test]
+    fn malformed_announce_gets_400_bad_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        write_bad_request(&mut server);
+        drop(server);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.0 400 Bad Request\r\n"),
+            "malformed announce must be answered with 400, got: {response}"
+        );
+        assert!(response.ends_with("\r\n\r\n"), "response must end headers");
     }
 
     fn parking_lot_stub() -> Mutex<HashMap<[u8; 20], Vec<Peer>>> {
