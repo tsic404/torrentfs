@@ -480,6 +480,8 @@ impl FsService {
         // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
         // be classified as stats *before* the data/ guard — otherwise they
         // would wrongly return EROFS instead of EPERM.
+        // Invariant: data base + slot width < STATS_INO_OFFSET (compile-time
+        // asserts in `src/fuse/inodes.rs`, TSI-2580).
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
             return Err(FsError::NotPermitted);
         }

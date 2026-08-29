@@ -29,6 +29,22 @@ pub const PENDING_TORRENT_DIR_INO_BASE: u64 = 6_000_000;
 pub const PENDING_TORRENT_FILE_INO_BASE: u64 = 7_000_000;
 pub const STATS_INO_OFFSET: u64 = 10_000_000;
 
+// ── Compile-time invariant (TSI-2580) ──
+// Every data inode base, plus its slot width, must stay below
+// `STATS_INO_OFFSET`.  Otherwise a data inode would fall inside
+// `is_stats_ino`'s `[STATS_INO_OFFSET, STATS_INO_OFFSET + 10_000_000)`
+// window and — because the stats guard runs before the data/ guard in
+// `FsService::setattr` — be silently classified as a stats inode
+// (EPERM instead of EROFS).  These assertions turn any future base that
+// crosses the boundary into a compile error.
+const _: () = assert!(DATA_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(DATA_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(DATA_FILE_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(SOURCE_PATH_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(PENDING_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(PENDING_TORRENT_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+const _: () = assert!(PENDING_TORRENT_FILE_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
 pub static NEXT_FH: AtomicU64 = AtomicU64::new(1);
 
