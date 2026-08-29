@@ -14,11 +14,12 @@ use crate::json_field_str;
 pub struct ProxyConfig {
     pub host: Option<String>,
     pub port: Option<i64>,
-    /// libtorrent `proxy_type` is 0..=7 (`none`/`socks4`/`socks5`/`socks5_pw`/
-    /// `http`/`http_pw`/`i2p_proxy`/`crypto`) but the Rust config models it as
-    /// a free-form string (TOML `type = "socks5"`) and `apply_str_setting`
-    /// in the C wrapper does not map it — the value is silently dropped there.
-    /// No enum-domain validation is applied here on purpose (TSI-2496).
+    /// libtorrent 2.1.1 `proxy_type_t` is 0..=6 (`none`/`socks4`/`socks5`/
+    /// `socks5_pw`/`http`/`http_pw`/`i2p_proxy`); `none` is expressed on the
+    /// Rust side as `None`. The config models the kind as a free-form string
+    /// (TOML `type = "socks5"`) and `apply_str_setting` in the C wrapper
+    /// does not map `proxy_type`, so it is silently dropped there.
+    /// Enum-domain validation is applied in `ProxyConfig::validate()`.
     #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,
     pub proxy_hostnames: Option<bool>,
@@ -26,6 +27,35 @@ pub struct ProxyConfig {
     pub proxy_tracker_connections: Option<bool>,
     pub anonymous_mode: Option<bool>,
     pub force_proxy: Option<bool>,
+}
+
+impl ProxyConfig {
+    /// Validate `proxy_type` (canonical `type` / alias `proxy_type`).
+    ///
+    /// The field is optional, but once present — including as an empty
+    /// string — it MUST name a real libtorrent proxy kind. Empty or
+    /// unknown values are rejected here rather than being silently
+    /// dropped in `write_json` and falling back to libtorrent's default,
+    /// which the user would never notice.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        const LEGAL_PROXY_TYPES: [&str; 6] = [
+            "socks4",
+            "socks5",
+            "socks5_pw",
+            "http",
+            "http_pw",
+            "i2p_proxy",
+        ];
+        match self.proxy_type.as_deref() {
+            Some(val) if LEGAL_PROXY_TYPES.contains(&val) => Ok(()),
+            Some(val) => Err(format!(
+                "[proxy] proxy_type must be one of {}, got {:?}",
+                LEGAL_PROXY_TYPES.join(", "),
+                val
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 impl WriteJson for ProxyConfig {

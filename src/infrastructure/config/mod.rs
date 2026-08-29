@@ -126,6 +126,9 @@ impl TorrentfsConfig {
         self.rate_limits
             .validate()
             .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
+        self.proxy
+            .validate()
+            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
         Ok(())
     }
 

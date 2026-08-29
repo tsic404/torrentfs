@@ -146,6 +146,87 @@ type = "socks5"
     );
 }
 
+// TSI-2510: `proxy_type` (canonical `type` / alias `proxy_type`) must be
+// validated once present — including the empty string, which used to be
+// silently dropped and fall back to libtorrent's default.
+#[test]
+fn test_load_config_rejects_empty_proxy_type() {
+    let toml = r#"
+[proxy]
+type = ""
+"#;
+    let err = load_config_from_str(toml).expect_err("empty proxy_type must be rejected");
+    assert!(
+        err.contains("proxy_type"),
+        "error must name the proxy_type field, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_load_config_rejects_invalid_proxy_type() {
+    let toml = r#"
+[proxy]
+proxy_type = "socks99"
+"#;
+    let err = load_config_from_str(toml).expect_err("invalid proxy_type must be rejected");
+    assert!(
+        err.contains("proxy_type") && err.contains("socks99"),
+        "error must name the proxy_type field and value, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_load_config_accepts_all_legal_proxy_types() {
+    for kind in [
+        "socks4",
+        "socks5",
+        "socks5_pw",
+        "http",
+        "http_pw",
+        "i2p_proxy",
+    ] {
+        let toml = format!("[proxy]\ntype = {:?}\n", kind);
+        let cfg = load_config_from_str(&toml)
+            .unwrap_or_else(|e| panic!("legal proxy_type {} must pass, got: {}", kind, e));
+        assert_eq!(cfg.proxy.proxy_type, Some(kind.to_string()));
+    }
+}
+
+#[test]
+fn test_load_config_default_proxy_type_is_none() {
+    let cfg = TorrentfsConfig::default_config();
+    assert_eq!(
+        cfg.proxy.proxy_type, None,
+        "unset proxy_type must stay None"
+    );
+}
+
+#[test]
+fn test_config_check_rejects_empty_proxy_type() {
+    assert_rejected(
+        &run_config_check("[proxy]\ntype = \"\"\n"),
+        "empty proxy_type via --config-check",
+    );
+}
+
+#[test]
+fn test_config_check_rejects_invalid_proxy_type() {
+    assert_rejected(
+        &run_config_check("[proxy]\nproxy_type = \"socks99\"\n"),
+        "invalid proxy_type via --config-check",
+    );
+}
+
+#[test]
+fn test_config_check_accepts_legal_proxy_type() {
+    assert_accepted(
+        &run_config_check("[proxy]\ntype = \"socks5\"\n"),
+        "legal proxy_type via --config-check",
+    );
+}
+
 #[test]
 fn test_load_config_with_multiple_sections() {
     let toml = r#"
