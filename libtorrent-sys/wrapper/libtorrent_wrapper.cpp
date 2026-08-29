@@ -762,11 +762,11 @@ static void apply_str_setting(lt::settings_pack& pack, const std::string& key, c
     } else if (key == "proxy_type") {
         // TSI-2535: map the config string ("socks4"…"i2p_proxy") to the
         // libtorrent proxy_type_t integer. Rust-side validate() restricts
-        // the value to this exact domain, so any other string reaching here
-        // means either a C++/Rust contract drift or a build where I2P is
-        // compiled out (TORRENT_USE_I2P=0) while validate() still accepts
-        // "i2p_proxy". Both are programming bugs, never user input — abort
-        // loudly instead of silently misconfiguring the session to `none`.
+        // the value to this exact domain and (TSI-2547) gates "i2p_proxy" on
+        // lt_torrent_i2p_enabled(), so any other string reaching here means a
+        // C++/Rust contract drift — a programming bug, never user input —
+        // abort loudly instead of silently misconfiguring the session to
+        // `none`.
         int proxy;
         if (val == "socks4") proxy = static_cast<int>(lt::settings_pack::socks4);
         else if (val == "socks5") proxy = static_cast<int>(lt::settings_pack::socks5);
@@ -1166,6 +1166,18 @@ int lt_session_get_int_setting(lt_session_t session, const char* key, int* out) 
         }
     } catch (const std::exception&) {}
     return -1;
+}
+
+// TSI-2547: report whether I2P support is compiled into this libtorrent build.
+// Mirrors the TORRENT_USE_I2P guard that wraps the `i2p_proxy` mapping in
+// apply_str_setting; Rust-side config validation calls this so the accepted
+// proxy_type domain matches the wrapper's actual capability.
+int lt_torrent_i2p_enabled(void) {
+#if TORRENT_USE_I2P
+    return 1;
+#else
+    return 0;
+#endif
 }
 // Include session_stats_alert header
 #include <libtorrent/session_stats.hpp>
