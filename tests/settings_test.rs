@@ -74,6 +74,23 @@ fn proxy_type_maps_to_libtorrent_proxy_type() {
     assert!(session.get_int_setting("nonexistent_key").is_err());
 }
 
+/// TSI-2566: `proxy_type` must round-trip through the production
+/// `new_with_custom_storage` path, not just `Session::new`. Both bake the
+/// config JSON through the C wrapper's `build_settings_pack`, so the
+/// readback must be asserted on the custom-storage path that the daemon
+/// actually uses.
+#[test]
+fn proxy_type_maps_to_libtorrent_proxy_type_with_custom_storage() {
+    let dir = tempfile::TempDir::new().unwrap();
+    with_large_stack(move || {
+        let mut config = TorrentfsConfig::default_config();
+        config.proxy.proxy_type = Some("socks5".to_string());
+        let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
+        // settings_pack::proxy_type_t::socks5 == 2
+        assert_int_setting(&session, "proxy_type", 2);
+    });
+}
+
 #[test]
 fn proxy_host_port_reach_libtorrent() {
     let mut config = TorrentfsConfig::default_config();
