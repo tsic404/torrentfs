@@ -17,8 +17,8 @@ pub struct ProxyConfig {
     /// libtorrent 2.1.1 `proxy_type_t` is 0..=6 (`none`/`socks4`/`socks5`/
     /// `socks5_pw`/`http`/`http_pw`/`i2p_proxy`); `none` is expressed on the
     /// Rust side as `None`. The config models the kind as a free-form string
-    /// (TOML `type = "socks5"`) and `apply_str_setting` in the C wrapper
-    /// does not map `proxy_type`, so it is silently dropped there.
+    /// (TOML `type = "socks5"`); `apply_str_setting` in the C wrapper maps it
+    /// to the matching `settings_pack::proxy_type_t` integer (TSI-2535).
     /// Enum-domain validation is applied in `ProxyConfig::validate()`.
     #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,

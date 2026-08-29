@@ -759,6 +759,29 @@ static void apply_str_setting(lt::settings_pack& pack, const std::string& key, c
         pack.set_str(lt::settings_pack::user_agent, val);
     } else if (key == "peer_fingerprint") {
         pack.set_str(lt::settings_pack::peer_fingerprint, val);
+    } else if (key == "proxy_type") {
+        // TSI-2535: map the config string ("socks4"…"i2p_proxy") to the
+        // libtorrent proxy_type_t integer. Rust-side validate() restricts
+        // the value to this exact domain, so any other string reaching here
+        // means either a C++/Rust contract drift or a build where I2P is
+        // compiled out (TORRENT_USE_I2P=0) while validate() still accepts
+        // "i2p_proxy". Both are programming bugs, never user input — abort
+        // loudly instead of silently misconfiguring the session to `none`.
+        int proxy;
+        if (val == "socks4") proxy = static_cast<int>(lt::settings_pack::socks4);
+        else if (val == "socks5") proxy = static_cast<int>(lt::settings_pack::socks5);
+        else if (val == "socks5_pw") proxy = static_cast<int>(lt::settings_pack::socks5_pw);
+        else if (val == "http") proxy = static_cast<int>(lt::settings_pack::http);
+        else if (val == "http_pw") proxy = static_cast<int>(lt::settings_pack::http_pw);
+#if TORRENT_USE_I2P
+        else if (val == "i2p_proxy") proxy = static_cast<int>(lt::settings_pack::i2p_proxy);
+#endif
+        else {
+            fprintf(stderr, "[proxy] unknown proxy_type %s (TORRENT_USE_I2P=%d) — aborting\n",
+                    val.c_str(), TORRENT_USE_I2P);
+            std::abort();
+        }
+        pack.set_int(lt::settings_pack::proxy_type, proxy);
     }
     // Unknown keys are silently ignored
 }
@@ -1122,6 +1145,28 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
     return -1;
 }
 
+static bool get_session_int_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
+    if (key == "proxy_type") {
+        if (settings.has_val(lt::settings_pack::proxy_type)) {
+            *out = settings.get_int(lt::settings_pack::proxy_type);
+            return true;
+        }
+    }
+    return false;
+}
+
+int lt_session_get_int_setting(lt_session_t session, const char* key, int* out) {
+    if (!session || !key || !out) return -1;
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+    std::lock_guard<std::mutex> lock(wrapper->mutex);
+    try {
+        auto settings = wrapper->session->get_settings();
+        if (get_session_int_setting_impl(settings, std::string(key), out)) {
+            return 0;
+        }
+    } catch (const std::exception&) {}
+    return -1;
+}
 // Include session_stats_alert header
 #include <libtorrent/session_stats.hpp>
 

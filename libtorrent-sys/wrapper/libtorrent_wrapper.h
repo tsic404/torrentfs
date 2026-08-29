@@ -124,6 +124,8 @@ void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
 
+int lt_session_get_int_setting(lt_session_t session, const char* key, int* out);
+
 // TSI-2344: request a `session_stats_alert`. The alert is delivered through
 // the normal alert queue and must be drained by the single alert-consumer
 // thread (`lt_session_pop_alerts`), which fills the shared stats snapshot.

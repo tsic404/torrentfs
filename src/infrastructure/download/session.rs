@@ -117,6 +117,26 @@ impl Session {
         }
     }
 
+    /// Read an integer setting from the live libtorrent session.
+    pub fn get_int_setting(&self, key: &str) -> TorrentResult<i32> {
+        let key_c = CString::new(key).map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Setting key contains null byte".to_string(),
+        })?;
+        let mut out: i32 = 0;
+        let result = unsafe {
+            libtorrent_sys::lt_session_get_int_setting(self.inner, key_c.as_ptr(), &mut out)
+        };
+        if result == 0 {
+            Ok(out)
+        } else {
+            Err(TorrentError::Unknown {
+                code: result,
+                message: format!("Setting '{}' not found or session unavailable", key),
+            })
+        }
+    }
+
     /// Re-apply saved settings JSON to the libtorrent session.
     /// No longer needed in normal flow: settings are now baked into session_params
     /// on the C++ side during session rebuild. Kept for testing / manual recovery.

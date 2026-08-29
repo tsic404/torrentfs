@@ -54,6 +54,26 @@ fn get_bool_setting_with_explicit_config() {
     assert!(session.get_bool_setting("nonexistent_key").is_err());
 }
 
+fn assert_int_setting(session: &Session, key: &str, expected: i32) {
+    let actual = session
+        .get_int_setting(key)
+        .unwrap_or_else(|e| panic!("get_int_setting({key}) failed: {e:?}"));
+    assert_eq!(
+        actual, expected,
+        "setting '{key}' expected {expected}, got {actual}"
+    );
+}
+
+#[test]
+fn proxy_type_maps_to_libtorrent_proxy_type() {
+    let mut config = TorrentfsConfig::default_config();
+    config.proxy.proxy_type = Some("socks5".to_string());
+    let session = Session::new(&config).unwrap();
+    // settings_pack::proxy_type_t::socks5 == 2
+    assert_int_setting(&session, "proxy_type", 2);
+    assert!(session.get_int_setting("nonexistent_key").is_err());
+}
+
 #[test]
 fn settings_work_with_custom_storage_session() {
     let dir = tempfile::TempDir::new().unwrap();
