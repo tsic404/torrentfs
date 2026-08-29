@@ -471,10 +471,11 @@ impl FsService {
     /// attributes (exit 0) while leaving the mode untouched.
     ///
     /// The errno differs by namespace: `data/` is genuinely read-only and
-    /// returns `EROFS` (matching `write`/`rmdir`/`unlink`/`rename`,
-    /// TSI-2533); `metadata/`, the `.stats` virtual files and the root
-    /// directory have virtual, immutable attributes, so `setattr` there
-    /// returns `EPERM` (TSI-2536).
+    /// returns `EROFS` (matching `rmdir`/`unlink`/`rename` and writes to
+    /// `data/` inodes, TSI-2533); `metadata/`, the `.stats` virtual files and
+    /// the root directory have virtual, immutable attributes, so `setattr`
+    /// there returns `EPERM` — the same `EPERM` that `write` on `.stats`
+    /// returns (TSI-2536, TSI-2579).
     pub fn setattr(&mut self, ino: u64) -> FsResult<Attr> {
         // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
         // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
@@ -753,8 +754,15 @@ impl FsService {
     }
 
     pub fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> FsResult<u32> {
+        // `.stats` files have virtual, immutable attributes — not a read-only
+        // namespace — so a write is rejected with `EPERM` (`NotPermitted`),
+        // matching `setattr` (TSI-2536) and `symlink` (TSI-2537). Stats-derived
+        // inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000) also satisfy
+        // `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must be classified
+        // as stats *before* the data/ guard below — otherwise they would
+        // wrongly return EROFS instead of EPERM.
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
-            return Err(FsError::ReadOnlyFileSystem);
+            return Err(FsError::NotPermitted);
         }
 
         // TSI-2228: data/ namespace is read-only. Data inodes live in
@@ -2367,6 +2375,27 @@ mod tests {
         let stats_ino = InodeManager::make_stats_ino(DATA_INO);
         assert!(InodeManager::is_stats_ino(stats_ino));
         let err = svc.setattr(stats_ino).unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+    }
+
+    /// TSI-2579: `write` on the `.stats` virtual files must return `EPERM`
+    /// (`NotPermitted`) — their attributes are virtual and immutable, not a
+    /// read-only namespace — matching `setattr` (TSI-2536) and `symlink`
+    /// (TSI-2537). Before the change it wrongly returned `EROFS`.
+    #[test]
+    fn stats_write_returns_eperm() {
+        let mut svc = bare_service();
+
+        let err = svc.write(STATS_INO, 0, b"x").unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        // Derived stats inode (`dir_ino + STATS_INO_OFFSET`) falls inside the
+        // `is_data_ino` range (>= DATA_TORRENT_INO_BASE), so it must be
+        // classified as stats *before* the data/ guard, otherwise it would
+        // wrongly return EROFS instead of EPERM.
+        let stats_ino = InodeManager::make_stats_ino(DATA_INO);
+        assert!(InodeManager::is_stats_ino(stats_ino));
+        let err = svc.write(stats_ino, 0, b"x").unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
     }
 
