@@ -64,6 +64,12 @@ struct Peer {
 /// advertises `interval=5`, so a live client announces well inside 30s.
 const PEER_EXPIRY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bound on the wait for the first announce bytes.  A client that connects
+/// and sends nothing would otherwise park `handle_announce` in `read`
+/// forever (TSI-2621); on timeout the empty request is answered with the
+/// same `400 Bad Request` as a malformed announce.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 struct TrackerState {
     /// info_hash → registered peers.
     peers: Mutex<HashMap<[u8; 20], Vec<Peer>>>,
@@ -116,8 +122,14 @@ fn write_bad_request(stream: &mut std::net::TcpStream) {
 /// Handle one `/announce`: register the peer, reply with a compact peer list
 /// excluding the requester itself.
 fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
+    // Bound the first read: a client that connects and sends no bytes must
+    // get the same 400 as a malformed announce, not a silent hang
+    // (TSI-2621).  `read` returns `Err` on timeout, which the existing
+    // `unwrap_or(0)` folds into an empty request below.
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).unwrap_or(0);
+
     let request = String::from_utf8_lossy(&buf[..n]);
 
     // Request line: GET /announce?<query> HTTP/1.x
@@ -603,6 +615,45 @@ mod tests {
             "malformed announce must be answered with 400, got: {response}"
         );
         assert!(response.ends_with("\r\n\r\n"), "response must end headers");
+    }
+
+    /// TSI-2621: a client that connects and sends no bytes must not park
+    /// `handle_announce` in `read` forever.  The first read times out and
+    /// the empty request gets the same `400 Bad Request` as a malformed
+    /// announce.
+    #[test]
+    fn empty_request_times_out_to_400_bad_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(TrackerState {
+            peers: parking_lot_stub(),
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        // If the server still hangs, this read fails the test instead of
+        // parking the suite forever.
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || handle_announce(state, server));
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.0 400 Bad Request\r\n"),
+            "empty request must be answered with 400, got: {response}"
+        );
+        // The response must arrive only after the read timeout fires — an
+        // immediate 400 would mean the timeout never guarded the read.
+        assert!(
+            start.elapsed() >= Duration::from_secs(4),
+            "400 must follow the read timeout, got it after {:?}",
+            start.elapsed()
+        );
     }
 
     fn parking_lot_stub() -> Mutex<HashMap<[u8; 20], Vec<Peer>>> {
