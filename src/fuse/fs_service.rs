@@ -474,6 +474,20 @@ impl FsService {
         }
         self.getattr(ino)
     }
+
+    /// `symlink` is never supported: torrentfs exposes only directories and
+    /// regular files.  The read-only `data/` namespace must return `EROFS`
+    /// (`ReadOnlyFileSystem`) to match `write`/`chmod`/`rmdir`/`unlink`/`rename`;
+    /// every other namespace returns `EPERM` (`NotPermitted`) because the
+    /// operation is unsupported, not a permissions question (TSI-2537).
+    pub fn symlink(&mut self, parent: u64) -> FsError {
+        if InodeManager::is_data_namespace(parent) {
+            FsError::ReadOnlyFileSystem
+        } else {
+            FsError::NotPermitted
+        }
+    }
+
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
             if let Some(db) = &self.db {
@@ -2495,6 +2509,30 @@ mod tests {
             .rename(data_dir_ino, "foo", DATA_INO, "bar")
             .unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    /// TSI-2537: `symlink` is unsupported everywhere, but the read-only
+    /// `data/` namespace must return `EROFS` (matching `write`/`chmod`/
+    /// `rmdir`/`unlink`/`rename`), while every other namespace returns
+    /// `EPERM`.  Before the guard, `symlink` never reached the service: the
+    /// fuser default answered `EPERM` for every parent.
+    #[test]
+    fn symlink_returns_erofs_in_data_namespace_only() {
+        let mut svc = bare_service();
+
+        // data/ root and a nested data inode → EROFS.
+        assert_eq!(svc.symlink(DATA_INO), FsError::ReadOnlyFileSystem);
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        assert_eq!(svc.symlink(data_dir_ino), FsError::ReadOnlyFileSystem);
+
+        // metadata/ and a nested metadata directory → EPERM (unsupported).
+        assert_eq!(svc.symlink(METADATA_INO), FsError::NotPermitted);
+        svc.mkdir(METADATA_INO, "dir").expect("mkdir");
+        let dir_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "dir")
+            .expect("dir inode");
+        assert_eq!(svc.symlink(dir_ino), FsError::NotPermitted);
     }
 
     /// TSI-2373: a cross-directory mv of a `.torrent` must prune the

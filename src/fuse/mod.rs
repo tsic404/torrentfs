@@ -762,6 +762,21 @@ impl Filesystem for TorrentFs {
             Err(e) => reply.error(e.into()),
         }
     }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        _link_name: &OsStr,
+        _target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        // TSI-2537: `symlink` is unsupported.  `data/` must return `EROFS`
+        // (matching chmod/write), every other namespace `EPERM` — the fuser
+        // default returns `EPERM` for all parents, which never reached the
+        // read-only-namespace guard.
+        reply.error(self.service.symlink(parent).into());
+    }
 }
 #[cfg(test)]
 mod pending_tests {
