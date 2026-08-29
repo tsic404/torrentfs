@@ -315,7 +315,7 @@ fn status_to_english(status: &TorrentStatus) -> &'static str {
 }
 
 /// Render the piece marker per the `.stats` spec:
-/// `[x]` downloaded, `[]` not wanted, `[N]` priority N, `[X N]` downloaded with N accesses.
+/// `[x]` downloaded, `[]` not wanted, `[N]` priority N, `[X n]` downloaded with n accesses.
 fn piece_marker(status: &PieceStatus) -> String {
     if status.is_cached {
         if status.hit_count > 0 {
