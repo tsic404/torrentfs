@@ -727,7 +727,9 @@ impl Filesystem for TorrentFs {
         reply: ReplyAttr,
     ) {
         // Attributes are virtual and immutable; return the current attributes.
-        match self.service.getattr(ino) {
+        // TSI-2533: chmod on the read-only `data/` namespace must return
+        // EROFS (delegated to `FsService::setattr`), never a silent success.
+        match self.service.setattr(ino) {
             Ok(attr) => reply.attr(&TTL, &self.to_fuse_attr(&attr)),
             Err(e) => reply.error(e.into()),
         }

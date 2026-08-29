@@ -461,6 +461,19 @@ impl FsService {
         }
     }
 
+    /// `setattr` (chmod/chown/truncate/utimens) on the read-only `data/`
+    /// namespace must return `EROFS` — never a silent success. `getattr`
+    /// alone cannot tell the difference between "attributes are virtual and
+    /// immutable" (metadata/stats) and "this inode exists but is not
+    /// writable", so a `chmod` on `data/` previously returned the current
+    /// attributes (exit 0) while leaving the mode untouched. This guard makes
+    /// `data/` match `write`/`rmdir`/`unlink`/`rename` (TSI-2533).
+    pub fn setattr(&mut self, ino: u64) -> FsResult<Attr> {
+        if InodeManager::is_data_namespace(ino) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
+        self.getattr(ino)
+    }
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
             if let Some(db) = &self.db {
@@ -2260,6 +2273,23 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
+    /// TSI-2533: `setattr` (chmod/chown/truncate/utimens) on the read-only
+    /// `data/` namespace must return `EROFS`. Before this guard, `getattr`
+    /// returned the current attributes (exit 0) and left the mode untouched —
+    /// a silent success that differed from `write`/`rmdir`/`unlink`/`rename`.
+    #[test]
+    fn data_namespace_setattr_returns_erofs() {
+        let mut svc = bare_service();
+
+        let err = svc.setattr(DATA_INO).unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // A data file inode lives in `data_inodes`, not `inodes`; without the
+        // guard `getattr` would resolve it and return its attributes.
+        let data_file_ino = DATA_FILE_INO_BASE + 1;
+        let err = svc.setattr(data_file_ino).unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
     /// Helper: create an empty writable `.torrent` inode via the public
     /// `create()` path (not direct `inodes` manipulation) and return its
     /// ino. Using the real path keeps the test honest about the
