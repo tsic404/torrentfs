@@ -508,6 +508,13 @@ fn test_config_check_flag_rejects_removed_ssl_listen() {
         !out.status.success(),
         "ssl_listen was removed with the libtorrent 2.1.1 wrapper; must be rejected as unknown"
     );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(logs.contains("ssl_listen"), "logs: {}", logs);
+    assert!(logs.contains("unknown field"), "logs: {}", logs);
 }
 
 #[test]
