@@ -389,6 +389,26 @@ fn has_active_reader(pieces: &[PieceStatus]) -> bool {
     pieces.iter().any(|p| p.priority > 0)
 }
 
+/// Render the `.stats` Pieces block for a torrent.
+///
+/// The header line (`-- Pieces (N pieces, X each) --`) is kept verbatim for
+/// human readers and existing consumers. The piece-marker line that follows
+/// is prefixed with a `Pieces:` label so machine parsers can locate the data
+/// line without matching the header's `Pieces (` literal (TSI-2681).
+fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n-- Pieces ({} pieces, {} each) --\n  Pieces: ",
+        pieces.len(),
+        format_bytes(piece_length)
+    ));
+    for status in pieces {
+        out.push_str(&piece_marker(status));
+    }
+    out.push('\n');
+    out
+}
+
 /// Render the `.stats` health alert line for a single torrent.
 ///
 /// The alert fires when the torrent has **no connected peers or seeds**
@@ -617,15 +637,7 @@ pub fn generate_torrent_stats(
     // download (TSI-2119).
     if let Some((piece_length, pieces)) = &piece_statuses {
         if !pieces.is_empty() {
-            output.push_str(&format!(
-                "\n-- Pieces ({} pieces, {} each) --\n  ",
-                pieces.len(),
-                format_bytes(*piece_length)
-            ));
-            for status in pieces {
-                output.push_str(&piece_marker(status));
-            }
-            output.push('\n');
+            output.push_str(&piece_block(*piece_length, pieces));
         }
     }
 
@@ -1114,6 +1126,27 @@ mod tests {
         ];
         let rendered: String = grid.iter().map(piece_marker).collect();
         assert_eq!(rendered, "[x][7][1][]");
+    }
+
+    #[test]
+    fn test_piece_block_has_label_line() {
+        // TSI-2681: the marker line carries a `Pieces:` label independent of
+        // the header's `Pieces (` literal, so parsers can locate the data line.
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        let block = piece_block(256 * 1024, &pieces);
+        assert!(block.contains("-- Pieces (2 pieces, 256.00 KB each) --\n"));
+        assert!(block.contains("\n  Pieces: [x][7]\n"));
     }
 
     #[test]

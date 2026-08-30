@@ -162,6 +162,22 @@ Rationale: a `.torrent` file is the durable handle to a downloaded swarm; a sile
 
 Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists` (`EEXIST`) when the destination name already resolves to a different inode.
 
+### `.stats` Pieces block
+
+Per-torrent `.stats` renders the piece lifecycle as a header line followed by
+a labelled marker line:
+
+```text
+-- Pieces (16 pieces, 256.00 KB each) --
+  Pieces: [x][7][1][]...
+```
+
+The `-- Pieces (N pieces, X each) --` header is human-readable prose; the data
+line is the one starting with the `Pieces:` label. Machine parsers should key
+on `Pieces:` rather than the `Pieces (` literal in the header.
+
+Source: `src/fuse/stats.rs` — `piece_block()`.
+
 ## Troubleshooting
 
 ### `cp` to the mountpoint fails with EIO (Input/output error)
