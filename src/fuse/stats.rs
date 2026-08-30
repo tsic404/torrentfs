@@ -395,6 +395,11 @@ fn has_active_reader(pieces: &[PieceStatus]) -> bool {
 /// human readers and existing consumers. The piece-marker line that follows
 /// is prefixed with a `Pieces:` label so machine parsers can locate the data
 /// line without matching the header's `Pieces (` literal (TSI-2681).
+///
+/// `PieceSize` / `PieceCount` key-value lines are appended after the marker
+/// line so metadata consumers can read piece dimensions structurally instead
+/// of regex-parsing the prose header (TSI-2691). The header itself must stay
+/// byte-for-byte unchanged.
 fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -406,6 +411,11 @@ fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
         out.push_str(&piece_marker(status));
     }
     out.push('\n');
+    out.push_str(&format!(
+        "  PieceSize: {}\n  PieceCount: {}\n",
+        format_bytes(piece_length),
+        pieces.len()
+    ));
     out
 }
 
@@ -1145,8 +1155,12 @@ mod tests {
             },
         ];
         let block = piece_block(256 * 1024, &pieces);
+        // TSI-2681: header stays byte-for-byte verbatim for existing consumers.
         assert!(block.contains("-- Pieces (2 pieces, 256.00 KB each) --\n"));
         assert!(block.contains("\n  Pieces: [x][7]\n"));
+        // TSI-2691: structured metadata lines appended after the marker line.
+        assert!(block.contains("\n  PieceSize: 256.00 KB\n"));
+        assert!(block.contains("\n  PieceCount: 2\n"));
     }
 
     #[test]
