@@ -368,6 +368,14 @@ fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
     cached * piece_length
 }
 
+/// Whether a torrent is fully downloaded, judged by **actual** piece
+/// availability (`is_cached`). Returns `false` for an empty piece list — no
+/// pieces means the snapshot is absent or the torrent has no content, neither
+/// of which counts as a completed download (TSI-2603).
+fn is_download_complete(pieces: &[PieceStatus]) -> bool {
+    !pieces.is_empty() && pieces.iter().all(|p| p.is_cached)
+}
+
 /// Render the `.stats` health alert line for a single torrent.
 ///
 /// The alert fires when the torrent has **no connected peers or seeds**
@@ -380,8 +388,13 @@ fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
 /// The wording therefore describes the **observed connection state** and
 /// avoids the prior text ("tracker may be unreachable") which coupled the
 /// alert to a cause the data cannot establish.
-fn health_alert(num_peers: i32, num_seeds: i32) -> Option<&'static str> {
-    if num_peers == 0 && num_seeds == 0 {
+///
+/// `download_complete` suppresses the alert (TSI-2603): once every piece is
+/// cached the torrent is fully downloaded, so zero peers is the expected end
+/// state — the user no longer needs connections — and a health warning would
+/// misreport a healthy finished torrent as unhealthy.
+fn health_alert(num_peers: i32, num_seeds: i32, download_complete: bool) -> Option<&'static str> {
+    if num_peers == 0 && num_seeds == 0 && !download_complete {
         Some("  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n")
     } else {
         None
@@ -517,6 +530,17 @@ pub fn generate_torrent_stats(
         .as_ref()
         .map(|(piece_length, pieces)| piece_downloaded(pieces, *piece_length))
         .unwrap_or(total_done);
+
+    // A fully cached torrent (all pieces present) is download-complete:
+    // zero peers is then the expected end state, so suppress the health
+    // alert (TSI-2603). `piece_statuses` is the authoritative availability
+    // source — libtorrent's `progress` can report 1.0 prematurely
+    // (TSI-2223), so every piece must actually be cached, not merely
+    // reported as such by libtorrent.
+    let download_complete = piece_statuses
+        .as_ref()
+        .map(|(_, pieces)| is_download_complete(pieces))
+        .unwrap_or(false);
     output.push_str("-- Status --\n");
     output.push_str(&format!("  Name: {}\n", t.name));
     output.push_str(&format!(
@@ -550,7 +574,7 @@ pub fn generate_torrent_stats(
     // -- Peers --
     output.push_str("\n-- Peers --\n");
     output.push_str(&format!("  Peers: {}  Seeds: {}\n", num_peers, num_seeds));
-    let health = health_alert(num_peers, num_seeds);
+    let health = health_alert(num_peers, num_seeds, download_complete);
     if let Some(line) = health {
         output.push_str(line);
     }
@@ -1031,13 +1055,29 @@ mod tests {
         // the fix depends on: non-cached + priority > 0 → `[N]`.
         let grid = vec![
             // Cached, no accesses → `[x]`
-            PieceStatus { priority: 0, is_cached: true, hit_count: 0 },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
             // Active read target, not cached, priority 7 → `[7]`
-            PieceStatus { priority: 7, is_cached: false, hit_count: 0 },
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
             // Prefetch edge, not cached, priority 1 → `[1]`
-            PieceStatus { priority: 1, is_cached: false, hit_count: 0 },
+            PieceStatus {
+                priority: 1,
+                is_cached: false,
+                hit_count: 0,
+            },
             // Outside window, not cached, priority 0 → `[]`
-            PieceStatus { priority: 0, is_cached: false, hit_count: 0 },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
         ];
         let rendered: String = grid.iter().map(piece_marker).collect();
         assert_eq!(rendered, "[x][7][1][]");
@@ -1389,11 +1429,53 @@ mod tests {
     }
 
     #[test]
+    fn test_is_download_complete_empty_is_false() {
+        // TSI-2603: an absent/empty piece snapshot must not count as a
+        // completed download — that would suppress the health alert for a
+        // torrent whose pieces were never queried.
+        assert!(!is_download_complete(&[]));
+    }
+
+    #[test]
+    fn test_is_download_complete_all_cached() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 2,
+            },
+        ];
+        assert!(is_download_complete(&pieces));
+    }
+
+    #[test]
+    fn test_is_download_complete_partial() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 1,
+            },
+            PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert!(!is_download_complete(&pieces));
+    }
+
+    #[test]
     fn test_health_alert_zero_peers_zero_seeds() {
         // TSI-2442: the alert fires on zero connected peers/seeds but must
         // not claim the tracker is unreachable — connected-peer count is not
         // a tracker-reachability signal.
-        let line = health_alert(0, 0).expect("alert should fire at 0/0");
+        let line = health_alert(0, 0, false).expect("alert should fire at 0/0");
         assert!(
             !line.contains("tracker may be unreachable"),
             "must not claim tracker unreachable: {line}"
@@ -1411,7 +1493,7 @@ mod tests {
     #[test]
     fn test_health_alert_with_peers() {
         assert!(
-            health_alert(3, 0).is_none(),
+            health_alert(3, 0, false).is_none(),
             "no alert when peers > 0"
         );
     }
@@ -1419,7 +1501,7 @@ mod tests {
     #[test]
     fn test_health_alert_with_seeds() {
         assert!(
-            health_alert(0, 2).is_none(),
+            health_alert(0, 2, false).is_none(),
             "no alert when seeds > 0"
         );
     }
@@ -1427,8 +1509,18 @@ mod tests {
     #[test]
     fn test_health_alert_both_present() {
         assert!(
-            health_alert(5, 1).is_none(),
+            health_alert(5, 1, false).is_none(),
             "no alert when peers and seeds > 0"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_download_complete_suppresses() {
+        // TSI-2603: a fully downloaded torrent legitimately has zero peers;
+        // the health alert must not fire when download is complete.
+        assert!(
+            health_alert(0, 0, true).is_none(),
+            "no alert when download is complete even at 0 peers / 0 seeds"
         );
     }
 }
