@@ -29,17 +29,34 @@ pub const PENDING_TORRENT_DIR_INO_BASE: u64 = 6_000_000;
 pub const PENDING_TORRENT_FILE_INO_BASE: u64 = 7_000_000;
 pub const STATS_INO_OFFSET: u64 = 10_000_000;
 
-// ── Compile-time invariant (TSI-2580) ──
-// Every data inode base, plus its slot width, must stay below
-// `STATS_INO_OFFSET`.  Otherwise a data inode would fall inside
-// `is_stats_ino`'s `[STATS_INO_OFFSET, STATS_INO_OFFSET + 10_000_000)`
-// window and — because the stats guard runs before the data/ guard in
-// `FsService::setattr` — be silently classified as a stats inode
-// (EPERM instead of EROFS).  These assertions turn any future base that
-// crosses the boundary into a compile error.
-const _: () = assert!(DATA_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
-const _: () = assert!(DATA_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
-const _: () = assert!(DATA_FILE_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+/// Row cap for the ID-derived data inode ranges (`DATA_TORRENT` /
+/// `DATA_DIR` / `DATA_FILE`), each encoded as `base + id` — one inode
+/// slot per DB row. Their real extent is the row count, not the
+/// `1_000_000` nominal slot width used by the hash-derived ranges.
+///
+/// This is a *soft* runtime constraint: the derive functions guard row
+/// ids against it with `debug_assert!`, which is compiled out of release
+/// builds. The compile-time assertions below only keep the constant
+/// layout consistent (`base + MAX_DATA_ROWS < STATS_INO_OFFSET`) — they
+/// do NOT bound the row ids actually handed to the derive functions.
+const MAX_DATA_ROWS: u64 = 1_000_000;
+
+// ── Compile-time invariants (TSI-2580 / TSI-2591) ──
+// Every data inode range must end below `STATS_INO_OFFSET`; otherwise a
+// real data inode would fall inside `is_stats_ino`'s
+// `[STATS_INO_OFFSET, STATS_INO_OFFSET + 10_000_000)` window and — because
+// the stats guard runs before the data/ guard in `FsService::setattr` — be
+// silently classified as a stats inode (EPERM instead of EROFS). These
+// assertions turn any future base that crosses the boundary into a compile
+// error.
+//
+// Hash-derived ranges (`SOURCE_PATH_DIR` / `PENDING_TORRENT*`) are capped
+// by `% 1_000_000` to `base + 999_999`, so their `+ 1_000_000` slot is
+// exact. ID-derived ranges use `MAX_DATA_ROWS` instead of the nominal
+// slot width, since `base + id` has no intrinsic upper bound.
+const _: () = assert!(DATA_TORRENT_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
+const _: () = assert!(DATA_DIR_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
+const _: () = assert!(DATA_FILE_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
 const _: () = assert!(SOURCE_PATH_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
 const _: () = assert!(PENDING_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
 const _: () = assert!(PENDING_TORRENT_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
@@ -166,17 +183,38 @@ impl InodeManager {
     }
 
     // ── Inode ID generators ──
-
     pub fn make_torrent_root_ino(torrent_id: i64) -> u64 {
+        debug_assert!(
+            Self::is_valid_row_id(torrent_id),
+            "row id {torrent_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
+        );
         DATA_TORRENT_INO_BASE + (torrent_id as u64)
     }
 
     pub fn make_torrent_dir_ino(dir_id: i64) -> u64 {
+        debug_assert!(
+            Self::is_valid_row_id(dir_id),
+            "row id {dir_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
+        );
         DATA_DIR_INO_BASE + (dir_id as u64)
     }
 
     pub fn make_torrent_file_ino(file_id: i64) -> u64 {
+        debug_assert!(
+            Self::is_valid_row_id(file_id),
+            "row id {file_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
+        );
         DATA_FILE_INO_BASE + (file_id as u64)
+    }
+
+    /// `true` if `id` is a valid DB row id for an ID-derived data inode
+    /// (`base + id` stays below `STATS_INO_OFFSET`).
+    ///
+    /// Shared by the `debug_assert!` guards in the derive functions and
+    /// the unit tests, so the bound check itself is exercised by tests
+    /// even in release builds (where `debug_assert!` is compiled out).
+    fn is_valid_row_id(id: i64) -> bool {
+        id >= 0 && (id as u64) < MAX_DATA_ROWS
     }
 
     pub fn make_source_path_dir_ino(path: &str) -> u64 {
@@ -561,6 +599,27 @@ mod tests {
         ));
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000));
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET - 1));
+    }
+
+    // ── ID-derived inode row-id bound (TSI-2591) ──
+
+    #[test]
+    fn test_is_valid_row_id_boundaries() {
+        assert!(InodeManager::is_valid_row_id(0));
+        assert!(InodeManager::is_valid_row_id(MAX_DATA_ROWS as i64 - 1));
+        assert!(!InodeManager::is_valid_row_id(MAX_DATA_ROWS as i64));
+        assert!(!InodeManager::is_valid_row_id(-1));
+    }
+
+    #[test]
+    fn test_id_derived_inos_stay_below_stats_offset_at_row_cap() {
+        // At the row cap, the derived inodes still fall below the stats
+        // window start — this is the invariant the compile-time asserts
+        // express for the constant layout.
+        let max_id = MAX_DATA_ROWS as i64 - 1;
+        assert!(InodeManager::make_torrent_root_ino(max_id) < STATS_INO_OFFSET);
+        assert!(InodeManager::make_torrent_dir_ino(max_id) < STATS_INO_OFFSET);
+        assert!(InodeManager::make_torrent_file_ino(max_id) < STATS_INO_OFFSET);
     }
 
     #[test]
