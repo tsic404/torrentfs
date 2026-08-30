@@ -39,6 +39,30 @@ kind (e.g. `socks5`). `type` matches libtorrent's `settings_pack` key and is
 the canonical name; `proxy_type` is accepted as an alias for users who find
 it more intuitive. Both set the same value.
 
+### SOCKS5 UDP ASSOCIATE probe (socks5 proxy)
+
+When a SOCKS5 proxy is configured, libtorrent tries to open a UDP tunnel
+through the proxy by sending a SOCKS5 UDP ASSOCIATE request (`cmd=3`). The
+request carries `host='0.0.0.0' port=0` — libtorrent's default send-local
+endpoint when none is set, not a real connect target. A relay with no UDP
+endpoint to associate cannot answer, so the relay log shows an unclosed
+`cmd=3` request.
+
+This is expected libtorrent behavior, not a configuration error:
+
+- It is triggered by the SOCKS5 proxy configuration and an unanswered UDP
+  ASSOCIATE — it does not depend on the listen port being `0`.
+- It is not a fixed pair: one UDP socket is opened per listening socket, and
+  libtorrent retries with exponential backoff when the association fails, so
+  the `cmd=3` request reappears periodically in the log.
+- Tracker announce and existing TCP peer connections use CONNECT (`cmd=1`)
+  and are unaffected.
+- UDP-dependent paths (uTP peer connections, UDP trackers, DHT) rely on this
+  tunnel; whether they work when the association is not established is not
+  covered here, so do not assume those paths are unaffected.
+- When no relay peer can answer, no action is needed — do not treat the
+  unclosed UDP ASSOCIATE request as a libtorrent or proxy misconfiguration.
+
 ## Container Deployment
 
 torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility.
