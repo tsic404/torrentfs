@@ -164,17 +164,21 @@ Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists`
 
 ### `.stats` Pieces block
 
-Per-torrent `.stats` renders the piece lifecycle as a header line followed by
-a labelled marker line:
+Per-torrent `.stats` renders the piece lifecycle as a header line, a labelled
+marker line, and structured piece-metadata lines:
 
 ```text
 -- Pieces (16 pieces, 256.00 KB each) --
   Pieces: [x][7][1][]...
+  PieceSize: 256.00 KB
+  PieceCount: 16
 ```
 
 The `-- Pieces (N pieces, X each) --` header is human-readable prose; the data
 line is the one starting with the `Pieces:` label. Machine parsers should key
-on `Pieces:` rather than the `Pieces (` literal in the header.
+on `Pieces:` rather than the `Pieces (` literal in the header, and read piece
+dimensions from the `PieceSize:` / `PieceCount:` key-value lines instead of
+regex-parsing the prose header.
 
 Source: `src/fuse/stats.rs` — `piece_block()`.
 
