@@ -376,6 +376,19 @@ fn is_download_complete(pieces: &[PieceStatus]) -> bool {
     !pieces.is_empty() && pieces.iter().all(|p| p.is_cached)
 }
 
+/// Whether any piece is cached (`is_cached`) — the torrent has already
+/// pulled down some bytes. Partial progress, distinct from the all-cached
+/// state covered by [`is_download_complete`] (TSI-2650).
+fn has_cached_piece(pieces: &[PieceStatus]) -> bool {
+    pieces.iter().any(|p| p.is_cached)
+}
+
+/// Whether any piece is currently wanted by an active reader (`priority > 0`).
+/// An elevated piece means a reader is actively fetching bytes (TSI-2650).
+fn has_active_reader(pieces: &[PieceStatus]) -> bool {
+    pieces.iter().any(|p| p.priority > 0)
+}
+
 /// Render the `.stats` health alert line for a single torrent.
 ///
 /// The alert fires when the torrent has **no connected peers or seeds**
@@ -393,8 +406,19 @@ fn is_download_complete(pieces: &[PieceStatus]) -> bool {
 /// cached the torrent is fully downloaded, so zero peers is the expected end
 /// state — the user no longer needs connections — and a health warning would
 /// misreport a healthy finished torrent as unhealthy.
-fn health_alert(num_peers: i32, num_seeds: i32, download_complete: bool) -> Option<&'static str> {
-    if num_peers == 0 && num_seeds == 0 && !download_complete {
+///
+/// `active_download` also suppresses the alert (TSI-2650): while a download
+/// is actively fetching bytes — at least one piece already cached, or at
+/// least one piece currently wanted by an active reader — the torrent is
+/// making progress, so the transient zero-peer window before the tracker
+/// announce returns must not be reported as a health degradation.
+fn health_alert(
+    num_peers: i32,
+    num_seeds: i32,
+    download_complete: bool,
+    active_download: bool,
+) -> Option<&'static str> {
+    if num_peers == 0 && num_seeds == 0 && !download_complete && !active_download {
         Some("  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n")
     } else {
         None
@@ -541,6 +565,15 @@ pub fn generate_torrent_stats(
         .as_ref()
         .map(|(_, pieces)| is_download_complete(pieces))
         .unwrap_or(false);
+    // A torrent actively fetching bytes — some piece already cached, or some
+    // piece wanted by an active reader — is making progress, so suppress the
+    // health alert during the transient zero-peer window before the tracker
+    // announce returns (TSI-2650). An absent piece snapshot yields no signal
+    // either way: neither flag suppresses the alert.
+    let active_download = piece_statuses
+        .as_ref()
+        .map(|(_, pieces)| has_cached_piece(pieces) || has_active_reader(pieces))
+        .unwrap_or(false);
     output.push_str("-- Status --\n");
     output.push_str(&format!("  Name: {}\n", t.name));
     output.push_str(&format!(
@@ -574,7 +607,7 @@ pub fn generate_torrent_stats(
     // -- Peers --
     output.push_str("\n-- Peers --\n");
     output.push_str(&format!("  Peers: {}  Seeds: {}\n", num_peers, num_seeds));
-    let health = health_alert(num_peers, num_seeds, download_complete);
+    let health = health_alert(num_peers, num_seeds, download_complete, active_download);
     if let Some(line) = health {
         output.push_str(line);
     }
@@ -1475,7 +1508,7 @@ mod tests {
         // TSI-2442: the alert fires on zero connected peers/seeds but must
         // not claim the tracker is unreachable — connected-peer count is not
         // a tracker-reachability signal.
-        let line = health_alert(0, 0, false).expect("alert should fire at 0/0");
+        let line = health_alert(0, 0, false, false).expect("alert should fire at 0/0");
         assert!(
             !line.contains("tracker may be unreachable"),
             "must not claim tracker unreachable: {line}"
@@ -1493,7 +1526,7 @@ mod tests {
     #[test]
     fn test_health_alert_with_peers() {
         assert!(
-            health_alert(3, 0, false).is_none(),
+            health_alert(3, 0, false, false).is_none(),
             "no alert when peers > 0"
         );
     }
@@ -1501,7 +1534,7 @@ mod tests {
     #[test]
     fn test_health_alert_with_seeds() {
         assert!(
-            health_alert(0, 2, false).is_none(),
+            health_alert(0, 2, false, false).is_none(),
             "no alert when seeds > 0"
         );
     }
@@ -1509,7 +1542,7 @@ mod tests {
     #[test]
     fn test_health_alert_both_present() {
         assert!(
-            health_alert(5, 1, false).is_none(),
+            health_alert(5, 1, false, false).is_none(),
             "no alert when peers and seeds > 0"
         );
     }
@@ -1519,8 +1552,57 @@ mod tests {
         // TSI-2603: a fully downloaded torrent legitimately has zero peers;
         // the health alert must not fire when download is complete.
         assert!(
-            health_alert(0, 0, true).is_none(),
+            health_alert(0, 0, true, false).is_none(),
             "no alert when download is complete even at 0 peers / 0 seeds"
         );
+    }
+
+    #[test]
+    fn test_health_alert_active_download_suppresses() {
+        // TSI-2650: during the transient zero-peer window before the first
+        // tracker announce returns, a download that is actively fetching
+        // bytes must not raise a health alert.
+        assert!(
+            health_alert(0, 0, false, true).is_none(),
+            "no alert while a download is actively fetching bytes"
+        );
+    }
+
+    #[test]
+    fn test_has_cached_piece() {
+        let pieces = [
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 1,
+            },
+        ];
+        assert!(has_cached_piece(&pieces));
+        assert!(!has_cached_piece(&pieces[..1]));
+        assert!(!has_cached_piece(&[]));
+    }
+
+    #[test]
+    fn test_has_active_reader() {
+        let pieces = [
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert!(has_active_reader(&pieces));
+        assert!(!has_active_reader(&pieces[..1]));
+        assert!(!has_active_reader(&[]));
     }
 }
