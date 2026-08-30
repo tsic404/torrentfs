@@ -234,9 +234,10 @@ On a bare development machine you can instead run the idempotent helper:
 sudo ./ci/enable_fuse_allow_other.sh
 ```
 
-It is safe to run repeatedly: it uncomments an existing
-`#user_allow_other` line or appends `user_allow_other` when the line is
-absent. `main.rs` detects the line at startup: when it is present the mount
+It converges to one active line when the option is absent or commented; a
+padded active line is not recognized by the exact-match check and a duplicate
+is appended. Pre-existing duplicate active lines are left as-is. `main.rs` detects
+the line at startup: when it is present the mount
 includes `allow_other`; when it is missing, a non-root mount fails with
 `Operation not permitted` and the error hints at `/etc/fuse.conf` — the
 kernel requires `user_allow_other` for any unprivileged FUSE mount, so there
