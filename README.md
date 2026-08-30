@@ -220,9 +220,11 @@ sudo ./ci/enable_fuse_allow_other.sh
 
 It is safe to run repeatedly: it uncomments an existing
 `#user_allow_other` line or appends `user_allow_other` when the line is
-absent. `main.rs` detects the line at startup and falls back to owner-only
-mounting with a warning when it is missing — so a mount that succeeds
-silently but only for the mounting user is this issue too.
+absent. `main.rs` detects the line at startup: when it is present the mount
+includes `allow_other`; when it is missing, a non-root mount fails with
+`Operation not permitted` and the error hints at `/etc/fuse.conf` — the
+kernel requires `user_allow_other` for any unprivileged FUSE mount, so there
+is no owner-only fallback.
 
 ## Offline QA: self-seeding test swarm
 

@@ -318,65 +318,20 @@ fn main() {
 
     let allow_other_enabled = fuse_allow_other_enabled().unwrap_or(false);
 
-    if allow_other_enabled {
-        let options = vec![
-            MountOption::FSName("torrentfs".to_string()),
-            MountOption::AutoUnmount,
-            MountOption::AllowOther,
-        ];
-
-        let db = match Database::open(&db_path) {
-            Ok(db) => {
-                info!("Database opened at {:?}", db_path);
-                Some(db)
-            }
-            Err(e) => {
-                if args.db.is_some() {
-                    error!("Failed to open database: {:?}", e);
-                    std::process::exit(1);
-                }
-                warn!(
-                    "Failed to open database at {:?}: {:?}, running without persistence",
-                    db_path, e
-                );
-                None
-            }
-        };
-
-        let fs = match db {
-            Some(d) => TorrentFs::new_with_db_and_cache(d, cache_path.clone(), &config),
-            None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
-        };
-        let worker_pool = fs.worker_pool();
-        let download_service = fs.download_service().cloned();
-        let notifier = fs.notifier_handle();
-
-        match fuser::spawn_mount2(fs, &mountpoint, &options) {
-            Ok(bg) => {
-                // TSI-2454: wire the kernel cache invalidation channel so
-                // `unlink`/`rmdir`/`rename` can immediately purge stale
-                // `data/` dentries instead of waiting for the 1s TTL.
-                notifier.set(Some(bg.notifier())).ok();
-                info!("torrentfs mounted");
-                wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
-                return;
-            }
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                warn!("Mount with AllowOther failed, falling back to owner-only mode");
-            }
-            Err(e) => {
-                error!("Failed to mount filesystem: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        warn!("user_allow_other not set in /etc/fuse.conf, mount will only be accessible by owner");
-    }
-
-    let options = vec![
+    // No owner-only fallback: on kernels that gate every unprivileged FUSE
+    // mount on `user_allow_other` in /etc/fuse.conf (not on the `allow_other`
+    // option itself), a retry without AllowOther fails with the same EPERM.
+    // The EPERM path below reuses the /etc/fuse.conf diagnostic instead of
+    // claiming a degraded owner-only mount.
+    let mut options = vec![
         MountOption::FSName("torrentfs".to_string()),
         MountOption::AutoUnmount,
     ];
+    if allow_other_enabled {
+        options.push(MountOption::AllowOther);
+    } else {
+        warn!("'user_allow_other' is not set in /etc/fuse.conf; mounting without allow_other");
+    }
 
     let db = match Database::open(&db_path) {
         Ok(db) => {
@@ -412,7 +367,6 @@ fn main() {
             notifier.set(Some(bg.notifier())).ok();
             info!("torrentfs mounted");
             wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
-            info!("torrentfs unmounted successfully");
         }
         Err(e) => {
             let error_msg = e.to_string();
