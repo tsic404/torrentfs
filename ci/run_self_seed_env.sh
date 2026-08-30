@@ -41,13 +41,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-command -v cargo >/dev/null || { echo "cargo not found in PATH" >&2; exit 1; }
+# Resolve a *working* cargo by probing `--version` on every PATH candidate (in
+# order) and then the rustup default location.  `--version` rejects broken
+# rustup shims (toolchain without the cargo component) that shadow a working
+# cargo further down PATH, and rejects directories mistaken for executables.
+CARGO=""
+try_cargo() {
+    local candidate="$1"
+    [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ] || return 1
+    "$candidate" --version >/dev/null 2>&1 || return 1
+    CARGO="$candidate"
+}
+
+old_ifs=$IFS
+IFS=:
+for dir in ${PATH:-}; do
+    [ -n "$dir" ] || continue
+    if try_cargo "$dir/cargo"; then break; fi
+done
+IFS=$old_ifs
+if [ -z "$CARGO" ]; then try_cargo "$HOME/.cargo/bin/cargo" \
+    || { echo "no working cargo in PATH or $HOME/.cargo/bin/cargo" >&2; exit 1; }; fi
 
 mkdir -p "$OUTPUT_DIR"
 cd "$ROOT_DIR"
 
 echo "[selfseed] building seeder (release)…"
-cargo build --locked --release --example torrentfs-selfseed-env --quiet
+"$CARGO" build --locked --release --example torrentfs-selfseed-env --quiet
 
 echo "[selfseed] generating ${PAYLOAD_MIB} MiB deterministic payload…"
 head -c $((PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
