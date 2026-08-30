@@ -330,7 +330,9 @@ fn main() {
     if allow_other_enabled {
         options.push(MountOption::AllowOther);
     } else {
-        warn!("'user_allow_other' is not set in /etc/fuse.conf; mounting without allow_other");
+        warn!(
+            "'user_allow_other' is not set in /etc/fuse.conf; non-root mount will fail with EPERM"
+        );
     }
 
     let db = match Database::open(&db_path) {
