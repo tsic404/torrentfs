@@ -161,6 +161,40 @@ mountpoint lives inside a container with bind propagation (see Container
 Deployment), run the same steps on the host as well — a stale mount can
 persist on both sides of the bind.
 
+### Non-root mount fails with `Operation not permitted` (EPERM)
+
+torrentfs mounts with `allow_other` so non-root users can access the mount.
+That option only works when the host's `/etc/fuse.conf` enables
+`user_allow_other`. Distributions ship that line commented out
+(`#user_allow_other`), which makes `torrentfs /mnt --config ...` return
+`Operation not permitted` for a non-root user. The container image already
+uncomments it at build time; the **host** running the container (or a bare
+development machine) needs the same change:
+
+```bash
+sudo sed -i 's/^#\s*user_allow_other\s*$/user_allow_other/' /etc/fuse.conf
+sudo sh -c 'grep -q "^user_allow_other$" /etc/fuse.conf || echo user_allow_other >> /etc/fuse.conf'
+```
+
+Verify the line is active, then remount:
+
+```bash
+grep '^user_allow_other$' /etc/fuse.conf && echo enabled
+torrentfs /mnt --config /path/to/config.toml
+```
+
+On a bare development machine you can instead run the idempotent helper:
+
+```bash
+sudo ./ci/enable_fuse_allow_other.sh
+```
+
+It is safe to run repeatedly: it uncomments an existing
+`#user_allow_other` line or appends `user_allow_other` when the line is
+absent. `main.rs` detects the line at startup and falls back to owner-only
+mounting with a warning when it is missing — so a mount that succeeds
+silently but only for the mounting user is this issue too.
+
 ## Offline QA: self-seeding test swarm
 
 Public sample torrents (e.g. the Ubuntu/Debian `.torrent` files commonly used in
