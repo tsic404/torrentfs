@@ -109,6 +109,31 @@ fn percent_decode(input: &str) -> Vec<u8> {
     out
 }
 
+/// Decode an `info_hash` query value into its 20 raw bytes.
+///
+/// libtorrent sends `info_hash` in one of two forms: `%XX`-escaped raw
+/// bytes, or bare ASCII hex (`info_hash=6be64a…`).  `percent_decode` only
+/// handles the former; the latter comes through as 40 ASCII bytes, so the
+/// direct `[u8; 20]` conversion rejects it and the announce wrongly gets a
+/// `400 Bad Request` (TSI-2623).  Fall back to hex decoding when the
+/// percent-decoded value is not already 20 raw bytes.
+fn decode_info_hash(value: &str) -> Option<[u8; 20]> {
+    let raw = percent_decode(value);
+    if let Ok(hash) = <[u8; 20]>::try_from(raw.as_slice()) {
+        return Some(hash);
+    }
+
+    let hex = std::str::from_utf8(&raw).ok()?;
+    if hex.len() != 40 {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Write a minimal `400 Bad Request` response and close the connection.
 ///
 /// Malformed announces used to fall through to a silent `return`, which
@@ -142,16 +167,14 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         }
     };
 
-    let info_hash: [u8; 20] = match query_param(&raw_query, "info_hash")
-        .map(|v| percent_decode(&v))
-        .and_then(|v| <[u8; 20]>::try_from(v.as_slice()).ok())
-    {
-        Some(h) => h,
-        None => {
-            write_bad_request(&mut stream);
-            return;
-        }
-    };
+    let info_hash: [u8; 20] =
+        match query_param(&raw_query, "info_hash").and_then(|v| decode_info_hash(&v)) {
+            Some(h) => h,
+            None => {
+                write_bad_request(&mut stream);
+                return;
+            }
+        };
     let peer_port: u16 = match query_param(&raw_query, "port").and_then(|v| v.parse().ok()) {
         Some(p) => p,
         None => {
@@ -653,6 +676,61 @@ mod tests {
             start.elapsed() >= Duration::from_secs(4),
             "400 must follow the read timeout, got it after {:?}",
             start.elapsed()
+        );
+    }
+
+    /// TSI-2623: `%XX`-encoded info_hash still decodes to 20 raw bytes.
+    #[test]
+    fn percent_encoded_info_hash_decodes() {
+        let encoded = "%01%23%45%67%89%AB%CD%EF%01%23%45%67%89%AB%CD%EF%FE%DC%BA%98";
+        let hash = decode_info_hash(encoded).expect("percent-encoded hash must decode");
+        assert_eq!(
+            hash,
+            [
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+                0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98,
+            ]
+        );
+    }
+
+    /// TSI-2623: bare ASCII hex info_hash (libtorrent's alternate form) must
+    /// decode via the `from_str_radix` fallback instead of being rejected.
+    #[test]
+    fn bare_hex_info_hash_decodes() {
+        let hex = "0102030405060708090a0b0c0d0e0f1011121314";
+        let hash = decode_info_hash(hex).expect("bare hex hash must decode");
+        assert_eq!(
+            hash,
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+            ]
+        );
+    }
+
+    /// TSI-2623: uppercase hex digits are accepted too; anything that is not
+    /// 20 raw bytes or exactly 40 hex digits stays rejected.
+    #[test]
+    fn malformed_info_hash_rejected() {
+        let uppercase = "0102030405060708090A0B0C0D0E0F1011121314";
+        assert!(
+            decode_info_hash(uppercase).is_some(),
+            "uppercase hex must decode"
+        );
+
+        assert!(
+            decode_info_hash("0102").is_none(),
+            "short hex must be rejected"
+        );
+        assert!(
+            decode_info_hash("").is_none(),
+            "empty value must be rejected"
+        );
+        let mut forty_non_hex = String::from("z");
+        forty_non_hex.push_str(&"0".repeat(39));
+        assert!(
+            decode_info_hash(&forty_non_hex).is_none(),
+            "non-hex 40-byte value must be rejected"
         );
     }
 
