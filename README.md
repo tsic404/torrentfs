@@ -2,6 +2,11 @@
 
 A FUSE-based virtual filesystem for BitTorrent management. Mount `.torrent` files, browse their structure, and read file contents on-demand via the BitTorrent network.
 
+## Documentation
+
+Supplementary docs live in [`docs/`](docs/README.md) — see its index for
+focused, discoverable guides such as test-environment network prerequisites.
+
 ## Architecture
 
 ```
