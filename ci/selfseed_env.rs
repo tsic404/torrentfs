@@ -5,11 +5,10 @@
 //! binary builds a deterministic single-file torrent from a fixed payload and
 //! serves it via a local tracker + libtorrent seeder, giving QA a swarm that
 //! works fully offline.
-//!
 //! Flow:
 //!  1. start a minimal HTTP tracker on a loopback port
-//!  2. bencode a single-file .torrent pointing at that tracker
-//!  3. copy the payload into the seed directory (complete data)
+//!  2. stream the payload into the seed directory, hashing each piece
+//!  3. bencode a single-file .torrent from those piece hashes
 //!  4. run a libtorrent session in seeding state until killed
 //!
 //! The tracker and seeder logic mirror `tests/common/mod.rs` (`MiniTracker`,
@@ -28,6 +27,10 @@ use parking_lot::Mutex;
 
 use torrentfs::download::{Session, TorrentState};
 use torrentfs::TorrentInfo;
+
+/// Piece length used when bencoding the single-file torrent.  `hash_and_seed`
+/// hashes the payload one chunk of this size at a time.
+const PIECE_LEN: usize = 262_144; // 256 KiB
 
 // ── minimal bencoding ────────────────────────────────────────────────────────
 
@@ -316,6 +319,44 @@ fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Stream `payload` into `seed_file` while hashing it piece-by-piece.
+///
+/// Returns the concatenated SHA-1 digests (one 20-byte digest per piece, in
+/// order) and the total payload length.  Memory stays bounded by one piece
+/// buffer plus the digest list — the previous `std::fs::read` held the whole
+/// payload resident, which OOM'd at 1024/2048 MiB (TSI-2745).
+fn hash_and_seed(payload: &std::path::Path, seed_file: &std::path::Path) -> (Vec<u8>, u64) {
+    use sha1_smol::Sha1;
+
+    let mut input = std::fs::File::open(payload).expect("failed to read payload");
+    let mut output = std::fs::File::create(seed_file).expect("failed to write seed file");
+
+    let mut pieces = Vec::new();
+    let mut buf = vec![0u8; PIECE_LEN];
+    let mut total: u64 = 0;
+    loop {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match input.read(&mut buf[filled..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("failed to read payload: {e}"),
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let chunk = &buf[..filled];
+        let mut h = Sha1::new();
+        h.update(chunk);
+        pieces.extend_from_slice(&h.digest().bytes());
+        output.write_all(chunk).expect("failed to write seed file");
+        total += filled as u64;
+    }
+    (pieces, total)
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 struct Args {
@@ -400,30 +441,34 @@ fn main() {
     );
     std::fs::write(&args.url_out, &announce_url).expect("failed to write tracker.url");
 
-    // 2. Deterministic single-file torrent over the fixed payload.
-    let payload = std::fs::read(&args.payload).expect("failed to read payload");
-    assert!(!payload.is_empty(), "payload must not be empty");
+    // 2. Deterministic single-file torrent over the fixed payload. Hashing
+    // and seeding share one bounded pass: the payload is streamed into the
+    // seed file piece-by-piece and never held whole in memory (TSI-2745).
+    // Validate non-empty up front so an empty payload fails before the seed
+    // dir and seed file are created, leaving no residue behind.
+    let payload_len = std::fs::metadata(&args.payload)
+        .expect("failed to read payload")
+        .len();
+    assert!(payload_len > 0, "payload must not be empty");
 
-    const PIECE_LEN: usize = 262_144; // 256 KiB
-    use sha1_smol::Sha1;
-    let pieces: Vec<u8> = payload
-        .chunks(PIECE_LEN)
-        .flat_map(|chunk| {
-            let mut h = Sha1::new();
-            h.update(chunk);
-            h.digest().bytes()
-        })
-        .collect();
-    let num_pieces = payload.chunks(PIECE_LEN).count();
+    let seed_dir = args
+        .torrent_out
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("seed_data");
+    std::fs::create_dir_all(&seed_dir).expect("failed to create seed dir");
 
     let name = "selfseed";
+    let (pieces, _) = hash_and_seed(&args.payload, &seed_dir.join(name));
+    let num_pieces = pieces.len() / 20;
+
     let dict: Vec<u8> = {
         let mut d = vec![b'd'];
         d.extend_from_slice(b"8:announce");
         d.extend_from_slice(&bencode_bytes(announce_url.as_bytes()));
         d.extend_from_slice(b"4:infod");
         d.extend_from_slice(b"6:length");
-        d.extend_from_slice(&bencode_int(payload.len() as i64));
+        d.extend_from_slice(&bencode_int(payload_len as i64));
         d.extend_from_slice(b"4:name");
         d.extend_from_slice(&bencode_bytes(name.as_bytes()));
         d.extend_from_slice(b"12:piece length");
@@ -441,15 +486,6 @@ fn main() {
         dict.len(),
         num_pieces
     );
-
-    // 3. Seed directory holds the complete file under the torrent's name.
-    let seed_dir = args
-        .torrent_out
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("seed_data");
-    std::fs::create_dir_all(&seed_dir).expect("failed to create seed dir");
-    std::fs::write(seed_dir.join(name), &payload).expect("failed to write seed file");
 
     let info = TorrentInfo::from_bytes(dict.clone()).expect("failed to parse generated torrent");
     println!(
@@ -529,6 +565,52 @@ fn main() {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Removes a temp directory on drop so a failing assertion does not leak
+    /// it in `/tmp` (TSI-2745 review).
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// TSI-2745: the seeder must hash and seed the payload in one bounded
+    /// pass.  Verify `hash_and_seed` yields piece digests identical to an
+    /// in-memory reference, copies the payload verbatim into the seed file,
+    /// and handles a trailing partial piece.
+    #[test]
+    fn hash_and_seed_streams_correctly() {
+        let dir =
+            std::env::temp_dir().join(format!("selfseed-env-hash-and-seed-{}", std::process::id()));
+        let _guard = TempDirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload_path = dir.join("payload.bin");
+        let seed_path = dir.join("seed_data").join("selfseed");
+        std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+
+        // 2 full pieces plus a trailing partial piece.
+        let mut data = vec![0u8; PIECE_LEN * 2 + 12345];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&payload_path, &data).unwrap();
+
+        let (pieces, total) = hash_and_seed(&payload_path, &seed_path);
+
+        assert_eq!(total, data.len() as u64);
+        assert_eq!(std::fs::read(&seed_path).unwrap(), data);
+
+        let expected: Vec<u8> = data
+            .chunks(PIECE_LEN)
+            .flat_map(|c| {
+                let mut h = sha1_smol::Sha1::new();
+                h.update(c);
+                h.digest().bytes()
+            })
+            .collect();
+        assert_eq!(pieces, expected);
+    }
 
     /// TSI-2417 regression: a downloader whose (ip, port) collides with the
     /// seeder's (pasta/slirp NAT shares the host IP and both default to port
