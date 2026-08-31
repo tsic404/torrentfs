@@ -433,7 +433,15 @@ fn main() {
         );
     }
 
-    // 1. Tracker first — the announce URL must be live before we bencode.
+    // 1. Validate the payload up front: an empty payload must fail before the
+    // tracker is started or tracker.url is written, leaving no residue behind
+    // (TSI-2746).
+    let payload_len = std::fs::metadata(&args.payload)
+        .expect("failed to read payload")
+        .len();
+    assert!(payload_len > 0, "payload must not be empty");
+
+    // 2. Tracker — the announce URL must be live before we bencode.
     start_tracker(&args.tracker_bind, args.tracker_port).expect("failed to start local tracker");
     let announce_url = format!(
         "http://{}:{}/announce",
@@ -441,15 +449,9 @@ fn main() {
     );
     std::fs::write(&args.url_out, &announce_url).expect("failed to write tracker.url");
 
-    // 2. Deterministic single-file torrent over the fixed payload. Hashing
+    // 3. Deterministic single-file torrent over the fixed payload. Hashing
     // and seeding share one bounded pass: the payload is streamed into the
     // seed file piece-by-piece and never held whole in memory (TSI-2745).
-    // Validate non-empty up front so an empty payload fails before the seed
-    // dir and seed file are created, leaving no residue behind.
-    let payload_len = std::fs::metadata(&args.payload)
-        .expect("failed to read payload")
-        .len();
-    assert!(payload_len > 0, "payload must not be empty");
 
     let seed_dir = args
         .torrent_out
