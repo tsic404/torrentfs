@@ -341,6 +341,15 @@ lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) 
         }
         settings.set_int(lt::settings_pack::alert_mask,
             lt::alert_category::error | lt::alert_category::status);
+        // TSI-2622: keep upload↔upload connections. torrentfs adds its idle
+        // handles in upload_mode, so a torrentfs↔torrentfs pair has both
+        // sides upload-only; libtorrent's default
+        // close_redundant_connections=true tears that connection down before
+        // .stats can observe it. Match lt_session_create_with_custom_storage
+        // (TSI-2467). Session::new has no user settings JSON on this path, so
+        // the unconditional false is correct — user config is applied later
+        // via lt_session_apply_settings.
+        settings.set_bool(lt::settings_pack::close_redundant_connections, false);
         wrapper->session->apply_settings(settings);
 
         return static_cast<lt_session_t>(wrapper);

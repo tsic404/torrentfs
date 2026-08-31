@@ -166,6 +166,69 @@ fn test_read_file_range_after_idle_handle() {
     }
 }
 
+/// Regression test (TSI-2622): an idle handle (upload_mode, no read yet) must
+/// establish a peer/seed connection on its own once the tracker returns the
+/// seeder.  Before the fix the libtorrent session never connected while the
+/// handle stayed idle, so `.stats` persistently showed `Peers: 0 Seeds: 0`
+/// until an explicit read (`dd`) forced the connect.  This test never reads:
+/// it only polls the engine's published snapshot.
+#[test]
+fn test_idle_handle_connects_to_seeder_without_read() {
+    // Serialize libtorrent session creation to avoid resource contention.
+    let _session_guard = common::acquire_session_lock();
+
+    let harness = TestHarness::new();
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    // TSI-2068: distinct downloader listen port so the MiniTracker can tell
+    // it apart from the seeder (which binds 6881).
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent for downloader"),
+    );
+    let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
+
+    // Create the lightweight upload_mode handle and leave it idle — never read.
+    engine
+        .ensure_handle(info.clone())
+        .expect("Failed to ensure lightweight handle");
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+    loop {
+        if let Some(status) = engine.try_torrent_status(&info_hash) {
+            println!(
+                "idle: state={:?} peers={} seeds={} (t={:.1}s)",
+                status.state,
+                status.num_peers,
+                status.num_seeds,
+                start.elapsed().as_secs_f64()
+            );
+            if status.num_peers > 0 || status.num_seeds > 0 {
+                println!(
+                    "idle handle connected: peers={} seeds={}",
+                    status.num_peers, status.num_seeds
+                );
+                return;
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "idle handle never connected within {}s; tracker announces: {}",
+                timeout.as_secs(),
+                harness.tracker.announce_count()
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Test that read_file_range returns correct data for different offset/size
 /// combinations, validating boundary handling.
 #[test]
