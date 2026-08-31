@@ -4005,11 +4005,9 @@ mod tests {
             _ => panic!("expected insertion"),
         };
 
-        // Verify files are retrievable and have unique names.
+        // Verify files are retrievable.
         let all_files = db.get_files_by_torrent_id(torrent_id).expect("get files");
         assert_eq!(all_files.len(), 2);
-        let name0 = all_files[0].name.as_str();
-        let name1 = all_files[1].name.as_str();
     }
 
     /// TSI-2293: `guard_empty_read` must reject empty data for a non-zero
