@@ -348,21 +348,20 @@ fn test_read_file_range_no_peers_error() {
 /// (the old ≤9s fast-fail) — it must block for the full
 /// `read_timeout_secs` and only then return `NoPeers`.
 ///
-/// Deterministic: tracker exists but returns an empty peer list for the
-/// whole run, so no peer can ever appear; DHT/LSD disabled.
+/// Deterministic: unique info_hash with no reachable tracker (the announce
+/// URL is a dead endpoint) and DHT/LSD disabled, so no peer can ever appear;
+/// the all-zero piece hashes additionally make a hash-valid piece impossible.
 #[test]
 fn test_no_peers_read_blocks_full_timeout_then_errors() {
     // Serialize libtorrent session creation to avoid resource contention
     // when multiple tests run in parallel within the same binary.
     let _session_guard = common::acquire_session_lock();
 
-    // Tracker is running but has NO peers registered — every announce
-    // returns an empty peer list for the entire duration of the read.
-    let tracker = common::MiniTracker::start();
-
-    let (torrent_data, file_content) =
-        common::create_test_torrent_with_tracker(&tracker.announce_url());
-    assert_eq!(file_content.len(), 16384);
+    // Use a unique info_hash (distinct name) so no other test's seeder or
+    // leaked seeder thread for the shared `create_test_torrent_with_tracker`
+    // torrent can be discovered and serve piece 0 during full-suite parallel
+    // load. The all-zero piece hashes also make a hash-valid piece impossible.
+    let torrent_data = distinct_torrent("no-peers-read.iso");
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
