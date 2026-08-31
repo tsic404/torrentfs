@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -363,8 +364,33 @@ fn parse_args() -> Args {
     args
 }
 
+/// Set by the SIGINT/SIGTERM handler so the keep-alive loop can observe the
+/// signal instead of sleeping out the full hour (SIGKILL on a hung 3600s
+/// sleep terminates the process mid-sleep, silently and without an error
+/// line).  Polling a 500ms sleep keeps the loop signal-responsive.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Async-signal-safe handler: only stores an atomic flag, mirroring
+/// `src/main.rs::handle_shutdown_signal`.
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
 fn main() {
     let args = parse_args();
+
+    // SAFETY: installing a trivial flag-setting handler; `libc::signal`
+    // is async-signal-safe to call from main before any thread spawns.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+    }
 
     // 1. Tracker first — the announce URL must be live before we bencode.
     start_tracker(&args.tracker_bind, args.tracker_port).expect("failed to start local tracker");
@@ -454,6 +480,13 @@ fn main() {
     // Wait until we're actually serving before declaring readiness.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
+        // A signal arriving during warmup must not wait out the 60s deadline:
+        // the supervisor's SIGTERM→SIGKILL grace (podman/docker: 10s) would
+        // fire first, killing the process silently (TSI-2704).
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("[seeder] shutdown signal received — stopping");
+            return;
+        }
         let status = handle.status().expect("status failed");
         eprintln!(
             "[seeder] state={:?} progress={:.1}% seeds={} peers={}",
@@ -475,9 +508,19 @@ fn main() {
 
     println!("[seeder] ready — Ctrl-C to stop");
     loop {
-        // Keep the session alive; re-announce each hour so the swarm entry
-        // never expires for long-running QA sessions.
-        std::thread::sleep(Duration::from_secs(3600));
+        // Re-announce each hour so the swarm entry never expires for
+        // long-running QA sessions.  Poll SHUTDOWN on a short sleep instead
+        // of sleeping the full hour: a supervisor that escalates SIGTERM to
+        // SIGKILL (podman/docker's 10s default grace period) would otherwise
+        // kill the process mid-sleep with no error line, surfacing as an
+        // intermittent silent exit after "ready" (TSI-2704).
+        for _ in 0..(3600 * 1000 / 500) {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                eprintln!("[seeder] shutdown signal received — stopping");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
         handle.force_reannounce();
     }
 }
