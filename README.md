@@ -65,9 +65,19 @@ This is expected libtorrent behavior, not a configuration error:
 
 ## Container Deployment
 
-torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility.
+torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility. Whether the FUSE filesystem is visible on the **host** (a bind-mounted host directory sees the mount created inside the container) depends on the container engine and its root/user namespace mode. The container always runs torrentfs correctly — the difference is whether the mount propagates out to the host.
 
-### Quick Start
+### FUSE visibility by container engine
+
+| Engine | Mode | Host-visible FUSE mount? | Notes |
+|---|---|---|---|
+| Docker | rootful (default) | ✅ Yes | Use `--mount ...,bind-propagation=rshared` and prepare a shared host mount (see Quick Start) |
+| podman | rootful (`sudo podman run ...`) | ✅ Yes | Same shared-propagation recipe as Docker |
+| podman | rootless (default) | ❌ No — mount stays inside the container | Use `podman exec` to access the filesystem, or run torrentfs directly on the host |
+
+If you need host-visible FUSE mounts, use **rootful Docker or rootful podman**. Rootless podman cannot create shared mounts — a fundamental user-namespace limitation, not a torrentfs or entrypoint bug.
+
+### Quick Start (rootful)
 
 ```bash
 # Docker (rootful) — host-visible FUSE mount via shared propagation
@@ -79,6 +89,7 @@ docker run --rm \
 ```
 
 On the host, prepare the shared mount first:
+
 ```bash
 mkdir -p /host/torrentfs
 mount --bind /host/torrentfs /host/torrentfs
