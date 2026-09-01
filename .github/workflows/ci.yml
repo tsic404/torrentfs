@@ -67,6 +67,15 @@ jobs:
       - name: Run entrypoint detection tests
         run: ./ci/tests/entrypoint_test.sh
 
+  deploy-rootful-test:
+    name: Deploy Rootful Shell Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run deploy_rootful tests
+        run: ./ci/tests/deploy_rootful_test.sh
+
   docker-build-amd64:
     name: Docker Build (amd64)
     if: github.event_name == 'pull_request'
