@@ -293,6 +293,15 @@ impl DownloadEngine {
         self.read_timeout_secs
     }
 
+    /// Worst-case seconds a single `read_file_range` call may block on the
+    /// engine thread before returning its own result.  The FUSE deferred-read
+    /// deadline must cover this budget (plus dispatch margin) so a ticket is
+    /// never expired with ENODATA while the engine is still legitimately
+    /// waiting for a slow seeder (TSI-2751).
+    pub fn read_wait_budget_secs(&self) -> u64 {
+        read_wait_budget_secs(self.read_timeout_secs)
+    }
+
     // ── Command senders ──────────────────────────────────────────────
 
     fn send(&self, cmd: Command) -> TorrentResult<()> {
@@ -418,6 +427,35 @@ impl Drop for DownloadEngine {
 
 /// libtorrent `torrent_flags::upload_mode` numeric value (`1 << 1`).
 const UPLOAD_MODE_FLAG: u64 = 1 << 1;
+
+/// Upper bound (seconds) on the peer-discovery wait in the slow read path
+/// (TSI-2417).  The engine's worst-case read budget sums the state-transition
+/// wait, the recheck wait, this peer-discovery wait and the piece-wait window —
+/// the FUSE deferred-read deadline must exceed that sum (TSI-2751).
+pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
+
+/// Upper bound (seconds) on the `force_recheck_and_wait` synchronous wait in
+/// the stale-piece path (TSI-2258).  It runs before peer discovery on the same
+/// engine thread, so it adds to the read budget (TSI-2751).
+pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
+
+/// Worst-case seconds a single `read_file_range` call may block on the engine
+/// thread before returning its own result: state-transition wait
+/// (`read_timeout_secs`) + recheck wait (≤ [`RECHECK_WAIT_CAP_SECS`]) +
+/// peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) + the piece-wait window
+/// (`read_timeout_secs`, one shared deadline across all pieces in the
+/// requested range — see `read_file_range`).
+///
+/// This is the budget the FUSE deferred-read deadline must cover.  Pure so it
+/// is unit-testable without a running engine.
+pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
+    let recheck_wait = std::cmp::min(read_timeout_secs, RECHECK_WAIT_CAP_SECS);
+    let peer_wait = std::cmp::min(read_timeout_secs, PEER_WAIT_CAP_SECS);
+    read_timeout_secs
+        .saturating_add(recheck_wait)
+        .saturating_add(peer_wait)
+        .saturating_add(read_timeout_secs)
+}
 
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
 /// thread (`set_alert_notify`), so this interval bounds `.stats` staleness
@@ -926,7 +964,7 @@ impl EngineState {
                 }
                 let peer_wait_start = Instant::now();
                 let peer_wait_timeout =
-                    Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
+                    Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
                 let mut reannounced_mid_wait = false;
                 loop {
                     if self.stopping.load(Ordering::Relaxed) {
@@ -997,9 +1035,15 @@ impl EngineState {
         }
 
         // ── Wait for each missing piece ────────────────────────────────
+        // TSI-2751: the deadline is shared across ALL pieces in the range —
+        // `read_timeout_secs` bounds the whole read, not each piece.  This
+        // keeps `read_wait_budget_secs()` in lockstep with the engine's true
+        // worst-case wait (state wait + peer-discovery wait + one piece-wait
+        // window), so the FUSE deferred-read deadline never expires a ticket
+        // while the engine is still legitimately waiting.
         let piece_wait_timeout = Duration::from_secs(self.read_timeout_secs);
+        let piece_wait_start = Instant::now();
         for piece_idx in start_piece..=end_piece {
-            let piece_start = Instant::now();
             loop {
                 if self.stopping.load(Ordering::Relaxed) {
                     self.release_reader(&info_hash);
@@ -1055,7 +1099,7 @@ impl EngineState {
                     break;
                 }
 
-                if piece_start.elapsed() >= piece_wait_timeout {
+                if piece_wait_start.elapsed() >= piece_wait_timeout {
                     self.release_reader(&info_hash);
                     // TSI-2261/TSI-2483: when the piece-wait times out,
                     // distinguish "no seeder available" from "slow download".
@@ -1220,7 +1264,8 @@ impl EngineState {
         //    transition OUT of checking.
         // 2. Poll interval — 200ms reduces syscall overhead while keeping
         //    recheck latency (typically <1s) acceptable.
-        let max_wait = Duration::from_secs(std::cmp::min(self.read_timeout_secs, 10));
+        let max_wait =
+            Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
         let start = Instant::now();
 
         // Grace period: let libtorrent queue the recheck before polling.
@@ -1543,5 +1588,33 @@ impl EngineState {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_wait_budget_secs;
+
+    /// TSI-2751: the read budget must cover all four synchronous phases —
+    /// state-transition wait + recheck wait (capped) + peer-discovery wait
+    /// (capped) + piece wait — so the FUSE deferred-read deadline never
+    /// expires a ticket while the engine is still legitimately waiting.
+    #[test]
+    fn budget_covers_all_slow_path_phases() {
+        // Default read_timeout_secs = 30:
+        //   30 (state) + 10 (recheck cap) + 9 (peer cap) + 30 (piece) = 79s.
+        assert_eq!(read_wait_budget_secs(30), 79);
+        // Short timeout still caps recheck + peer waits at the timeout itself.
+        assert_eq!(read_wait_budget_secs(4), 4 + 4 + 4 + 4);
+        // Timeout below both caps.
+        assert_eq!(read_wait_budget_secs(2), 2 + 2 + 2 + 2);
+    }
+
+    #[test]
+    fn budget_exceeds_legacy_deadline_for_default_timeout() {
+        // The old FUSE deadline was `read_timeout_secs + 5` (35s) — shorter
+        // than the engine's 79s worst-case budget and even its ~39s
+        // peer-wait+piece-wait path. The new budget must exceed it.
+        assert!(read_wait_budget_secs(30) > 30 + 5);
     }
 }

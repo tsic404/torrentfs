@@ -46,6 +46,12 @@ use crate::services::download::DownloadService;
 /// Maximum number of concurrent pending (deferred) read replies.
 const MAX_PENDING: usize = 256;
 
+/// Dispatch margin (seconds) added to the engine's read budget when computing
+/// the deferred-read deadline: covers worker-pool scheduling and the alert
+/// consumer latency.  This is a heuristic safety pad, not a hard guarantee
+/// (TSI-2751).
+const READ_DEADLINE_MARGIN_SECS: u64 = 5;
+
 /// A reply that can be resolved exactly once — either with data or an errno.
 ///
 /// Implemented for `fuser::ReplyData` in production and for a counting mock in
@@ -552,7 +558,22 @@ impl Filesystem for TorrentFs {
                 // Insert into the bounded pending table. `insert` blocks the
                 // FUSE dispatch thread while the table is full (design §9
                 // backpressure): never error, never return truncated data.
-                let deadline = Instant::now() + Duration::from_secs(self.read_timeout_secs + 5);
+                //
+                // TSI-2751: the deadline must cover the engine's worst-case
+                // read budget (state wait + recheck wait + peer-discovery wait
+                // + piece wait),
+                // not just `read_timeout_secs`.  The old `read_timeout + 5`
+                // (35s default) expired tickets before the engine's own
+                // ~39s slow-path budget elapsed, so a slow-but-present seeder
+                // that would have served the piece got a premature ENODATA.
+                let budget_secs = self
+                    .service
+                    .download_service
+                    .as_ref()
+                    .map(|ds| ds.read_wait_budget_secs())
+                    .unwrap_or(self.read_timeout_secs);
+                let deadline = Instant::now()
+                    + Duration::from_secs(budget_secs.saturating_add(READ_DEADLINE_MARGIN_SECS));
                 let id = self.pending_table.insert(reply, torrent_id, deadline);
                 self.service.metrics.pending_reads_inc();
                 debug!(

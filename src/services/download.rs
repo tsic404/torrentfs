@@ -101,6 +101,13 @@ impl DownloadService {
         self.engine.snapshot_stats()
     }
 
+    /// Worst-case seconds a single blocking read may occupy the engine thread
+    /// before returning.  The FUSE deferred-read deadline derives from this
+    /// budget (TSI-2751).
+    pub fn read_wait_budget_secs(&self) -> u64 {
+        self.engine.read_wait_budget_secs()
+    }
+
     /// Get the CacheManager shared with the download session.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
         Some(self.cache_manager.clone())
