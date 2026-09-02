@@ -10,3 +10,4 @@ discoverable documents that don't belong inline there.
 | Document | Purpose |
 |----------|---------|
 | [`testing-network-prerequisites.md`](testing-network-prerequisites.md) | Host network requirements for trustworthy end-to-end byte verification through the SOCKS5 proxy |
+| [`qa-fuse-content-read.md`](qa-fuse-content-read.md) | How to verify torrent content reads across rootful vs rootless container engines |
