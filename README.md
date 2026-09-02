@@ -96,6 +96,30 @@ mount --bind /host/torrentfs /host/torrentfs
 mount --make-shared /host/torrentfs
 ```
 
+### Reaching host loopback services (`--network host`)
+
+The bundled self-seed QA environment (`ci/run_self_seed_env.sh`) runs its
+tracker and seeder on the **host**, bound to `127.0.0.1` (loopback-only; see
+[Offline QA](#offline-qa-self-seeding-test-swarm)). A container runs in its own
+network namespace, so `127.0.0.1` inside the container is the container itself,
+not the host — torrentfs cannot reach the host's seeder and its announces fail.
+
+To reach a host loopback service, run the container in the host network
+namespace with `--network host`:
+
+```bash
+# Docker (rootful) — host network so the container's 127.0.0.1 = host loopback
+docker run --rm --network host \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  ghcr.io/tsip404/torrentfs
+```
+
+`--network host` is orthogonal to FUSE mount visibility: combine it with the
+`rshared` recipe above for host-visible mounts, or with `podman exec` access
+for rootless podman. It applies to rootful and rootless containers alike — the
+isolation that matters here is the network namespace, not the user namespace.
+
 ### Rootless podman
 
 Rootless podman **does not support shared mount propagation** (`rshared`). This is a fundamental limitation of user namespaces — the container cannot create mount events that propagate to the host.
@@ -279,5 +303,7 @@ cat <mountpoint>/data/selfseed/selfseed    # served by the local seeder
 - The payload (`ci/selfseed/output/payload.txt`) is deterministic; diff it
   against what you read through the mount to verify integrity.
 - The swarm is loopback-only (tracker `127.0.0.1:16969`, no DHT/LSD/UPnP), so
-  it never touches public trackers.
+  it never touches public trackers. Running torrentfs inside a container while
+  the seeder stays on the host requires `--network host` — see
+  [Container Deployment](#container-deployment).
 - Source: `ci/selfseed_env.rs` (cargo example `torrentfs-selfseed-env`).
