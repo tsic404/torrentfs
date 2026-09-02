@@ -209,3 +209,53 @@ fn proxy_type_applies_to_session() {
         );
     }
 }
+
+/// TSI-2798: `listen_interfaces` / `outgoing_interfaces` are wired to the
+/// settings_pack (connections.rs → JSON → wrapper `apply_str_setting`) but
+/// previously had no readback path, so the wiring could never be verified.
+/// Read them back from the live session to prove both settings reach libtorrent.
+#[test]
+fn listen_and_outgoing_interfaces_reach_libtorrent() {
+    let mut config = TorrentfsConfig::default_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:6881".to_string());
+    config.connections.outgoing_interfaces = Some("10.20.33.70".to_string());
+    let session = Session::new(&config).unwrap();
+    assert_eq!(
+        session
+            .get_str_setting("listen_interfaces")
+            .expect("listen_interfaces must be readable"),
+        "0.0.0.0:6881"
+    );
+    assert_eq!(
+        session
+            .get_str_setting("outgoing_interfaces")
+            .expect("outgoing_interfaces must be readable"),
+        "10.20.33.70"
+    );
+}
+
+/// TSI-2798: same readback assertion on the production path — the daemon
+/// creates sessions via `new_with_custom_storage`, which bakes settings into
+/// `session_params` on the C++ side rather than applying them post-hoc.
+#[test]
+fn listen_and_outgoing_interfaces_reach_libtorrent_with_custom_storage() {
+    let dir = tempfile::TempDir::new().unwrap();
+    with_large_stack(move || {
+        let mut config = TorrentfsConfig::default_config();
+        config.connections.listen_interfaces = Some("0.0.0.0:6881".to_string());
+        config.connections.outgoing_interfaces = Some("10.20.33.70".to_string());
+        let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
+        assert_eq!(
+            session
+                .get_str_setting("listen_interfaces")
+                .expect("listen_interfaces must be readable"),
+            "0.0.0.0:6881"
+        );
+        assert_eq!(
+            session
+                .get_str_setting("outgoing_interfaces")
+                .expect("outgoing_interfaces must be readable"),
+            "10.20.33.70"
+        );
+    });
+}

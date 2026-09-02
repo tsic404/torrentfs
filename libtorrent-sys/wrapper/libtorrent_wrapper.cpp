@@ -1190,7 +1190,21 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
 }
 
 static bool get_session_str_setting_impl(lt::settings_pack const& settings, const std::string& key, std::string& out) {
-    if (key == "proxy_hostname") {
+    // TSI-2798: `listen_interfaces` / `outgoing_interfaces` are wired to the
+    // settings_pack by `apply_str_setting` (connections.rs → JSON → wrapper),
+    // but had no readback path, so nothing could verify they actually reached
+    // the live session. Read them back so tests can prove the wiring.
+    if (key == "listen_interfaces") {
+        if (settings.has_val(lt::settings_pack::listen_interfaces)) {
+            out = settings.get_str(lt::settings_pack::listen_interfaces);
+            return true;
+        }
+    } else if (key == "outgoing_interfaces") {
+        if (settings.has_val(lt::settings_pack::outgoing_interfaces)) {
+            out = settings.get_str(lt::settings_pack::outgoing_interfaces);
+            return true;
+        }
+    } else if (key == "proxy_hostname") {
         if (settings.has_val(lt::settings_pack::proxy_hostname)) {
             out = settings.get_str(lt::settings_pack::proxy_hostname);
             return true;
