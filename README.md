@@ -124,6 +124,38 @@ docker run --rm --network host \
 for rootless podman. It applies to rootful and rootless containers alike — the
 isolation that matters here is the network namespace, not the user namespace.
 
+### Port conflict with the host seeder (`listen_interfaces`)
+
+Under `--network host` the container shares the host's network namespace, so
+torrentfs and the host's self-seed seeder must not bind the same port.
+torrentfs listens on `0.0.0.0:6881` by default (the libtorrent default; see
+`[connections] listen_interfaces`), and the self-seed seeder
+(`ci/run_self_seed_env.sh`) is also a libtorrent session that defaults to the
+same `6881`. In separate network namespaces the two are independent; sharing
+one namespace makes both attempt `6881` and collide.
+
+Give torrentfs a distinct listen port via a TOML config file passed to
+`--config`:
+
+```toml
+# torrentfs-config.toml
+[connections]
+listen_interfaces = "0.0.0.0:6882"
+```
+
+```bash
+docker run --rm --network host \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  -v "$PWD/torrentfs-config.toml:/torrentfs-config.toml:ro" \
+  ghcr.io/tsic404/torrentfs /mnt --config /torrentfs-config.toml
+```
+
+The seeder stays on `6881`; torrentfs moves to `6882`. The same applies to any
+other BitTorrent peer already bound to `6881` on the host — the collision is a
+property of the shared network namespace, not of the self-seed environment
+specifically.
+
 ### Rootless podman
 
 Rootless podman **does not support shared mount propagation** (`rshared`). This is a fundamental limitation of user namespaces — the container cannot create mount events that propagate to the host.
