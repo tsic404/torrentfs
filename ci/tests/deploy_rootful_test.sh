@@ -85,10 +85,10 @@ expect_missing_value_exit_2 --name
 # --- parse_args: value assignment ---
 
 run_test "parse_args assigns all value options and --dry-run" \
-    'parse_args --engine docker --mountpoint /mnt/tf --state /srv/tf --image ghcr.io/tsip404/torrentfs:main-amd64 --name tf-qa --dry-run; [ "$ENGINE" = docker ] && [ "$MOUNTPOINT" = /mnt/tf ] && [ "$STATE_DIR" = /srv/tf ] && [ "$IMAGE" = ghcr.io/tsip404/torrentfs:main-amd64 ] && [ "$NAME" = tf-qa ] && [ "$DRY_RUN" -eq 1 ]'
+    'parse_args --engine docker --mountpoint /mnt/tf --state /srv/tf --image ghcr.io/tsic404/torrentfs:main-amd64 --name tf-qa --dry-run; [ "$ENGINE" = docker ] && [ "$MOUNTPOINT" = /mnt/tf ] && [ "$STATE_DIR" = /srv/tf ] && [ "$IMAGE" = ghcr.io/tsic404/torrentfs:main-amd64 ] && [ "$NAME" = tf-qa ] && [ "$DRY_RUN" -eq 1 ]'
 
 run_test "parse_args default IMAGE is explicitly tagged" \
-    '[ "$IMAGE" = ghcr.io/tsip404/torrentfs:main ]'
+    '[ "$IMAGE" = ghcr.io/tsic404/torrentfs:main ]'
 # --- parse_args: unknown option ---
 
 run_test "unknown option exits 2" \
@@ -116,7 +116,7 @@ run_test "dry-run sequence includes state dir mkdir" \
     'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "mkdir -p /var/lib/torrentfs"'
 
 run_test "dry-run sequence includes explicit image tag" \
-    'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "ghcr.io/tsip404/torrentfs:main"'
+    'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "ghcr.io/tsic404/torrentfs:main"'
 
 run_test "dry-run sequence includes engine command" \
     'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "podman run -d --name torrentfs"'
