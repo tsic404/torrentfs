@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
+use std::time::{Duration, Instant};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -117,7 +118,10 @@ fn user_in_fuse_group() -> bool {
 /// Strategy mirrors fuser's own `fuse_unmount_pure()`: try `umount2(MNT_DETACH)`
 /// first (root / rootful container), then fall back to the setuid `fusermount`
 /// helper when that returns `EPERM` (non-root mount owner).
-fn unmount_fuse(mountpoint: &Path) {
+///
+/// Returns `true` when the mount was detached so clean shutdown can proceed,
+/// `false` when every attempt failed and the mount is still live.
+fn unmount_fuse(mountpoint: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let c_path = match std::ffi::CString::new(mountpoint.as_os_str().as_bytes()) {
         Ok(c) => c,
@@ -126,14 +130,14 @@ fn unmount_fuse(mountpoint: &Path) {
                 "mountpoint {:?} contains a NUL byte; cannot unmount",
                 mountpoint
             );
-            return;
+            return false;
         }
     };
 
     let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
     if ret == 0 {
         info!("unmounted {} (umount2 MNT_DETACH)", mountpoint.display());
-        return;
+        return true;
     }
     warn!(
         "umount2({}) failed ({}), falling back to fusermount",
@@ -154,7 +158,7 @@ fn unmount_fuse(mountpoint: &Path) {
         {
             Ok(output) if output.status.success() => {
                 info!("unmounted {} ({bin} -u)", mountpoint.display());
-                return;
+                return true;
             }
             Ok(output) => {
                 warn!(
@@ -169,11 +173,64 @@ fn unmount_fuse(mountpoint: &Path) {
         }
     }
     warn!("all unmount attempts failed for {}", mountpoint.display());
+    false
+}
+
+/// Upper bound on the whole graceful-shutdown teardown: engine stop + cache
+/// flush + worker drain + FUSE unmount + session join.
+///
+/// The session join receives only the part of this budget left after the
+/// earlier steps (`SHUTDOWN_TIMEOUT.saturating_sub(elapsed_since_signal)`), so
+/// the total time from SIGTERM to process exit is bounded.  The bound matters
+/// in containers where the FUSE superblock can be held alive by an external
+/// bind mount (entrypoint.sh's rootful path publishes `/mnt-inner` via
+/// `mount --bind`): that reference keeps the kernel from aborting the
+/// connection, so the session thread stays blocked in `read()` on `/dev/fuse`
+/// and would otherwise hang until the container engine SIGKILLs.  Past this
+/// window the thread is abandoned and process exit closes `/dev/fuse`,
+/// leaving the now-stale bind mount for the entrypoint to unmount.
+///
+/// A container stop grace period should therefore exceed this budget (e.g.
+/// `docker stop -t 10`) so teardown finishes before SIGKILL.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of waiting for the FUSE session thread to exit during shutdown.
+#[derive(Debug, PartialEq, Eq)]
+enum JoinOutcome {
+    /// The session thread exited within the timeout — safe to join.
+    Finished,
+    /// The session thread did not exit — abandon it so the process can exit.
+    TimedOut,
+}
+
+/// Poll `is_finished` until it reports true, or `timeout` elapses.
+///
+/// Split out of `wait_for_shutdown` so the bounded-wait policy is unit-testable
+/// without mounting a real filesystem.
+fn wait_bounded<F>(is_finished: F, timeout: Duration, poll_interval: Duration) -> JoinOutcome
+where
+    F: Fn() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if is_finished() {
+            return JoinOutcome::Finished;
+        }
+        if Instant::now() >= deadline {
+            return JoinOutcome::TimedOut;
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 /// Park the main thread until SIGINT/SIGTERM, then run graceful shutdown:
-/// stop the download engine, drain the download worker queue, unmount, and
-/// join the FUSE session (which drops the libtorrent session).
+/// stop the download engine, drain the download worker queue, unmount the FUSE
+/// session, and join the session thread (which drops the libtorrent session).
+/// The whole teardown is bounded by [`SHUTDOWN_TIMEOUT`], measured from the
+/// signal.  If the unmount fails, the process exits non-zero.  If the unmount
+/// succeeds but the session thread does not exit within the remaining budget —
+/// possible when an external bind mount keeps the superblock alive — the
+/// thread is abandoned and process exit closes `/dev/fuse`.
 fn wait_for_shutdown(
     worker_pool: Arc<WorkerPool>,
     download_service: Option<Arc<DownloadService>>,
@@ -183,6 +240,9 @@ fn wait_for_shutdown(
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::park();
     }
+    // The shutdown deadline starts when the signal arrives; every subsequent
+    // teardown step (engine stop, flush, drain, unmount) consumes part of it.
+    let shutdown_started = Instant::now();
     info!("shutdown requested — stopping download engine");
     if let Some(ds) = &download_service {
         ds.shutdown();
@@ -210,10 +270,33 @@ fn wait_for_shutdown(
     info!("draining download worker queue");
     worker_pool.shutdown();
     info!("unmounting FUSE filesystem");
-    unmount_fuse(mountpoint);
+    if !unmount_fuse(mountpoint) {
+        error!("FUSE unmount failed; the mountpoint is left in an inconsistent state");
+        std::process::exit(1);
+    }
     info!("joining FUSE session");
-    bg.join();
-    info!("torrentfs unmounted successfully");
+    // The join gets only the shutdown budget left after the steps above, so
+    // the total teardown time is bounded.  Normal path: the unmount aborts the
+    // connection and the session thread exits immediately.  With an external
+    // bind mount holding the superblock alive it never exits — abandon it so
+    // the process can terminate (see SHUTDOWN_TIMEOUT).
+    let join_budget = SHUTDOWN_TIMEOUT.saturating_sub(shutdown_started.elapsed());
+    match wait_bounded(
+        || bg.guard.is_finished(),
+        join_budget,
+        Duration::from_millis(20),
+    ) {
+        JoinOutcome::Finished => {
+            bg.join();
+            info!("torrentfs unmounted successfully");
+        }
+        JoinOutcome::TimedOut => {
+            warn!(
+                "FUSE session thread did not exit within the {}s shutdown window; abandoning it so the process can exit",
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
+        }
+    }
 }
 
 fn main() {
@@ -392,5 +475,29 @@ fn main() {
             error!("Failed to mount filesystem: {}", error_msg);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_bounded_returns_finished_when_thread_exits() {
+        assert_eq!(
+            wait_bounded(|| true, Duration::from_secs(5), Duration::from_millis(1)),
+            JoinOutcome::Finished
+        );
+    }
+    #[test]
+    fn wait_bounded_returns_timed_out_when_thread_never_exits() {
+        assert_eq!(
+            wait_bounded(
+                || false,
+                Duration::from_millis(10),
+                Duration::from_millis(1)
+            ),
+            JoinOutcome::TimedOut
+        );
     }
 }
