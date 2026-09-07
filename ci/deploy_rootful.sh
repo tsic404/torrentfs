@@ -14,8 +14,8 @@ STATE_DIR="/var/lib/torrentfs"
 # The repo publishes per-arch tags (`main-amd64`, `main-arm64`) plus a merged
 # multi-arch `main`; plain `latest` is only emitted for v-tag pushes and does
 # not exist today. Pin an explicit pullable tag by default — override with
-# `--image` (e.g. `--image ghcr.io/tsip404/torrentfs:main-amd64`).
-IMAGE="ghcr.io/tsip404/torrentfs:main"
+# `--image` (e.g. `--image ghcr.io/tsic404/torrentfs:main-amd64`).
+IMAGE="ghcr.io/tsic404/torrentfs:main"
 NAME="torrentfs"
 DRY_RUN=0
 
@@ -40,7 +40,7 @@ Defaults:
   engine     first of podman/docker found on PATH (podman preferred)
   mountpoint /host/torrentfs (host-visible FUSE mount)
   state      /var/lib/torrentfs (persistent db + piece cache)
-  image      ghcr.io/tsip404/torrentfs:main
+  image      ghcr.io/tsic404/torrentfs:main
   name       torrentfs
 EOF
 }

@@ -65,7 +65,7 @@ This is expected libtorrent behavior, not a configuration error:
 
 ## Container Deployment
 
-torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility. Whether the FUSE filesystem is visible on the **host** (a bind-mounted host directory sees the mount created inside the container) depends on the container engine and its root/user namespace mode. The container always runs torrentfs correctly — the difference is whether the mount propagates out to the host.
+torrentfs ships a Docker image (`ghcr.io/tsic404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility. Whether the FUSE filesystem is visible on the **host** (a bind-mounted host directory sees the mount created inside the container) depends on the container engine and its root/user namespace mode. The container always runs torrentfs correctly — the difference is whether the mount propagates out to the host.
 
 ### FUSE visibility by container engine
 
@@ -89,7 +89,7 @@ docker run --rm \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
-  ghcr.io/tsip404/torrentfs
+  ghcr.io/tsic404/torrentfs
 ```
 
 On the host, prepare the shared mount first:
@@ -116,7 +116,7 @@ namespace with `--network host`:
 docker run --rm --network host \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-  ghcr.io/tsip404/torrentfs
+  ghcr.io/tsic404/torrentfs
 ```
 
 `--network host` is orthogonal to FUSE mount visibility: combine it with the
@@ -134,7 +134,7 @@ Rootless podman **does not support shared mount propagation** (`rshared`). This 
 podman run -d --name torrentfs \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-  ghcr.io/tsip404/torrentfs
+  ghcr.io/tsic404/torrentfs
 
 podman exec torrentfs ls /mnt/metadata/
 ```
@@ -163,15 +163,15 @@ setting, not an image property — so raise it at runtime:
 
 ```bash
 # podman
-podman run --stop-timeout 30 ... ghcr.io/tsip404/torrentfs
+podman run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs
 
 # docker
-docker run --stop-timeout 30 ... ghcr.io/tsip404/torrentfs
+docker run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs
 
 # compose (both engines)
 services:
   torrentfs:
-    image: ghcr.io/tsip404/torrentfs
+    image: ghcr.io/tsic404/torrentfs
     stop_grace_period: 30s
 
 # quadlet / systemd

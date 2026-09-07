@@ -35,7 +35,7 @@ docker run -d --name torrentfs-qa \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --mount type=bind,source=/tmp/torrentfs-qa-mnt,target=/mnt,bind-propagation=rshared \
-  ghcr.io/tsip404/torrentfs:main /mnt
+  ghcr.io/tsic404/torrentfs:main /mnt
 
 cat /tmp/torrentfs-qa-mnt/data/<torrent>/<file>   # host-side content read
 ```
@@ -49,7 +49,7 @@ with `podman exec`:
 podman run -d --name torrentfs-qa \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-  ghcr.io/tsip404/torrentfs:main /mnt
+  ghcr.io/tsic404/torrentfs:main /mnt
 
 podman exec torrentfs-qa ls /mnt/data/<torrent>/          # structure
 podman exec torrentfs-qa cat /mnt/data/<torrent>/<file>   # content
