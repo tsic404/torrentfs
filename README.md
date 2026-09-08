@@ -131,8 +131,9 @@ torrentfs and the host's self-seed seeder must not bind the same port.
 torrentfs listens on `0.0.0.0:6881` by default (the libtorrent default; see
 `[connections] listen_interfaces`), and the self-seed seeder
 (`ci/run_self_seed_env.sh`) is also a libtorrent session that defaults to the
-same `6881`. In separate network namespaces the two are independent; sharing
-one namespace makes both attempt `6881` and collide.
+same `6881`. With Docker's default `bridge` network the two live in separate
+network namespaces; `--network host` puts them in the same namespace and
+triggers the collision.
 
 Give torrentfs a distinct listen port via a TOML config file passed to
 `--config`:
