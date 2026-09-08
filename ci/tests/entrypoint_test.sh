@@ -24,6 +24,10 @@ FAIL=0
 # Extract everything before the main section marker.
 HELPERS_FILE="$(mktemp)"
 awk '/^# ── main/{exit} {print}' "$ENTRYPOINT" > "$HELPERS_FILE"
+# Also extract the start_torrentfs function (defined after the main marker) so
+# the integration test can exercise its exit-101 conflict paths without
+# running the real FUSE mount or dispatch functions.
+awk '/^start_torrentfs\(\) \{/{f=1} f{print} f && /^}/{exit}' "$ENTRYPOINT" >> "$HELPERS_FILE"
 trap 'rm -f "$HELPERS_FILE"' EXIT
 
 # Append a test-only override helper to the extracted functions so it is
@@ -32,14 +36,18 @@ trap 'rm -f "$HELPERS_FILE"' EXIT
 # printf logic.
 cat >> "$HELPERS_FILE" <<'EOF'
 
-# Write a fake mountinfo to a temp file and redefine is_bind_mount to read
-# from it instead of /proc/self/mountinfo.
+# Write a fake mountinfo to a temp file, point production mountpoint_has_fuse
+# at it via TORRENTFS_MOUNTINFO_PATH, and redefine is_bind_mount to read from
+# it instead of /proc/self/mountinfo.
 setup_mountinfo() {
     local content="$1"
     local tmpfile
     tmpfile="$(mktemp)"
     printf '%s\n' "$content" > "$tmpfile"
     MOUNTINFO_FAKE="$tmpfile"
+    # mountpoint_has_fuse reads its source from TORRENTFS_MOUNTINFO_PATH (the
+    # production function, not a redefined copy), so point it at the fixture.
+    export TORRENTFS_MOUNTINFO_PATH="$tmpfile"
     trap 'rm -f "$MOUNTINFO_FAKE"' EXIT
     is_bind_mount() {
         local target="$1"
@@ -142,6 +150,55 @@ run_test "is_bind_mount returns false for non-existent mountpoint" \
 
 run_test "is_bind_mount returns false for empty mountinfo" \
     'setup_mountinfo ""; if is_bind_mount /mnt; then exit 1; else exit 0; fi'
+
+# --- mountpoint_has_fuse ---
+# Detects a FUSE mount at the target. The filesystem type is the first field
+# after the "-" separator (0..N optional fields precede it), so fixtures vary
+# the optional-field count to prove fstype is not read from a fixed column.
+
+run_test "mountpoint_has_fuse true with 0 optional fields" \
+    'setup_mountinfo "36 35 98:0 /mnt-inner /mnt rw - fuse.torrentfs torrentfs rw"; if mountpoint_has_fuse /mnt; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_has_fuse true with 2 optional fields (shared master)" \
+    'setup_mountinfo "36 35 98:0 /mnt-inner /mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"; if mountpoint_has_fuse /mnt; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_has_fuse true when fstype is bare fuse" \
+    'setup_mountinfo "36 35 98:0 /mnt-inner /mnt rw shared:1 master:2 - fuse torrentfs rw"; if mountpoint_has_fuse /mnt; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_has_fuse false for non-fuse mount (ext4, 2 optional fields)" \
+    'setup_mountinfo "36 35 98:0 / /mnt rw shared:1 master:2 - ext4 /dev/sda1 rw"; if mountpoint_has_fuse /mnt; then exit 1; else exit 0; fi'
+
+run_test "mountpoint_has_fuse false for fuse mount at another target" \
+    'setup_mountinfo "36 35 98:0 /mnt-inner /mnt-inner rw shared:1 master:2 - fuse.torrentfs torrentfs rw"; if mountpoint_has_fuse /mnt; then exit 1; else exit 0; fi'
+
+run_test "mountpoint_has_fuse false for empty mountinfo" \
+    'setup_mountinfo ""; if mountpoint_has_fuse /mnt; then exit 1; else exit 0; fi'
+
+# --- start_torrentfs exit-101 integration ---
+# start_torrentfs must refuse (exit 101) when a FUSE mount already exists at
+# the mountpoint. recover_stale_mountpoint and flock are stubbed so the test
+# exercises the detection branch; the mountpoint is a throwaway temp dir and
+# the mountinfo source is injected via TORRENTFS_MOUNTINFO_PATH.
+
+run_test "start_torrentfs exits 101 on FUSE conflict" \
+    'mnt="$(mktemp -d)"
+export TORRENTFS_MOUNTINFO_PATH="$mnt/mountinfo"
+printf "%s\n" "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw" > "$TORRENTFS_MOUNTINFO_PATH"
+recover_stale_mountpoint() { return 0; }
+flock() { return 0; }
+rc=0
+( start_torrentfs "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 101'
+
+run_test "start_torrentfs exits 101 when mountpoint is locked" \
+    'mnt="$(mktemp -d)"
+recover_stale_mountpoint() { return 0; }
+flock() { return 1; }
+rc=0
+( start_torrentfs "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 101'
 
 # --- mountpoint_enotconn ---
 # setup_stat defines a fake `stat` function (a shell builtin here, so a PATH
