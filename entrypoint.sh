@@ -22,7 +22,7 @@ set -euo pipefail
 needs_fuse() {
     for arg in "$@"; do
         case "$arg" in
-            --help|-h|help|--version|-V)
+            --help|-h|help|--version|-V|--config-check)
                 return 1  # does NOT need FUSE
                 ;;
         esac
@@ -46,22 +46,100 @@ validate_config() {
     fi
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --config)
-            config_flag_next=1
-            ;;
-        --config=*)
-            validate_config "${arg#--config=}"
-            ;;
-        *)
-            if [ "${config_flag_next:-0}" -eq 1 ]; then
-                validate_config "$arg"
-                config_flag_next=0
+# ── argument parsing ──────────────────────────────────────────────────────
+# torrentfs's CLI is `torrentfs [OPTIONS] <mountpoint>` (clap): options may
+# precede or follow the single positional mountpoint. The entrypoint needs the
+# mountpoint separately (to mkdir/recover/probe it before mounting), so we parse
+# the command line once here — validating any --config files and separating the
+# mountpoint from the arguments forwarded to torrentfs. This makes
+# `--config <path> /mnt` and `/mnt --config <path>` equivalent.
+
+# First positional argument (the mountpoint); empty when none was given.
+mountpoint=""
+# Every argument except the mountpoint, forwarded to torrentfs in order.
+torrentfs_args=()
+
+parse_args() {
+    local arg expect_value="" options_ended=0
+    mountpoint=""
+    torrentfs_args=()
+
+    for arg in "$@"; do
+        if [ "$options_ended" -eq 1 ]; then
+            # After `--`, every remaining argument is positional.
+            if [ -z "$mountpoint" ]; then
+                mountpoint="$arg"
+            else
+                torrentfs_args+=("$arg")
             fi
+            continue
+        fi
+
+        if [ -n "$expect_value" ]; then
+            # Value of the preceding --config/--db/--cache option.
+            if [ "$expect_value" = "--config" ]; then
+                validate_config "$arg"
+            fi
+            torrentfs_args+=("$arg")
+            expect_value=""
+            continue
+        fi
+
+        case "$arg" in
+            --)
+                # End of options: everything after this is positional.
+                options_ended=1
+                ;;
+            --config=*)
+                validate_config "${arg#--config=}"
+                torrentfs_args+=("$arg")
+                ;;
+            --config|--db|--cache)
+                torrentfs_args+=("$arg")
+                expect_value="$arg"
+                ;;
+            --db=*|--cache=*)
+                torrentfs_args+=("$arg")
+                ;;
+            -*)
+                # Any other option is forwarded verbatim. Flags that bypass
+                # the FUSE mount (--help, --version, --config-check) are
+                # handled by needs_fuse before this forwarding is consumed.
+                torrentfs_args+=("$arg")
+                ;;
+            *)
+                if [ -z "$mountpoint" ]; then
+                    mountpoint="$arg"
+                else
+                    torrentfs_args+=("$arg")
+                fi
+                ;;
+        esac
+    done
+}
+
+parse_args "$@"
+
+# Reject a missing or unusable mountpoint with an actionable diagnostic (exit 2,
+# matching clap's usage-error code) before the FUSE device check runs, so the
+# specific error is not masked by the FUSE diagnostic (exit 100). Also refuses a
+# `-`-prefixed path: the downstream mkdir/stat/umount/mount commands — and
+# torrentfs itself — would parse such a name as an option rather than a path.
+validate_mountpoint() {
+    local mp="${1:-}"
+    if [ -z "$mp" ]; then
+        echo "[entrypoint] ERROR: no mount point specified" >&2
+        echo "[entrypoint] Usage: torrentfs [OPTIONS] <MOUNTPOINT>" >&2
+        exit 2
+    fi
+    case "$mp" in
+        -*)
+            echo "[entrypoint] ERROR: mount point '$mp' must not begin with '-'" >&2
+            echo "[entrypoint] Prefix with './' to use a literal '-'-prefixed name." >&2
+            exit 2
             ;;
     esac
-done
+}
 
 in_container() {
     # Heuristics: cgroup mount, /.dockerenv, /run/.containerenv (podman)
@@ -209,6 +287,8 @@ if ! needs_fuse "$@"; then
     echo "[entrypoint] skipping FUSE check for diagnostic command — starting torrentfs" >&2
     exec torrentfs "$@"
 fi
+
+validate_mountpoint "$mountpoint"
 
 if ! ensure_fuse_device; then
     cat >&2 <<'DIAG'
@@ -392,4 +472,5 @@ start_torrentfs_rootful() {
 }
 
 echo "[entrypoint] /dev/fuse is available" >&2
-start_torrentfs "$@"
+
+start_torrentfs "$mountpoint" "${torrentfs_args[@]}"

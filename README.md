@@ -152,6 +152,11 @@ docker run --rm --network host \
   ghcr.io/tsic404/torrentfs /mnt --config /torrentfs-config.toml
 ```
 
+`--config` may precede or follow the mountpoint — `ghcr.io/tsic404/torrentfs
+--config /torrentfs-config.toml /mnt` is equivalent to the form above. The
+entrypoint parses the command line and mounts on the first positional argument
+regardless of where `--config` appears.
+
 The seeder stays on `6881`; torrentfs moves to `6882`. The same applies to any
 other BitTorrent peer already bound to `6881` on the host — the collision is a
 property of the shared network namespace, not of the self-seed environment

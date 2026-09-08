@@ -63,6 +63,12 @@ setup_stat() {
         return "$STAT_FAKE_EXIT"
     }
 }
+
+# Stub out validate_config so parse_args tests can pass --config without
+# invoking the real torrentfs binary (unavailable in this test environment).
+# parse_args is only exercised for argument structure here; config validity
+# itself is covered by the Rust --config-check tests.
+validate_config() { :; }
 EOF
 
 # ── test harness ─────────────────────────────────────────────────────────────
@@ -107,11 +113,63 @@ run_test "needs_fuse --version does not need FUSE" \
 run_test "needs_fuse -V does not need FUSE" \
     'if needs_fuse -V; then exit 1; else exit 0; fi'
 
+run_test "needs_fuse --config-check does not need FUSE" \
+    'if needs_fuse --config-check; then exit 1; else exit 0; fi'
+
+run_test "needs_fuse --config-check --config /foo.toml does not need FUSE" \
+    'if needs_fuse --config-check --config /foo.toml; then exit 1; else exit 0; fi'
+
 run_test "needs_fuse /mnt needs FUSE" \
     'if needs_fuse /mnt; then exit 0; else exit 1; fi'
 
 run_test "needs_fuse --config /foo.toml /mnt needs FUSE" \
     'if needs_fuse --config /foo.toml /mnt; then exit 0; else exit 1; fi'
+
+# --- parse_args (mountpoint identification, TSI-2902) ---
+# parse_args splits the command line into $mountpoint (first positional) and
+# $torrentfs_args (everything else), validating --config values. It must skip
+# option values so the mountpoint may precede or follow --config/--db/--cache.
+
+run_test "parse_args /mnt sets mountpoint=/mnt" \
+    'parse_args /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args --config /foo.toml /mnt sets mountpoint=/mnt" \
+    'parse_args --config /foo.toml /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args /mnt --config /foo.toml sets mountpoint=/mnt" \
+    'parse_args /mnt --config /foo.toml; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args --config=/foo.toml /mnt sets mountpoint=/mnt" \
+    'parse_args --config=/foo.toml /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args --db /db/path /mnt sets mountpoint=/mnt" \
+    'parse_args --db /db/path /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args --cache /cache/dir /mnt sets mountpoint=/mnt" \
+    'parse_args --cache /cache/dir /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args forwards non-mountpoint args to torrentfs_args" \
+    'parse_args --config /foo.toml /mnt; [ "${#torrentfs_args[@]}" -eq 2 ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /foo.toml ]'
+
+run_test "parse_args -- /mnt sets mountpoint=/mnt" \
+    'parse_args -- /mnt; [ "$mountpoint" = /mnt ]'
+
+run_test "parse_args -- --mnt sets mountpoint=--mnt" \
+    'parse_args -- --mnt; [ "$mountpoint" = "--mnt" ]'
+
+# --- validate_mountpoint (mountpoint guard, TSI-2902) ---
+# validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
+# before the FUSE device check. The nested subshell captures the exit code so
+# `set -e` does not abort the test on the expected non-zero status.
+
+run_test "validate_mountpoint /mnt accepts a normal path" \
+    'validate_mountpoint /mnt'
+
+run_test "validate_mountpoint empty rejects with exit 2" \
+    'rc=0; ( validate_mountpoint "" ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
+
+run_test "validate_mountpoint --mnt rejects dash-prefixed with exit 2" \
+    'rc=0; ( validate_mountpoint --mnt ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
 
 # --- in_container (on a non-container test system, should return false) ---
 
