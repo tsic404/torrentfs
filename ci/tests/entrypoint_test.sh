@@ -161,6 +161,21 @@ run_test "mountpoint_enotconn false on ENOENT" \
 run_test "fuse_device_exists does not crash" \
     'fuse_device_exists 2>/dev/null || true; exit 0'
 
+# --- wait_for_fuse_mount ---
+# The helper polls `mountpoint` and watches torrentfs (via `kill -0` / `wait`).
+# Mock all three so the 30s deadline never actually elapses: `mountpoint`
+# controls readiness, `kill -0` controls liveness, `wait` supplies the exit
+# code. `kill`/`wait` are shell builtins here, so shell functions shadow them.
+
+run_test "wait_for_fuse_mount returns 0 when mount becomes ready" \
+    'mountpoint() { return 0; }; if wait_for_fuse_mount 99999 /mnt 2>/dev/null; then exit 0; else exit 1; fi'
+
+run_test "wait_for_fuse_mount propagates torrentfs exit code on premature exit" \
+    'mountpoint() { return 1; }; kill() { return 1; }; wait() { return 7; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 7 ]'
+
+run_test "wait_for_fuse_mount treats clean exit without mount as failure (rc 1)" \
+    'mountpoint() { return 1; }; kill() { return 1; }; wait() { return 0; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 echo ""

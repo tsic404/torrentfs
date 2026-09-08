@@ -194,6 +194,61 @@ RECOVERY
     return 0
 }
 
+# Wait up to 30s for torrentfs (pid $1) to publish its FUSE mount at $2.
+# Returns 0 once the mount is ready. On failure — torrentfs exiting before the
+# mount appeared, or the 30s deadline passing — prints an actionable diagnostic
+# and returns a non-zero exit code to propagate (torrentfs's own code when it
+# exited first, otherwise 1). Callers must `exit` with the returned code.
+wait_for_fuse_mount() {
+    local torrentfs_pid="$1" target="$2"
+
+    local ready=0 exited=0 i
+    for i in $(seq 1 60); do
+        if mountpoint -q "$target" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        # torrentfs died before the mount came up (e.g. fusermount3 was
+        # blocked from opening /dev/fuse by Docker's seccomp profile) — stop
+        # waiting so we surface its exit code instead of a bare timeout.
+        if ! kill -0 "$torrentfs_pid" 2>/dev/null; then
+            exited=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$ready" -eq 1 ]; then
+        return 0
+    fi
+
+    local rc=1
+    if [ "$exited" -eq 1 ]; then
+        # Reap torrentfs so its non-zero status is not lost; `wait` under
+        # `set -e` would otherwise swallow it.
+        wait "$torrentfs_pid" 2>/dev/null || rc=$?
+    else
+        # Still alive but the mount never appeared — stop it.
+        kill "$torrentfs_pid" 2>/dev/null || true
+        wait "$torrentfs_pid" 2>/dev/null || true
+    fi
+    # A clean (0) exit with no mount is still a crash from the container's view.
+    [ "$rc" -ne 0 ] || rc=1
+
+    if [ "$exited" -eq 1 ]; then
+        echo "[entrypoint] ERROR: torrentfs exited with code $rc before the FUSE mount became ready" >&2
+    else
+        echo "[entrypoint] ERROR: FUSE mount at $target did not become ready within 30s" >&2
+    fi
+    echo "[entrypoint]   The FUSE filesystem could not be mounted. Common causes:" >&2
+    echo "[entrypoint]     - missing --device /dev/fuse (or the fuse kernel module)" >&2
+    echo "[entrypoint]     - missing --cap-add SYS_ADMIN (required for the mount syscall)" >&2
+    echo "[entrypoint]     - Docker seccomp blocking /dev/fuse access even when the" >&2
+    echo "[entrypoint]       device node exists: add --security-opt seccomp=unconfined" >&2
+    echo "[entrypoint]       (or run --privileged)" >&2
+    return "$rc"
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 echo "[entrypoint] torrentfs container startup" >&2
@@ -316,21 +371,10 @@ start_torrentfs_rootless() {
     torrentfs "$mountpoint" "$@" &
     torrentfs_pid=$!
 
-    # Wait for FUSE mount to become ready (up to 30s)
-    local ready=0
-    for i in $(seq 1 60); do
-        if mountpoint -q "$mountpoint" 2>/dev/null; then
-            ready=1
-            break
-        fi
-        sleep 0.5
-    done
-
-    if [ "$ready" -eq 0 ]; then
-        echo "[entrypoint] FUSE mount did not become ready within 30s" >&2
-        kill "$torrentfs_pid" 2>/dev/null || true
-        wait "$torrentfs_pid" 2>/dev/null || true
-        exit 1
+    local mount_rc=0
+    wait_for_fuse_mount "$torrentfs_pid" "$mountpoint" || mount_rc=$?
+    if [ "$mount_rc" -ne 0 ]; then
+        exit "$mount_rc"
     fi
 
     echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
@@ -365,20 +409,10 @@ start_torrentfs_rootful() {
     torrentfs "$internal_mnt" "$@" &
     torrentfs_pid=$!
 
-    local ready=0
-    for i in $(seq 1 60); do
-        if mountpoint -q "$internal_mnt" 2>/dev/null; then
-            ready=1
-            break
-        fi
-        sleep 0.5
-    done
-
-    if [ "$ready" -eq 0 ]; then
-        echo "[entrypoint] FUSE mount did not become ready within 30s" >&2
-        kill "$torrentfs_pid" 2>/dev/null || true
-        wait "$torrentfs_pid" 2>/dev/null || true
-        exit 1
+    local mount_rc=0
+    wait_for_fuse_mount "$torrentfs_pid" "$internal_mnt" || mount_rc=$?
+    if [ "$mount_rc" -ne 0 ]; then
+        exit "$mount_rc"
     fi
 
     echo "[entrypoint] FUSE mount ready — publishing to $mountpoint" >&2
