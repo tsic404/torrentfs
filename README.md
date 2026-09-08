@@ -100,6 +100,22 @@ mount --bind /host/torrentfs /host/torrentfs
 mount --make-shared /host/torrentfs
 ```
 
+### One host directory per container
+
+The `rshared` recipe above shares a host directory across containers. Do not
+bind-mount the **same** host directory into two torrentfs containers: the
+second container's `mount --bind` stacks a second FUSE mount on top of the
+first and severs the first container's mount — both sides then report
+`ENOTCONN`. The entrypoint guards against this in two ways: it takes an
+exclusive `flock` on the mountpoint directory (the same inode across
+containers, so the lock is mutually exclusive and held for the container's
+lifetime), and it detects a FUSE mount already present at the mountpoint.
+Either conflict makes it refuse to start (exit `101`) instead of clobbering
+the other container's mount.
+
+Give each container its own host directory / mountpoint, or run a single
+container per host directory.
+
 ### Reaching host loopback services (`--network host`)
 
 The bundled self-seed QA environment (`ci/run_self_seed_env.sh`) runs its
@@ -222,6 +238,12 @@ crash) can still leave a stale mount. The entrypoint now probes the mountpoint
 for `ENOTCONN` at startup and, when it finds one, lazy-unmounts it
 (`umount -l`) and retries automatically — printing recovery steps only if the
 auto-recovery itself fails.
+
+`ENOTCONN` has a second cause: two containers sharing one host directory
+(see "One host directory per container" above). The entrypoint distinguishes
+the two — a live FUSE mount propagated in from another container is refused at
+startup (exit `101`), never lazily unmounted, because unmounting it would
+sever the *other* container's healthy mount.
 
 ## Filesystem Semantics
 

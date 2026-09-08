@@ -13,6 +13,12 @@
 #      directly on the container path. When the mountpoint is a bind mount
 #      (e.g. -v /host:/mnt:shared), an explicit warning is emitted that the
 #      ':shared' flag is ineffective and the host will not see the FUSE mount.
+#   6. Concurrent-mountpoint conflict handling: two containers sharing one
+#      host directory via rshared propagation would stack FUSE mounts and
+#      sever each other's mount (ENOTCONN). The entrypoint takes an exclusive
+#      flock on the mountpoint directory (same inode across containers) held
+#      for the container lifetime, then refuses to start if $mountpoint
+#      already carries a foreign FUSE mount.
 
 set -euo pipefail
 
@@ -327,6 +333,36 @@ wait_for_fuse_mount() {
     return "$rc"
 }
 
+# Detect whether $1 already has a FUSE mount stacked on it. Returns 0 when a
+# fuse-type entry exists at the target, 1 otherwise.
+#
+# Two containers sharing one host directory via rshared bind propagation can
+# stack FUSE mounts on top of each other: container2's `mount --bind` on its
+# /mnt propagates onto container1's /mnt, and the later mount severs the
+# earlier container's FUSE connection (ENOTCONN). Before this entrypoint
+# mounts anything, a fuse entry at $1 can only belong to another container —
+# so this probe doubles as the "another torrentfs already owns this
+# mountpoint" conflict detector. A plain bind mount (`-v host:/mnt`) is not a
+# FUSE mount and does not trip it.
+#
+# The mountinfo source is injectable via TORRENTFS_MOUNTINFO_PATH so tests can
+# exercise this production function directly against a fixture.
+mountpoint_has_fuse() {
+    local target="$1" mountinfo="${TORRENTFS_MOUNTINFO_PATH:-/proc/self/mountinfo}"
+    # Field 5 is the mount point. The filesystem type is the first field after
+    # the "-" separator: the optional-fields column (field 7) holds 0..N
+    # entries (`shared:X master:Y` on rshared propagation trees), so fstype is
+    # NOT a fixed column index and `$9` would miss a fuse mount.
+    awk -v mp="$target" '
+        $5 == mp {
+            for (i = 7; i < NF; i++) {
+                if ($i == "-" && $(i + 1) ~ /^fuse/) { found = 1; exit }
+            }
+        }
+        END { exit !found }
+    ' "$mountinfo" 2>/dev/null
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 echo "[entrypoint] torrentfs container startup" >&2
@@ -407,6 +443,37 @@ start_torrentfs() {
     # mounting so a restart self-heals.
     if ! recover_stale_mountpoint "$mountpoint"; then
         exit 100
+    fi
+
+    # Serialize mount ownership across containers. The lock is taken on the
+    # mountpoint directory itself: two containers bind-mounting the same host
+    # directory resolve it to the same inode, so flock on that inode gives
+    # cross-container mutual exclusion. Held for the container's lifetime (fd 9
+    # stays open), it closes the check-then-mount TOCTOU window for
+    # simultaneous starts — exactly one container proceeds to mount.
+    mkdir -p "$mountpoint"
+    exec 9<"$mountpoint"
+    if ! flock -n 9; then
+        echo "[entrypoint] ERROR: $mountpoint is locked by another running torrentfs" >&2
+        echo "[entrypoint]   container. One host directory supports a single torrentfs" >&2
+        echo "[entrypoint]   container — stop the other one before starting this one." >&2
+        exit 101
+    fi
+
+    # A live FUSE mount already on $mountpoint means another torrentfs
+    # container propagated its mount here (rshared shared host directory).
+    # Stacking a second FUSE mount would sever the other container's mount —
+    # ENOTCONN on both sides — so refuse instead of clobbering it.
+    if mountpoint_has_fuse "$mountpoint"; then
+        echo "[entrypoint] ERROR: $mountpoint is already a FUSE mount owned by another" >&2
+        echo "[entrypoint]   running torrentfs instance." >&2
+        echo "[entrypoint]   Two containers bind-mounted the same host directory with" >&2
+        echo "[entrypoint]   rshared propagation; stacking a second FUSE mount here would" >&2
+        echo "[entrypoint]   sever the first container's mount (ENOTCONN)." >&2
+        echo "[entrypoint]   One host directory supports a single torrentfs container." >&2
+        echo "[entrypoint]   Fix: stop the other container, or give this container a" >&2
+        echo "[entrypoint]   different host directory / mountpoint." >&2
+        exit 101
     fi
 
     if is_rootless_podman; then
