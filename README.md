@@ -254,6 +254,20 @@ line is the one starting with the `Pieces:` label. Machine parsers should key
 on `Pieces:` rather than the `Pieces (` literal in the header, and read piece
 dimensions from the `PieceSize:` / `PieceCount:` key-value lines instead of
 regex-parsing the prose header.
+Each bracketed token in the `Pieces:` marker line is one piece's state,
+rendered back-to-back with no separator by `piece_marker()`
+(`src/fuse/stats.rs`):
+
+| Marker | Meaning |
+|--------|---------|
+| `[x]` | cached but never accessed (`hit_count == 0`) |
+| `[X n]` | cached and accessed `n` times (`hit_count > 0`) |
+| `[N]` | wanted for download but not cached yet (`!is_cached && priority > 0`) |
+| `[]` | not wanted and not cached (`!is_cached && priority == 0`) |
+
+Here *cached* means the piece is present in the disk cache
+(`PieceStatus::is_cached`), *wanted* means a reader has requested it
+(`PieceStatus::priority > 0`), and the access count is `PieceStatus::hit_count`.
 
 Source: `src/fuse/stats.rs` — `piece_block()`.
 

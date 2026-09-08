@@ -315,7 +315,10 @@ fn status_to_english(status: &TorrentStatus) -> &'static str {
 }
 
 /// Render the piece marker per the `.stats` spec:
-/// `[x]` downloaded, `[]` not wanted, `[N]` priority N, `[X n]` downloaded with n accesses.
+/// `[x]` cached but never accessed (`hit_count == 0`),
+/// `[X n]` cached and accessed `n` times (`hit_count > 0`),
+/// `[N]` wanted but not cached (`!is_cached && priority > 0`),
+/// `[]` not wanted and not cached (`!is_cached && priority == 0`).
 fn piece_marker(status: &PieceStatus) -> String {
     if status.is_cached {
         if status.hit_count > 0 {
