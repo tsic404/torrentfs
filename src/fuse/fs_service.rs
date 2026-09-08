@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use fuser::Notifier;
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use sha1_smol::Sha1;
 
@@ -1764,7 +1764,7 @@ impl FsService {
                 Ok(false) => {
                     self.metrics.l2_miss();
                     self.metrics.deferred_read();
-                    info!(
+                    debug!(
                         "Deferring read for torrent file (torrent_id={}, file_id={}): \
                          pieces not on disk, blocking in worker thread",
                         torrent_id, file_id
