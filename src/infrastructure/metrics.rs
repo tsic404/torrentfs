@@ -155,10 +155,18 @@ impl Metrics {
     /// previously wrapped the u64 gauge and surfaced as a huge value in
     /// `.stats`. Clamp at zero instead.
     pub fn pending_reads_dec(&self) {
+        self.pending_reads_dec_n(1);
+    }
+
+    /// Record removal of `n` pending reads (FUSE deferred-read tickets) at
+    /// once.  Used when a coalesced read group fans out its result to `n`
+    /// waiters (TSI-2896).  Saturating: a double-resolution race can decrement
+    /// past zero; clamp at zero instead of wrapping the u64 gauge.
+    pub fn pending_reads_dec_n(&self, n: usize) {
         let _ =
             self.pending_reads_current
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(1))
+                    Some(cur.saturating_sub(n as u64))
                 });
     }
 
