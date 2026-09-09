@@ -47,7 +47,7 @@ pub enum FsError {
     NameTooLong,
 
     // ── data integrity ──
-    #[error("corrupt torrent: {0}")]
+    #[error("Invalid .torrent file: {0}")]
     CorruptTorrent(String),
     #[error("corrupt piece: {0}")]
     CorruptPiece(String),
@@ -136,6 +136,17 @@ mod tests {
     fn torrent_error_parse_maps_to_corrupt_torrent() {
         let e: FsError = TorrentError::ParseError("bad bencode".to_string()).into();
         assert!(matches!(e, FsError::CorruptTorrent(_)));
+    }
+
+    /// TSI-2923: the user-facing message names the file type and the cause,
+    /// so an invalid seed is distinguishable from a generic I/O error.
+    #[test]
+    fn corrupt_torrent_display_names_file_and_reason() {
+        let e = FsError::CorruptTorrent("expected value in bencoded string".to_string());
+        assert_eq!(
+            e.to_string(),
+            "Invalid .torrent file: expected value in bencoded string"
+        );
     }
 
     #[test]
