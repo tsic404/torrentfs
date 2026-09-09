@@ -353,7 +353,11 @@ wait_for_fuse_mount() {
 
     local ready=0 exited=0 i
     for i in $(seq 1 60); do
-        if mountpoint -q "$target" 2>/dev/null; then
+        # `mountpoint -q` reports any mountpoint as mounted, so a bind mount at
+        # $target (e.g. -v /host:/mnt) would make it succeed before torrentfs
+        # has published its FUSE filesystem. Probe mountinfo for a fuse-type
+        # entry instead, so readiness means the FUSE mount itself is up.
+        if mountpoint_has_fuse "$target"; then
             ready=1
             break
         fi
@@ -410,18 +414,43 @@ wait_for_fuse_mount() {
 # mountpoint" conflict detector. A plain bind mount (`-v host:/mnt`) is not a
 # FUSE mount and does not trip it.
 #
+# The target is canonicalized before comparison because mountinfo records the
+# kernel-normalized mount point (symlinks resolved, `.`/`..` merged, trailing
+# `/` dropped) — the raw CLI path would never match for relative, symlink, or
+# non-canonical inputs.
+#
 # The mountinfo source is injectable via TORRENTFS_MOUNTINFO_PATH so tests can
 # exercise this production function directly against a fixture.
 mountpoint_has_fuse() {
     local target="$1" mountinfo="${TORRENTFS_MOUNTINFO_PATH:-/proc/self/mountinfo}"
+    # Canonicalize to the kernel's representation. The mountpoint exists by the
+    # time we probe (mkdir -p ran first); if it can't be resolved, report "no
+    # FUSE mount" rather than risk a false ready.
+    target="$(readlink -f "$target" 2>/dev/null)" || return 1
     # Field 5 is the mount point. The filesystem type is the first field after
     # the "-" separator: the optional-fields column (field 7) holds 0..N
     # entries (`shared:X master:Y` on rshared propagation trees), so fstype is
     # NOT a fixed column index and `$9` would miss a fuse mount.
-    awk -v mp="$target" '
-        $5 == mp {
-            for (i = 7; i < NF; i++) {
-                if ($i == "-" && $(i + 1) ~ /^fuse/) { found = 1; exit }
+    #
+    # Field 5 octal-escapes space/tab/newline/backslash (`\040`/`\011`/`\012`/
+    # `\134`); decode before comparing against the canonical target. Backslash
+    # is decoded last so an escaped backslash (`\134`) isn't re-read as the
+    # start of another escape sequence (`\134012` must stay backslash+"012").
+    # The canonical target is passed via the environment (ENVIRON) rather than
+    # `awk -v`, which would interpret backslash escapes in the value and mangle
+    # a mountpoint whose path contains a literal backslash.
+    TORRENTFS_TARGET="$target" awk '
+        BEGIN { mp = ENVIRON["TORRENTFS_TARGET"] }
+        {
+            p = $5
+            gsub(/\\040/, " ", p)
+            gsub(/\\011/, "\t", p)
+            gsub(/\\012/, "\n", p)
+            gsub(/\\134/, "\\", p)
+            if (p == mp) {
+                for (i = 7; i < NF; i++) {
+                    if ($i == "-" && $(i + 1) ~ /^fuse/) { found = 1; exit }
+                }
             }
         }
         END { exit !found }
