@@ -64,11 +64,17 @@ validate_config() {
 mountpoint=""
 # Every argument except the mountpoint, forwarded to torrentfs in order.
 torrentfs_args=()
+# --cache / --db values, captured so the state-ownership fix can cover custom
+# state volumes in addition to the default XDG directory.
+cache_arg=""
+db_arg=""
 
 parse_args() {
     local arg expect_value="" options_ended=0
     mountpoint=""
     torrentfs_args=()
+    cache_arg=""
+    db_arg=""
 
     for arg in "$@"; do
         if [ "$options_ended" -eq 1 ]; then
@@ -83,9 +89,11 @@ parse_args() {
 
         if [ -n "$expect_value" ]; then
             # Value of the preceding --config/--db/--cache option.
-            if [ "$expect_value" = "--config" ]; then
-                validate_config "$arg"
-            fi
+            case "$expect_value" in
+                --config) validate_config "$arg" ;;
+                --db) db_arg="$arg" ;;
+                --cache) cache_arg="$arg" ;;
+            esac
             torrentfs_args+=("$arg")
             expect_value=""
             continue
@@ -104,7 +112,12 @@ parse_args() {
                 torrentfs_args+=("$arg")
                 expect_value="$arg"
                 ;;
-            --db=*|--cache=*)
+            --db=*)
+                db_arg="${arg#--db=}"
+                torrentfs_args+=("$arg")
+                ;;
+            --cache=*)
+                cache_arg="${arg#--cache=}"
                 torrentfs_args+=("$arg")
                 ;;
             -*)
@@ -210,6 +223,58 @@ ensure_fuse_device() {
 
     return 1
 }
+
+# torrentfs persists its piece cache and SQLite DB under the XDG data
+# directory ($XDG_DATA_HOME or ~/.local/share), or under --cache / --db when
+# those overrides are given.  A previous container run — e.g. an older image
+# that ran as a non-root user — can leave that tree owned by a different UID
+# (nobody:nogroup).  The current user then cannot write the DB (SQLite
+# ReadOnly) or the cache metadata, which silently disables the download
+# engine so every data read returns EIO.  Re-home the tree to the current
+# user before starting so a reused state volume is always writable.
+
+# Re-home one path to the current user.  Recurses only when the path's
+# ownership differs from the current user, so a matching tree is left
+# untouched — a GB-scale piece cache is not walked on every cold start, and a
+# correctly-owned host bind mount is never recursively re-chowned.  Skipped
+# when the path does not exist yet: torrentfs creates it fresh with the
+# correct ownership.
+rehome_ownership() {
+    local target="$1" uid gid
+    [ -e "$target" ] || return 0
+    uid="$(id -u)"; gid="$(id -g)"
+    [ "$(stat -c '%u:%g' "$target" 2>/dev/null)" = "$uid:$gid" ] && return 0
+    if ! chown -R "$uid:$gid" "$target" 2>/dev/null; then
+        echo "[entrypoint] WARNING: could not chown $target to $uid:$gid" >&2
+    fi
+}
+
+fix_state_dir_ownership() {
+    # Only root can re-home a foreign-owned tree; non-root runs (bare metal)
+    # cannot chown and should not try.
+    if ! is_root; then
+        return 0
+    fi
+
+    rehome_ownership "${XDG_DATA_HOME:-$HOME/.local/share}/torrentfs"
+
+    if [ -n "${cache_arg:-}" ]; then
+        rehome_ownership "$cache_arg"
+    fi
+    if [ -n "${db_arg:-}" ]; then
+        # --db names the SQLite file; SQLite writes its -wal / -shm sidecars
+        # into the file's parent directory, so re-home that too (never `.` or
+        # `/`, which a bare filename or root path would produce).
+        local db_dir
+        db_dir="$(dirname "$db_arg")"
+        case "$db_dir" in
+            .|/|'') : ;;
+            *) rehome_ownership "$db_dir" ;;
+        esac
+        rehome_ownership "$db_arg"
+    fi
+}
+
 
 # Try a metadata-only stat on $1 and report whether it fails with ENOTCONN.
 # Used to detect a stale FUSE mount left behind by a previous container run
@@ -573,5 +638,7 @@ start_torrentfs_rootful() {
 }
 
 echo "[entrypoint] /dev/fuse is available" >&2
+
+fix_state_dir_ownership
 
 start_torrentfs "$mountpoint" "${torrentfs_args[@]}"

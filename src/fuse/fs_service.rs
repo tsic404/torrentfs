@@ -160,10 +160,24 @@ impl FsService {
             }
         }
         let metrics = Arc::new(Metrics::new());
-        let download_service =
-            DownloadService::new_with_metrics(cache_path.as_path(), config, metrics.clone())
-                .ok()
-                .map(Arc::new);
+        let download_service = match DownloadService::new_with_metrics(
+            cache_path.as_path(),
+            config,
+            metrics.clone(),
+        ) {
+            Ok(ds) => Some(Arc::new(ds)),
+            Err(e) => {
+                error!(
+                    "Failed to initialize download engine (piece cache {:?}): {:?}. \
+                         File content reads and seeding will be unavailable. \
+                         Ensure the cache directory is writable by the current user — \
+                         a state directory left over from a previous container run \
+                         under a different user is the usual cause.",
+                    cache_path, e
+                );
+                None
+            }
+        };
 
         // Create the SeedingManager and register it as the CacheManager
         // eviction callback.  The Arc is kept on FsService so it can be
@@ -2279,6 +2293,27 @@ mod tests {
         assert_eq!(split_piece_key("abc:piece:x"), None);
         assert_eq!(split_piece_key("abc"), None);
         assert_eq!(split_piece_key(""), None);
+    }
+
+    /// TSI-2933 P0: an unwritable cache directory must leave the download
+    /// engine unset (`download_service == None`) instead of crashing or
+    /// silently mounting a filesystem that can only browse metadata.  `main`
+    /// turns this `None` into a fatal exit before mounting, so the behavior
+    /// is observable here at the construction-failure path.
+    #[test]
+    fn unwritable_cache_dir_yields_no_download_service() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // A regular file where the cache directory component should be: the
+        // engine's `create_dir_all(<cache>/pieces)` fails with ENOTDIR, so the
+        // download service is left unset.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").expect("write blocker");
+
+        let svc = FsService::new_with_cache_path(blocker, &TorrentfsConfig::default_config());
+        assert!(
+            svc.download_service.is_none(),
+            "unwritable cache dir must leave download_service unset"
+        );
     }
 
     /// TSI-2228: Bare service without any torrents — sufficient for testing

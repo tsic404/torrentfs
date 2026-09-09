@@ -156,6 +156,18 @@ run_test "parse_args --db /db/path /mnt sets mountpoint=/mnt" \
 run_test "parse_args --cache /cache/dir /mnt sets mountpoint=/mnt" \
     'parse_args --cache /cache/dir /mnt; [ "$mountpoint" = /mnt ]'
 
+run_test "parse_args --db /db/path captures db_arg" \
+    'parse_args --db /db/path /mnt; [ "$db_arg" = /db/path ]'
+
+run_test "parse_args --cache /cache/dir captures cache_arg" \
+    'parse_args --cache /cache/dir /mnt; [ "$cache_arg" = /cache/dir ]'
+
+run_test "parse_args --db=/db/path captures db_arg inline" \
+    'parse_args --db=/db/path /mnt; [ "$db_arg" = /db/path ]'
+
+run_test "parse_args --cache=/cache/dir captures cache_arg inline" \
+    'parse_args --cache=/cache/dir /mnt; [ "$cache_arg" = /cache/dir ]'
+
 run_test "parse_args forwards non-mountpoint args to torrentfs_args" \
     'parse_args --config /foo.toml /mnt; [ "${#torrentfs_args[@]}" -eq 2 ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /foo.toml ]'
 
@@ -275,6 +287,99 @@ run_test "mountpoint_enotconn false on ENOENT" \
 
 run_test "fuse_device_exists does not crash" \
     'fuse_device_exists 2>/dev/null || true; exit 0'
+
+# --- fix_state_dir_ownership ---
+# Re-homes the torrentfs state tree (default XDG dir, plus any --cache/--db
+# overrides) to the current user when a previous (possibly non-root) container
+# run left it owned by a different UID.  The function is exercised against a
+# throwaway XDG_DATA_HOME; is_root, id, stat, and chown are stubbed so no real
+# uid/chown runs on the test host.
+
+run_test "fix_state_dir_ownership skips when not root" \
+    'is_root() { return 1; }
+called=""
+chown() { called="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ -z "$called" ]'
+
+run_test "fix_state_dir_ownership skips when state dir is missing" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+called=""
+chown() { called="$*"; }
+data_home="$(mktemp -d)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ -z "$called" ]'
+
+run_test "fix_state_dir_ownership chowns existing state dir when ownership mismatches" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+stat() { echo "1:1"; }
+chown_args=""
+chown() { chown_args="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ]'
+
+run_test "fix_state_dir_ownership skips chown when ownership already matches" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+stat() { echo "0:0"; }
+called=""
+chown() { called="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ -z "$called" ]'
+
+run_test "fix_state_dir_ownership respects XDG_DATA_HOME default via HOME" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+stat() { echo "1:1"; }
+chown_args=""
+chown() { chown_args="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/.local/share/torrentfs"
+unset XDG_DATA_HOME
+HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ "$chown_args" = "-R 0:0 $data_home/.local/share/torrentfs" ]'
+
+run_test "fix_state_dir_ownership chowns custom --cache and --db paths" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+stat() { echo "1:1"; }
+chown_calls=""
+chown() { chown_calls="$chown_calls|$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/cache" "$data_home/db"
+touch "$data_home/db/metadata.db"
+cache_arg="$data_home/cache"
+db_arg="$data_home/db/metadata.db"
+XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
+rm -rf "$data_home"
+echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/cache"
+echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/db"
+echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/db/metadata.db"'
+
+run_test "fix_state_dir_ownership does not chown cwd for a bare --db filename" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+stat() { echo "1:1"; }
+called=""
+chown() { called="$*"; }
+data_home="$(mktemp -d)"
+db_arg="metadata.db"
+XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
+rm -rf "$data_home"
+[ -z "$called" ]'
 
 # --- wait_for_fuse_mount ---
 # The helper polls `mountpoint` and watches torrentfs (via `kill -0` / `wait`).

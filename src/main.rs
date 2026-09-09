@@ -444,6 +444,22 @@ fn main() {
     let download_service = fs.download_service().cloned();
     let notifier = fs.notifier_handle();
 
+    // The download engine is essential: without it every data read returns
+    // EIO and no torrent can be seeded. `None` here means initialization
+    // failed (e.g. the cache directory is owned by a different user left over
+    // from a previous container run). Fail loudly instead of mounting a
+    // filesystem that can only browse metadata.
+    if download_service.is_none() {
+        error!(
+            "Download engine failed to initialize (cache dir {:?}). torrentfs \
+             cannot download or seed file content. Ensure the cache directory \
+             is writable by the current user — a state directory left over from \
+             a previous container run under a different user is the usual cause.",
+            cache_path
+        );
+        std::process::exit(1);
+    }
+
     match fuser::spawn_mount2(fs, &mountpoint, &options) {
         Ok(bg) => {
             // TSI-2454: wire the kernel cache invalidation channel so
