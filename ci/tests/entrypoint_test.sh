@@ -291,8 +291,10 @@ run_test "fuse_device_exists does not crash" \
 # --- fix_state_dir_ownership ---
 # Re-homes the torrentfs state tree (default XDG dir, plus any --cache/--db
 # overrides) to the current user when a previous (possibly non-root) container
-# run left it owned by a different UID.  The function is exercised against a
-# throwaway XDG_DATA_HOME; is_root, id, stat, and chown are stubbed so no real
+# run left any part of it owned by a different UID.  `rehome_ownership` probes
+# ownership *recursively* via `find`, so a correct top-level directory with a
+# leftover nobody:nogroup file underneath still triggers the chown.  is_root,
+# id, find, and chown are stubbed (except the one real-`find` test) so no real
 # uid/chown runs on the test host.
 
 run_test "fix_state_dir_ownership skips when not root" \
@@ -315,10 +317,10 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
-run_test "fix_state_dir_ownership chowns existing state dir when ownership mismatches" \
+run_test "fix_state_dir_ownership chowns when find detects a mismatch" \
     'is_root() { return 0; }
 id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
-stat() { echo "1:1"; }
+find() { echo "/mismatch"; }
 chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
@@ -327,10 +329,10 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ "$chown_args" = "-R 0:0 $data_home/torrentfs" ]'
 
-run_test "fix_state_dir_ownership skips chown when ownership already matches" \
+run_test "fix_state_dir_ownership skips chown when find detects no mismatch" \
     'is_root() { return 0; }
 id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
-stat() { echo "0:0"; }
+find() { :; }
 called=""
 chown() { called="$*"; }
 data_home="$(mktemp -d)"
@@ -339,10 +341,45 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
+run_test "fix_state_dir_ownership chowns when find probe fails (non-zero, empty)" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+find() { return 1; }
+chown_args=""
+chown() { chown_args="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ]'
+
+run_test "fix_state_dir_ownership detects nested ownership mismatch via real find" \
+    'is_root() { return 0; }
+id() { case "$1" in -u) echo 12345 ;; -g) echo 12345 ;; esac; }
+chown_args=""
+chown() { chown_args="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs/sub"
+touch "$data_home/torrentfs/sub/cache_metadata.txt"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ "$chown_args" = "-R 12345:12345 $data_home/torrentfs" ]'
+
+run_test "fix_state_dir_ownership skips chown on a consistent tree (real find)" \
+    'is_root() { return 0; }
+called=""
+chown() { called="$*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs/sub"
+touch "$data_home/torrentfs/sub/cache_metadata.txt"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+rm -rf "$data_home"
+[ -z "$called" ]'
+
 run_test "fix_state_dir_ownership respects XDG_DATA_HOME default via HOME" \
     'is_root() { return 0; }
 id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
-stat() { echo "1:1"; }
+find() { echo "/mismatch"; }
 chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
@@ -355,7 +392,7 @@ rm -rf "$data_home"
 run_test "fix_state_dir_ownership chowns custom --cache and --db paths" \
     'is_root() { return 0; }
 id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
-stat() { echo "1:1"; }
+find() { echo "/mismatch"; }
 chown_calls=""
 chown() { chown_calls="$chown_calls|$*"; }
 data_home="$(mktemp -d)"
@@ -372,7 +409,7 @@ echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/db/metadata.db"'
 run_test "fix_state_dir_ownership does not chown cwd for a bare --db filename" \
     'is_root() { return 0; }
 id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
-stat() { echo "1:1"; }
+find() { echo "/mismatch"; }
 called=""
 chown() { called="$*"; }
 data_home="$(mktemp -d)"
