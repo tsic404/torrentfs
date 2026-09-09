@@ -325,6 +325,28 @@ Rationale: a `.torrent` file is the durable handle to a downloaded swarm; a sile
 
 Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists` (`EEXIST`) when the destination name already resolves to a different inode.
 
+### `dd skip` past EOF
+
+Reading at or beyond the end of a `data/` file returns 0 bytes (EOF), not an error — an out-of-bounds `read` is served as an empty result, exactly like a regular file. Source: `src/fuse/fs_service.rs` — `read()` returns `ReadOutcome::Ready(Vec::new())` when `offset >= file_size`.
+
+GNU `dd` therefore behaves against a torrentfs file exactly as it does against any non-empty seekable file whose size is smaller than the skip offset:
+
+```console
+$ dd if=/mnt/torrentfs/data/<name>/file skip=999999999 count=1
+dd: /mnt/torrentfs/data/<name>/file: cannot skip to specified offset
+0+0 records in
+0+0 records out
+0 bytes copied, 0.000… s, 0.0 kB/s
+```
+
+The `cannot skip to specified offset` line is a GNU coreutils/Linux `dd` behavior (POSIX does not mandate the diagnostic wording) for a `skip` that reaches past EOF: it is emitted only when `fstat()` reports a non-empty `st_size` smaller than the requested skip offset. It is **not** an error from torrentfs:
+
+- The `lseek` succeeds — the kernel serves it through the generic file-offset path once the FUSE `lseek` operation is reported as unsupported.
+- The subsequent `read` returns 0 bytes (EOF), as above.
+- `dd` exits 0.
+
+The same command against a non-empty regular file on any Linux filesystem prints the identical message and exits 0; against a zero-byte file `dd` prints only `0+0 records` and exits 0, no diagnostic. Suppressing the warning from the filesystem side would require misreporting the file's `st_size` (or its type) to `fstat()`, which would break legitimate size queries — so torrentfs leaves the warning intact as the correct, informative signal that the requested skip exceeded the file.
+
 ### `.stats` Pieces block
 
 Per-torrent `.stats` renders the piece lifecycle as a header line, a labelled marker line, and structured piece-metadata lines:
