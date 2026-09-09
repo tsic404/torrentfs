@@ -2,6 +2,181 @@
 
 A FUSE-based virtual filesystem for BitTorrent management. Mount `.torrent` files, browse their structure, and read file contents on-demand via the BitTorrent network.
 
+Copy a `.torrent` file into the filesystem and torrentfs generates the corresponding data directory automatically; you browse the seed's structure as a normal directory tree and read any file — pieces are fetched from the swarm only when you read them, then cached and re-seeded.
+
+## Features
+
+- **Drop-in `.torrent` ingestion** — copy a `.torrent` file into the `metadata/` directory; torrentfs parses it and exposes its file tree under `data/` automatically.
+- **On-demand reads** — file contents are downloaded from the BitTorrent network only when read, with piece priority boosted for the active read.
+- **Automatic caching** — downloaded pieces are cached in memory and on disk (LRU), so repeated reads skip the network.
+- **Automatic seeding** — cached/downloaded pieces are re-seeded back to the swarm.
+- **Persistent metadata** — torrent metadata and directory structure are stored in SQLite and survive restarts.
+- **Virtual statistics** — a `.stats` file at the root, per directory, and per torrent reports piece lifecycle, cache hit rates, and session status.
+- **TOML configuration** — proxy, DHT, rate limits, tracker, encryption, and ~15 other sections; every key is optional and falls back to libtorrent defaults.
+- **Docker image** — `ghcr.io/tsic404/torrentfs` with an entrypoint that handles FUSE device setup and mount visibility (rootful/rootless).
+
+## Installation
+
+### Build from source
+
+Requirements:
+
+- Rust toolchain (stable)
+- `libtorrent-rasterbar` 2.1.x with pkg-config metadata
+- `openssl` development files
+- `libfuse` development files
+- `clang` / `libclang` (for FFI bindings)
+- A C++17 compiler (`gcc` or `clang`)
+
+Build the binary:
+
+```bash
+cargo build --release
+# binary at target/release/torrentfs
+```
+
+Or install to your cargo bin path:
+
+```bash
+cargo install --path .
+```
+
+The FFI crate (`libtorrent-sys`) probes `libtorrent-rasterbar` and `openssl` via pkg-config and compiles the C++ wrapper against the ABI definitions the installed libtorrent was built with. See `Dockerfile` for the exact dependency set used in the shipped image.
+
+### Docker image
+
+```bash
+docker pull ghcr.io/tsic404/torrentfs
+```
+
+The image builds libtorrent from source (statically, `-fno-gnu-unique`) and includes the entrypoint that configures FUSE and mount visibility. See [Container Deployment](#container-deployment).
+
+## Quick Start
+
+### Local
+
+The steps below run the binary built in [Installation](#installation) as `./target/release/torrentfs`. If you ran `cargo install --path .`, the bare `torrentfs` name is on your `PATH` and can be used instead.
+
+1. Ensure `/dev/fuse` exists and the FUSE kernel module is loaded:
+
+   ```bash
+   modprobe fuse
+   ls -l /dev/fuse
+   ```
+
+2. Enable `allow_other` for non-root users (torrentfs mounts with `allow_other`; without this line a non-root mount fails with `Operation not permitted`):
+
+   ```bash
+   sudo ./ci/enable_fuse_allow_other.sh
+   ```
+
+3. Mount:
+
+   ```bash
+   mkdir -p /mnt/torrentfs
+   ./target/release/torrentfs /mnt/torrentfs
+   ```
+
+4. Copy a `.torrent` in and read its contents:
+
+   ```bash
+   cp ubuntu-24.04.iso.torrent /mnt/torrentfs/metadata/
+   ls /mnt/torrentfs/data/
+   cat /mnt/torrentfs/data/<name>/README
+   ```
+
+### Docker (rootful, host-visible mount)
+
+Prepare a shared host mount, then run with `rshared` bind propagation:
+
+```bash
+mkdir -p /host/torrentfs
+mount --bind /host/torrentfs /host/torrentfs
+mount --make-shared /host/torrentfs
+
+docker run --rm \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  ghcr.io/tsic404/torrentfs
+```
+
+The filesystem is then visible on the host at `/host/torrentfs`. For podman and rootless variants, see [Container Deployment](#container-deployment).
+
+## Usage
+
+### Adding a torrent
+
+Copy a `.torrent` file into the `metadata/` directory (any subdirectory works; each `.torrent` generates a matching tree under `data/`):
+
+```bash
+cp some.iso.torrent /mnt/torrentfs/metadata/
+```
+
+torrentfs parses the torrent on `release` (file close) and creates the data directory in the background — the `data/` mirror is populated within a fraction of a second.
+
+### Browsing and reading
+
+```bash
+ls /mnt/torrentfs/data/
+ls /mnt/torrentfs/data/<torrent-name>/
+cat /mnt/torrentfs/data/<torrent-name>/path/to/file
+```
+
+The `data/` tree is read-only (`EROFS` for writes); `metadata/` holds your `.torrent` files. Read progress and piece state are visible in the virtual `.stats` files.
+
+### Statistics
+
+- `/mnt/torrentfs/.stats` — global session overview.
+- `/mnt/torrentfs/data/.stats` and per-torrent/per-directory `.stats` — piece lifecycle and cache metrics for that subtree.
+
+See [`.stats` Pieces block](#stats-pieces-block) for the marker semantics.
+
+### Configuration
+
+Pass a TOML file with `--config`:
+
+```bash
+./target/release/torrentfs /mnt/torrentfs --config torrentfs-config.toml
+```
+
+Every key is optional; missing keys use libtorrent defaults. Example:
+
+```toml
+# torrentfs-config.toml
+[connections]
+listen_interfaces = "0.0.0.0:6881"
+
+[proxy]
+host = "127.0.0.1"
+port = 1080
+type = "socks5"
+```
+
+Validate a config without mounting:
+
+```bash
+./target/release/torrentfs --config torrentfs-config.toml --config-check
+```
+
+CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--config-check]`.
+
+#### `[proxy]` key naming
+
+The `[proxy]` section accepts both `type` and `proxy_type` for the proxy kind (e.g. `socks5`). `type` matches libtorrent's `settings_pack` key and is the canonical name; `proxy_type` is accepted as an alias for users who find it more intuitive. Both set the same value.
+
+#### SOCKS5 UDP ASSOCIATE probe (socks5 proxy)
+
+When a SOCKS5 proxy is configured, libtorrent tries to open a UDP tunnel through the proxy by sending a SOCKS5 UDP ASSOCIATE request (`cmd=3`). The request carries `host='0.0.0.0' port=0` — libtorrent's default send-local endpoint when none is set, not a real connect target. A relay with no UDP endpoint to associate cannot answer, so the relay log shows an unclosed `cmd=3` request.
+
+This is expected libtorrent behavior, not a configuration error:
+
+- It is triggered by the SOCKS5 proxy configuration and an unanswered UDP ASSOCIATE — it does not depend on the listen port being `0`.
+- It is not a fixed pair: one UDP socket is opened per listening socket, and libtorrent retries with exponential backoff when the association fails, so the `cmd=3` request reappears periodically in the log.
+- Tracker announce and existing TCP peer connections use CONNECT (`cmd=1`) and are unaffected.
+- UDP-dependent paths (uTP peer connections, UDP trackers, DHT) rely on this tunnel; whether they work when the association is not established is not covered here, so do not assume those paths are unaffected.
+- When no relay peer can answer, no action is needed — do not treat the unclosed UDP ASSOCIATE request as a libtorrent or proxy misconfiguration.
+
 ## Architecture
 
 ```
@@ -16,47 +191,7 @@ main → fuse → services → domain/infrastructure
 | `domain` | Pure data models and repository traits (`Torrent`, `TorrentFile`, `TorrentRepository`) |
 | `infrastructure` | Concrete implementations: `db` (SQLite), `download` (libtorrent session), `cache` (LRU piece cache), `config` (TOML), `metadata` (.torrent parsing) |
 
-### Key modules
-
-- `src/fuse/` — FUSE protocol (`mod.rs`), inode management (`inodes.rs`), data resolution (`lookup.rs`), stats generation (`stats.rs`)
-- `src/services/` — `torrent.rs` (DB delegation for torrent CRUD), `download.rs` (piece download orchestration), `seeding.rs` (seeding lifecycle)
-- `src/domain/` — `types.rs` (data models), `repository.rs` (traits), `error.rs` (error types)
-- `src/infrastructure/` — `db/` (SQLite persistence), `download/` (libtorrent session + piece management), `cache/` (LRU cache), `config/` (TOML config), `metadata/` (.torrent parsing)
-- `src/seeding.rs` — `SeedingManager` (peer seeding with cache eviction callbacks)
-- `src/error.rs` — re-exports from `domain::error`
-
 Dependency direction: `domain` has no dependency on `infrastructure`; `infrastructure` implements `domain` traits.
-
-### `[proxy]` key naming
-
-The `[proxy]` section accepts both `type` and `proxy_type` for the proxy
-kind (e.g. `socks5`). `type` matches libtorrent's `settings_pack` key and is
-the canonical name; `proxy_type` is accepted as an alias for users who find
-it more intuitive. Both set the same value.
-
-### SOCKS5 UDP ASSOCIATE probe (socks5 proxy)
-
-When a SOCKS5 proxy is configured, libtorrent tries to open a UDP tunnel
-through the proxy by sending a SOCKS5 UDP ASSOCIATE request (`cmd=3`). The
-request carries `host='0.0.0.0' port=0` — libtorrent's default send-local
-endpoint when none is set, not a real connect target. A relay with no UDP
-endpoint to associate cannot answer, so the relay log shows an unclosed
-`cmd=3` request.
-
-This is expected libtorrent behavior, not a configuration error:
-
-- It is triggered by the SOCKS5 proxy configuration and an unanswered UDP
-  ASSOCIATE — it does not depend on the listen port being `0`.
-- It is not a fixed pair: one UDP socket is opened per listening socket, and
-  libtorrent retries with exponential backoff when the association fails, so
-  the `cmd=3` request reappears periodically in the log.
-- Tracker announce and existing TCP peer connections use CONNECT (`cmd=1`)
-  and are unaffected.
-- UDP-dependent paths (uTP peer connections, UDP trackers, DHT) rely on this
-  tunnel; whether they work when the association is not established is not
-  covered here, so do not assume those paths are unaffected.
-- When no relay peer can answer, no action is needed — do not treat the
-  unclosed UDP ASSOCIATE request as a libtorrent or proxy misconfiguration.
 
 ## Container Deployment
 
@@ -72,54 +207,19 @@ torrentfs ships a Docker image (`ghcr.io/tsic404/torrentfs`) with a smart entryp
 
 If you need host-visible FUSE mounts, use **rootful Docker or rootful podman**. Rootless podman cannot create shared mounts — a fundamental user-namespace limitation, not a torrentfs or entrypoint bug.
 
-For QA, the same split governs where content reads are verified: host-side under
-rootful engines, inside the container under rootless podman.
-
-### Quick Start (rootful)
-
-```bash
-# Docker (rootful) — host-visible FUSE mount via shared propagation
-docker run --rm \
-  --device /dev/fuse \
-  --cap-add SYS_ADMIN \
-  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
-  ghcr.io/tsic404/torrentfs
-```
-
-On the host, prepare the shared mount first:
-
-```bash
-mkdir -p /host/torrentfs
-mount --bind /host/torrentfs /host/torrentfs
-mount --make-shared /host/torrentfs
-```
+For QA, the same split governs where content reads are verified: host-side under rootful engines, inside the container under rootless podman.
 
 ### One host directory per container
 
-The `rshared` recipe above shares a host directory across containers. Do not
-bind-mount the **same** host directory into two torrentfs containers: the
-second container's `mount --bind` stacks a second FUSE mount on top of the
-first and severs the first container's mount — both sides then report
-`ENOTCONN`. The entrypoint guards against this in two ways: it takes an
-exclusive `flock` on the mountpoint directory (the same inode across
-containers, so the lock is mutually exclusive and held for the container's
-lifetime), and it detects a FUSE mount already present at the mountpoint.
-Either conflict makes it refuse to start (exit `101`) instead of clobbering
-the other container's mount.
+The `rshared` recipe above shares a host directory across containers. Do not bind-mount the **same** host directory into two torrentfs containers: the second container's `mount --bind` stacks a second FUSE mount on top of the first and severs the first container's mount — both sides then report `ENOTCONN`. The entrypoint guards against this in two ways: it takes an exclusive `flock` on the mountpoint directory (the same inode across containers, so the lock is mutually exclusive and held for the container's lifetime), and it detects a FUSE mount already present at the mountpoint. Either conflict makes it refuse to start (exit `101`) instead of clobbering the other container's mount.
 
-Give each container its own host directory / mountpoint, or run a single
-container per host directory.
+Give each container its own host directory / mountpoint, or run a single container per host directory.
 
 ### Reaching host loopback services (`--network host`)
 
-The bundled self-seed QA environment (`ci/run_self_seed_env.sh`) runs its
-tracker and seeder on the **host**, bound to `127.0.0.1` (loopback-only; see
-[Offline QA](#offline-qa-self-seeding-test-swarm)). A container runs in its own
-network namespace, so `127.0.0.1` inside the container is the container itself,
-not the host — torrentfs cannot reach the host's seeder and its announces fail.
+The bundled self-seed QA environment (`ci/run_self_seed_env.sh`) runs its tracker and seeder on the **host**, bound to `127.0.0.1` (loopback-only; see [Offline QA](#offline-qa-self-seeding-test-swarm)). A container runs in its own network namespace, so `127.0.0.1` inside the container is the container itself, not the host — torrentfs cannot reach the host's seeder and its announces fail.
 
-To reach a host loopback service, run the container in the host network
-namespace with `--network host`:
+To reach a host loopback service, run the container in the host network namespace with `--network host`:
 
 ```bash
 # Docker (rootful) — host network so the container's 127.0.0.1 = host loopback
@@ -129,24 +229,13 @@ docker run --rm --network host \
   ghcr.io/tsic404/torrentfs
 ```
 
-`--network host` is orthogonal to FUSE mount visibility: combine it with the
-`rshared` recipe above for host-visible mounts, or with `podman exec` access
-for rootless podman. It applies to rootful and rootless containers alike — the
-isolation that matters here is the network namespace, not the user namespace.
+`--network host` is orthogonal to FUSE mount visibility: combine it with the `rshared` recipe above for host-visible mounts, or with `podman exec` access for rootless podman. It applies to rootful and rootless containers alike — the isolation that matters here is the network namespace, not the user namespace.
 
 ### Port conflict with the host seeder (`listen_interfaces`)
 
-Under `--network host` the container shares the host's network namespace, so
-torrentfs and the host's self-seed seeder must not bind the same port.
-torrentfs listens on `0.0.0.0:6881` by default (the libtorrent default; see
-`[connections] listen_interfaces`), and the self-seed seeder
-(`ci/run_self_seed_env.sh`) is also a libtorrent session that defaults to the
-same `6881`. With Docker's default `bridge` network the two live in separate
-network namespaces; `--network host` puts them in the same namespace and
-triggers the collision.
+Under `--network host` the container shares the host's network namespace, so torrentfs and the host's self-seed seeder must not bind the same port. torrentfs listens on `0.0.0.0:6881` by default (the libtorrent default; see `[connections] listen_interfaces`), and the self-seed seeder (`ci/run_self_seed_env.sh`) is also a libtorrent session that defaults to the same `6881`. With Docker's default `bridge` network the two live in separate network namespaces; `--network host` puts them in the same namespace and triggers the collision.
 
-Give torrentfs a distinct listen port via a TOML config file passed to
-`--config`:
+Give torrentfs a distinct listen port via a TOML config file passed to `--config`:
 
 ```toml
 # torrentfs-config.toml
@@ -162,15 +251,9 @@ docker run --rm --network host \
   ghcr.io/tsic404/torrentfs /mnt --config /torrentfs-config.toml
 ```
 
-`--config` may precede or follow the mountpoint — `ghcr.io/tsic404/torrentfs
---config /torrentfs-config.toml /mnt` is equivalent to the form above. The
-entrypoint parses the command line and mounts on the first positional argument
-regardless of where `--config` appears.
+`--config` may precede or follow the mountpoint — `ghcr.io/tsic404/torrentfs --config /torrentfs-config.toml /mnt` is equivalent to the form above. The entrypoint parses the command line and mounts on the first positional argument regardless of where `--config` appears.
 
-The seeder stays on `6881`; torrentfs moves to `6882`. The same applies to any
-other BitTorrent peer already bound to `6881` on the host — the collision is a
-property of the shared network namespace, not of the self-seed environment
-specifically.
+The seeder stays on `6881`; torrentfs moves to `6882`. The same applies to any other BitTorrent peer already bound to `6881` on the host — the collision is a property of the shared network namespace, not of the self-seed environment specifically.
 
 ### Rootless podman
 
@@ -190,24 +273,16 @@ podman exec torrentfs ls /mnt/metadata/
 **What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. Passing `-v /host:/mnt:shared` or `--mount ...,bind-propagation=rshared` is silently ineffective — rootless user namespaces cannot create shared mounts, so no mount event reaches the host. The entrypoint detects bind mounts on the mountpoint in rootless mode and emits an explicit warning at startup. If you need host-visible FUSE mounts:
 
 - Use rootful podman (`sudo podman run ...`) or Docker
-- Run the bundled one-click helper `sudo ./ci/deploy_rootful.sh` — it prepares
-  the host shared mount and starts the container with `rshared` bind
-  propagation and a persistent state directory
+- Run the bundled one-click helper `sudo ./ci/deploy_rootful.sh` — it prepares the host shared mount and starts the container with `rshared` bind propagation and a persistent state directory
 - Run torrentfs directly on the host without a container
 
 The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
 
 ### Shutdown and restart (`stop_timeout`)
 
-`podman stop` / `docker stop` send SIGTERM and then SIGKILL after a grace
-period. The container engine default is **10 seconds**, which is not enough
-for torrentfs to stop the download engine, drain its worker queue, flush the
-cache, and unmount the FUSE filesystem. The forced SIGKILL then leaves a stale
-FUSE mount that reports `ENOTCONN` ("Transport endpoint is not connected") on
-the next start, and `mkdir /mnt` in the entrypoint would fail.
+`podman stop` / `docker stop` send SIGTERM and then SIGKILL after a grace period. The container engine default is **10 seconds**, which is not enough for torrentfs to stop the download engine, drain its worker queue, flush the cache, and unmount the FUSE filesystem. The forced SIGKILL then leaves a stale FUSE mount that reports `ENOTCONN` ("Transport endpoint is not connected") on the next start, and `mkdir /mnt` in the entrypoint would fail.
 
-The image cannot raise that timeout — the grace period is a container-runtime
-setting, not an image property — so raise it at runtime:
+The image cannot raise that timeout — the grace period is a container-runtime setting, not an image property — so raise it at runtime:
 
 ```bash
 # podman
@@ -227,17 +302,9 @@ services:
 TimeoutStopSec=30
 ```
 
-Even with a sufficient timeout, an externally killed container (or a host
-crash) can still leave a stale mount. The entrypoint now probes the mountpoint
-for `ENOTCONN` at startup and, when it finds one, lazy-unmounts it
-(`umount -l`) and retries automatically — printing recovery steps only if the
-auto-recovery itself fails.
+Even with a sufficient timeout, an externally killed container (or a host crash) can still leave a stale mount. The entrypoint now probes the mountpoint for `ENOTCONN` at startup and, when it finds one, lazy-unmounts it (`umount -l`) and retries automatically — printing recovery steps only if the auto-recovery itself fails.
 
-`ENOTCONN` has a second cause: two containers sharing one host directory
-(see "One host directory per container" above). The entrypoint distinguishes
-the two — a live FUSE mount propagated in from another container is refused at
-startup (exit `101`), never lazily unmounted, because unmounting it would
-sever the *other* container's healthy mount.
+`ENOTCONN` has a second cause: two containers sharing one host directory (see "One host directory per container" above). The entrypoint distinguishes the two — a live FUSE mount propagated in from another container is refused at startup (exit `101`), never lazily unmounted, because unmounting it would sever the *other* container's healthy mount.
 
 ## Filesystem Semantics
 
@@ -260,8 +327,7 @@ Source: `src/fuse/fs_service.rs` — `rename()` returns `FsError::AlreadyExists`
 
 ### `.stats` Pieces block
 
-Per-torrent `.stats` renders the piece lifecycle as a header line, a labelled
-marker line, and structured piece-metadata lines:
+Per-torrent `.stats` renders the piece lifecycle as a header line, a labelled marker line, and structured piece-metadata lines:
 
 ```text
 -- Pieces (16 pieces, 256.00 KB each) --
@@ -270,14 +336,7 @@ marker line, and structured piece-metadata lines:
   PieceCount: 16
 ```
 
-The `-- Pieces (N pieces, X each) --` header is human-readable prose; the data
-line is the one starting with the `Pieces:` label. Machine parsers should key
-on `Pieces:` rather than the `Pieces (` literal in the header, and read piece
-dimensions from the `PieceSize:` / `PieceCount:` key-value lines instead of
-regex-parsing the prose header.
-Each bracketed token in the `Pieces:` marker line is one piece's state,
-rendered back-to-back with no separator by `piece_marker()`
-(`src/fuse/stats.rs`):
+The `-- Pieces (N pieces, X each) --` header is human-readable prose; the data line is the one starting with the `Pieces:` label. Machine parsers should key on `Pieces:` rather than the `Pieces (` literal in the header, and read piece dimensions from the `PieceSize:` / `PieceCount:` key-value lines instead of regex-parsing the prose header. Each bracketed token in the `Pieces:` marker line is one piece's state, rendered back-to-back with no separator by `piece_marker()` (`src/fuse/stats.rs`):
 
 | Marker | Meaning |
 |--------|---------|
@@ -286,9 +345,7 @@ rendered back-to-back with no separator by `piece_marker()`
 | `[N]` | wanted for download but not cached yet (`!is_cached && priority > 0`) |
 | `[]` | not wanted and not cached (`!is_cached && priority == 0`) |
 
-Here *cached* means the piece is present in the disk cache
-(`PieceStatus::is_cached`), *wanted* means a reader has requested it
-(`PieceStatus::priority > 0`), and the access count is `PieceStatus::hit_count`.
+Here *cached* means the piece is present in the disk cache (`PieceStatus::is_cached`), *wanted* means a reader has requested it (`PieceStatus::priority > 0`), and the access count is `PieceStatus::hit_count`.
 
 Source: `src/fuse/stats.rs` — `piece_block()`.
 
@@ -296,10 +353,7 @@ Source: `src/fuse/stats.rs` — `piece_block()`.
 
 ### `cp` to the mountpoint fails with EIO (Input/output error)
 
-A sporadic `EIO` on `cp` (or any I/O) into the mountpoint usually means a
-previous torrentfs instance was not fully cleaned up: the old mount is still
-lazily attached (or the old process still holds the FUSE device), so writes
-race against a half-torn-down mount.
+A sporadic `EIO` on `cp` (or any I/O) into the mountpoint usually means a previous torrentfs instance was not fully cleaned up: the old mount is still lazily attached (or the old process still holds the FUSE device), so writes race against a half-torn-down mount.
 
 Clean up the environment before retrying:
 
@@ -315,20 +369,11 @@ pkill -f 'torrentfs.*<mountpoint>'   # only if a stale instance is listed above
 mountpoint -q /path/to/mountpoint && echo "still mounted" || echo "clean"
 ```
 
-Retry the operation only after step 3 reports the mountpoint clean. If the
-mountpoint lives inside a container with bind propagation (see Container
-Deployment), run the same steps on the host as well — a stale mount can
-persist on both sides of the bind.
+Retry the operation only after step 3 reports the mountpoint clean. If the mountpoint lives inside a container with bind propagation (see Container Deployment), run the same steps on the host as well — a stale mount can persist on both sides of the bind.
 
 ### Non-root mount fails with `Operation not permitted` (EPERM)
 
-torrentfs mounts with `allow_other` so non-root users can access the mount.
-That option only works when the host's `/etc/fuse.conf` enables
-`user_allow_other`. Distributions ship that line commented out
-(`#user_allow_other`), which makes `torrentfs /mnt --config ...` return
-`Operation not permitted` for a non-root user. The container image already
-uncomments it at build time; the **host** running the container (or a bare
-development machine) needs the same change:
+torrentfs mounts with `allow_other` so non-root users can access the mount. That option only works when the host's `/etc/fuse.conf` enables `user_allow_other`. Distributions ship that line commented out (`#user_allow_other`), which makes `torrentfs /mnt --config ...` return `Operation not permitted` for a non-root user. The container image already uncomments it at build time; the **host** running the container (or a bare development machine) needs the same change:
 
 ```bash
 sudo sed -i 's/^#\s*user_allow_other\s*$/user_allow_other/' /etc/fuse.conf
@@ -339,7 +384,7 @@ Verify the line is active, then remount:
 
 ```bash
 grep '^user_allow_other$' /etc/fuse.conf && echo enabled
-torrentfs /mnt --config /path/to/config.toml
+./target/release/torrentfs /mnt --config /path/to/config.toml
 ```
 
 On a bare development machine you can instead run the idempotent helper:
@@ -348,22 +393,11 @@ On a bare development machine you can instead run the idempotent helper:
 sudo ./ci/enable_fuse_allow_other.sh
 ```
 
-It converges to one active line when the option is absent or commented; a
-padded active line is not recognized by the exact-match check and a duplicate
-is appended. Pre-existing duplicate active lines are left as-is. `main.rs` detects
-the line at startup: when it is present the mount
-includes `allow_other`; when it is missing, a non-root mount fails with
-`Operation not permitted` and the error hints at `/etc/fuse.conf` — the
-kernel requires `user_allow_other` for any unprivileged FUSE mount, so there
-is no owner-only fallback.
+It converges to one active line when the option is absent or commented; a padded active line is not recognized by the exact-match check and a duplicate is appended. Pre-existing duplicate active lines are left as-is. `main.rs` detects the line at startup: when it is present the mount includes `allow_other`; when it is missing, a non-root mount fails with `Operation not permitted` and the error hints at `/etc/fuse.conf` — the kernel requires `user_allow_other` for any unprivileged FUSE mount, so there is no owner-only fallback.
 
 ## Offline QA: self-seeding test swarm
 
-Public sample torrents (e.g. the Ubuntu/Debian `.torrent` files commonly used in
-QA) often have **no reachable seeders** on a given network. Reads through the
-mount then fail with `ENODATA` ("No data available") — this is correct,
-healthy-warn behavior, not a bug. To exercise real on-demand downloads without
-external infrastructure, run the bundled self-seed environment:
+Public sample torrents (e.g. the Ubuntu/Debian `.torrent` files commonly used in QA) often have **no reachable seeders** on a given network. Reads through the mount then fail with `ENODATA` ("No data available") — this is correct, healthy-warn behavior, not a bug. To exercise real on-demand downloads without external infrastructure, run the bundled self-seed environment:
 
 ```bash
 ./ci/run_self_seed_env.sh                 # builds + starts tracker & seeder
@@ -372,10 +406,10 @@ cp ci/selfseed/output/selfseed.torrent <mountpoint>/metadata/
 cat <mountpoint>/data/selfseed/selfseed    # served by the local seeder
 ```
 
-- The payload (`ci/selfseed/output/payload.txt`) is deterministic; diff it
-  against what you read through the mount to verify integrity.
-- The swarm is loopback-only (tracker `127.0.0.1:16969`, no DHT/LSD/UPnP), so
-  it never touches public trackers. Running torrentfs inside a container while
-  the seeder stays on the host requires `--network host` — see
-  [Container Deployment](#container-deployment).
+- The payload (`ci/selfseed/output/payload.txt`) is deterministic; diff it against what you read through the mount to verify integrity.
+- The swarm is loopback-only (tracker `127.0.0.1:16969`, no DHT/LSD/UPnP), so it never touches public trackers. Running torrentfs inside a container while the seeder stays on the host requires `--network host` — see [Container Deployment](#container-deployment).
 - Source: `ci/selfseed_env.rs` (cargo example `torrentfs-selfseed-env`).
+
+## License
+
+No license is currently declared: the repository has no `LICENSE` file and `Cargo.toml` sets no `license` field.
