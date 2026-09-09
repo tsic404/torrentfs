@@ -233,17 +233,26 @@ ensure_fuse_device() {
 # engine so every data read returns EIO.  Re-home the tree to the current
 # user before starting so a reused state volume is always writable.
 
-# Re-home one path to the current user.  Recurses only when the path's
-# ownership differs from the current user, so a matching tree is left
-# untouched — a GB-scale piece cache is not walked on every cold start, and a
-# correctly-owned host bind mount is never recursively re-chowned.  Skipped
-# when the path does not exist yet: torrentfs creates it fresh with the
-# correct ownership.
+# Re-home one path to the current user.  Recurses only when the tree's
+# ownership does not already match the current user throughout.  A reused
+# volume can have a correct top-level owner but leftover nobody:nogroup files
+# underneath (old image state) — a top-level-only probe misses those, leaving
+# cache_metadata.txt unwritable and failing the download engine.  `find`
+# exits at the first mismatch, so a consistent GB-scale piece cache is only
+# walked read-only (no chown syscalls) on every cold start.  Skipped when the
+# path does not exist yet: torrentfs creates it fresh with correct ownership.
 rehome_ownership() {
-    local target="$1" uid gid
+    local target="$1" uid gid probe
     [ -e "$target" ] || return 0
     uid="$(id -u)"; gid="$(id -g)"
-    [ "$(stat -c '%u:%g' "$target" 2>/dev/null)" = "$uid:$gid" ] && return 0
+    # Capture find's exit status separately from its output: a consistent tree
+    # is status==0 AND empty output.  A non-zero status (unreadable subtree,
+    # unmapped nobody dir in a rootless userns, I/O error, faulty mount) is a
+    # probe failure — not a clean bill of health — so fall through to chown
+    # rather than silently skipping a leftover foreign-owned tree.
+    if probe="$(find "$target" \( ! -user "$uid" -o ! -group "$gid" \) -print -quit 2>/dev/null)"; then
+        [ -z "$probe" ] && return 0
+    fi
     if ! chown -R "$uid:$gid" "$target" 2>/dev/null; then
         echo "[entrypoint] WARNING: could not chown $target to $uid:$gid" >&2
     fi
