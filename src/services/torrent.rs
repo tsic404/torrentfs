@@ -41,8 +41,8 @@ impl TorrentService {
     /// available without downloading any data.
     pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> FsResult<()> {
         let info = TorrentInfo::from_bytes(data.to_vec()).map_err(|e| {
-            warn!("Failed to parse torrent {}: {:?}", filename, e);
-            FsError::CorruptTorrent(format!("Failed to parse torrent {}: {:?}", filename, e))
+            warn!("Invalid .torrent file {}: {}", filename, e.reason());
+            FsError::CorruptTorrent(e.reason().to_string())
         })?;
 
         let metadata = info.metadata().map_err(|e| {

@@ -47,6 +47,25 @@ impl TorrentError {
             TorrentError::NoPeers(_) | TorrentError::PieceNotReady(_) | TorrentError::Timeout(_)
         )
     }
+
+    /// The underlying cause message, stripped of the variant's own
+    /// classification prefix (`"Failed to parse torrent: "`, `"Unknown
+    /// error: code N, message: "`, …).  Callers that supply their own
+    /// classification use this to compose a user-facing message such as
+    /// `Invalid .torrent file: <reason>` without a redundant prefix.
+    pub fn reason(&self) -> &str {
+        match self {
+            TorrentError::InvalidFile(msg)
+            | TorrentError::ParseError(msg)
+            | TorrentError::ConfigError(msg)
+            | TorrentError::IoError(msg)
+            | TorrentError::NoPeers(msg)
+            | TorrentError::PieceNotReady(msg)
+            | TorrentError::Timeout(msg) => msg,
+            TorrentError::Unknown { message, .. } => message,
+            TorrentError::NullPointer => "null pointer",
+        }
+    }
 }
 
 impl From<std::io::Error> for TorrentError {
@@ -175,6 +194,34 @@ mod tests {
             message: "unknown".into()
         }
         .is_transient());
+    }
+
+    // ── reason() ────────────────────────────────────────────────────────
+
+    #[test]
+    fn reason_strips_variant_prefix() {
+        assert_eq!(
+            TorrentError::ParseError("bad bencode".into()).reason(),
+            "bad bencode"
+        );
+        assert_eq!(
+            TorrentError::InvalidFile("no such path".into()).reason(),
+            "no such path"
+        );
+    }
+
+    #[test]
+    fn reason_for_unknown_returns_message_only() {
+        let err = TorrentError::Unknown {
+            code: 4,
+            message: "expected value in bencoded string".into(),
+        };
+        assert_eq!(err.reason(), "expected value in bencoded string");
+    }
+
+    #[test]
+    fn reason_for_null_pointer_is_static() {
+        assert_eq!(TorrentError::NullPointer.reason(), "null pointer");
     }
 
     // ── error_from_c ────────────────────────────────────────────────────

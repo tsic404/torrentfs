@@ -862,8 +862,8 @@ impl FsService {
                         info!("Torrent {} validated successfully", name);
                     }
                     Err(e) => {
-                        warn!("Invalid torrent file {}: {:?}", name, e);
-                        return Err(FsError::InvalidArgument);
+                        warn!("Invalid .torrent file {}: {}", name, e.reason());
+                        return Err(FsError::CorruptTorrent(e.reason().to_string()));
                     }
                 }
             }
@@ -3631,16 +3631,27 @@ mod tests {
         svc.flush(ino).expect("empty torrent flush ok");
     }
 
-    /// TSI-2918: a non-empty but unparseable `.torrent` still fails `flush`
-    /// with EINVAL — the "write-time EINVAL" semantics this issue preserves.
+    /// TSI-2923: a non-empty but unparseable `.torrent` fails `flush` with a
+    /// reason-carrying `CorruptTorrent` (→ EINVAL), so the user sees
+    /// `Invalid .torrent file: <reason>` rather than a bare "Invalid
+    /// argument" that cannot distinguish an invalid seed from other I/O
+    /// errors.
     #[test]
-    fn flush_invalid_torrent_returns_einval() {
+    fn flush_invalid_torrent_returns_corrupt_torrent() {
         let mut svc = service_with_db();
         let (ino, _fh) = create_torrent_file(&mut svc, "bad.torrent");
         svc.write(ino, 0, b"not a torrent").expect("write ok");
 
         let err = svc.flush(ino).unwrap_err();
-        assert_eq!(err, FsError::InvalidArgument);
+        match err {
+            FsError::CorruptTorrent(reason) => {
+                assert!(
+                    !reason.is_empty(),
+                    "invalid .torrent must carry a non-empty reason"
+                );
+            }
+            other => panic!("expected CorruptTorrent, got {:?}", other),
+        }
     }
 
     // ── TSI-2234: unlink-while-open keeps the inode alive ───────────────
