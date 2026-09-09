@@ -837,9 +837,12 @@ impl FsService {
     pub fn flush(&mut self, ino: u64) -> FsResult<()> {
         if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
             if name.ends_with(".torrent") {
+                // TSI-2918: a zero-byte `.torrent` has nothing to validate.
+                // Surfacing EINVAL here made `touch` report a spurious write
+                // error on close for a file that was never written. Let it
+                // pass; `release` discards the empty inode (ENOENT).
                 if data.is_empty() {
-                    warn!("Zero-byte torrent file {} rejected", name);
-                    return Err(FsError::InvalidArgument);
+                    return Ok(());
                 }
 
                 if data.len() > MAX_TORRENT_SIZE {
@@ -892,7 +895,7 @@ impl FsService {
                     if data.is_empty() {
                         warn!("Zero-byte torrent file {} removed", name);
                         self.inode_mgr.inodes.remove(&ino);
-                        return Ok(());
+                        return Err(FsError::NotFound);
                     }
 
                     if data.len() > MAX_TORRENT_SIZE {
@@ -3473,16 +3476,20 @@ mod tests {
         (created.attr.ino, created.fh)
     }
 
-    /// TSI-2247: Closing an empty `.torrent` file must hit the fast path —
-    /// `release` returns `Ok(())` immediately without touching
+    /// TSI-2247/TSI-2918: Closing an empty `.torrent` file hits the fast path.
+    /// `release` discards the inode and returns `NotFound` (ENOENT) — a
+    /// zero-byte file is treated as if it never existed — without touching
     /// `processing_torrents` or the DB.
     #[test]
     fn release_empty_torrent_is_fast_path() {
         let mut svc = service_with_db();
         let (ino, fh) = create_torrent_file(&mut svc, "empty.torrent");
 
-        // release must succeed instantly — no DB insert, no background spawn.
-        svc.release(fh).expect("release ok");
+        // release must return immediately — no DB insert, no background spawn.
+        let err = svc
+            .release(fh)
+            .expect_err("empty torrent release should ENOENT");
+        assert_eq!(err, FsError::NotFound);
 
         // Inode is removed.
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
@@ -3613,12 +3620,24 @@ mod tests {
         assert!(t2.is_some(), "b.torrent should be in DB");
     }
 
-    /// TSI-2247: `flush` for an empty `.torrent` returns `EINVAL` (fast
-    /// path — no FFI call to libtorrent).
+    /// TSI-2918: `flush` for an empty `.torrent` returns `Ok` — a zero-byte
+    /// file has nothing to validate. Discarding it is `release`'s job, so
+    /// `touch` no longer surfaces a spurious EINVAL on close.
     #[test]
-    fn flush_empty_torrent_returns_einval() {
+    fn flush_empty_torrent_is_allowed() {
         let mut svc = service_with_db();
         let (ino, _fh) = create_torrent_file(&mut svc, "empty.torrent");
+
+        svc.flush(ino).expect("empty torrent flush ok");
+    }
+
+    /// TSI-2918: a non-empty but unparseable `.torrent` still fails `flush`
+    /// with EINVAL — the "write-time EINVAL" semantics this issue preserves.
+    #[test]
+    fn flush_invalid_torrent_returns_einval() {
+        let mut svc = service_with_db();
+        let (ino, _fh) = create_torrent_file(&mut svc, "bad.torrent");
+        svc.write(ino, 0, b"not a torrent").expect("write ok");
 
         let err = svc.flush(ino).unwrap_err();
         assert_eq!(err, FsError::InvalidArgument);
