@@ -2,11 +2,6 @@
 
 A FUSE-based virtual filesystem for BitTorrent management. Mount `.torrent` files, browse their structure, and read file contents on-demand via the BitTorrent network.
 
-## Documentation
-
-Supplementary docs live in [`docs/`](docs/README.md) — see its index for
-focused, discoverable guides such as test-environment network prerequisites.
-
 ## Architecture
 
 ```
@@ -78,8 +73,7 @@ torrentfs ships a Docker image (`ghcr.io/tsic404/torrentfs`) with a smart entryp
 If you need host-visible FUSE mounts, use **rootful Docker or rootful podman**. Rootless podman cannot create shared mounts — a fundamental user-namespace limitation, not a torrentfs or entrypoint bug.
 
 For QA, the same split governs where content reads are verified: host-side under
-rootful engines, inside the container under rootless podman — see
-[`docs/qa-fuse-content-read.md`](docs/qa-fuse-content-read.md).
+rootful engines, inside the container under rootless podman.
 
 ### Quick Start (rootful)
 
