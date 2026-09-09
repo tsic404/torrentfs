@@ -46,7 +46,7 @@ The FFI crate (`libtorrent-sys`) probes `libtorrent-rasterbar` and `openssl` via
 ### Docker image
 
 ```bash
-docker pull ghcr.io/tsic404/torrentfs
+docker pull ghcr.io/tsic404/torrentfs:main
 ```
 
 The image builds libtorrent from source (statically, `-fno-gnu-unique`) and includes the entrypoint that configures FUSE and mount visibility. See [Container Deployment](#container-deployment).
@@ -98,7 +98,7 @@ docker run --rm \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
-  ghcr.io/tsic404/torrentfs
+  ghcr.io/tsic404/torrentfs:main
 ```
 
 The filesystem is then visible on the host at `/host/torrentfs`. For podman and rootless variants, see [Container Deployment](#container-deployment).
@@ -226,7 +226,7 @@ To reach a host loopback service, run the container in the host network namespac
 docker run --rm --network host \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-  ghcr.io/tsic404/torrentfs
+  ghcr.io/tsic404/torrentfs:main
 ```
 
 `--network host` is orthogonal to FUSE mount visibility: combine it with the `rshared` recipe above for host-visible mounts, or with `podman exec` access for rootless podman. It applies to rootful and rootless containers alike — the isolation that matters here is the network namespace, not the user namespace.
@@ -248,10 +248,10 @@ docker run --rm --network host \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   -v "$PWD/torrentfs-config.toml:/torrentfs-config.toml:ro" \
-  ghcr.io/tsic404/torrentfs /mnt --config /torrentfs-config.toml
+  ghcr.io/tsic404/torrentfs:main /mnt --config /torrentfs-config.toml
 ```
 
-`--config` may precede or follow the mountpoint — `ghcr.io/tsic404/torrentfs --config /torrentfs-config.toml /mnt` is equivalent to the form above. The entrypoint parses the command line and mounts on the first positional argument regardless of where `--config` appears.
+`--config` may precede or follow the mountpoint — `ghcr.io/tsic404/torrentfs:main --config /torrentfs-config.toml /mnt` is equivalent to the form above. The entrypoint parses the command line and mounts on the first positional argument regardless of where `--config` appears.
 
 The seeder stays on `6881`; torrentfs moves to `6882`. The same applies to any other BitTorrent peer already bound to `6881` on the host — the collision is a property of the shared network namespace, not of the self-seed environment specifically.
 
@@ -265,7 +265,7 @@ Rootless podman **does not support shared mount propagation** (`rshared`). This 
 podman run -d --name torrentfs \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
-  ghcr.io/tsic404/torrentfs
+  ghcr.io/tsic404/torrentfs:main
 
 podman exec torrentfs ls /mnt/metadata/
 ```
@@ -286,15 +286,15 @@ The image cannot raise that timeout — the grace period is a container-runtime 
 
 ```bash
 # podman
-podman run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs
+podman run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs:main
 
 # docker
-docker run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs
+docker run --stop-timeout 30 ... ghcr.io/tsic404/torrentfs:main
 
 # compose (both engines)
 services:
   torrentfs:
-    image: ghcr.io/tsic404/torrentfs
+    image: ghcr.io/tsic404/torrentfs:main
     stop_grace_period: 30s
 
 # quadlet / systemd
