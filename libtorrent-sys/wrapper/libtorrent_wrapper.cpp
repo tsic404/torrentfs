@@ -797,6 +797,11 @@ static void apply_str_setting(lt::settings_pack& pack, const std::string& key, c
         pack.set_str(lt::settings_pack::user_agent, val);
     } else if (key == "peer_fingerprint") {
         pack.set_str(lt::settings_pack::peer_fingerprint, val);
+    } else if (key == "handshake_client_version") {
+        // TSI-2954: peer wire-protocol handshake client version string; PT
+        // trackers may inspect it to identify the client, so surface it for
+        // spoofing alongside user_agent / peer_fingerprint.
+        pack.set_str(lt::settings_pack::handshake_client_version, val);
     } else if (key == "proxy_hostname" || key == "host") {
         // Canonical key is `proxy_hostname`; `host` is accepted as a legacy
         // alias so any already-serialized config keeps working.
@@ -1212,6 +1217,11 @@ static bool get_session_str_setting_impl(lt::settings_pack const& settings, cons
     } else if (key == "peer_fingerprint") {
         if (settings.has_val(lt::settings_pack::peer_fingerprint)) {
             out = settings.get_str(lt::settings_pack::peer_fingerprint);
+            return true;
+        }
+    } else if (key == "handshake_client_version") {
+        if (settings.has_val(lt::settings_pack::handshake_client_version)) {
+            out = settings.get_str(lt::settings_pack::handshake_client_version);
             return true;
         }
     }
