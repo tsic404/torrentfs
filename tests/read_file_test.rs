@@ -438,7 +438,16 @@ fn test_peer_appearing_mid_read_returns_data() {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
-    config.timeouts.read_timeout_secs = Some(30);
+    // TSI-2945: the seeder is introduced 6s after the read starts, and its
+    // libtorrent session startup + tracker announce + peer connect must all
+    // complete before the read's piece-wait window (`read_timeout_secs`)
+    // expires.  On slow CI (arm64/amd64) 30s occasionally elapsed before the
+    // seeder could serve the piece, firing NoPeers and failing the merge gate.
+    // Bump to 120s so the seeder has ample budget; the peer-wait cap
+    // (PEER_WAIT_CAP_SECS = 9) is unchanged, so the TSI-2358 regression
+    // (fail-fast at <=9s) is still exercised.  The happy path is unaffected:
+    // the read returns as soon as the piece arrives, long before the deadline.
+    config.timeouts.read_timeout_secs = Some(120);
 
     let engine = Arc::new(
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
