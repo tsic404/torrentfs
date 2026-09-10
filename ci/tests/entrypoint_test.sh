@@ -244,6 +244,78 @@ run_test "mountpoint_has_fuse false for fuse mount at another target" \
 run_test "mountpoint_has_fuse false for empty mountinfo" \
     'setup_mountinfo ""; if mountpoint_has_fuse /mnt; then exit 1; else exit 0; fi'
 
+# --- mountpoint_has_fuse canonicalization / escape decoding (TSI-2942) ---
+# mountinfo records the kernel-normalized mount point (symlinks resolved,
+# `.`/`..` merged, trailing `/` dropped) with space/tab/newline/backslash
+# octal-escaped.
+# These fixtures exercise a real target path against its mountinfo-escaped
+# form, proving mountpoint_has_fuse canonicalizes and decodes before comparing.
+
+run_test "mountpoint_has_fuse canonicalizes a relative target" \
+    'd="$(mktemp -d)"; mkdir -p "$d/sub"
+canon="$(readlink -f "$d/sub")"
+setup_mountinfo "36 35 98:0 / $canon rw - fuse.torrentfs torrentfs rw"
+rc=0
+( cd "$d" && mountpoint_has_fuse sub ) || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse matches a target containing a space" \
+    'd="$(mktemp -d)"; mkdir -p "$d/with space"
+escaped="$d/with\040space"
+setup_mountinfo "36 35 98:0 / $escaped rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/with space" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse matches a target with a trailing slash" \
+    'd="$(mktemp -d)"; mkdir -p "$d/sub"
+canon="$(readlink -f "$d/sub")"
+setup_mountinfo "36 35 98:0 / $canon rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/sub/" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse canonicalizes dot-dot path components" \
+    'd="$(mktemp -d)"; mkdir -p "$d/sub"
+canon="$(readlink -f "$d/sub")"
+setup_mountinfo "36 35 98:0 / $canon rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/../$(basename "$d")/sub" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse resolves a symlink target" \
+    'd="$(mktemp -d)"; mkdir -p "$d/sub"; ln -s "$d/sub" "$d/link"
+canon="$(readlink -f "$d/sub")"
+setup_mountinfo "36 35 98:0 / $canon rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/link" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse matches a target containing a backslash" \
+    'd="$(mktemp -d)"; mkdir -p "$d/back\slash"
+escaped="$d/back\134slash"
+setup_mountinfo "36 35 98:0 / $escaped rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/back\slash" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
+run_test "mountpoint_has_fuse matches a target containing a newline" \
+    'd="$(mktemp -d)"; mkdir -p "$d/line
+break"
+escaped="$d/line\012break"
+setup_mountinfo "36 35 98:0 / $escaped rw - fuse.torrentfs torrentfs rw"
+rc=0
+mountpoint_has_fuse "$d/line
+break" || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
+
 # --- start_torrentfs exit-101 integration ---
 # start_torrentfs must refuse (exit 101) when a FUSE mount already exists at
 # the mountpoint. recover_stale_mountpoint and flock are stubbed so the test
@@ -419,19 +491,20 @@ rm -rf "$data_home"
 [ -z "$called" ]'
 
 # --- wait_for_fuse_mount ---
-# The helper polls `mountpoint` and watches torrentfs (via `kill -0` / `wait`).
-# Mock all three so the 30s deadline never actually elapses: `mountpoint`
-# controls readiness, `kill -0` controls liveness, `wait` supplies the exit
-# code. `kill`/`wait` are shell builtins here, so shell functions shadow them.
+# The helper polls `mountpoint_has_fuse` and watches torrentfs (via `kill -0`
+# / `wait`). Mock all three so the 30s deadline never actually elapses:
+# `mountpoint_has_fuse` controls readiness, `kill -0` controls liveness, `wait`
+# supplies the exit code. `kill`/`wait` are shell builtins here, so shell
+# functions shadow them.
 
-run_test "wait_for_fuse_mount returns 0 when mount becomes ready" \
-    'mountpoint() { return 0; }; if wait_for_fuse_mount 99999 /mnt 2>/dev/null; then exit 0; else exit 1; fi'
+run_test "wait_for_fuse_mount returns 0 when FUSE mount becomes ready" \
+    'mountpoint_has_fuse() { return 0; }; if wait_for_fuse_mount 99999 /mnt 2>/dev/null; then exit 0; else exit 1; fi'
 
 run_test "wait_for_fuse_mount propagates torrentfs exit code on premature exit" \
-    'mountpoint() { return 1; }; kill() { return 1; }; wait() { return 7; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 7 ]'
+    'mountpoint_has_fuse() { return 1; }; kill() { return 1; }; wait() { return 7; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 7 ]'
 
 run_test "wait_for_fuse_mount treats clean exit without mount as failure (rc 1)" \
-    'mountpoint() { return 1; }; kill() { return 1; }; wait() { return 0; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
+    'mountpoint_has_fuse() { return 1; }; kill() { return 1; }; wait() { return 0; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
 
 # ── summary ──────────────────────────────────────────────────────────────────
 
