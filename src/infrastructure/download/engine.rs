@@ -12,6 +12,7 @@
 //! `DownloadManager` big lock (TSI-2119).
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -455,6 +456,21 @@ pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
         .saturating_add(recheck_wait)
         .saturating_add(peer_wait)
         .saturating_add(read_timeout_secs)
+}
+
+/// Format the stderr hint emitted when a read times out with zero connected
+/// seeders (TSI-2975).  The message describes the *current* swarm state at
+/// timeout — a seeder that connected and left during the wait also lands here,
+/// so it says "no seeder connected", not "no seeder ever connected".  The
+/// daemon writes the line to its own stderr (operator-facing; a FUSE daemon
+/// has no channel into the reading client's stderr), letting the operator
+/// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`).  Pure so the
+/// exact message is unit-testable without a running engine.
+pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
+    format!(
+        "no seeder connected (Peers:{} Seeds:{})",
+        num_peers, num_seeds
+    )
 }
 
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
@@ -1114,9 +1130,9 @@ impl EngineState {
                     // zero-seeder swarm that would mislead the user into
                     // checking tracker health for what is really a stale
                     // handle.
-                    let (progress, num_seeds) =
+                    let (progress, num_peers, num_seeds) =
                         match self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
-                            Some(s) => (s.progress * 100.0, s.num_seeds),
+                            Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
                             None => {
                                 return Err(TorrentError::Timeout(format!(
                                     "Timed out waiting for piece {} after {:.0}s \
@@ -1127,6 +1143,22 @@ impl EngineState {
                             }
                         };
                     if num_seeds == 0 {
+                        // TSI-2975: a read that blocks out the piece-wait
+                        // window with zero connected seeders currently has no
+                        // seeder to serve it, unlike the `Timeout` branch
+                        // below ("seeder present but slow").  Write a one-line
+                        // hint to the daemon's own stderr (operator-facing; a
+                        // FUSE daemon has no channel into the reading client's
+                        // stderr).  Use a direct, non-panicking write and drop
+                        // its result: `eprintln!` panics on a closed/broken
+                        // stderr, which would abort this engine thread (no
+                        // `catch_unwind` here), and `tracing` is not used
+                        // because its default writer is stdout, not stderr.
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "{}",
+                            no_seeder_stderr_hint(num_peers, num_seeds)
+                        );
                         return Err(TorrentError::NoPeers(format!(
                             "No seeder connected for info_hash {} after {:.0}s. \
                              The torrent has no available seeder — check \
@@ -1593,7 +1625,24 @@ impl EngineState {
 
 #[cfg(test)]
 mod tests {
-    use super::read_wait_budget_secs;
+    use super::{no_seeder_stderr_hint, read_wait_budget_secs};
+
+    /// TSI-2975: the no-seeder stderr hint must use the exact message the
+    /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
+    /// live peer/seed counts — so a currently-empty swarm is distinguishable
+    /// from "seeder slow" (which surfaces as `DownloadTimeout`, not this hint).
+    #[test]
+    fn no_seeder_hint_reports_live_counts() {
+        assert_eq!(
+            no_seeder_stderr_hint(0, 0),
+            "no seeder connected (Peers:0 Seeds:0)"
+        );
+        // Peers may be non-zero (leechers without the piece) while seeds stay 0.
+        assert_eq!(
+            no_seeder_stderr_hint(3, 0),
+            "no seeder connected (Peers:3 Seeds:0)"
+        );
+    }
 
     /// TSI-2751: the read budget must cover all four synchronous phases —
     /// state-transition wait + recheck wait (capped) + peer-discovery wait
