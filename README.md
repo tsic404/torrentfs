@@ -270,13 +270,13 @@ podman run -d --name torrentfs \
 podman exec torrentfs ls /mnt/metadata/
 ```
 
-**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. Passing `-v /host:/mnt:shared` or `--mount ...,bind-propagation=rshared` is silently ineffective — rootless user namespaces cannot create shared mounts, so no mount event reaches the host. The entrypoint detects bind mounts on the mountpoint in rootless mode and emits an explicit warning at startup. If you need host-visible FUSE mounts:
+**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. Passing `-v /host:/mnt:shared` or `--mount ...,bind-propagation=rshared` is silently ineffective — rootless user namespaces cannot create shared mounts, so no mount event reaches the host. The entrypoint detects a bind mount on the mountpoint under rootless podman and **fails fast** (exit `102`) instead of silently mounting container-only, so the standard `-v …:/mnt:shared` recipe can never leave you with a "host cannot see `data/`" surprise. If you need host-visible FUSE mounts:
 
 - Use rootful podman (`sudo podman run ...`) or Docker
 - Run the bundled one-click helper `sudo ./ci/deploy_rootful.sh` — it prepares the host shared mount and starts the container with `rshared` bind propagation and a persistent state directory
 - Run torrentfs directly on the host without a container
 
-The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
+For container-only access under rootless podman, run **without** a bind mount on the mountpoint (as in the `podman exec` recipe above): the entrypoint then mounts directly on the mountpoint, container-only.
 
 ### Non-root execution (UID downgrade)
 

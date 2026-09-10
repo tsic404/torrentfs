@@ -11,8 +11,9 @@
 #   5. Rootless podman detection: shared propagation is unsupported in user
 #      namespaces, so the two-stage bind mount is skipped and torrentfs mounts
 #      directly on the container path. When the mountpoint is a bind mount
-#      (e.g. -v /host:/mnt:shared), an explicit warning is emitted that the
-#      ':shared' flag is ineffective and the host will not see the FUSE mount.
+#      (e.g. -v /host:/mnt:shared) — the host-visibility recipe — the entrypoint
+#      fails fast (exit 102) instead of silently mounting container-only: the
+#      ':shared' flag is ineffective and the host will never see the FUSE mount.
 #   6. Concurrent-mountpoint conflict handling: two containers sharing one
 #      host directory via rshared propagation would stack FUSE mounts and
 #      sever each other's mount (ENOTCONN). The entrypoint takes an exclusive
@@ -241,10 +242,10 @@ run_daemon() {
     fi
     exec "$@"
 }
-
 # Check whether $1 is a bind mount (root field != "/" in /proc/self/mountinfo).
-# Used to detect `-v <host>:<container>:shared` style bind mounts so we can
-# warn that shared propagation is ineffective under rootless podman.
+# Used to detect `-v <host>:<container>:shared` style bind mounts: under rootless
+# podman the ':shared' propagation is silently downgraded, so the FUSE mount can
+# never reach the host — the entrypoint fails fast rather than degrade silently.
 is_bind_mount() {
     local target="$1"
     # Field 4 is the root within the source filesystem; "/" means it is the
@@ -647,25 +648,54 @@ start_torrentfs() {
         start_torrentfs_rootless "$mountpoint" "$@"
     fi
 }
-
 # Direct mount path (no bind mount): torrentfs mounts directly on the
 # mountpoint, so the FUSE filesystem is only visible inside the container.
 # Used whenever host visibility is impossible — rootless podman (user
-# namespace) and non-root `--user` runs.
+# namespace) and non-root `--user` runs. Under rootless podman running as
+# container root, a bind mount on the mountpoint (the ':shared' host-visibility
+# recipe) fails fast (exit 102) instead of silently degrading.
 start_torrentfs_rootless() {
     local mountpoint="$1"
     shift
 
     mkdir -p "$mountpoint"
 
-    # A bind mount on the mountpoint cannot propagate a FUSE mount to the host
-    # here: ':shared' / 'rshared' needs real root in a non-userns container.
+    # A bind mount on the mountpoint signals host-visibility intent:
+    # `-v <host>:<container>:shared` is the standard startup recipe. Under
+    # rootless podman that ':shared' flag is silently downgraded to a private
+    # bind mount — the user namespace cannot create shared mount events — so
+    # the FUSE mount can never reach the host. Fail fast instead of silently
+    # mounting container-only: the user asked for a host-visible mount that we
+    # cannot deliver, and a confusing "host cannot see data/" is worse than a
+    # clear refusal.
+    #
+    # Scoped to container root (is_root): only root under rootless podman is
+    # the `:shared` host-visibility recipe. A non-root `--user` run (Docker or
+    # rootless podman) bind-mounts /mnt for mountpoint writability, not host
+    # visibility — that keeps the container-only path with a warning below.
     if is_bind_mount "$mountpoint"; then
+        if is_rootless_podman && is_root; then
+            echo "[entrypoint] ERROR: $mountpoint is a bind mount, but shared propagation" >&2
+            echo "[entrypoint]   (rshared) is unsupported under rootless podman — the" >&2
+            echo "[entrypoint]   ':shared' flag is silently ignored, so the FUSE mount" >&2
+            echo "[entrypoint]   cannot reach the host. Refusing to start container-only" >&2
+            echo "[entrypoint]   instead of silently degrading." >&2
+            echo "[entrypoint]   Fixes:" >&2
+            echo "[entrypoint]     - Host-visible mount: run rootful — Docker, or 'sudo" >&2
+            echo "[entrypoint]       podman' with --mount type=bind,bind-propagation=rshared." >&2
+            echo "[entrypoint]     - Container-only access: drop the ':shared' bind mount and" >&2
+            echo "[entrypoint]       reach data/ via 'podman exec <container> ls /mnt/…'." >&2
+            exit 102
+        fi
+        # Non-root `--user` run (Docker or rootless podman): a bind mount here
+        # is for mountpoint writability (the image's /mnt is root-owned), not
+        # host visibility. Still surface the host-visibility limitation in case
+        # ':shared' was intended, but proceed container-only as documented.
         echo "[entrypoint] WARNING: $mountpoint is a bind mount, but shared propagation is" >&2
-        echo "[entrypoint]   unavailable (rootless podman or non-root user) — ':shared' /" >&2
-        echo "[entrypoint]   'rshared' is ineffective here. The FUSE filesystem will only" >&2
-        echo "[entrypoint]   be visible inside the container. For host-visible mounts, run" >&2
-        echo "[entrypoint]   as root via Docker or rootful podman (sudo podman)." >&2
+        echo "[entrypoint]   unavailable for a non-root user — ':shared' / 'rshared' is" >&2
+        echo "[entrypoint]   ineffective here. The FUSE filesystem will only be visible" >&2
+        echo "[entrypoint]   inside the container. For host-visible mounts, run as root" >&2
+        echo "[entrypoint]   via Docker or rootful podman (sudo podman)." >&2
     fi
 
     echo "[entrypoint] direct mount (no host propagation) — FUSE mount will only be visible inside the container" >&2
