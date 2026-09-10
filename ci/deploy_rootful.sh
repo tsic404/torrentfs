@@ -104,7 +104,7 @@ print_dry_run() {
     echo "    --device /dev/fuse \\"
     echo "    --cap-add SYS_ADMIN \\"
     echo "    --mount type=bind,source=$MOUNTPOINT,target=/mnt,bind-propagation=rshared \\"
-    echo "    --mount type=bind,source=$STATE_DIR,target=/root/.local/share/torrentfs \\"
+    echo "    --mount type=bind,source=$STATE_DIR,target=/home/torrentfs/.local/share/torrentfs \\"
     echo "    --stop-timeout 30 \\"
     echo "    $IMAGE"
 }
@@ -122,7 +122,7 @@ run_deploy() {
         --device /dev/fuse \
         --cap-add SYS_ADMIN \
         --mount "type=bind,source=$MOUNTPOINT,target=/mnt,bind-propagation=rshared" \
-        --mount "type=bind,source=$STATE_DIR,target=/root/.local/share/torrentfs" \
+        --mount "type=bind,source=$STATE_DIR,target=/home/torrentfs/.local/share/torrentfs" \
         --stop-timeout 30 \
         "$IMAGE"
 

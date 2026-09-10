@@ -100,6 +100,13 @@ jobs:
       - name: Smoke test image
         run: docker run --rm torrentfs:ci --help
 
+      - name: Smoke test privilege drop
+        run: |
+          docker run --rm \
+            -v "$PWD/ci/tests/entrypoint_smoke.sh:/smoke.sh:ro" \
+            --entrypoint /bin/bash \
+            torrentfs:ci /smoke.sh
+
   docker-build-arm64:
     name: Docker Build (arm64)
     if: github.event_name == 'pull_request'

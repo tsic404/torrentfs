@@ -121,6 +121,9 @@ run_test "dry-run sequence includes explicit image tag" \
 run_test "dry-run sequence includes engine command" \
     'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "podman run -d --name torrentfs"'
 
+run_test "dry-run mounts state at the non-root daemon home" \
+    'ENGINE=podman; out=$(print_dry_run); printf "%s\n" "$out" | grep -q "target=/home/torrentfs/.local/share/torrentfs"'
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 echo ""
