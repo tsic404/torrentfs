@@ -22,6 +22,23 @@
 
 set -euo pipefail
 
+# ── privilege drop ────────────────────────────────────────────────────────────
+# torrentfs is a network-facing daemon (untrusted .torrent input + libtorrent).
+# A rootful container holds real root and drops to this dedicated non-root user
+# before the daemon starts; rootless podman maps container UID 0 to the invoking
+# host user (user namespace), so its "root" is already unprivileged on the host
+# and a drop to a subuid would sever /dev/fuse and bind-mounted state access —
+# no drop occurs there.
+TORRENTFS_UID=1000
+TORRENTFS_GID=1000
+TORRENTFS_HOME=/home/torrentfs
+
+# Resolved at startup by resolve_daemon_ids: who the daemon runs as, and who
+# the state tree is re-homed to.
+daemon_uid=""
+daemon_gid=""
+daemon_home=""
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 # Commands that do not require a FUSE mount — pass these straight through.
@@ -192,6 +209,39 @@ is_rootless_podman() {
     return 1
 }
 
+# Drop privileges only in a rootful container (real root). Rootless podman's
+# "root" is the invoking host user inside a user namespace: keep it, since a
+# drop would sever /dev/fuse and state-volume access.
+should_drop_privileges() {
+    is_root && ! is_rootless_podman
+}
+
+# Resolve the daemon identity once, so the state-ownership fix and the launch
+# both target the same owner torrentfs will actually run as.
+resolve_daemon_ids() {
+    if should_drop_privileges; then
+        daemon_uid="$TORRENTFS_UID"
+        daemon_gid="$TORRENTFS_GID"
+        daemon_home="$TORRENTFS_HOME"
+    else
+        daemon_uid="$(id -u)"
+        daemon_gid="$(id -g)"
+        daemon_home="${HOME:-/}"
+    fi
+}
+
+# Launch torrentfs under the correct identity. Always called in the background;
+# `exec` keeps the background subshell's PID equal to the daemon's PID so the
+# caller's `kill`/`wait` track torrentfs itself (an intermediate subshell would
+# orphan the daemon on shutdown).
+run_daemon() {
+    if should_drop_privileges; then
+        exec setpriv --reuid="$daemon_uid" --regid="$daemon_gid" --clear-groups \
+            env HOME="$daemon_home" "$@"
+    fi
+    exec "$@"
+}
+
 # Check whether $1 is a bind mount (root field != "/" in /proc/self/mountinfo).
 # Used to detect `-v <host>:<container>:shared` style bind mounts so we can
 # warn that shared propagation is ineffective under rootless podman.
@@ -215,6 +265,11 @@ ensure_fuse_device() {
     if is_root; then
         echo "[entrypoint] /dev/fuse missing — attempting to create device node" >&2
         if mknod /dev/fuse c 10 229 2>/dev/null; then
+            # A non-root daemon (privilege drop in rootful containers) needs
+            # read-write /dev/fuse. Only chmod the node we just created (0600
+            # root): chmod-ing a --device-provided node would mutate the host's
+            # device permissions through the rootful bind mount.
+            chmod a+rw /dev/fuse
             echo "[entrypoint] /dev/fuse created successfully" >&2
             return 0
         fi
@@ -242,19 +297,26 @@ ensure_fuse_device() {
 # walked read-only (no chown syscalls) on every cold start.  Skipped when the
 # path does not exist yet: torrentfs creates it fresh with correct ownership.
 rehome_ownership() {
-    local target="$1" uid gid probe
+    local target="$1" probe
     [ -e "$target" ] || return 0
-    uid="$(id -u)"; gid="$(id -g)"
+    # resolve_daemon_ids() runs first (main calls it before
+    # fix_state_dir_ownership); an empty daemon_uid would make `find ! -user ""`
+    # a probe failure and `chown -R ":"` a silent no-op that leaves the tree
+    # foreign-owned. Fail loudly if that contract is broken.
+    if [ -z "${daemon_uid:-}" ] || [ -z "${daemon_gid:-}" ]; then
+        echo "[entrypoint] ERROR: daemon identity not resolved; refusing to rehome $target" >&2
+        return 1
+    fi
     # Capture find's exit status separately from its output: a consistent tree
     # is status==0 AND empty output.  A non-zero status (unreadable subtree,
     # unmapped nobody dir in a rootless userns, I/O error, faulty mount) is a
     # probe failure — not a clean bill of health — so fall through to chown
     # rather than silently skipping a leftover foreign-owned tree.
-    if probe="$(find "$target" \( ! -user "$uid" -o ! -group "$gid" \) -print -quit 2>/dev/null)"; then
+    if probe="$(find "$target" \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null)"; then
         [ -z "$probe" ] && return 0
     fi
-    if ! chown -R "$uid:$gid" "$target" 2>/dev/null; then
-        echo "[entrypoint] WARNING: could not chown $target to $uid:$gid" >&2
+    if ! chown -R "$daemon_uid:$daemon_gid" "$target" 2>/dev/null; then
+        echo "[entrypoint] WARNING: could not chown $target to $daemon_uid:$daemon_gid" >&2
     fi
 }
 
@@ -265,7 +327,7 @@ fix_state_dir_ownership() {
         return 0
     fi
 
-    rehome_ownership "${XDG_DATA_HOME:-$HOME/.local/share}/torrentfs"
+    rehome_ownership "${XDG_DATA_HOME:-$daemon_home/.local/share}/torrentfs"
 
     if [ -n "${cache_arg:-}" ]; then
         rehome_ownership "$cache_arg"
@@ -579,32 +641,34 @@ start_torrentfs() {
         exit 101
     fi
 
-    if is_rootless_podman; then
-        start_torrentfs_rootless "$mountpoint" "$@"
-    else
+    if should_drop_privileges; then
         start_torrentfs_rootful "$mountpoint" "$@"
+    else
+        start_torrentfs_rootless "$mountpoint" "$@"
     fi
 }
 
-# Rootless podman path: direct FUSE mount, no bind mount (propagation not supported).
+# Direct mount path (no bind mount): torrentfs mounts directly on the
+# mountpoint, so the FUSE filesystem is only visible inside the container.
+# Used whenever host visibility is impossible — rootless podman (user
+# namespace) and non-root `--user` runs.
 start_torrentfs_rootless() {
     local mountpoint="$1"
     shift
 
     mkdir -p "$mountpoint"
 
-    # If the mountpoint is a bind mount (e.g. -v /host:/mnt:shared), warn
-    # explicitly that shared propagation cannot work under rootless podman —
-    # the host will NOT see the FUSE filesystem even though the bind mount
-    # itself is present.
+    # A bind mount on the mountpoint cannot propagate a FUSE mount to the host
+    # here: ':shared' / 'rshared' needs real root in a non-userns container.
     if is_bind_mount "$mountpoint"; then
-        echo "[entrypoint] WARNING: $mountpoint is a bind mount, but rootless podman cannot propagate" >&2
-        echo "[entrypoint]   FUSE mounts to the host — ':shared' / 'rshared' is ineffective here." >&2
-        echo "[entrypoint]   The FUSE filesystem will only be visible inside the container." >&2
-        echo "[entrypoint]   For host-visible mounts, use rootful podman (sudo podman) or Docker." >&2
+        echo "[entrypoint] WARNING: $mountpoint is a bind mount, but shared propagation is" >&2
+        echo "[entrypoint]   unavailable (rootless podman or non-root user) — ':shared' /" >&2
+        echo "[entrypoint]   'rshared' is ineffective here. The FUSE filesystem will only" >&2
+        echo "[entrypoint]   be visible inside the container. For host-visible mounts, run" >&2
+        echo "[entrypoint]   as root via Docker or rootful podman (sudo podman)." >&2
     fi
 
-    echo "[entrypoint] rootless podman detected — FUSE mount will only be visible inside the container" >&2
+    echo "[entrypoint] direct mount (no host propagation) — FUSE mount will only be visible inside the container" >&2
     echo "[entrypoint] starting torrentfs directly on $mountpoint" >&2
 
     local torrentfs_pid=""
@@ -618,7 +682,7 @@ start_torrentfs_rootless() {
     }
     trap cleanup EXIT INT TERM
 
-    torrentfs "$mountpoint" "$@" &
+    run_daemon torrentfs "$mountpoint" "$@" &
     torrentfs_pid=$!
 
     local mount_rc=0
@@ -641,6 +705,9 @@ start_torrentfs_rootful() {
     local internal_mnt="/mnt-inner"
 
     mkdir -p "$internal_mnt"
+    if should_drop_privileges; then
+        chown "$daemon_uid:$daemon_gid" "$internal_mnt"
+    fi
     mkdir -p "$mountpoint"
 
     echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
@@ -656,7 +723,7 @@ start_torrentfs_rootful() {
     }
     trap cleanup EXIT INT TERM
 
-    torrentfs "$internal_mnt" "$@" &
+    run_daemon torrentfs "$internal_mnt" "$@" &
     torrentfs_pid=$!
 
     local mount_rc=0
@@ -676,6 +743,8 @@ start_torrentfs_rootful() {
 }
 
 echo "[entrypoint] /dev/fuse is available" >&2
+
+resolve_daemon_ids
 
 fix_state_dir_ownership
 

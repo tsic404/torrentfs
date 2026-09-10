@@ -278,6 +278,18 @@ podman exec torrentfs ls /mnt/metadata/
 
 The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
 
+### Non-root execution (UID downgrade)
+
+torrentfs is a network-facing daemon — it ingests untrusted `.torrent` files and links libtorrent — so the image does not run it as real root where that is avoidable:
+
+- The image ships a dedicated non-root user `torrentfs` (UID/GID `1000`, home `/home/torrentfs`).
+- In a **rootful** container (Docker, `sudo podman`), the entrypoint performs the privileged setup as root — `/dev/fuse`, the state directory, and the `rshared` bind mount — then drops the torrentfs daemon itself to `torrentfs` via `setpriv` before it starts.
+- Under **rootless podman**, container UID `0` already maps to the invoking host user through the user namespace: the process is unprivileged on the host, and dropping to a subuid would sever access to `/dev/fuse` and bind-mounted state volumes. The entrypoint therefore keeps the mapped root and does not drop.
+
+The daemon's state directory follows the running user's XDG data dir — in a rootful container that is `/home/torrentfs/.local/share/torrentfs` (the old root-running image used `/root/.local/share/torrentfs`); bind-mount a persistent volume there (see `ci/deploy_rootful.sh`). You can also run as a non-root user directly (`podman run --user 1000:1000 --userns keep-id ...`): the entrypoint skips the root-only setup and mounts directly on the mountpoint, container-only. The mountpoint must be writable by that user — rootless podman's user namespace maps the image's root-owned `/mnt` to the invoking user, but `docker run --user 1000:1000` keeps `/mnt` root-owned, so pass a writable bind mount (`-v /path:/mnt`) for the FUSE mount to succeed.
+
+Non-root FUSE mounting needs `/dev/fuse` to be world-accessible (the udev default is `0666`) or the daemon user to be in the host's `fuse` group; the entrypoint widens `/dev/fuse` only when it creates the node itself, never a `--device`-provided one. `user_allow_other` is already enabled in `/etc/fuse.conf` at image build time.
+
 ### Shutdown and restart (`stop_timeout`)
 
 `podman stop` / `docker stop` send SIGTERM and then SIGKILL after a grace period. The container engine default is **10 seconds**, which is not enough for torrentfs to stop the download engine, drain its worker queue, flush the cache, and unmount the FUSE filesystem. The forced SIGKILL then leaves a stale FUSE mount that reports `ENOTCONN` ("Transport endpoint is not connected") on the next start, and `mkdir /mnt` in the entrypoint would fail.

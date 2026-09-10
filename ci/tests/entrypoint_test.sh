@@ -72,6 +72,17 @@ setup_stat() {
     }
 }
 
+# Install a fake `setpriv` on PATH that prints its argv (one per line) to
+# stdout and exits 0. Lets run_daemon tests assert the exact privilege-drop
+# invocation without a real setpriv or a drop to an existing UID.
+install_fake_setpriv() {
+    local dir
+    dir="$(mktemp -d)"
+    printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$@"' > "$dir/setpriv"
+    chmod +x "$dir/setpriv"
+    PATH="$dir:$PATH"
+}
+
 # Stub out validate_config so parse_args tests can pass --config without
 # invoking the real torrentfs binary (unavailable in this test environment).
 # parse_args is only exercised for argument structure here; config validity
@@ -342,6 +353,49 @@ rc=0
 rm -rf "$mnt"
 test "$rc" -eq 101'
 
+# --- start_torrentfs dispatch ---
+# The two-stage bind mount (host visibility) needs real root in a non-userns
+# container; everything else — rootless podman (userns root) and non-root
+# --user runs — mounts directly. recover_stale_mountpoint/flock/
+# mountpoint_has_fuse are stubbed to pass the guards, and the two dispatch
+# targets record which one ran.
+
+run_test "start_torrentfs dispatches to rootful for rootful root" \
+    'mnt="$(mktemp -d)"
+recover_stale_mountpoint() { return 0; }
+flock() { return 0; }
+mountpoint_has_fuse() { return 1; }
+is_root() { return 0; }; is_rootless_podman() { return 1; }
+start_torrentfs_rootful() { echo ROOTFUL > "$mnt/dispatch"; }
+start_torrentfs_rootless() { echo ROOTLESS > "$mnt/dispatch"; }
+start_torrentfs "$mnt"
+grep -q ROOTFUL "$mnt/dispatch"
+rm -rf "$mnt"'
+
+run_test "start_torrentfs dispatches to direct mount under rootless podman" \
+    'mnt="$(mktemp -d)"
+recover_stale_mountpoint() { return 0; }
+flock() { return 0; }
+mountpoint_has_fuse() { return 1; }
+is_root() { return 0; }; is_rootless_podman() { return 0; }
+start_torrentfs_rootful() { echo ROOTFUL > "$mnt/dispatch"; }
+start_torrentfs_rootless() { echo ROOTLESS > "$mnt/dispatch"; }
+start_torrentfs "$mnt"
+grep -q ROOTLESS "$mnt/dispatch"
+rm -rf "$mnt"'
+
+run_test "start_torrentfs dispatches to direct mount for non-root" \
+    'mnt="$(mktemp -d)"
+recover_stale_mountpoint() { return 0; }
+flock() { return 0; }
+mountpoint_has_fuse() { return 1; }
+is_root() { return 1; }; is_rootless_podman() { return 1; }
+start_torrentfs_rootful() { echo ROOTFUL > "$mnt/dispatch"; }
+start_torrentfs_rootless() { echo ROOTLESS > "$mnt/dispatch"; }
+start_torrentfs "$mnt"
+grep -q ROOTLESS "$mnt/dispatch"
+rm -rf "$mnt"'
+
 # --- mountpoint_enotconn ---
 # setup_stat defines a fake `stat` function (a shell builtin here, so a PATH
 # stub would never be consulted) with the given exit code and stderr text.
@@ -362,12 +416,13 @@ run_test "fuse_device_exists does not crash" \
 
 # --- fix_state_dir_ownership ---
 # Re-homes the torrentfs state tree (default XDG dir, plus any --cache/--db
-# overrides) to the current user when a previous (possibly non-root) container
-# run left any part of it owned by a different UID.  `rehome_ownership` probes
-# ownership *recursively* via `find`, so a correct top-level directory with a
-# leftover nobody:nogroup file underneath still triggers the chown.  is_root,
-# id, find, and chown are stubbed (except the one real-`find` test) so no real
-# uid/chown runs on the test host.
+# overrides) to the daemon user when a previous container run left any part of
+# it owned by a different UID.  `rehome_ownership` probes ownership
+# *recursively* via `find`, so a correct top-level directory with a leftover
+# nobody:nogroup file underneath still triggers the chown.  is_root, find, and
+# chown are stubbed (except the real-`find` tests), and daemon_uid/daemon_gid/
+# daemon_home are set directly (resolve_daemon_ids is covered separately) so no
+# real uid/chown runs on the test host.
 
 run_test "fix_state_dir_ownership skips when not root" \
     'is_root() { return 1; }
@@ -381,7 +436,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership skips when state dir is missing" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 called=""
 chown() { called="$*"; }
 data_home="$(mktemp -d)"
@@ -391,7 +446,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership chowns when find detects a mismatch" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { echo "/mismatch"; }
 chown_args=""
 chown() { chown_args="$*"; }
@@ -403,7 +458,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership skips chown when find detects no mismatch" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { :; }
 called=""
 chown() { called="$*"; }
@@ -415,7 +470,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership chowns when find probe fails (non-zero, empty)" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { return 1; }
 chown_args=""
 chown() { chown_args="$*"; }
@@ -427,7 +482,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership detects nested ownership mismatch via real find" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 12345 ;; -g) echo 12345 ;; esac; }
+daemon_uid=12345; daemon_gid=12345
 chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
@@ -439,6 +494,7 @@ rm -rf "$data_home"
 
 run_test "fix_state_dir_ownership skips chown on a consistent tree (real find)" \
     'is_root() { return 0; }
+daemon_uid="$(id -u)"; daemon_gid="$(id -g)"
 called=""
 chown() { called="$*"; }
 data_home="$(mktemp -d)"
@@ -448,22 +504,22 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
-run_test "fix_state_dir_ownership respects XDG_DATA_HOME default via HOME" \
+run_test "fix_state_dir_ownership respects daemon_home when XDG unset" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { echo "/mismatch"; }
 chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
 mkdir -p "$data_home/.local/share/torrentfs"
 unset XDG_DATA_HOME
-HOME="$data_home" fix_state_dir_ownership
+daemon_home="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ "$chown_args" = "-R 0:0 $data_home/.local/share/torrentfs" ]'
 
 run_test "fix_state_dir_ownership chowns custom --cache and --db paths" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { echo "/mismatch"; }
 chown_calls=""
 chown() { chown_calls="$chown_calls|$*"; }
@@ -480,7 +536,7 @@ echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/db/metadata.db"'
 
 run_test "fix_state_dir_ownership does not chown cwd for a bare --db filename" \
     'is_root() { return 0; }
-id() { case "$1" in -u) echo 0 ;; -g) echo 0 ;; esac; }
+daemon_uid=0; daemon_gid=0
 find() { echo "/mismatch"; }
 called=""
 chown() { called="$*"; }
@@ -489,6 +545,55 @@ db_arg="metadata.db"
 XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
+
+# --- should_drop_privileges / resolve_daemon_ids / run_daemon ---
+# The privilege-drop decision: drop only when root AND not in a rootless-podman
+# user namespace (where container UID 0 already maps to the invoking host user).
+
+run_test "should_drop_privileges true as root outside rootless podman" \
+    'is_root() { return 0; }; is_rootless_podman() { return 1; }; should_drop_privileges'
+
+run_test "should_drop_privileges false as root under rootless podman" \
+    'is_root() { return 0; }; is_rootless_podman() { return 0; }; if should_drop_privileges; then exit 1; else exit 0; fi'
+
+run_test "should_drop_privileges false as non-root" \
+    'is_root() { return 1; }; is_rootless_podman() { return 1; }; if should_drop_privileges; then exit 1; else exit 0; fi'
+
+run_test "resolve_daemon_ids picks torrentfs user when dropping" \
+    'is_root() { return 0; }; is_rootless_podman() { return 1; }
+resolve_daemon_ids
+[ "$daemon_uid" = 1000 ] && [ "$daemon_gid" = 1000 ] && [ "$daemon_home" = /home/torrentfs ]'
+
+run_test "resolve_daemon_ids keeps current user when not dropping" \
+    'is_root() { return 1; }; is_rootless_podman() { return 0; }
+id() { case "$1" in -u) echo 4242 ;; -g) echo 4343 ;; esac; }
+HOME=/some/home resolve_daemon_ids
+[ "$daemon_uid" = 4242 ] && [ "$daemon_gid" = 4343 ] && [ "$daemon_home" = /some/home ]'
+
+run_test "resolve_daemon_ids falls back to / when HOME is unset" \
+    'is_root() { return 1; }; is_rootless_podman() { return 0; }
+id() { case "$1" in -u) echo 4242 ;; -g) echo 4343 ;; esac; }
+unset HOME
+resolve_daemon_ids
+[ "$daemon_uid" = 4242 ] && [ "$daemon_gid" = 4343 ] && [ "$daemon_home" = / ]'
+
+run_test "rehome_ownership refuses when daemon identity is unresolved" \
+    'unset daemon_uid daemon_gid
+d="$(mktemp -d)"
+rc=0
+( rehome_ownership "$d" ) 2>/dev/null || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 1 ]'
+
+run_test "run_daemon drops to torrentfs via setpriv" \
+    'should_drop_privileges() { return 0; }
+daemon_uid=1000; daemon_gid=1000; daemon_home=/home/torrentfs
+install_fake_setpriv
+out="$( ( run_daemon torrentfs /mnt --db /db ) 2>/dev/null )"
+printf "%s\n" "$out" | grep -q -- "--reuid=1000"
+printf "%s\n" "$out" | grep -q -- "--regid=1000"
+printf "%s\n" "$out" | grep -q -- "--clear-groups"
+printf "%s\n" "$out" | grep -q -- "HOME=/home/torrentfs"'
 
 # --- wait_for_fuse_mount ---
 # The helper polls `mountpoint_has_fuse` and watches torrentfs (via `kill -0`

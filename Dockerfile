@@ -64,7 +64,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libfuse2 \
     fuse3 \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    passwd \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 1000 torrentfs \
+    && useradd --uid 1000 --gid 1000 --home-dir /home/torrentfs \
+        --create-home --shell /usr/sbin/nologin torrentfs
 
 # Enable allow_other so non-root users can access the shared mount.
 # fuse3 ships /etc/fuse.conf with `#user_allow_other` commented out; uncomment
