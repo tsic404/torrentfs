@@ -123,6 +123,21 @@ fn peer_fingerprint_still_reaches_libtorrent() {
 }
 
 #[test]
+fn handshake_client_version_reaches_libtorrent() {
+    // TSI-2954: the peer wire-protocol handshake client version string must
+    // reach the live session, not be silently dropped as an unknown string key.
+    let mut config = TorrentfsConfig::default_config();
+    config.user_agent.handshake_client_version = Some("4.6.5".to_string());
+    let session = Session::new(&config).unwrap();
+    assert_eq!(
+        session
+            .get_str_setting("handshake_client_version")
+            .expect("handshake_client_version must be readable"),
+        "4.6.5"
+    );
+}
+
+#[test]
 fn settings_work_with_custom_storage_session() {
     let dir = tempfile::TempDir::new().unwrap();
     with_large_stack(move || {
