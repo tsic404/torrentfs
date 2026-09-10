@@ -28,6 +28,9 @@ awk '/^# ── main/{exit} {print}' "$ENTRYPOINT" > "$HELPERS_FILE"
 # the integration test can exercise its exit-101 conflict paths without
 # running the real FUSE mount or dispatch functions.
 awk '/^start_torrentfs\(\) \{/{f=1} f{print} f && /^}/{exit}' "$ENTRYPOINT" >> "$HELPERS_FILE"
+# Also extract start_torrentfs_rootless so the fail-fast (exit 102) branch can
+# be exercised without a real FUSE mount or torrentfs binary.
+awk '/^start_torrentfs_rootless\(\) \{/{f=1} f{print} f && /^}/{exit}' "$ENTRYPOINT" >> "$HELPERS_FILE"
 trap 'rm -f "$HELPERS_FILE"' EXIT
 
 # Append a test-only override helper to the extracted functions so it is
@@ -395,6 +398,61 @@ start_torrentfs_rootless() { echo ROOTLESS > "$mnt/dispatch"; }
 start_torrentfs "$mnt"
 grep -q ROOTLESS "$mnt/dispatch"
 rm -rf "$mnt"'
+
+# --- start_torrentfs_rootless fail-fast (TSI-2976) ---
+# Under rootless podman running as container root (is_root), a bind mount on
+# the mountpoint is the ':shared' host-visibility recipe whose propagation
+# cannot be honored — the entrypoint must exit 102 instead of silently mounting
+# container-only. Non-root `--user` runs (Docker or rootless podman) bind-mount
+# /mnt for writability and keep the warning + container-only path;
+# bind-mount-free rootless runs also proceed. run_daemon/wait_for_fuse_mount are
+# stubbed so the "proceeds" cases short-circuit without a real mount.
+
+run_test "start_torrentfs_rootless fails fast on bind mount under rootless podman (root)" \
+    'mnt="$(mktemp -d)"
+is_root() { return 0; }
+is_rootless_podman() { return 0; }
+is_bind_mount() { return 0; }
+rc=0
+( start_torrentfs_rootless "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 102'
+
+run_test "start_torrentfs_rootless warns but proceeds for non-root docker --user bind mount" \
+    'mnt="$(mktemp -d)"
+is_root() { return 1; }
+is_rootless_podman() { return 1; }
+is_bind_mount() { return 0; }
+run_daemon() { :; }
+wait_for_fuse_mount() { return 1; }
+rc=0
+( start_torrentfs_rootless "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 1'
+
+run_test "start_torrentfs_rootless warns but proceeds for rootless podman --user bind mount" \
+    'mnt="$(mktemp -d)"
+is_root() { return 1; }
+is_rootless_podman() { return 0; }
+is_bind_mount() { return 0; }
+run_daemon() { :; }
+wait_for_fuse_mount() { return 1; }
+rc=0
+( start_torrentfs_rootless "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 1'
+
+run_test "start_torrentfs_rootless proceeds without bind mount under rootless podman" \
+    'mnt="$(mktemp -d)"
+is_root() { return 0; }
+is_rootless_podman() { return 0; }
+is_bind_mount() { return 1; }
+run_daemon() { :; }
+wait_for_fuse_mount() { return 1; }
+rc=0
+( start_torrentfs_rootless "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 1'
 
 # --- mountpoint_enotconn ---
 # setup_stat defines a fake `stat` function (a shell builtin here, so a PATH
