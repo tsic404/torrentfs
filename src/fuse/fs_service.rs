@@ -1116,6 +1116,18 @@ impl FsService {
     }
 
     pub fn unlink(&mut self, parent: u64, name: &str) -> FsResult<Option<i64>> {
+        self.unlink_with_pending_timeout(parent, name, PENDING_ADD_TIMEOUT)
+    }
+
+    /// TSI-2967: like `unlink`, but the pending-add wait timeout is
+    /// injectable so tests can exercise the timeout path in milliseconds
+    /// instead of hard-waiting out the production 5s deadline.
+    pub(crate) fn unlink_with_pending_timeout(
+        &mut self,
+        parent: u64,
+        name: &str,
+        pending_timeout: Duration,
+    ) -> FsResult<Option<i64>> {
         let mut removed_id = None;
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
@@ -1145,6 +1157,19 @@ impl FsService {
                 let source_path = self.inode_mgr.extract_source_path(*file_parent);
 
                 if let Some(ref ts) = self.torrent_service {
+                    // TSI-2967: a fast `cp` followed immediately by `rm` races
+                    // the detached `add_torrent` thread spawned by `release`
+                    // (TSI-2247). `remove_torrent` finds no DB row yet and
+                    // returns `Ok(None)`, so the inode is marked unlinked;
+                    // then the in-flight add lands the row AFTER the unlink and
+                    // `data/` serves an orphaned torrent root with no
+                    // metadata/ counterpart. Wait (bounded) for the pending
+                    // add to settle first so the subsequent remove finds and
+                    // deletes the row. On timeout, fail cleanly — the inode is
+                    // untouched, so the user can retry.
+                    let dedup_key = (source_path.clone(), filename.clone());
+                    self.wait_for_pending_add(&dedup_key, pending_timeout, "unlink")?;
+
                     match ts.remove_torrent(&filename, &source_path) {
                         Ok(Some((torrent_id, info_hash))) => {
                             removed_id = Some(torrent_id);
@@ -1437,7 +1462,7 @@ impl FsService {
                 // back to the pre-rename name below — a bare `?` would leave
                 // metadata/ showing the new name while the still-pending
                 // background add lands the DB row at the OLD one,
-                if let Err(e) = self.wait_for_pending_add(&dedup_key, pending_timeout) {
+                if let Err(e) = self.wait_for_pending_add(&dedup_key, pending_timeout, "rename") {
                     self.inode_mgr.inodes.insert(
                         source_ino,
                         InodeData::File {
@@ -1550,11 +1575,14 @@ impl FsService {
     /// the Condvar instead of polling the map. On timeout the caller has
     /// already rolled back any inode state and must fail the operation.
     /// `timeout` is a parameter so tests can use a short deadline instead of
-    /// the production 5s.
+    /// the production 5s. `op` names the calling operation (`"rename"` /
+    /// `"unlink"`) so the timeout log and error message read correctly for
+    /// whichever path hit the wait.
     fn wait_for_pending_add(
         &self,
         dedup_key: &(String, String),
         timeout: Duration,
+        op: &str,
     ) -> FsResult<()> {
         let deadline = std::time::Instant::now() + timeout;
         let mut guard = self
@@ -1565,18 +1593,19 @@ impl FsService {
             let now = std::time::Instant::now();
             if now >= deadline {
                 error!(
-                    "Timed out waiting for pending add of '{:?}' before rename",
-                    dedup_key
+                    "Timed out waiting for pending add of '{:?}' before {}",
+                    dedup_key, op
                 );
-                return Err(FsError::Internal(
-                    "torrent is still being processed; retry the rename".to_string(),
-                ));
+                return Err(FsError::Internal(format!(
+                    "torrent is still being processed; retry the {}",
+                    op
+                )));
             }
             let (g, timed_out) = self
                 .processing_torrents_cv
                 .wait_timeout(guard, deadline - now)
                 .map_err(|_| {
-                    error!("Condvar poisoned in rename() pending-add wait");
+                    error!("Condvar poisoned in {}() pending-add wait", op);
                     FsError::LockPoisoned
                 })?;
             guard = g;
@@ -3032,7 +3061,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let err = svc
-            .wait_for_pending_add(&key, Duration::from_millis(100))
+            .wait_for_pending_add(&key, Duration::from_millis(100), "rename")
             .expect_err("short timeout must fail");
         assert!(
             matches!(err, FsError::Internal(_)),
@@ -3846,6 +3875,98 @@ mod tests {
         assert!(svc.processing_torrents.lock().unwrap().is_empty());
         // Inode destroyed on last release.
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2967: a fast `cp` immediately followed by `rm` must not leave an
+    /// orphaned DB row. `unlink` waits (bounded) for the detached
+    /// `add_torrent` (spawned by `release`, TSI-2247) to settle before calling
+    /// `remove_torrent`, so the row the add just landed is found and deleted
+    /// instead of surviving as a ghost `data/` entry with no metadata/.
+    #[test]
+    fn unlink_waits_for_pending_add_then_removes_row() {
+        let mut svc = service_with_db();
+
+        let key = ("".to_string(), "foo.torrent".to_string());
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        let _ino = writable_file_ino(&mut svc, "foo.torrent");
+
+        // Simulate the detached `add_torrent` thread: after a short delay it
+        // lands the DB row, then clears the pending key (signalling unlink to
+        // proceed). Without the TSI-2967 wait, unlink would observe no row
+        // yet, return `Ok(None)`, and this row would be orphaned.
+        let db = svc.db.as_ref().unwrap().clone();
+        let processing = svc.processing_torrents.clone();
+        let cv = svc.processing_torrents_cv.clone();
+        let key2 = key.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            {
+                let mut db_guard = db.lock().unwrap();
+                db_guard
+                    .insert_torrent("", "foo", "foo.torrent", 16, "hash-2967", 1)
+                    .expect("insert torrent");
+            }
+            processing.lock().unwrap().remove(&key2);
+            cv.notify_one();
+        });
+
+        // unlink must block until the pending add settles, then find + delete
+        // the freshly-inserted row.
+        let removed = svc
+            .unlink(METADATA_INO, "foo.torrent")
+            .expect("unlink must succeed");
+        assert!(removed.is_some(), "unlink must remove the landed DB row");
+
+        // No orphan: the row is gone.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("foo.torrent", "")
+                .expect("db query")
+                .is_none(),
+            "torrent row must be removed, not left as a data/ orphan"
+        );
+    }
+
+    /// TSI-2967: if the pending add never settles (stuck), `unlink` must fail
+    /// cleanly (leaving the inode visible) instead of returning `Ok(None)` and
+    /// letting the eventual add land an orphaned row. Exercises the
+    /// injected-deadline path without hard-waiting the 5s production timeout.
+    #[test]
+    fn unlink_fails_cleanly_when_add_stays_pending() {
+        let mut svc = service_with_db();
+        let ino = writable_file_ino(&mut svc, "stuck.torrent");
+
+        // Pending forever — no background thread will clear it.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(("".to_string(), "stuck.torrent".to_string()), ());
+
+        let started = std::time::Instant::now();
+        let result = svc.unlink_with_pending_timeout(
+            METADATA_INO,
+            "stuck.torrent",
+            Duration::from_millis(100),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout must honor the injected deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result.is_err(),
+            "unlink over a stuck pending add must fail, not orphan"
+        );
+
+        // Clean failure: the inode is untouched and still visible under
+        // metadata/, so the user can retry once the add settles.
+        assert!(!svc.inode_mgr.is_unlinked_file(ino));
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
     }
 
     /// TSI-2234 (review blocking #1): a directory whose only remaining
