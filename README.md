@@ -103,6 +103,10 @@ docker run --rm \
 
 The filesystem is then visible on the host at `/host/torrentfs`. For podman and rootless variants, see [Container Deployment](#container-deployment).
 
+### Rootless podman (container-only access)
+
+Rootless podman cannot create shared mounts, so the `rshared` / `:shared` bind-mount recipe above is rejected by the entrypoint (exit `102`) instead of silently mounting container-only. Run **without** a bind mount on the mountpoint and access the filesystem inside the container via `podman exec` — see [Rootless podman](#rootless-podman) under [Container Deployment](#container-deployment) for the command, which includes `--stop-timeout 30` for clean shutdown. For host-visible mounts, use rootful Docker or `sudo podman`.
+
 ## Usage
 
 ### Adding a torrent
@@ -263,6 +267,7 @@ Rootless podman **does not support shared mount propagation** (`rshared`). This 
 
 ```bash
 podman run -d --name torrentfs \
+  --stop-timeout 30 \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
   ghcr.io/tsic404/torrentfs:main
