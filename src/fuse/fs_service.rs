@@ -1759,17 +1759,32 @@ impl FsService {
                     self.metrics.l2_hit();
                     match ds.read_file_range(info.clone(), file_index, offset, size) {
                         Ok(data) => {
-                            // TSI-2293: guard against `Ok(empty)` for a
-                            // non-zero `size` — same root cause as the
-                            // deferred path (see `guard_empty_read`).
-                            if let Err(e) = guard_empty_read(&data, size) {
+                            // TSI-2293 + TSI-3017: `pieces_on_disk` said the
+                            // range was on disk, but `read_file_range` returned
+                            // empty.  Defer to the download engine instead of
+                            // failing immediately.  The two sub-scenarios both
+                            // converge on ENODATA in the deferred worker:
+                            // no seeder waits the 30s timeout window then
+                            // surfaces `NoPeers` (resolved via `resolve_error`),
+                            // while a file_offset mismatch (TSI-2293) returns
+                            // `Ok(Vec::new())` immediately (resolved via
+                            // `resolve_or_enodata`) — no 30s wait.
+                            if guard_empty_read(&data, size).is_err() {
                                 warn!(
-                                    "Sync read returned 0 bytes for \
-                                     non-zero size (torrent_id={}, \
-                                     file_id={}, size={}); returning ENODATA",
+                                    "Sync read returned 0 bytes for non-zero \
+                                     size (torrent_id={}, file_id={}, size={}); \
+                                     deferring to download path",
                                     torrent_id, file_id, size
                                 );
-                                return Err(e);
+                                self.metrics.deferred_read();
+                                return Ok(ReadOutcome::Pending {
+                                    info: info.clone(),
+                                    file_index,
+                                    offset,
+                                    size,
+                                    info_hash: info_hash.clone(),
+                                    torrent_id,
+                                });
                             }
                             // TSI-2274: populate the L1 range cache so a
                             // repeated read of this exact range is served
@@ -4250,6 +4265,87 @@ mod tests {
         // Empty data, non-zero size → error.
         let err = guard_empty_read(&[], 4096).unwrap_err();
         assert!(matches!(err, FsError::NoPeers(_)));
+    }
+    /// TSI-3017: when `pieces_on_disk` reports the range as on-disk but
+    /// `read_file_range` returns empty, `read_data` must defer to the download
+    /// engine (`Pending`) rather than fail immediately with ENODATA.  Reading
+    /// at `offset == file_size` makes `pieces_on_disk` short-circuit to `true`
+    /// (empty range) and the engine return `Ok(Vec::new())` immediately, so the
+    /// sync empty-read deferral is exercised without a live seeder.
+    #[test]
+    fn sync_empty_read_defers_to_download_path() {
+        let torrent_bytes = minimal_torrent_bytes(); // single 16-byte file
+        let info = TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent");
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let files = info.files().expect("files");
+
+        let mut db = Database::open_in_memory().expect("in-memory db");
+        let file_entries: Vec<FileEntry> = files
+            .iter()
+            .map(|f| FileEntry {
+                path: f.path.clone(),
+                size: f.size as i64,
+            })
+            .collect();
+        let torrent_id = match db
+            .insert_torrent_with_files(
+                "src",
+                "foo",
+                "foo.torrent",
+                16,
+                &info_hash,
+                1,
+                &file_entries,
+            )
+            .expect("insert torrent")
+        {
+            InsertTorrentResult::Inserted(id) => id,
+            other => panic!("unexpected insert result: {:?}", other),
+        };
+        db.set_torrent_data(torrent_id, &torrent_bytes)
+            .expect("set torrent data");
+        let db_arc = Arc::new(Mutex::new(db));
+        let file_id = db_arc
+            .lock()
+            .unwrap()
+            .get_files_by_torrent_id(torrent_id)
+            .expect("get files")[0]
+            .id;
+
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        let config = TorrentfsConfig::default_config();
+        let download_service =
+            Arc::new(DownloadService::new(cache_dir.path(), &config).expect("download service"));
+
+        let metrics = Arc::new(Metrics::new());
+        let mut svc = FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(TorrentService::new(
+                db_arc.clone(),
+                Some(download_service.clone()),
+                None,
+            )),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            processing_torrents_cv: Arc::new(Condvar::new()),
+            download_service: Some(download_service),
+            seeding_manager: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+            notifier: Arc::new(OnceLock::new()),
+        };
+
+        // `offset == file_size` (16) → `pieces_on_disk` says "empty range"
+        // (true) and `read_file_range` returns empty → defer, not error.
+        let outcome = svc
+            .read_data(torrent_id, file_id, 16, 1)
+            .expect("read_data must succeed");
+        assert!(
+            matches!(outcome, ReadOutcome::Pending { .. }),
+            "sync empty read must defer to the download path (Pending), not error"
+        );
     }
 
     /// TSI-2293: `guard_empty_read` must pass through non-empty data and
