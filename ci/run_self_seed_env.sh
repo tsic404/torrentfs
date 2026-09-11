@@ -11,13 +11,19 @@
 #   - a single-file torrent built from a fixed 4 MiB payload
 #   - a libtorrent seeder serving that payload from ci/selfseed/seed_data/
 #
-# Everything is loopback-only: no DHT, no LSD, no UPnP, no NAT-PMP, no public
-# trackers.  Run this before starting torrentfs, then drop
-# ./output/selfseed.torrent into the mounted torrentfs directory and read files
-# through the mount — pieces are served by the local seeder.
+# By default everything is loopback-only: no DHT, no LSD, no UPnP, no NAT-PMP,
+# no public trackers.  To let a container reach the host's loopback services,
+# override the defaults with `--tracker-bind <host IP>` /
+# `--announce-host <host-reachable IP>` so the tracker binds and the .torrent
+# announce URL points at a non-loopback address.  The tracker is IPv4-only, so
+# IPv6 literals are rejected rather than silently breaking the swarm.
+# Run this before starting torrentfs, then drop ./output/selfseed.torrent into
+# the mounted torrentfs directory and read files through the mount — pieces are
+# served by the local seeder.
 #
 # Usage:
 #   ./ci/run_self_seed_env.sh [--payload-mib N] [--port PORT]
+#                             [--tracker-bind IP] [--announce-host IP]
 #
 # Outputs (relative to the repo's ci/selfseed/ directory):
 #   output/selfseed.torrent — the .torrent to copy into torrentfs
@@ -32,14 +38,31 @@ ENV_DIR="$SCRIPT_DIR/selfseed"
 OUTPUT_DIR="$ENV_DIR/output"
 PAYLOAD_MIB=4
 TRACKER_PORT=16969
+TRACKER_BIND=""
+ANNOUNCE_HOST=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --payload-mib) PAYLOAD_MIB="$2"; shift 2 ;;
         --port) TRACKER_PORT="$2"; shift 2 ;;
+        --tracker-bind) TRACKER_BIND="$2"; shift 2 ;;
+        --announce-host) ANNOUNCE_HOST="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+# The self-seed tracker is IPv4-only (`ci/selfseed_env.rs`): its announce
+# handler accepts only V4 peer addresses and the announce URL is written
+# without IPv6 brackets, so an IPv6 literal would silently produce a broken
+# swarm.  Reject it up front instead of letting the passthrough fail downstream.
+if [[ "$TRACKER_BIND" == *:* ]]; then
+    echo "IPv6 not supported by the self-seed tracker: --tracker-bind '$TRACKER_BIND'" >&2
+    exit 2
+fi
+if [[ "$ANNOUNCE_HOST" == *:* ]]; then
+    echo "IPv6 not supported by the self-seed tracker: --announce-host '$ANNOUNCE_HOST'" >&2
+    exit 2
+fi
 
 # Resolve a *working* cargo by probing `--version` on every PATH candidate (in
 # order) and then the rustup default location.  `--version` rejects broken
@@ -74,11 +97,21 @@ head -c $((PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
     | tr '\0' 'a' > "$OUTPUT_DIR/payload.txt"
 
 echo "[selfseed] creating torrent + starting tracker…"
-"$ROOT_DIR/target/release/examples/torrentfs-selfseed-env" \
+SEED_ARGS=( \
     --payload "$OUTPUT_DIR/payload.txt" \
     --tracker-port "$TRACKER_PORT" \
+)
+if [ -n "$TRACKER_BIND" ]; then
+    SEED_ARGS+=(--tracker-bind "$TRACKER_BIND")
+fi
+if [ -n "$ANNOUNCE_HOST" ]; then
+    SEED_ARGS+=(--announce-host "$ANNOUNCE_HOST")
+fi
+SEED_ARGS+=( \
     --torrent-out "$OUTPUT_DIR/selfseed.torrent" \
-    --url-out "$OUTPUT_DIR/tracker.url"
+    --url-out "$OUTPUT_DIR/tracker.url" \
+)
+"$ROOT_DIR/target/release/examples/torrentfs-selfseed-env" "${SEED_ARGS[@]}"
 
 echo ""
 echo "════════════════════════════════════════════════════════════"
