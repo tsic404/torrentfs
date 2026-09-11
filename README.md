@@ -11,7 +11,7 @@ A FUSE-based virtual filesystem for BitTorrent management: mount `.torrent` file
 - **Persistent metadata** — metadata and directory structure live in SQLite and survive restarts.
 - **Virtual statistics** — `.stats` files report piece lifecycle, cache hit rates, and session status.
 - **TOML configuration** — proxy, DHT, rate limits, tracker, encryption, and 15 other sections; every key is optional and falls back to libtorrent defaults.
-- **Docker image** — `ghcr.io/tsic404/torrentfs` with an entrypoint handling FUSE device setup and mount visibility (rootful/rootless).
+- **Docker image** — `ghcr.io/tsic404/torrentfs` with an entrypoint handling FUSE device setup, mount visibility, and privilege drop — rootful runs a two-stage rshared bind mount for host visibility; rootless podman skips it (no UID downgrade, container-only mount) and, as container root, fails fast (exit 102) on any bind mount at the mountpoint.
 
 ## Installation
 
