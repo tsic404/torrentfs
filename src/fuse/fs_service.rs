@@ -3248,6 +3248,52 @@ mod tests {
         assert_ne!(outcome.fh, 0, "data torrent file must get a real fh");
     }
 
+    /// TSI-2988: an out-of-bounds read (`offset >= file_size`) must return
+    /// 0 bytes (EOF), never dirty piece data. The `read` handler's guard is
+    /// the first line of defense before any piece is read from cache/network.
+    #[test]
+    fn read_at_or_past_eof_returns_empty() {
+        let mut svc = bare_service();
+        let ino = DATA_FILE_INO_BASE + 1;
+        svc.inode_mgr.data_inodes.insert(
+            ino,
+            DataInode::TorrentFile {
+                torrent_id: 1,
+                file_id: 1,
+                name: "foo".to_string(),
+                size: 16,
+                torrent_source_path: String::new(),
+                torrent_filename: String::new(),
+            },
+        );
+
+        // offset == file_size (exactly at EOF) → empty.
+        let out = svc.read(ino, 16, 4096).expect("read at EOF");
+        assert!(
+            matches!(&out, ReadOutcome::Ready(d) if d.is_empty()),
+            "read at offset == file_size must return empty (EOF)"
+        );
+
+        // offset > file_size (past EOF) → empty.
+        let out = svc.read(ino, 999_999_999, 1).expect("read past EOF");
+        assert!(
+            matches!(&out, ReadOutcome::Ready(d) if d.is_empty()),
+            "read at offset > file_size must return empty (EOF)"
+        );
+
+        // offset < file_size (in bounds) must NOT be served as EOF: it
+        // proceeds to `read_data`, which fails here because `bare_service`
+        // has no torrent service. This asserts the guard does not over-fire.
+        let err = match svc.read(ino, 15, 4096) {
+            Err(e) => e,
+            Ok(_) => panic!("in-bounds read must not be served as Ready"),
+        };
+        assert!(
+            matches!(&err, FsError::Internal(_)),
+            "in-bounds read must not be treated as EOF; got {err:?}"
+        );
+    }
+
     /// TSI-2246: non-data files (e.g. metadata) must NOT set direct_io —
     /// page cache is fine for static in-memory content.
     #[test]
