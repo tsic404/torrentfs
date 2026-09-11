@@ -10,7 +10,7 @@ A FUSE-based virtual filesystem for BitTorrent management: mount `.torrent` file
 - **Automatic seeding** — cached/downloaded pieces are re-seeded to the swarm.
 - **Persistent metadata** — metadata and directory structure live in SQLite and survive restarts.
 - **Virtual statistics** — `.stats` files report piece lifecycle, cache hit rates, and session status.
-- **TOML configuration** — proxy, DHT, rate limits, tracker, encryption, and ~15 other sections; every key is optional and falls back to libtorrent defaults.
+- **TOML configuration** — proxy, DHT, rate limits, tracker, encryption, and 15 other sections; every key is optional and falls back to libtorrent defaults.
 - **Docker image** — `ghcr.io/tsic404/torrentfs` with an entrypoint handling FUSE device setup and mount visibility (rootful/rootless).
 
 ## Installation
