@@ -475,22 +475,23 @@ impl FsService {
         }
     }
 
-    /// `setattr` (chmod/chown/truncate/utimens) on any namespace whose
-    /// attributes are virtual and immutable must never silently succeed.
+    /// `setattr` on a namespace whose attributes are virtual and immutable
+    /// (`metadata/`, `.stats`, root) must never silently succeed for an
+    /// attribute change (chmod/chown/utimens) — those return `EPERM`.
     ///
-    /// `getattr` alone cannot tell the difference between "attributes are
-    /// virtual and immutable" (metadata, `.stats`, root) and "this inode exists
-    /// but is not writable", so a `chmod` on `data/` (or on a `metadata/`
-    /// file whose mode is fixed at 0o444) previously returned the current
-    /// attributes (exit 0) while leaving the mode untouched.
+    /// A *truncate* (size change) is different: it is a legitimate write on
+    /// a `metadata/` `.torrent` buffer. `cp` overwriting an existing
+    /// `.torrent` opens it with `O_TRUNC`; the kernel sends `FUSE_OPEN`
+    /// first and the `SETATTR(size=0)` truncate follows it (fs/fuse/file.c),
+    /// so the daemon sees `open` → `setattr`. Rejecting that truncate with
+    /// `EPERM` broke the overwrite path (TSI-3064): creating a new file
+    /// worked, but overwriting an existing one failed. So a pure truncate on
+    /// a `metadata/` file resizes its in-memory buffer and returns the
+    /// updated attributes; `data/` stays `EROFS`, `.stats`/root stay `EPERM`.
     ///
-    /// The errno differs by namespace: `data/` is genuinely read-only and
-    /// returns `EROFS` (matching `rmdir`/`unlink`/`rename` and writes to
-    /// `data/` inodes, TSI-2533); `metadata/`, the `.stats` virtual files and
-    /// the root directory have virtual, immutable attributes, so `setattr`
-    /// there returns `EPERM` — the same `EPERM` that `write` on `.stats`
-    /// returns (TSI-2536, TSI-2579).
-    pub fn setattr(&mut self, ino: u64) -> FsResult<Attr> {
+    /// `size` is `Some(n)` only for a pure truncate — the adapter filters
+    /// out requests that also carry a mode/uid/gid/timestamp change.
+    pub fn setattr(&mut self, ino: u64, size: Option<u64>) -> FsResult<Attr> {
         // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
         // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
         // be classified as stats *before* the data/ guard — otherwise they
@@ -504,6 +505,29 @@ impl FsService {
             return Err(FsError::ReadOnlyFileSystem);
         }
         if self.inode_mgr.is_metadata_child(ino) || ino == ROOT_INO {
+            if let Some(target) = size {
+                // A truncate on a `metadata/` `.torrent` buffer (the
+                // `O_TRUNC` overwrite path). Only a `File` inode carries
+                // resizable data; a directory has no size to set.
+                return match self.inode_mgr.inodes.get_mut(&ino) {
+                    Some(InodeData::File { data, name, .. }) => {
+                        if target > MAX_TORRENT_SIZE as u64 {
+                            return Err(FsError::FileTooLarge(format!(
+                                "truncate {} to {} bytes exceeds limit {}",
+                                name, target, MAX_TORRENT_SIZE
+                            )));
+                        }
+                        let target = target as usize;
+                        if target > data.len() {
+                            data.resize(target, 0);
+                        } else {
+                            data.truncate(target);
+                        }
+                        Ok(self.inode_mgr.attr_for_file(ino, target as u64))
+                    }
+                    _ => Err(FsError::NotPermitted),
+                };
+            }
             return Err(FsError::NotPermitted);
         }
         self.getattr(ino)
@@ -2282,6 +2306,26 @@ mod tests {
         t
     }
 
+    /// A single-file torrent whose `name` field (and therefore info-hash)
+    /// differs per call — lets tests overwrite one torrent with a distinct
+    /// one and assert the stored bytes actually changed.
+    fn minimal_torrent_named(name: &str) -> Vec<u8> {
+        assert!(!name.is_empty(), "name must be non-empty");
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi16e");
+        t.extend_from_slice(b"4:name");
+        t.extend_from_slice(name.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(name.as_bytes());
+        t.extend_from_slice(b"12:piece lengthi16384e");
+        t.extend_from_slice(b"6:pieces20:");
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
     fn service_with_torrent(torrent_bytes: &[u8]) -> (FsService, String, i64, Arc<Metrics>) {
         let info = TorrentInfo::from_bytes(torrent_bytes.to_vec()).expect("parse torrent");
         let info_hash = hex::encode(info.info_hash().expect("info hash"));
@@ -2416,36 +2460,289 @@ mod tests {
     fn data_namespace_setattr_returns_erofs() {
         let mut svc = bare_service();
 
-        let err = svc.setattr(DATA_INO).unwrap_err();
+        let err = svc.setattr(DATA_INO, None).unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
 
         // A data file inode lives in `data_inodes`, not `inodes`; without the
         // guard `getattr` would resolve it and return its attributes.
         let data_file_ino = DATA_FILE_INO_BASE + 1;
-        let err = svc.setattr(data_file_ino).unwrap_err();
+        let err = svc.setattr(data_file_ino, None).unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
-    /// TSI-2536: `setattr` (chmod/chown/truncate/utimens) on the `metadata/`
-    /// namespace must return `EPERM` — never a silent success. `metadata/`
-    /// is writable (create/write/rename/unlink work), so `EROFS` would be
-    /// misleading; `EPERM` reflects "attributes are virtual and immutable".
+    /// TSI-2536: an *attribute change* (chmod/chown/utimens) on the
+    /// `metadata/` namespace must return `EPERM` — never a silent success.
+    /// `metadata/` is writable (create/write/rename/unlink work), so `EROFS`
+    /// would be misleading; `EPERM` reflects "attributes are virtual and
+    /// immutable". A truncate (size change) is *not* an attribute change —
+    /// it must succeed (see `metadata_file_truncate_succeeds`, TSI-3064).
     #[test]
     fn metadata_namespace_setattr_returns_eperm() {
         let mut svc = bare_service();
 
-        let err = svc.setattr(METADATA_INO).unwrap_err();
+        let err = svc.setattr(METADATA_INO, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
 
         // A metadata/ file (writable .torrent buffer, but attributes are
-        // virtual and immutable) must also reject setattr.
+        // virtual and immutable) must also reject an attribute change.
         let ino = svc
             .create(METADATA_INO, "ubuntu.iso.torrent")
             .expect("create metadata file")
             .attr
             .ino;
-        let err = svc.setattr(ino).unwrap_err();
+        let err = svc.setattr(ino, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
+    }
+
+    /// TSI-3064: a *truncate* (size change) on a `metadata/` file is a
+    /// legitimate write — `cp` overwriting an existing `.torrent` opens it
+    /// with `O_TRUNC`, which the kernel turns into `setattr(size=0)`. That
+    /// must resize the in-memory buffer and succeed, not return `EPERM`.
+    #[test]
+    fn metadata_file_truncate_succeeds() {
+        let mut svc = bare_service();
+        let ino = svc
+            .create(METADATA_INO, "debian.torrent")
+            .expect("create metadata file")
+            .attr
+            .ino;
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write torrent bytes");
+
+        // Truncate to 0 (the O_TRUNC overwrite path) must succeed.
+        let attr = svc.setattr(ino, Some(0)).expect("truncate must succeed");
+        assert_eq!(attr.size, 0);
+
+        // The in-memory buffer is cleared.
+        let file_data = match svc.inode_mgr.inodes.get(&ino) {
+            Some(InodeData::File { data, .. }) => data,
+            other => panic!("expected File inode, got {:?}", other),
+        };
+        assert!(
+            file_data.is_empty(),
+            "truncate to 0 must clear buffered bytes"
+        );
+
+        // A subsequent write repopulates from offset 0 (no stale tail).
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("rewrite after truncate");
+        let file_data = match svc.inode_mgr.inodes.get(&ino) {
+            Some(InodeData::File { data, .. }) => data,
+            other => panic!("expected File inode, got {:?}", other),
+        };
+        assert_eq!(file_data, &minimal_torrent_bytes());
+    }
+
+    /// TSI-3064 (review): truncating to `MAX_TORRENT_SIZE + 1` must be
+    /// rejected with `FileTooLarge` (→ EFBIG), mirroring the write-path
+    /// guard — never a silent cap or an over-limit allocation.
+    #[test]
+    fn truncate_beyond_max_size_returns_file_too_large() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "big.torrent");
+        let over = MAX_TORRENT_SIZE as u64 + 1;
+        let err = svc.setattr(ino, Some(over)).unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+        // Buffer untouched (still empty).
+        assert!(svc
+            .inode_mgr
+            .inodes
+            .get(&ino)
+            .and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.is_empty()),
+                _ => None,
+            })
+            .unwrap());
+    }
+
+    /// TSI-3064 (review): truncating to exactly `MAX_TORRENT_SIZE` is the
+    /// positive boundary the reject test hovers around — the guard uses
+    /// strict `>`, so the limit itself must be accepted.
+    #[test]
+    fn truncate_to_exact_max_size_is_allowed() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "max.torrent");
+        let attr = svc
+            .setattr(ino, Some(MAX_TORRENT_SIZE as u64))
+            .expect("truncate at limit");
+        assert_eq!(attr.size, MAX_TORRENT_SIZE as u64);
+        assert_eq!(
+            svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.len()),
+                _ => None,
+            }),
+            Some(MAX_TORRENT_SIZE)
+        );
+    }
+
+    /// TSI-3064 (review): truncating to a *larger* size (grow) must
+    /// zero-fill the extended region and make `getattr` report the new size;
+    /// a subsequent write past the grown tail must still append correctly.
+    #[test]
+    fn truncate_grow_zero_fills_and_reflects_new_size() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "grow.torrent");
+        svc.write(ino, 0, b"AB").expect("write 2 bytes");
+
+        // Grow from 2 → 4: the [2..4] region must be zero-filled.
+        let attr = svc.setattr(ino, Some(4)).expect("grow truncate");
+        assert_eq!(attr.size, 4);
+        let data = svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+            InodeData::File { data, .. } => Some(data.clone()),
+            _ => None,
+        });
+        assert_eq!(data.as_deref(), Some(b"AB\0\0".as_slice()));
+
+        // getattr reflects the grown size.
+        assert_eq!(svc.getattr(ino).expect("getattr").size, 4);
+
+        // A subsequent write after the grown tail appends normally.
+        svc.write(ino, 4, b"CD").expect("write after grow");
+        let data = svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+            InodeData::File { data, .. } => Some(data.clone()),
+            _ => None,
+        });
+        assert_eq!(data.as_deref(), Some(b"AB\0\0CD".as_slice()));
+    }
+
+    /// TSI-3064: the complete host-side `cp`-overwrite sequence on an existing
+    /// `metadata/` file. The first `cp` creates the file (create → write →
+    /// flush → release); the second `cp` overwrites it (lookup → O_TRUNC
+    /// truncate → open → write → flush → release). Every step — especially
+    /// the truncate — must succeed, and the stored bytes must be replaced by
+    /// the new torrent.
+    #[test]
+    fn cp_overwrite_existing_torrent_flow() {
+        let wait_idle = |svc: &FsService| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if svc.processing_torrents.lock().unwrap().is_empty() {
+                    return;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("processing_torrents not cleaned up after 10s");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        let mut svc = service_with_db();
+        let first = minimal_torrent_named("first");
+        let second = minimal_torrent_named("second");
+        assert_ne!(first, second);
+
+        // First `cp`: create a new file.
+        let created = svc.create(METADATA_INO, "debian.torrent").expect("create");
+        let ino = created.attr.ino;
+        svc.write(ino, 0, &first).expect("first write");
+        svc.flush(ino).expect("first flush");
+        svc.release(created.fh).expect("first release");
+        wait_idle(&svc);
+
+        // Second `cp`: overwrite the existing file.
+        let entry = svc
+            .lookup(METADATA_INO, "debian.torrent")
+            .expect("lookup")
+            .expect("existing file must resolve");
+        assert_eq!(entry.ino, ino, "overwrite must target the same inode");
+
+        // `cp` with `O_TRUNC`: the kernel sends `FUSE_OPEN` first, then the
+        // `SETATTR(size=0)` truncate (fs/fuse/file.c). Follow that order.
+        let fh = match svc.open(ino).expect("open") {
+            OpenOutcome { fh, .. } => fh,
+        };
+        // Truncate to 0 — the regression: must not return EPERM.
+        let attr = svc.setattr(ino, Some(0)).expect("truncate must not EPERM");
+        assert_eq!(attr.size, 0);
+        svc.write(ino, 0, &second).expect("overwrite write");
+        svc.flush(ino).expect("overwrite flush");
+        svc.release(fh).expect("overwrite release");
+        wait_idle(&svc);
+
+        // The DB row now holds the second torrent's bytes.
+        let db = svc.db.as_ref().unwrap().lock().unwrap();
+        let row = db
+            .get_torrent_by_filename_and_source_path("debian.torrent", "")
+            .expect("db query")
+            .expect("torrent persisted");
+        assert_eq!(
+            row.torrent_data.as_deref(),
+            Some(second.as_slice()),
+            "overwrite must replace the stored bytes"
+        );
+    }
+
+    /// TSI-3064: concurrent host-side overwrites of an existing `metadata/`
+    /// file (the shared-mount-propagation scenario) must never surface
+    /// `EPERM`. Each writer performs the full `cp`-overwrite sequence under a
+    /// shared mutex.
+    ///
+    /// The mutex is *not* a test-only simplification: the production FUSE
+    /// dispatcher is single-threaded (fuser 0.16 takes `&mut self` on every
+    /// `Filesystem` method), so concurrent host requests are already
+    /// serialized at exactly this boundary. The test therefore mirrors the
+    /// real dispatch interleaving — writers never overlap *inside* FsService
+    /// — and asserts only that the serialized truncate→write sequence never
+    /// surfaces `EPERM` and always leaves one writer's full payload. It does
+    /// not test torn writes, because the dispatcher itself precludes them.
+    #[test]
+    fn concurrent_overwrite_existing_torrent_never_eperm() {
+        let svc = Arc::new(Mutex::new(bare_service()));
+
+        // Prime an existing file (the first `cp`).
+        {
+            let mut s = svc.lock().unwrap();
+            let created = s.create(METADATA_INO, "debian.torrent").expect("create");
+            s.write(created.attr.ino, 0, &minimal_torrent_bytes())
+                .expect("prime write");
+            s.release(created.fh).expect("prime release");
+        }
+
+        const WRITERS: usize = 4;
+        const ITERATIONS: usize = 20;
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        let payload = minimal_torrent_named("concurrent");
+        let mut handles = Vec::new();
+
+        for _ in 0..WRITERS {
+            let svc = Arc::clone(&svc);
+            let barrier = Arc::clone(&barrier);
+            let payload = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    let mut s = svc.lock().unwrap();
+                    let entry = s
+                        .lookup(METADATA_INO, "debian.torrent")
+                        .expect("lookup")
+                        .expect("file exists");
+                    let ino = entry.ino;
+                    // O_TRUNC truncate — the regression point.
+                    s.setattr(ino, Some(0)).expect("truncate must not EPERM");
+                    let fh = match s.open(ino).expect("open") {
+                        OpenOutcome { fh, .. } => fh,
+                    };
+                    s.write(ino, 0, &payload).expect("write");
+                    s.flush(ino).expect("flush");
+                    s.release(fh).expect("release");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        // Final content is exactly one full payload (no torn/partial write).
+        let mut s = svc.lock().unwrap();
+        let entry = s
+            .lookup(METADATA_INO, "debian.torrent")
+            .expect("lookup")
+            .expect("file exists");
+        let data = match s.inode_mgr.inodes.get(&entry.ino) {
+            Some(InodeData::File { data, .. }) => data.clone(),
+            other => panic!("expected File inode, got {:?}", other),
+        };
+        assert_eq!(data, payload);
     }
 
     /// TSI-2536: the root directory and the `.stats` virtual files have
@@ -2456,10 +2753,10 @@ mod tests {
     fn root_and_stats_setattr_return_eperm() {
         let mut svc = bare_service();
 
-        let err = svc.setattr(ROOT_INO).unwrap_err();
+        let err = svc.setattr(ROOT_INO, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
 
-        let err = svc.setattr(STATS_INO).unwrap_err();
+        let err = svc.setattr(STATS_INO, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
 
         // Derived stats inode (`dir_ino + STATS_INO_OFFSET`) falls inside the
@@ -2468,7 +2765,7 @@ mod tests {
         // wrongly return EROFS (Radian 💭3).
         let stats_ino = InodeManager::make_stats_ino(DATA_INO);
         assert!(InodeManager::is_stats_ino(stats_ino));
-        let err = svc.setattr(stats_ino).unwrap_err();
+        let err = svc.setattr(stats_ino, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
     }
 
