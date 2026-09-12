@@ -397,6 +397,54 @@ pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>
     (torrent, test_content)
 }
 
+/// Build a multi-piece single-file `.torrent` (4 × 256 KiB = 1 MiB) pointing
+/// at `announce_url`.  Returns `(torrent_bytes, file_content)`.
+///
+/// TSI-3041: the multi-piece fixture exposes the per-read O(num_pieces)
+/// download-machinery overhead that the single-piece 16 KiB fixture hides —
+/// a byte-granular read on a cached file previously paid `post_torrent_updates`
+/// + a full piece-priority sweep on every read, regardless of the 1-byte size.
+pub fn build_multipiece_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
+    const PIECE_LEN: usize = 256 * 1024;
+    const NUM_PIECES: usize = 4;
+    let total = PIECE_LEN * NUM_PIECES;
+
+    let mut content = Vec::with_capacity(total);
+    for i in 0..total {
+        content.push((i as u8).wrapping_mul(31).wrapping_add(7));
+    }
+
+    let mut hashes = Vec::with_capacity(20 * NUM_PIECES);
+    for p in 0..NUM_PIECES {
+        use sha1_smol::Sha1;
+        let mut hasher = Sha1::new();
+        hasher.update(&content[p * PIECE_LEN..(p + 1) * PIECE_LEN]);
+        hashes.extend_from_slice(&hasher.digest().bytes());
+    }
+
+    let mut t = Vec::new();
+    t.push(b'd');
+    t.extend_from_slice(b"8:announce");
+    t.extend_from_slice(announce_url.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(announce_url.as_bytes());
+    t.extend_from_slice(b"4:infod");
+    t.extend_from_slice(b"6:lengthi");
+    t.extend_from_slice(total.to_string().as_bytes());
+    t.push(b'e');
+    t.extend_from_slice(b"4:name9:multi.bin");
+    t.extend_from_slice(b"12:piece lengthi");
+    t.extend_from_slice(PIECE_LEN.to_string().as_bytes());
+    t.push(b'e');
+    t.extend_from_slice(b"6:pieces");
+    t.extend_from_slice(hashes.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(&hashes);
+    t.extend_from_slice(b"ee");
+
+    (t, content)
+}
+
 /// Build a config suitable for local testing: disable DHT, enable LSD,
 /// to ensure reliable peer discovery on localhost.
 pub fn local_test_config() -> torrentfs::TorrentfsConfig {
@@ -460,12 +508,26 @@ impl TestHarness {
     ///
     /// Waits for the seeder to fully start and announce before returning.
     pub fn new() -> Self {
+        Self::with_torrent(create_test_torrent_with_tracker)
+    }
+
+    /// Create a harness whose seeder serves a custom single-file torrent.
+    ///
+    /// `torrent_fn` receives the tracker announce URL and returns
+    /// `(torrent_bytes, file_content)`.  The seed file name is taken from the
+    /// parsed torrent info (`info.name()`), so the torrent's `name` field must
+    /// match the seeded file name (as in [`create_test_torrent_with_tracker`]
+    /// and [`build_multipiece_torrent`]).
+    pub fn with_torrent<F>(torrent_fn: F) -> Self
+    where
+        F: FnOnce(&str) -> (Vec<u8>, Vec<u8>),
+    {
         let tracker = MiniTracker::start();
         let announce_url = tracker.announce_url();
 
         eprintln!("TestHarness: tracker started at {}", announce_url);
 
-        let (torrent_data, file_content) = create_test_torrent_with_tracker(&announce_url);
+        let (torrent_data, file_content) = torrent_fn(&announce_url);
 
         let info = TorrentInfo::from_bytes(torrent_data.clone())
             .expect("TestHarness: failed to parse torrent");
@@ -473,8 +535,9 @@ impl TestHarness {
         let seed_dir =
             tempfile::TempDir::new().expect("TestHarness: failed to create seed temp dir");
 
-        // Write the file data to the seed directory so libtorrent finds it complete
-        let seed_file_path = seed_dir.path().join("final_verification.txt");
+        // Write the file data to the seed directory so libtorrent finds it complete.
+        // The seed file name must match the torrent's single-file `name` field.
+        let seed_file_path = seed_dir.path().join(info.name());
         std::fs::write(&seed_file_path, &file_content)
             .expect("TestHarness: failed to write seed file");
 

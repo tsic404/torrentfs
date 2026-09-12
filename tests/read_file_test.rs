@@ -438,6 +438,12 @@ fn test_peer_appearing_mid_read_returns_data() {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
+    // TSI-2383: force the downloader onto a distinct listen port so the
+    // MiniTracker can distinguish it from the seeder (which defaults to
+    // 6881 via Session::new with NULL listen_interfaces).  When both
+    // sessions collide on the same port the tracker deduplicates by
+    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
     // TSI-2945: the seeder is introduced 6s after the read starts, and its
     // libtorrent session startup + tracker announce + peer connect must all
     // complete before the read's piece-wait window (`read_timeout_secs`)
@@ -830,4 +836,104 @@ fn test_concurrent_reads_during_download_are_consistent() {
         reference, &harness.file_content,
         "Downloaded data doesn't match seed content"
     );
+}
+
+/// TSI-3041: byte-granular reads (`dd bs=1 count=4096`) from a fully-cached
+/// file must complete fast — a 1-byte read must not pay per-read machinery
+/// costs that scale with the read *count* rather than the read size.
+///
+/// Two per-read costs made this pathological before the fix: (1) the cached
+/// read path ran `reader_added` (priority gradient), `publish_snapshot`
+/// (`post_torrent_updates` + a full piece-status rebuild) and `release_reader`
+/// (`reset_all` = `set_piece_priority` over every non-default piece) on every
+/// read; (2) every cached read marked the piece metadata dirty, and the engine
+/// loop flushed (fsync'd) `cache_metadata.txt` after every command — once per
+/// 1-byte read.  Together a single byte read carried the same overhead as a
+/// full download, making byte-granular reads pathologically slow.
+///
+/// This test uses a 4 × 256 KiB (4-piece) fixture so the O(num_pieces)
+/// per-read overhead is visible, warms the cache with one full read, then reads
+/// `BYTE_READS` bytes one at a time and asserts they complete within a loose
+/// wall-clock bound.  The pre-fix per-read machinery exceeds the bound by
+/// orders of magnitude.
+#[test]
+fn test_cached_byte_granular_reads() {
+    let _session_guard = common::acquire_session_lock();
+
+    let harness = TestHarness::with_torrent(common::build_multipiece_torrent);
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:16882".to_string());
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent"),
+    );
+
+    // Warm the cache: read the whole file once (downloads all 4 pieces).  The
+    // first read may race the seeder connection, so transient errors are retried.
+    let full_len = harness.file_content.len() as u32;
+    {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(60);
+        loop {
+            match engine.read_file_range(info.clone(), 0, 0, full_len) {
+                Ok(data) => {
+                    assert_eq!(data, harness.file_content);
+                    break;
+                }
+                Err(e) => {
+                    if start.elapsed() > timeout {
+                        panic!("Timed out warming the cache: {:?}", e);
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+
+    // Byte-granular reads from the now-cached pieces must be fast: read
+    // `BYTE_READS` bytes one at a time and assert both correctness and a loose
+    // wall-clock upper bound.  The pre-fix per-read download machinery
+    // (`post_torrent_updates` + a piece-priority sweep per read) exceeds this
+    // bound by orders of magnitude.
+    const BYTE_READS: usize = 4096;
+    const WALL_CLOCK_BOUND: Duration = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+    for off in 0..BYTE_READS {
+        let byte = engine
+            .read_file_range(info.clone(), 0, off as u64, 1)
+            .expect("cached 1-byte read should succeed");
+        assert_eq!(
+            byte[0], harness.file_content[off],
+            "byte mismatch at offset {}",
+            off
+        );
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < WALL_CLOCK_BOUND,
+        "cached {} byte-granular reads took {:?}, expected < {:?} (per-read download machinery regression?)",
+        BYTE_READS,
+        elapsed,
+        WALL_CLOCK_BOUND
+    );
+
+    // Sanity: bytes at each piece boundary are also served correctly from the
+    // cached fast path (the multi-piece fixture exercises >1 piece).
+    for off in [0u64, 256 * 1024 - 1, 256 * 1024, 512 * 1024 - 1, 512 * 1024] {
+        let byte = engine
+            .read_file_range(info.clone(), 0, off, 1)
+            .expect("cached 1-byte read at piece boundary should succeed");
+        assert_eq!(
+            byte[0], harness.file_content[off as usize],
+            "byte mismatch at piece-boundary offset {}",
+            off
+        );
+    }
+
+    engine.shutdown();
 }
