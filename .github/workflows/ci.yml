@@ -107,6 +107,9 @@ jobs:
             --entrypoint /bin/bash \
             torrentfs:ci /smoke.sh
 
+      - name: Smoke test torrentfs user shell
+        run: ./ci/tests/user_shell_smoke.sh torrentfs:ci
+
   docker-build-arm64:
     name: Docker Build (arm64)
     if: github.event_name == 'pull_request'
