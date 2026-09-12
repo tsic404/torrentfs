@@ -1129,6 +1129,18 @@ impl FsService {
         pending_timeout: Duration,
     ) -> FsResult<Option<i64>> {
         let mut removed_id = None;
+
+        // TSI-3044: `.stats` is a reserved virtual filename whose files have
+        // immutable attributes — `rm` on it returns `EPERM` (`NotPermitted`),
+        // matching `write` (TSI-2579), `setattr` (TSI-2536), and `symlink`
+        // (TSI-2537).  The root `.stats` (`STATS_INO`) previously fell
+        // through the metadata-child guard below → `EACCES`; the `data/`
+        // subtree `.stats` (derived stats inode) previously hit the data/
+        // guard → `EROFS`.  Both are rejections, but `.stats` must return a
+        // single `EPERM` consistent with every other mutating operation on it.
+        if name == ".stats" {
+            return Err(FsError::NotPermitted);
+        }
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
         }
@@ -2479,6 +2491,27 @@ mod tests {
         assert!(InodeManager::is_stats_ino(stats_ino));
         let err = svc.write(stats_ino, 0, b"x").unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
+    }
+
+    /// TSI-3044: `unlink` (`rm`) on the `.stats` virtual files must return
+    /// `EPERM` (`NotPermitted`), matching `write` (TSI-2579) — not `EACCES`
+    /// (the root `.stats` previously fell through the metadata-child guard)
+    /// nor `EROFS` (the `data/` subtree `.stats` previously hit the data/
+    /// guard).
+    #[test]
+    fn stats_unlink_returns_eperm() {
+        let mut svc = bare_service();
+
+        // Root `.stats` (STATS_INO, parent ROOT_INO).
+        let err = svc.unlink(ROOT_INO, ".stats").unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        // `data/` subtree `.stats` (derived stats inode, parent DATA_INO).
+        let err = svc.unlink(DATA_INO, ".stats").unwrap_err();
+        assert_eq!(err, FsError::NotPermitted);
+
+        // No side effects: the root `.stats` inode must still exist.
+        assert!(svc.inode_mgr.inodes.contains_key(&STATS_INO));
     }
 
     /// Helper: create an empty writable `.torrent` inode via the public
