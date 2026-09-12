@@ -489,7 +489,13 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Ok(cmd) => {
                 let stop = state.handle_command(cmd);
                 state.publish_snapshot();
-                state.flush_cache_metadata();
+                // TSI-3041: do NOT flush cache metadata per command.  Every
+                // cached read marks the piece metadata dirty
+                // (`record_access`), so a per-command flush fsync'd
+                // `cache_metadata.txt` once per 1-byte read — the dominant
+                // cost that made `dd bs=1 count=4096` hang on a cached file.
+                // Flushing on the periodic tick (timeout branch) and on
+                // shutdown is the TSI-2274 "periodic flush" intent.
                 if stop {
                     break;
                 }
@@ -854,27 +860,6 @@ impl EngineState {
             }
         }
 
-        // ── ReaderAdded: elevate priority for this read ────────────────
-        {
-            let handle = self
-                .handles
-                .get(&info_hash)
-                .ok_or_else(|| Self::missing())?;
-            if let Err(e) =
-                self.scheduler
-                    .reader_added(handle, info, file_index, offset, size, &self.store)
-            {
-                tracing::warn!("read_file_range: reader_added failed: {:?}", e);
-            }
-        }
-        // Publish the snapshot immediately so `.stats` reflects the elevated
-        // piece priorities while this read is in progress (TSI-2224).  Without
-        // this, `publish_snapshot` only runs in the engine loop between
-        // commands — but this handler blocks the engine thread until the read
-        // completes, by which point `release_reader` has already reset all
-        // priorities to 0, so `.stats` always saw an all-`[]` Pieces grid.
-        self.publish_snapshot();
-
         // ── Detect stale libtorrent piece state (TSI-2258) ───────────────
         // A piece can be purged from cache (file deleted + metadata cleared by
         // the background SHA-1 verification) while libtorrent's internal
@@ -897,6 +882,14 @@ impl EngineState {
         }
 
         // ── Fast path: all pieces available locally ────────────────────
+        // TSI-3041: a fully-cached read must not run the download machinery.
+        // `reader_added` (priority gradient), `publish_snapshot`
+        // (`post_torrent_updates` + a full piece-status rebuild) and
+        // `release_reader` (`reset_all` = `set_piece_priority` over every
+        // non-default piece) all scale with torrent size and exist only to
+        // drive a piece download.  For a cached range they added per-read FFI
+        // overhead that made byte-granular reads (`dd bs=1 count=4096`)
+        // pathologically slow.  Read straight from the piece store instead.
         if self.all_pieces_local(
             &info_hash,
             start_piece,
@@ -905,7 +898,7 @@ impl EngineState {
             num_pieces,
             total_size,
         ) {
-            let result = self.read_from_disk(
+            return self.read_from_disk(
                 &info_hash,
                 start_piece,
                 end_piece,
@@ -916,9 +909,28 @@ impl EngineState {
                 end_offset,
                 size,
             );
-            self.release_reader(&info_hash);
-            return result;
         }
+
+        // ── ReaderAdded: elevate priority for this read ────────────────
+        {
+            let handle = self
+                .handles
+                .get(&info_hash)
+                .ok_or_else(|| Self::missing())?;
+            if let Err(e) =
+                self.scheduler
+                    .reader_added(handle, info, file_index, offset, size, &self.store)
+            {
+                tracing::warn!("read_file_range: reader_added failed: {:?}", e);
+            }
+        }
+        // Publish the snapshot immediately so `.stats` reflects the elevated
+        // piece priorities while this read is in progress (TSI-2224).  Without
+        // this, `publish_snapshot` only runs in the engine loop between
+        // commands — but this handler blocks the engine thread until the read
+        // completes, by which point `release_reader` has already reset all
+        // priorities to 0, so `.stats` always saw an all-`[]` Pieces grid.
+        self.publish_snapshot();
 
         // ── Switch to download mode ────────────────────────────────────
         // The handle was created in upload_mode (connect, never request). The
