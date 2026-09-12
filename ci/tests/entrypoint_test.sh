@@ -502,7 +502,7 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
-run_test "fix_state_dir_ownership chowns when find detects a mismatch" \
+run_test "fix_state_dir_ownership warns and chowns when find detects a mismatch" \
     'is_root() { return 0; }
 daemon_uid=0; daemon_gid=0
 find() { echo "/mismatch"; }
@@ -510,9 +510,13 @@ chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
 mkdir -p "$data_home/torrentfs"
-XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+warn_file="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
 rm -rf "$data_home"
-[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ]'
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] && grep -q "re-homing to 0:0" "$warn_file"
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
 
 run_test "fix_state_dir_ownership skips chown when find detects no mismatch" \
     'is_root() { return 0; }
@@ -526,7 +530,7 @@ XDG_DATA_HOME="$data_home" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
-run_test "fix_state_dir_ownership chowns when find probe fails (non-zero, empty)" \
+run_test "fix_state_dir_ownership chowns silently when find probe fails (non-zero, empty)" \
     'is_root() { return 0; }
 daemon_uid=0; daemon_gid=0
 find() { return 1; }
@@ -534,9 +538,13 @@ chown_args=""
 chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
 mkdir -p "$data_home/torrentfs"
-XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+warn_file="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
 rm -rf "$data_home"
-[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ]'
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] && [ ! -s "$warn_file" ]
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
 
 run_test "fix_state_dir_ownership detects nested ownership mismatch via real find" \
     'is_root() { return 0; }

@@ -314,7 +314,14 @@ rehome_ownership() {
     # probe failure — not a clean bill of health — so fall through to chown
     # rather than silently skipping a leftover foreign-owned tree.
     if probe="$(find "$target" \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null)"; then
-        [ -z "$probe" ] && return 0
+        if [ -z "$probe" ]; then
+            return 0
+        fi
+        # A foreign-owned entry was found. Warn before re-homing so a reused
+        # state volume's chown to the daemon user is visible rather than
+        # silent: the host-side owner (`torrentfs:torrentfs`) is a consequence
+        # of this re-home, not an image defect.
+        echo "[entrypoint] WARNING: foreign-owned files found in $target (first: $probe); re-homing to $daemon_uid:$daemon_gid" >&2
     fi
     if ! chown -R "$daemon_uid:$daemon_gid" "$target" 2>/dev/null; then
         echo "[entrypoint] WARNING: could not chown $target to $daemon_uid:$daemon_gid" >&2
