@@ -58,6 +58,10 @@ FROM debian:sid-slim
 
 # libtorrent is statically linked into /usr/local/bin/torrentfs; only its
 # runtime deps (OpenSSL, C++ runtime) and FUSE are needed here.
+#
+# The daemon user gets /bin/sh (not /usr/sbin/nologin) as its login shell:
+# a container has no login(1)/PAM path for nologin to guard, and operators
+# need `docker exec --user torrentfs sh` to debug the mount (TSI-3043).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 \
     libstdc++6 \
@@ -68,7 +72,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 torrentfs \
     && useradd --uid 1000 --gid 1000 --home-dir /home/torrentfs \
-        --create-home --shell /usr/sbin/nologin torrentfs
+        --create-home --shell /bin/sh torrentfs
 
 # Enable allow_other so non-root users can access the shared mount.
 # fuse3 ships /etc/fuse.conf with `#user_allow_other` commented out; uncomment
