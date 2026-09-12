@@ -888,25 +888,41 @@ impl Filesystem for TorrentFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<std::time::SystemTime>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<std::time::SystemTime>,
         _fh: Option<u64>,
-        _crtime: Option<std::time::SystemTime>,
-        _chgtime: Option<std::time::SystemTime>,
-        _bkuptime: Option<std::time::SystemTime>,
+        crtime: Option<std::time::SystemTime>,
+        chgtime: Option<std::time::SystemTime>,
+        bkuptime: Option<std::time::SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        // Attributes are virtual and immutable; return the current attributes.
         // TSI-2533/TSI-2536: chmod on a virtual/read-only namespace must not
         // silently succeed — `FsService::setattr` returns EROFS for `data/`
         // and EPERM for `metadata/`, `.stats`, and the root directory.
-        match self.service.setattr(ino) {
+        //
+        // TSI-3064: a *pure truncate* (the `O_TRUNC` overwrite path, e.g.
+        // `cp` onto an existing `metadata/` file) is a legitimate write, not
+        // an attribute change — it must reach the service with `size =
+        // Some(n)` instead of being folded into the blanket EPERM. A request
+        // that also carries a mode/uid/gid/timestamp change is treated as an
+        // attribute change (truncate = None) and still returns EPERM.
+        let attr_change = mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some();
+        let truncate = if attr_change { None } else { size };
+        match self.service.setattr(ino, truncate) {
             Ok(attr) => reply.attr(&TTL, &self.to_fuse_attr(&attr)),
             Err(e) => reply.error(e.into()),
         }
