@@ -54,6 +54,17 @@ needs_fuse() {
     return 0  # needs FUSE
 }
 
+# Does the command line request --config-check? Unlike --help/--version (which
+# clap short-circuits before conflict resolution), --config-check *conflicts*
+# with the mountpoint positional, so its short-circuit path must forward the
+# parsed args (mountpoint already separated by parse_args) instead of "$@".
+has_config_check() {
+    for arg in "$@"; do
+        [ "$arg" = "--config-check" ] && return 0
+    done
+    return 1
+}
+
 # Config errors are fatal: torrentfs exits non-zero on a bad --config, and
 # we surface that immediately instead of failing later at the FUSE mount
 # stage with a misleading diagnostic.
@@ -549,6 +560,11 @@ fi
 if ! needs_fuse "$@"; then
     # Help, version, and other diagnostic commands don't need FUSE.
     echo "[entrypoint] skipping FUSE check for diagnostic command — starting torrentfs" >&2
+    if has_config_check "${torrentfs_args[@]}"; then
+        # --config-check conflicts with the mountpoint positional in clap, so
+        # forward the parsed args (mountpoint stripped) rather than "$@".
+        exec torrentfs "${torrentfs_args[@]}"
+    fi
     exec torrentfs "$@"
 fi
 
