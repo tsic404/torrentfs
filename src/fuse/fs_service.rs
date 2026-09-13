@@ -930,25 +930,47 @@ impl FsService {
             }) = self.inode_mgr.inodes.get(&ino).cloned()
             {
                 if name.ends_with(".torrent") {
+                    let source_path = self.inode_mgr.extract_source_path(parent);
+                    let dedup_key = (source_path.clone(), name.clone());
+
                     if data.is_empty() {
                         warn!("Zero-byte torrent file {} removed", name);
+                        // TSI-3080: overwriting an existing `metadata/` file
+                        // with empty content removes the metadata inode but
+                        // left the DB row behind, orphaning the
+                        // `data/<seed>.torrent/` mirror.  Wait for an in-flight
+                        // `add_torrent` first (TSI-2967) so its row lands
+                        // before we delete it, then drop the row + inode.
+                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
+                        self.remove_torrent_and_data_state(&source_path, &name)?;
                         self.inode_mgr.inodes.remove(&ino);
                         return Err(FsError::NotFound);
                     }
 
                     if data.len() > MAX_TORRENT_SIZE {
+                        // Defensive guard — unreachable via the public API:
+                        // `write` and `setattr` both cap the buffer at
+                        // MAX_TORRENT_SIZE, so an oversized `cp` fails in
+                        // `write` with EFBIG and lands in the invalid-bencode
+                        // branch below.  Kept (mirroring `flush`'s size guard)
+                        // in case a future path lets the buffer overshoot.
+                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
+                        self.remove_torrent_and_data_state(&source_path, &name)?;
                         self.inode_mgr.inodes.remove(&ino);
                         return Ok(());
                     }
 
                     if TorrentInfo::from_bytes(data.clone()).is_err() {
                         warn!("Torrent {} invalid, removing inode", name);
+                        // TSI-3080: same orphan fix + pending-add wait for
+                        // unparseable content (the oversized-`cp` case lands
+                        // here: `write` rejects the tail with EFBIG, leaving
+                        // partial invalid bytes behind).
+                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
+                        self.remove_torrent_and_data_state(&source_path, &name)?;
                         self.inode_mgr.inodes.remove(&ino);
                         return Ok(());
                     }
-
-                    let source_path = self.inode_mgr.extract_source_path(parent);
-                    let dedup_key = (source_path.clone(), name.clone());
 
                     // TSI-2247: Dedup guard — check + insert atomically, then
                     // DROP the lock before spawning background work.  The key
@@ -1020,6 +1042,113 @@ impl FsService {
         }
 
         Ok(())
+    }
+
+    /// TSI-3080: remove a torrent by `(source_path, filename)` and clean up
+    /// every `data/`-side trace — cached data inodes, kernel dentry entries,
+    /// the processing-lock key, and the L1 range cache.  Shared by `unlink`
+    /// and by `release`'s invalid-content path, where overwriting an existing
+    /// `metadata/` `.torrent` with invalid/oversized/empty bencode removed the
+    /// metadata inode but left the DB row behind, orphaning the
+    /// `data/<seed>.torrent/` mirror until a restart re-synced it.
+    ///
+    /// Both callers (`unlink`, `release`'s invalid-content path) call
+    /// `wait_for_pending_add` before invoking this so a detached
+    /// `add_torrent` on the same `(source_path, filename)` settles first
+    /// (TSI-2967) — otherwise the in-flight add lands its row *after* the
+    /// removal and rebuilds the orphan this method is meant to clear.
+    ///
+    /// Returns `Ok(Some((torrent_id, info_hash)))` when a row was removed, or
+    /// `Ok(None)` when no row existed (a freshly-written file that never
+    /// landed in the DB).  A DB error propagates.
+    fn remove_torrent_and_data_state(
+        &mut self,
+        source_path: &str,
+        filename: &str,
+    ) -> FsResult<Option<(i64, String)>> {
+        let Some(ts) = &self.torrent_service else {
+            return Ok(None);
+        };
+
+        let (torrent_id, info_hash) = match ts.remove_torrent(filename, source_path)? {
+            Some(pair) => pair,
+            None => {
+                // No DB row (never added): still invalidate any stale pending
+                // TorrentRoot cached from a prior lookup (TSI-2454).
+                let data_parent = if source_path.is_empty() {
+                    DATA_INO
+                } else {
+                    InodeManager::make_source_path_dir_ino(source_path)
+                };
+                self.inval_data_entry(data_parent, filename);
+                return Ok(None);
+            }
+        };
+
+        // Clean up metadata directories left empty by this deletion so the
+        // `data/` mirror no longer exposes orphaned directories.  A cleanup
+        // failure is non-fatal (TSI-2234).
+        let cleaned = ts
+            .cleanup_orphaned_metadata_directories(source_path)
+            .unwrap_or_default();
+
+        self.inode_mgr
+            .data_inodes
+            .retain(|_, data_inode| match data_inode {
+                DataInode::TorrentRoot {
+                    torrent_id: tid, ..
+                } => *tid != torrent_id,
+                DataInode::TorrentDir {
+                    torrent_id: tid, ..
+                } => *tid != torrent_id,
+                DataInode::TorrentFile {
+                    torrent_id: tid, ..
+                } => *tid != torrent_id,
+                DataInode::SourcePathDir { path } => !cleaned.contains(path),
+            });
+
+        // TSI-2454: purge the kernel dentry cache for the removed torrent root
+        // so the stale mirror vanishes at once instead of lingering for the
+        // 1s FUSE TTL.
+        let data_parent = if source_path.is_empty() {
+            DATA_INO
+        } else {
+            InodeManager::make_source_path_dir_ino(source_path)
+        };
+        self.inval_data_entry(data_parent, filename);
+
+        // Invalidate each cleaned source-path directory (leaf-first).
+        for cleaned_path in &cleaned {
+            let (dir_parent, dir_name) = Self::split_data_dir_parent(cleaned_path);
+            self.inval_data_entry(dir_parent, &dir_name);
+        }
+
+        {
+            let mut processing = self.processing_torrents.lock().map_err(|e| {
+                error!(
+                    "Mutex poisoned in remove_torrent_and_data_state() processing_torrents: {}",
+                    e
+                );
+                FsError::LockPoisoned
+            })?;
+            processing.remove(&(source_path.to_string(), filename.to_string()));
+        }
+
+        {
+            let mut cache = self.torrent_data_cache.lock().map_err(|e| {
+                error!(
+                    "Mutex poisoned in remove_torrent_and_data_state() torrent_data_cache: {}",
+                    e
+                );
+                FsError::LockPoisoned
+            })?;
+            // TSI-2274: L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
+            // drop every range cached for this torrent.
+            let prefix = format!("{}:", info_hash);
+            cache.retain(|k, _| !k.starts_with(&prefix));
+        }
+
+        Ok(Some((torrent_id, info_hash)))
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &str) -> FsResult<Attr> {
@@ -1192,7 +1321,7 @@ impl FsService {
                 let filename = name.clone();
                 let source_path = self.inode_mgr.extract_source_path(*file_parent);
 
-                if let Some(ref ts) = self.torrent_service {
+                if self.torrent_service.is_some() {
                     // TSI-2967: a fast `cp` followed immediately by `rm` races
                     // the detached `add_torrent` thread spawned by `release`
                     // (TSI-2247). `remove_torrent` finds no DB row yet and
@@ -1206,8 +1335,8 @@ impl FsService {
                     let dedup_key = (source_path.clone(), filename.clone());
                     self.wait_for_pending_add(&dedup_key, pending_timeout, "unlink")?;
 
-                    match ts.remove_torrent(&filename, &source_path) {
-                        Ok(Some((torrent_id, info_hash))) => {
+                    match self.remove_torrent_and_data_state(&source_path, &filename) {
+                        Ok(Some((torrent_id, _info_hash))) => {
                             removed_id = Some(torrent_id);
                             // TSI-2234: defer inode destruction. Mark the
                             // inode unlinked (so its directory name vanishes
@@ -1219,72 +1348,6 @@ impl FsService {
                             // open_files is NOT stripped: that would orphan
                             // the handle and silently drop buffered bytes.
                             self.inode_mgr.unlink_file(ino);
-
-                            // Clean up metadata directories left empty by this
-                            // deletion so the data/ mirror no longer exposes
-                            // orphaned directories. A cleanup failure is
-                            // non-fatal: the dirs stay in the DB, so the
-                            // cached SourcePathDir entries remain valid.
-                            let cleaned = ts
-                                .cleanup_orphaned_metadata_directories(&source_path)
-                                .unwrap_or_default();
-
-                            self.inode_mgr
-                                .data_inodes
-                                .retain(|_, data_inode| match data_inode {
-                                    DataInode::TorrentRoot {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    DataInode::TorrentDir {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    DataInode::TorrentFile {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    DataInode::SourcePathDir { path } => !cleaned.contains(path),
-                                });
-
-                            // TSI-2454: purge the kernel dentry cache so the
-                            // removed torrent vanishes from `data/` at once
-                            // instead of lingering for the 1s FUSE TTL.  The
-                            // parent in `data/` is `DATA_INO` for root-level
-                            // torrents or the `SourcePathDir` inode for a
-                            // subdirectory.
-                            let data_parent = if source_path.is_empty() {
-                                DATA_INO
-                            } else {
-                                InodeManager::make_source_path_dir_ino(&source_path)
-                            };
-                            self.inval_data_entry(data_parent, &filename);
-
-                            // Invalidate each cleaned source-path directory
-                            // (leaf-first) so empty parent dirs vanish from
-                            // `data/` too.  A cleaned path's parent is
-                            // `DATA_INO` (top-level) or the SourcePathDir
-                            // inode of its parent path.
-                            for cleaned_path in &cleaned {
-                                let (dir_parent, dir_name) =
-                                    Self::split_data_dir_parent(cleaned_path);
-                                self.inval_data_entry(dir_parent, &dir_name);
-                            }
-
-                            let mut processing = self.processing_torrents.lock().map_err(|e| {
-                                error!("Mutex poisoned in unlink() processing_torrents: {}", e);
-                                FsError::LockPoisoned
-                            })?;
-                            processing.remove(&(source_path.clone(), filename.clone()));
-                            drop(processing);
-
-                            let mut cache = self.torrent_data_cache.lock().map_err(|e| {
-                                error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
-                                FsError::LockPoisoned
-                            })?;
-                            // TSI-2274: L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
-                            // drop every range cached for this torrent.
-                            let prefix = format!("{}:", info_hash);
-                            cache.retain(|k, _| !k.starts_with(&prefix));
-                            drop(cache);
-
                             info!(
                                 "Deleted torrent '{}' (id={}, source_path='{}')",
                                 filename, torrent_id, source_path
@@ -1293,17 +1356,6 @@ impl FsService {
                         Ok(None) => {
                             // TSI-2234: same deferred-destruction logic.
                             self.inode_mgr.unlink_file(ino);
-                            // TSI-2454: the file was not yet in the DB but
-                            // `data/` may still show a pending TorrentRoot
-                            // cached from a prior lookup.  The filename is
-                            // the directory name the data/ mirror uses for
-                            // the torrent root, so invalidate it.
-                            let data_parent = if source_path.is_empty() {
-                                DATA_INO
-                            } else {
-                                InodeManager::make_source_path_dir_ino(&source_path)
-                            };
-                            self.inval_data_entry(data_parent, &filename);
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
@@ -3931,6 +3983,22 @@ mod tests {
         (created.attr.ino, created.fh)
     }
 
+    /// Wait (bounded) for the detached `add_torrent` thread(s) spawned by
+    /// `release` to clear `processing_torrents` — i.e. the DB insert landed —
+    /// so a subsequent assertion on DB state observes the settled row.
+    fn wait_for_processing_empty(svc: &FsService) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("processing_torrents not cleaned up after 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// TSI-2247/TSI-2918: Closing an empty `.torrent` file hits the fast path.
     /// `release` discards the inode and returns `NotFound` (ENOENT) — a
     /// zero-byte file is treated as if it never existed — without touching
@@ -3965,6 +4033,138 @@ mod tests {
 
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
         assert!(svc.processing_torrents.lock().unwrap().is_empty());
+    }
+
+    /// TSI-3080: overwriting an existing `metadata/` `.torrent` (already in the
+    /// DB) with invalid bencode removes the metadata inode but must ALSO delete
+    /// the existing DB row, so the `data/<seed>.torrent/` mirror does not
+    /// become an orphan.  The overwrite path is `open` → `setattr(size=0)`
+    /// (O_TRUNC) → `write` bad bytes → `release` (TSI-3064).
+    #[test]
+    fn release_invalid_overwrite_removes_existing_db_row() {
+        let mut svc = service_with_db();
+
+        // First add a valid torrent and let the detached add_torrent land.
+        let (ino, fh) = create_torrent_file(&mut svc, "seed.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write valid");
+        svc.release(fh).expect("release valid");
+        wait_for_processing_empty(&svc);
+
+        {
+            let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+            assert!(
+                db_guard
+                    .get_torrent_by_filename_and_source_path("seed.torrent", "")
+                    .expect("db query")
+                    .is_some(),
+                "valid torrent must be in the DB before overwrite"
+            );
+        }
+
+        // The valid `release` keeps the inode (the DB-backed entry supersedes
+        // it), so the overwrite targets the same inode.
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+
+        // Overwrite with invalid bencode: O_TRUNC then bad write, then close.
+        let fh2 = svc.open(ino).expect("reopen").fh;
+        svc.setattr(ino, Some(0)).expect("truncate");
+        svc.write(ino, 0, b"not a torrent").expect("write bad");
+        svc.release(fh2).expect("release invalid overwrite");
+
+        // The metadata inode is removed...
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        // ...and the DB row is gone too — no orphaned data/ mirror.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("seed.torrent", "")
+                .expect("db query")
+                .is_none(),
+            "overwriting with invalid content must remove the existing DB row"
+        );
+    }
+
+    /// TSI-3080: overwriting an existing torrent with empty content
+    /// (`cp /dev/null` onto it) hits `release`'s empty-data branch and must
+    /// also remove the existing DB row.
+    #[test]
+    fn release_empty_overwrite_removes_existing_db_row() {
+        let mut svc = service_with_db();
+
+        let (ino, fh) = create_torrent_file(&mut svc, "seed.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write valid");
+        svc.release(fh).expect("release valid");
+        wait_for_processing_empty(&svc);
+
+        // O_TRUNC to empty, then close.
+        let fh2 = svc.open(ino).expect("reopen").fh;
+        svc.setattr(ino, Some(0)).expect("truncate");
+        let err = svc.release(fh2).expect_err("empty release should ENOENT");
+        assert_eq!(err, FsError::NotFound);
+
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("seed.torrent", "")
+                .expect("db query")
+                .is_none(),
+            "empty overwrite must remove the existing DB row"
+        );
+    }
+
+    /// TSI-3080: an invalid-content overwrite racing a detached `add_torrent`
+    /// (the same race `unlink` guards via `wait_for_pending_add`, TSI-2967)
+    /// must block until the add settles, then delete the row it landed —
+    /// otherwise the in-flight add rebuilds the `data/` orphan this fix clears.
+    #[test]
+    fn release_invalid_overwrite_waits_for_pending_add_then_removes_row() {
+        let mut svc = service_with_db();
+
+        let key = ("".to_string(), "seed.torrent".to_string());
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        let (ino, fh) = create_torrent_file(&mut svc, "seed.torrent");
+        svc.write(ino, 0, b"not a torrent").expect("write bad");
+
+        // Simulate the detached `add_torrent` thread: after a short delay it
+        // lands the DB row, then clears the pending key (signalling release to
+        // proceed). Without the wait, release would observe no row yet and
+        // return `Ok(None)`, leaving this row orphaned in `data/`.
+        let db = svc.db.as_ref().unwrap().clone();
+        let processing = svc.processing_torrents.clone();
+        let cv = svc.processing_torrents_cv.clone();
+        let key2 = key.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            {
+                let mut db_guard = db.lock().unwrap();
+                db_guard
+                    .insert_torrent("", "seed", "seed.torrent", 16, "hash-3080", 1)
+                    .expect("insert torrent");
+            }
+            processing.lock().unwrap().remove(&key2);
+            cv.notify_one();
+        });
+
+        // release must block until the pending add settles, then remove the
+        // freshly-inserted row.
+        svc.release(fh).expect("release invalid overwrite");
+
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("seed.torrent", "")
+                .expect("db query")
+                .is_none(),
+            "invalid overwrite must wait for the pending add, then remove its row"
+        );
     }
 
     /// TSI-2247: Closing a valid `.torrent` file must NOT block the caller.
