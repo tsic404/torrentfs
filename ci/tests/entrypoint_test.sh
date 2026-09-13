@@ -147,6 +147,24 @@ run_test "needs_fuse /mnt needs FUSE" \
 run_test "needs_fuse --config /foo.toml /mnt needs FUSE" \
     'if needs_fuse --config /foo.toml /mnt; then exit 0; else exit 1; fi'
 
+# --- has_config_check ---
+# has_config_check drives the --config-check diagnostic short-circuit: unlike
+# --help/--version, --config-check conflicts with the mountpoint positional in
+# clap, so the entrypoint must forward the parsed args (mountpoint stripped)
+# instead of "$@" (TSI-3113).
+
+run_test "has_config_check --config-check is true" \
+    'has_config_check --config-check'
+
+run_test "has_config_check --config /foo.toml --config-check /mnt is true" \
+    'has_config_check --config /foo.toml --config-check /mnt'
+
+run_test "has_config_check --help is false" \
+    'if has_config_check --help; then exit 1; else exit 0; fi'
+
+run_test "has_config_check /mnt is false" \
+    'if has_config_check /mnt; then exit 1; else exit 0; fi'
+
 # --- parse_args (mountpoint identification, TSI-2902) ---
 # parse_args splits the command line into $mountpoint (first positional) and
 # $torrentfs_args (everything else), validating --config values. It must skip
@@ -185,11 +203,17 @@ run_test "parse_args --cache=/cache/dir captures cache_arg inline" \
 run_test "parse_args forwards non-mountpoint args to torrentfs_args" \
     'parse_args --config /foo.toml /mnt; [ "${#torrentfs_args[@]}" -eq 2 ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /foo.toml ]'
 
+run_test "parse_args --config /foo.toml --config-check /mnt separates mountpoint" \
+    'parse_args --config /foo.toml --config-check /mnt; [ "$mountpoint" = /mnt ] && [ "${#torrentfs_args[@]}" -eq 3 ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /foo.toml ] && [ "${torrentfs_args[2]}" = --config-check ]'
+
 run_test "parse_args -- /mnt sets mountpoint=/mnt" \
     'parse_args -- /mnt; [ "$mountpoint" = /mnt ]'
 
 run_test "parse_args -- --mnt sets mountpoint=--mnt" \
     'parse_args -- --mnt; [ "$mountpoint" = "--mnt" ]'
+
+run_test "parse_args -- --config-check treats it as mountpoint (escape)" \
+    'parse_args -- --config-check; [ "$mountpoint" = "--config-check" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
 
 # --- validate_mountpoint (mountpoint guard, TSI-2902) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
