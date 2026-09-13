@@ -64,7 +64,7 @@ struct Args {
     #[arg(long, help = "Configuration file path (TOML)")]
     config: Option<PathBuf>,
     /// Validate the config file and exit (0 = valid, non-zero = invalid).
-    #[arg(long, conflicts_with_all = ["mountpoint", "db", "cache"], requires = "config",
+    #[arg(long, conflicts_with_all = ["mountpoint"], requires = "config",
           help = "Validate a configuration file and exit")]
     config_check: bool,
 }
@@ -515,5 +515,43 @@ mod tests {
             ),
             JoinOutcome::TimedOut
         );
+    }
+
+    #[test]
+    fn config_check_accepts_db_and_cache() {
+        let args = Args::try_parse_from([
+            "torrentfs",
+            "--config",
+            "/cfg.toml",
+            "--config-check",
+            "--db",
+            "/state.db",
+            "--cache",
+            "/cache",
+        ])
+        .expect("--config-check must not conflict with --db/--cache");
+        assert!(args.config_check);
+        assert_eq!(args.db.as_deref(), Some(Path::new("/state.db")));
+        assert_eq!(args.cache.as_deref(), Some(Path::new("/cache")));
+    }
+
+    #[test]
+    fn config_check_still_conflicts_with_mountpoint() {
+        let err = Args::try_parse_from([
+            "torrentfs",
+            "--config",
+            "/cfg.toml",
+            "--config-check",
+            "/mnt",
+        ])
+        .expect_err("--config-check must still conflict with mountpoint");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn config_check_requires_config() {
+        let err = Args::try_parse_from(["torrentfs", "--config-check"])
+            .expect_err("--config-check must require --config");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }
