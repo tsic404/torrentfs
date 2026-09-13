@@ -93,6 +93,12 @@ pub struct FsService {
     /// `processing_torrents`, so a `rename` blocked on an in-flight
     /// `add_torrent` wakes immediately instead of polling.
     pub processing_torrents_cv: Arc<Condvar>,
+    /// TSI-3114: `(source_path, filename) -> error message` for `.torrent`
+    /// files whose async DB persistence failed.  `lookup`/`readdir` on the
+    /// `data/` mirror consult this to surface the failure as EIO instead of
+    /// silently omitting the torrent (FUSE_RELEASE errors are ignored by the
+    /// kernel, so the failure cannot propagate through `release` itself).
+    pub persist_errors: Arc<Mutex<HashMap<(String, String), String>>>,
     pub download_service: Option<Arc<DownloadService>>,
     pub seeding_manager: Option<Arc<SeedingManager>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -217,6 +223,7 @@ impl FsService {
             processing_torrents_cv: Arc::new(Condvar::new()),
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
             download_service,
             seeding_manager,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -310,6 +317,35 @@ impl FsService {
 
     // ── Namespace-agnostic queries ──────────────────────────────────────────
 
+    /// TSI-3114: map a `data/` torrent-root lookup `(parent, name)` to its
+    /// `(source_path, filename)` persist-error key, or `None` when `parent`
+    /// is not a torrent-root parent (DATA_INO or a SourcePathDir).
+    fn torrent_root_lookup_key(&self, parent: u64, name: &str) -> Option<(String, String)> {
+        let source_path = if parent == DATA_INO {
+            String::new()
+        } else {
+            match self.inode_mgr.data_inodes.get(&parent) {
+                Some(DataInode::SourcePathDir { path }) => path.clone(),
+                _ => return None,
+            }
+        };
+        Some((source_path, name.to_string()))
+    }
+
+    /// TSI-3114: the `source_path` a `data/` directory inode lists, or `None`
+    /// when `ino` is not a directory whose children are torrent roots (i.e.
+    /// DATA_INO or a SourcePathDir).
+    fn data_dir_source_path(&self, ino: u64) -> Option<String> {
+        if ino == DATA_INO {
+            Some(String::new())
+        } else {
+            match self.inode_mgr.data_inodes.get(&ino) {
+                Some(DataInode::SourcePathDir { path }) => Some(path.clone()),
+                _ => None,
+            }
+        }
+    }
+
     pub fn lookup(&mut self, parent: u64, name: &str) -> FsResult<Option<Entry>> {
         if parent == ROOT_INO {
             return Ok(match name {
@@ -375,6 +411,19 @@ impl FsService {
         }
 
         if parent == DATA_INO || InodeManager::is_data_ino(parent) {
+            // TSI-3114: surface a previously-failed async persist as EIO
+            // (FUSE_RELEASE errors are dropped by the kernel, so `release`
+            // cannot propagate the DB failure itself).
+            if let Some(key) = self.torrent_root_lookup_key(parent, name) {
+                if let Some(msg) = self
+                    .persist_errors
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(&key).cloned())
+                {
+                    return Err(FsError::Database(msg));
+                }
+            }
             if let Some(db) = &self.db {
                 if let Some((ino, kind, size)) = DataResolver::lookup_data_inode(
                     &mut self.inode_mgr,
@@ -548,6 +597,22 @@ impl FsService {
 
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
+            // TSI-3114: surface failed persists in this directory as EIO.
+            if let Some(sp) = self.data_dir_source_path(ino) {
+                let failed = self
+                    .persist_errors
+                    .lock()
+                    .ok()
+                    .map(|g| g.keys().any(|(p, _)| p == &sp))
+                    .unwrap_or(false);
+                if failed {
+                    let label = if sp.is_empty() { "data/" } else { &sp };
+                    return Err(FsError::Database(format!(
+                        "a torrent under '{}' failed to persist; see daemon log",
+                        label
+                    )));
+                }
+            }
             if let Some(db) = &self.db {
                 if let Some(entries) = DataResolver::readdir_data(
                     &mut self.inode_mgr,
@@ -974,14 +1039,14 @@ impl FsService {
 
                     // TSI-2247: Dedup guard — check + insert atomically, then
                     // DROP the lock before spawning background work.  The key
-                    // is `(source_path, filename)` so that torrents in the
-                    // same directory (especially the root, where
-                    // `source_path` is `""`) don't collide.  The previous
-                    // code held `processing_torrents` during the entire
-                    // `add_torrent` call (DB insert + handle creation),
-                    // blocking the single-threaded FUSE dispatch loop.  Now
-                    // `add_torrent` runs on a detached thread so `release`
-                    // never blocks the dispatcher.
+                    // is `(source_path, filename)` so torrents in the same
+                    // directory (especially the root, where `source_path` is
+                    // `""`) don't collide.  Persistence + handle registration
+                    // run on a detached thread so the single-threaded FUSE
+                    // dispatcher is never blocked (TSI-3114): a DB write
+                    // failure is recorded and surfaced as EIO by the next
+                    // `lookup`/`readdir` of `data/`, because the kernel drops
+                    // the FUSE_RELEASE reply error.
                     {
                         let mut processing = self.processing_torrents.lock().map_err(|e| {
                             error!("Mutex poisoned in release(): {}", e);
@@ -999,25 +1064,35 @@ impl FsService {
                     }
                     // Lock released here.
 
-                    // The inode is NOT removed here: if the background
-                    // `add_torrent` fails, the file must remain visible so
-                    // the user can retry or delete it.  On success the
-                    // DB-backed entry supersedes this inode (lookup queries
-                    // the DB), so keeping it is harmless — this mirrors the
-                    // pre-TSI-2247 behavior.
-                    if let Some(ts) = &self.torrent_service {
-                        let ts = ts.clone();
+                    // The inode is NOT removed here: if persistence fails, the
+                    // file must remain visible so the user can retry or delete
+                    // it, and the failure is recorded (TSI-3114) for
+                    // `lookup`/`readdir` to surface as EIO.  On success the
+                    // DB-backed entry supersedes this inode (lookup queries the
+                    // DB), so keeping it is harmless.
+                    if let Some(ts) = self.torrent_service.clone() {
                         let processing = self.processing_torrents.clone();
                         let processing_cv = self.processing_torrents_cv.clone();
+                        let persist_errors = self.persist_errors.clone();
                         let key = dedup_key.clone();
-                        let fname = name.clone();
                         std::thread::spawn(move || {
-                            match ts.add_torrent(&data, &source_path, &name) {
-                                Ok(()) => {
-                                    info!("Successfully processed torrent: {}", fname);
+                            match ts.persist_torrent(&data, &source_path, &name) {
+                                Ok(persisted) => {
+                                    // Clear any stale failure from a prior
+                                    // attempt; this one succeeded.
+                                    if let Ok(mut guard) = persist_errors.lock() {
+                                        guard.remove(&key);
+                                    }
+                                    ts.register_torrent_handle(&persisted);
                                 }
                                 Err(e) => {
-                                    error!("Failed to process torrent {}: {}", fname, e);
+                                    error!("Failed to persist torrent {}: {}", name, e);
+                                    // TSI-3114: record the failure so the next
+                                    // user-visible lookup/readdir of data/
+                                    // surfaces it as EIO.
+                                    if let Ok(mut guard) = persist_errors.lock() {
+                                        guard.insert(key.clone(), e.to_string());
+                                    }
                                 }
                             }
                             if let Ok(mut guard) = processing.lock() {
@@ -1066,6 +1141,13 @@ impl FsService {
         source_path: &str,
         filename: &str,
     ) -> FsResult<Option<(i64, String)>> {
+        // TSI-3114: clear any recorded persistence failure for this
+        // (source_path, filename) — the torrent is being removed, so the
+        // `data/` mirror must not keep surfacing a stale EIO for it.
+        if let Ok(mut guard) = self.persist_errors.lock() {
+            guard.remove(&(source_path.to_string(), filename.to_string()));
+        }
+
         let Some(ts) = &self.torrent_service else {
             return Ok(None);
         };
@@ -2401,6 +2483,7 @@ mod tests {
             db: Some(db_arc.clone()),
             torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
             processing_torrents_cv: Arc::new(Condvar::new()),
             download_service: None,
             seeding_manager: None,
@@ -2479,6 +2562,7 @@ mod tests {
             processing_torrents_cv: Arc::new(Condvar::new()),
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
             seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3965,6 +4049,7 @@ mod tests {
             db: Some(db_arc.clone()),
             torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
             processing_torrents_cv: Arc::new(Condvar::new()),
             seeding_manager: None,
@@ -4218,6 +4303,72 @@ mod tests {
             .expect("db query");
         assert!(torrent.is_some(), "torrent should be in DB after release");
         assert_eq!(torrent.unwrap().filename, "valid.torrent");
+    }
+
+    /// TSI-3114: a DB write failure (e.g. disk full → SQLite
+    /// `SystemIoFailure`) must not be silent.  Persistence runs on a detached
+    /// thread (TSI-2247 keeps the FUSE dispatcher unblocked) and records the
+    /// failure; the next user-visible `lookup`/`readdir` of `data/` surfaces
+    /// it as `FsError::Database` → EIO.  The kernel drops the FUSE_RELEASE
+    /// reply error, so `release` itself cannot propagate it.
+    #[test]
+    fn release_propagates_db_write_failure_as_eio() {
+        let db = Database::open_in_memory().expect("in-memory db");
+        // Simulate a full disk: make the connection read-only so the INSERT
+        // fails.  Any SQLite write error maps to FsError::Database → EIO.
+        db.conn
+            .execute_batch("PRAGMA query_only = ON;")
+            .expect("set query_only");
+        let db_arc = Arc::new(Mutex::new(db));
+        let metrics = Arc::new(Metrics::new());
+        let mut svc = FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(TorrentService::new(db_arc, None, None)),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            processing_torrents_cv: Arc::new(Condvar::new()),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            seeding_manager: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+            notifier: Arc::new(OnceLock::new()),
+        };
+
+        let (ino, fh) = create_torrent_file(&mut svc, "full.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write ok");
+
+        // release returns Ok (persistence is async); the failure is recorded
+        // for the data/ mirror to surface.
+        svc.release(fh).expect("release ok");
+        wait_for_processing_empty(&svc);
+
+        // The metadata inode stays visible so the user can retry or delete.
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        // No leaked pending key.
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+
+        // The failure is surfaced as EIO by the data/ mirror, not silently
+        // omitted.
+        let lookup_err = svc
+            .lookup(DATA_INO, "full.torrent")
+            .expect_err("failed torrent lookup must EIO");
+        assert!(
+            matches!(lookup_err, FsError::Database(_)),
+            "expected FsError::Database, got {:?}",
+            lookup_err
+        );
+        let readdir_err = svc
+            .readdir(DATA_INO, 0)
+            .expect_err("failed torrent readdir must EIO");
+        assert!(
+            matches!(readdir_err, FsError::Database(_)),
+            "expected FsError::Database, got {:?}",
+            readdir_err
+        );
     }
 
     /// TSI-2247: `processing_torrents` is NOT held during `add_torrent` —
@@ -4857,6 +5008,7 @@ mod tests {
                 None,
             )),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
             processing_torrents_cv: Arc::new(Condvar::new()),
             download_service: Some(download_service),
             seeding_manager: None,

@@ -21,6 +21,19 @@ pub struct TorrentService {
     download_service: Option<Arc<DownloadService>>,
     seeding_manager: Option<Arc<SeedingManager>>,
 }
+/// Result of synchronously persisting a torrent into the database.
+///
+/// Carries the parsed metadata plus the insert disposition so the (deferred,
+/// non-fatal) download-handle registration can run afterward without
+/// re-parsing or re-querying the DB.
+pub struct PersistedTorrent {
+    info: Arc<TorrentInfo>,
+    is_new: bool,
+    /// `Some(old_info_hash)` when an overwrite replaced a different info-hash;
+    /// the old hash's engine handle and piece cache are released in
+    /// [`TorrentService::register_torrent_handle`].
+    stale_info_hash: Option<String>,
+}
 
 impl TorrentService {
     pub fn new(
@@ -35,11 +48,22 @@ impl TorrentService {
         }
     }
 
-    /// Add a torrent to the database. Parses the torrent data, extracts metadata,
-    /// and persists everything atomically.  After persistence, creates an
-    /// upload_mode libtorrent handle so peer/seed information is immediately
-    /// available without downloading any data.
-    pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> FsResult<()> {
+    /// Parse a `.torrent` and persist it into the database.
+    ///
+    /// Runs on a detached thread from `release` (TSI-2247), so the
+    /// single-threaded FUSE dispatcher is never blocked by the SQLite write.
+    /// A DB write failure (e.g. SQLite `SystemIoFailure` on a full disk) is
+    /// recorded in `FsService::persist_errors` and surfaced as
+    /// `FsError::Database` → `EIO` by the *next* `lookup`/`readdir` of
+    /// `data/` — not by `cp`'s `close()`, whose FUSE_RELEASE reply error the
+    /// kernel drops.  The non-fatal download-handle creation is split out
+    /// into [`Self::register_torrent_handle`].
+    pub fn persist_torrent(
+        &self,
+        data: &[u8],
+        source_path: &str,
+        filename: &str,
+    ) -> FsResult<PersistedTorrent> {
         let info = TorrentInfo::from_bytes(data.to_vec()).map_err(|e| {
             warn!("Invalid .torrent file {}: {}", filename, e.reason());
             FsError::CorruptTorrent(e.reason().to_string())
@@ -72,7 +96,7 @@ impl TorrentService {
                 .collect();
 
             let result = db_guard
-                .insert_torrent_with_files(
+                .insert_torrent_with_files_and_data(
                     source_path,
                     &metadata.name,
                     filename,
@@ -80,6 +104,7 @@ impl TorrentService {
                     &info_hash_hex,
                     metadata.num_files as i64,
                     &files,
+                    data,
                 )
                 .map_err(|e| {
                     error!("Failed to insert torrent with files {}: {:?}", filename, e);
@@ -87,12 +112,7 @@ impl TorrentService {
                 })?;
 
             let (is_new, stale_info_hash) = match result {
-                InsertTorrentResult::Inserted(torrent_id) => {
-                    db_guard.set_torrent_data(torrent_id, data).map_err(|e| {
-                        error!("Failed to store torrent data for {}: {:?}", filename, e);
-                        FsError::from(e)
-                    })?;
-
+                InsertTorrentResult::Inserted(_) => {
                     info!(
                         "Persisted torrent '{}' ({} files, {} bytes) from {}",
                         metadata.name,
@@ -170,33 +190,49 @@ impl TorrentService {
             (is_new, stale_info_hash)
         };
 
+        Ok(PersistedTorrent {
+            info,
+            is_new,
+            stale_info_hash,
+        })
+    }
+
+    /// Register the download handle for an already-persisted torrent.
+    ///
+    /// Best-effort and non-fatal: the torrent is already in the DB and a
+    /// handle is created lazily on first access, so every failure here is
+    /// logged and swallowed.  Runs off the FUSE dispatch thread (TSI-2247) so
+    /// libtorrent FFI never blocks the single-threaded dispatcher.
+    pub fn register_torrent_handle(&self, persisted: &PersistedTorrent) {
         // TSI-2381 (review): the overwrite orphaned the OLD info-hash's
         // engine handle, scheduler, private_torrents entry, and on-disk
-        // `cache/pieces/<old>/` — release them AFTER the DB guard is
-        // dropped (no I/O under the DB lock), mirroring `remove_torrent`.
+        // `cache/pieces/<old>/` — release them AFTER the DB row is updated
+        // (no I/O under the DB lock), mirroring `remove_torrent`.
         // TSI-2417: same ordering as remove_torrent — handle released before
         // pieces purged, so libtorrent never checks a torrent whose files
         // are vanishing underneath it.
-        if let Some(old) = stale_info_hash {
-            self.release_engine_and_seeding(&old);
-            self.purge_pieces_cache(&old);
+        if let Some(old) = &persisted.stale_info_hash {
+            self.release_engine_and_seeding(old);
+            self.purge_pieces_cache(old);
         }
+
+        let name = persisted.info.name();
 
         // Create upload_mode handle so peer/seed info is visible immediately
         // without triggering any data download (all pieces at priority 0).
-        if is_new {
+        if persisted.is_new {
             if let Some(ds) = &self.download_service {
-                match ds.ensure_handle_lightweight(info.clone()) {
+                match ds.ensure_handle_lightweight(persisted.info.clone()) {
                     Ok(_) => {
                         info!(
                             "Created lightweight handle for torrent '{}' (upload_mode)",
-                            metadata.name
+                            name
                         );
                     }
                     Err(e) => {
                         warn!(
                             "Failed to create lightweight handle for torrent '{}': {:?}",
-                            metadata.name, e
+                            name, e
                         );
                         // Non-fatal: the torrent is already in the database and
                         // a handle will be created lazily when first accessed.
@@ -210,10 +246,10 @@ impl TorrentService {
             // isolation prevents passkey leakage and peer cross-pollination
             // across private tracker swarms.
             if let Some(ds) = &self.download_service {
-                if let Err(e) = ds.merge_trackers(info.clone()) {
+                if let Err(e) = ds.merge_trackers(persisted.info.clone()) {
                     warn!(
                         "Failed to merge trackers for duplicate torrent '{}': {:?}",
-                        metadata.name, e
+                        name, e
                     );
                     // Non-fatal: the torrent is already in the DB; tracker
                     // merge is a best-effort optimization, not a correctness
@@ -222,7 +258,17 @@ impl TorrentService {
                 }
             }
         }
+    }
 
+    /// Add a torrent to the database and register its download handle in one
+    /// synchronous call.  [`Self::persist_torrent`] +
+    /// [`Self::register_torrent_handle`] composed for callers that want the
+    /// original atomic behavior (tests); the FUSE `release` path calls the two
+    /// phases separately so a DB failure surfaces as `EIO` while handle
+    /// registration stays off the dispatcher thread.
+    pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> FsResult<()> {
+        let persisted = self.persist_torrent(data, source_path, filename)?;
+        self.register_torrent_handle(&persisted);
         Ok(())
     }
 
