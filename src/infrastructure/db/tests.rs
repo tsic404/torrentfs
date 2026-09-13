@@ -904,6 +904,64 @@ fn test_insert_torrent_with_files_atomic() {
     assert_eq!(root_dirs.len(), 2);
 }
 
+/// TSI-3114: `insert_torrent_with_files_and_data` writes `torrent_data` in the
+/// SAME transaction as the row + file tree, so a failure cannot leave a
+/// `torrent_data = NULL` row behind (the old `set_torrent_data` follow-up ran
+/// outside the insert transaction and could be split by a disk-full).
+#[test]
+fn test_insert_torrent_with_files_and_data_is_atomic() {
+    let files = vec![FileEntry {
+        path: "a.txt".to_string(),
+        size: 10,
+    }];
+
+    // Success: torrent_data is present immediately after commit.
+    let mut db = Database::open_in_memory().unwrap();
+    let result = db
+        .insert_torrent_with_files_and_data(
+            "path1",
+            "Test",
+            "Test.torrent",
+            10,
+            "hash1",
+            1,
+            &files,
+            b"raw-torrent-bytes",
+        )
+        .unwrap();
+    let id = match result {
+        InsertTorrentResult::Inserted(id) => id,
+        _ => panic!("Expected Inserted"),
+    };
+    let torrent = db.get_torrent_by_id(id).unwrap().unwrap();
+    assert_eq!(
+        torrent.torrent_data.as_deref(),
+        Some(&b"raw-torrent-bytes"[..])
+    );
+
+    // Failure: a read-only connection makes the transaction fail and roll
+    // back — no torrent row (and thus no NULL-torrent_data row) survives.
+    let mut db2 = Database::open_in_memory().unwrap();
+    db2.conn
+        .execute_batch("PRAGMA query_only = ON;")
+        .expect("set query_only");
+    let result = db2.insert_torrent_with_files_and_data(
+        "path2",
+        "Test2",
+        "Test2.torrent",
+        10,
+        "hash2",
+        1,
+        &files,
+        b"raw-torrent-bytes",
+    );
+    assert!(result.is_err(), "read-only insert must fail");
+    assert!(
+        db2.get_torrents_by_source_path("path2").unwrap().is_empty(),
+        "no partial row may survive the failed transaction"
+    );
+}
+
 #[test]
 fn test_insert_torrent_with_files_populates_path() {
     let mut db = Database::open_in_memory().unwrap();

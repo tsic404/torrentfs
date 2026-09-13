@@ -91,6 +91,59 @@ impl Database {
         file_count: i64,
         files: &[FileEntry],
     ) -> Result<InsertTorrentResult, DbError> {
+        self.insert_torrent_with_files_inner(
+            source_path,
+            name,
+            filename,
+            total_size,
+            info_hash,
+            file_count,
+            files,
+            None,
+        )
+    }
+
+    /// Insert a torrent, its files, AND its raw `.torrent` bytes in one
+    /// transaction (TSI-3114).  Writing `torrent_data` here — instead of a
+    /// separate `set_torrent_data` follow-up outside the insert transaction —
+    /// makes the row complete on commit: a disk-full between the two used to
+    /// leave a row with `torrent_data = NULL` that a same-content re-copy
+    /// could never repair (the Duplicate branch keeps the existing row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_torrent_with_files_and_data(
+        &mut self,
+        source_path: &str,
+        name: &str,
+        filename: &str,
+        total_size: i64,
+        info_hash: &str,
+        file_count: i64,
+        files: &[FileEntry],
+        data: &[u8],
+    ) -> Result<InsertTorrentResult, DbError> {
+        self.insert_torrent_with_files_inner(
+            source_path,
+            name,
+            filename,
+            total_size,
+            info_hash,
+            file_count,
+            files,
+            Some(data),
+        )
+    }
+
+    fn insert_torrent_with_files_inner(
+        &mut self,
+        source_path: &str,
+        name: &str,
+        filename: &str,
+        total_size: i64,
+        info_hash: &str,
+        file_count: i64,
+        files: &[FileEntry],
+        data: Option<&[u8]>,
+    ) -> Result<InsertTorrentResult, DbError> {
         let tx = self.conn.transaction()?;
 
         // Check for existing torrent with same source_path and filename
@@ -107,10 +160,10 @@ impl Database {
             return Ok(InsertTorrentResult::Duplicate(id));
         }
 
-        // Insert torrent record
+        // Insert torrent record (torrent_data written atomically when provided)
         tx.execute(
-            "INSERT INTO torrents (source_path, name, filename, total_size, info_hash, file_count, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            params![source_path, name, filename, total_size, info_hash, file_count],
+            "INSERT INTO torrents (source_path, name, filename, total_size, info_hash, file_count, status, torrent_data) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            params![source_path, name, filename, total_size, info_hash, file_count, data.map(|d| d.to_vec())],
         )?;
         let torrent_id = tx.last_insert_rowid();
 
