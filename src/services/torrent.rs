@@ -401,26 +401,6 @@ impl TorrentService {
         }
     }
 
-    /// Clean up metadata directories orphaned by a torrent deletion or move.
-    /// Returns the removed directory paths (leaf-first) so callers can evict
-    /// stale `data_inodes` cache entries.
-    pub fn cleanup_orphaned_metadata_directories(
-        &self,
-        source_path: &str,
-    ) -> FsResult<Vec<String>> {
-        let mut db_guard = self.db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            FsError::LockPoisoned
-        })?;
-
-        db_guard
-            .cleanup_orphaned_metadata_directories(source_path)
-            .map_err(|e| {
-                error!("Failed to cleanup orphaned metadata directories: {:?}", e);
-                FsError::from(e)
-            })
-    }
-
     /// Rename a torrent in the database.
     pub fn rename_torrent(
         &self,

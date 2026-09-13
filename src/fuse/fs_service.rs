@@ -1167,13 +1167,11 @@ impl FsService {
             }
         };
 
-        // Clean up metadata directories left empty by this deletion so the
-        // `data/` mirror no longer exposes orphaned directories.  A cleanup
-        // failure is non-fatal (TSI-2234).
-        let cleaned = ts
-            .cleanup_orphaned_metadata_directories(source_path)
-            .unwrap_or_default();
-
+        // TSI-3119: empty metadata directories must persist (and be restored
+        // on restart), so no directory rows are pruned here. Only the removed
+        // torrent's data/ mirror entries are evicted; source-path directory
+        // rows and their cached SourcePathDir entries stay valid — the
+        // directories still exist, now empty.
         self.inode_mgr
             .data_inodes
             .retain(|_, data_inode| match data_inode {
@@ -1186,7 +1184,7 @@ impl FsService {
                 DataInode::TorrentFile {
                     torrent_id: tid, ..
                 } => *tid != torrent_id,
-                DataInode::SourcePathDir { path } => !cleaned.contains(path),
+                DataInode::SourcePathDir { .. } => true,
             });
 
         // TSI-2454: purge the kernel dentry cache for the removed torrent root
@@ -1198,12 +1196,6 @@ impl FsService {
             InodeManager::make_source_path_dir_ino(source_path)
         };
         self.inval_data_entry(data_parent, filename);
-
-        // Invalidate each cleaned source-path directory (leaf-first).
-        for cleaned_path in &cleaned {
-            let (dir_parent, dir_name) = Self::split_data_dir_parent(cleaned_path);
-            self.inval_data_entry(dir_parent, &dir_name);
-        }
 
         {
             let mut processing = self.processing_torrents.lock().map_err(|e| {
@@ -1647,38 +1639,13 @@ impl FsService {
 
                 ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
 
-                // TSI-2373: a cross-directory move orphans the metadata
-                // directories at the old source_path — the DB rows survive,
-                // so the data/ mirror keeps exposing a ghost tree for a path
-                // that no longer holds any torrent. Prune them the same way
-                // unlink does, and evict the stale cached SourcePathDir /
-                // TorrentRoot entries so later lookups re-resolve from the
-                // DB at the new location. Cleanup failure is non-fatal: the
-                // directories stay in the DB, so the cached entries remain
-                // valid.
+                // TSI-3119: a cross-directory move leaves the old source-path
+                // directory empty, but empty directories must persist (and be
+                // restored on restart) — so no directory rows are pruned
+                // here. Only the moved torrent's stale TorrentRoot cache
+                // entry is evicted; the source-path directory rows and their
+                // cached SourcePathDir entries stay valid.
                 if old_source_path != new_source_path {
-                    if !old_source_path.is_empty() {
-                        let cleaned = ts
-                            .cleanup_orphaned_metadata_directories(&old_source_path)
-                            .unwrap_or_default();
-
-                        self.inode_mgr
-                            .data_inodes
-                            .retain(|_, data_inode| match data_inode {
-                                DataInode::SourcePathDir { path } => !cleaned.contains(path),
-                                _ => true,
-                            });
-
-                        // TSI-2454: purge the kernel dentry cache for each
-                        // cleaned source-path directory so the stale mirror
-                        // vanishes at once instead of lingering for the 1s
-                        // FUSE TTL.
-                        for cleaned_path in &cleaned {
-                            let (dir_parent, dir_name) = Self::split_data_dir_parent(cleaned_path);
-                            self.inval_data_entry(dir_parent, &dir_name);
-                        }
-                    }
-
                     // Evict cached TorrentRoot entries bound to the old
                     // location so later lookups re-resolve from the DB at the
                     // new one.
@@ -3178,11 +3145,11 @@ mod tests {
         assert_eq!(svc.symlink(dir_ino), FsError::NotPermitted);
     }
 
-    /// TSI-2373: a cross-directory mv of a `.torrent` must prune the
-    /// metadata directories orphaned at the old source_path, so the data/
-    /// mirror stops exposing the ghost tree.
+    /// A cross-directory mv of a `.torrent` from the metadata root moves the
+    /// DB row and must evict the stale TorrentRoot cache entry bound to the
+    /// old (root) source_path, so a later lookup re-resolves under cat-b.
     #[test]
-    fn cross_directory_mv_prunes_orphaned_old_source_path_dirs() {
+    fn cross_directory_mv_evicts_stale_torrent_root_cache() {
         let mut svc = service_with_db();
 
         // mkdir cat-b under metadata/ (persisted via ensure_metadata_directories).
@@ -3258,11 +3225,13 @@ mod tests {
         );
     }
 
-    /// TSI-2373: same contract for a torrent nested in a subdirectory — the
-    /// emptied directory chain (cat-a and its parents) must vanish from both
-    /// the DB and the cached SourcePathDir entries.
+    /// TSI-3119: a cross-directory mv of a `.torrent` empties the old
+    /// source-path directory, but empty directories must persist (and be
+    /// restored on restart) — so the `cat-a` row survives in
+    /// `metadata_directories`, while only the moved torrent's stale
+    /// TorrentRoot cache entry is evicted.
     #[test]
-    fn cross_directory_mv_from_subdir_removes_ghost_dir_chain() {
+    fn cross_directory_mv_persists_emptied_source_dir() {
         let mut svc = service_with_db();
 
         svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
@@ -3314,7 +3283,8 @@ mod tests {
         svc.rename(cat_a_ino, "t1.torrent", cat_b_ino, "t1.torrent")
             .expect("cross-directory rename");
 
-        // DB: no torrent left under cat-a, and its mirror directory row is gone.
+        // DB: the torrent moved to cat-b, but the now-empty cat-a directory
+        // row must survive (empty directories persist across restart).
         {
             let db = svc.db.as_ref().unwrap().lock().unwrap();
             assert!(db
@@ -3326,10 +3296,10 @@ mod tests {
                 .unwrap()
                 .is_some());
             assert!(
-                !db.get_source_path_prefixes("")
+                db.get_source_path_prefixes("")
                     .unwrap()
                     .contains(&"cat-a".to_string()),
-                "ghost cat-a directory must be pruned from metadata_directories"
+                "emptied cat-a directory must persist in metadata_directories"
             );
             assert!(
                 db.get_source_path_prefixes("")
@@ -3339,19 +3309,66 @@ mod tests {
             );
         }
 
-        // Cached SourcePathDir and TorrentRoot entries bound to the dead
-        // source_path must be evicted — later lookups re-resolve from the DB.
-        assert!(
-            !svc.inode_mgr
-                .data_inodes
-                .contains_key(&InodeManager::make_source_path_dir_ino("cat-a")),
-            "stale SourcePathDir cache entry for cat-a must be evicted"
-        );
+        // The moved torrent's TorrentRoot cache entry bound to the old
+        // location must be evicted — later lookups re-resolve from the DB.
         assert!(
             !svc.inode_mgr
                 .data_inodes
                 .contains_key(&InodeManager::make_torrent_root_ino(1)),
             "stale TorrentRoot cache entry for cat-a must be evicted"
+        );
+        // The SourcePathDir cache entry for cat-a stays valid — the empty
+        // directory still exists.
+        assert!(
+            svc.inode_mgr
+                .data_inodes
+                .contains_key(&InodeManager::make_source_path_dir_ino("cat-a")),
+            "SourcePathDir cache entry for persisted empty cat-a must remain"
+        );
+    }
+
+    /// TSI-3119: removing the last torrent from a directory must NOT prune
+    /// the now-empty directory from `metadata_directories` — the empty
+    /// directory persists so it is restored on restart.
+    #[test]
+    fn unlink_last_torrent_persists_emptied_directory() {
+        let mut svc = service_with_db();
+
+        svc.mkdir(METADATA_INO, "media").expect("mkdir media");
+        let media_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "media")
+            .expect("media inode");
+
+        // Add a torrent under media/ directly (source_path = "media").
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("media", "t1", "t1.torrent", 16, "hash-media", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: media_ino,
+                name: "t1.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // Remove the torrent — the directory it lived in becomes empty.
+        let removed = svc.unlink(media_ino, "t1.torrent").expect("unlink torrent");
+        assert!(removed.is_some(), "unlink must remove the landed DB row");
+
+        // The now-empty media directory must survive in the DB.
+        let db = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db.get_source_path_prefixes("")
+                .unwrap()
+                .contains(&"media".to_string()),
+            "emptied media directory must persist in metadata_directories"
         );
     }
 
