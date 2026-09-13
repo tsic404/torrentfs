@@ -1,13 +1,13 @@
 //! torrentfs — A FUSE filesystem for BitTorrent management.
 //! Thin binary entry point. All logic lives in the library crate.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use fuser::MountOption;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn, Level};
@@ -63,10 +63,87 @@ struct Args {
     cache: Option<PathBuf>,
     #[arg(long, help = "Configuration file path (TOML)")]
     config: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        help = "Log verbosity (error|warn|info|debug|trace); overrides RUST_LOG"
+    )]
+    log_level: Option<LogLevelArg>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Append logs to a file instead of stdout"
+    )]
+    log_file: Option<PathBuf>,
     /// Validate the config file and exit (0 = valid, non-zero = invalid).
     #[arg(long, conflicts_with_all = ["mountpoint"], requires = "config",
           help = "Validate a configuration file and exit")]
     config_check: bool,
+}
+
+/// CLI log verbosity. Maps 1:1 onto `tracing::Level`; clap derives the flag's
+/// accepted values from the variant names (error/warn/info/debug/trace).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogLevelArg {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevelArg {
+    fn to_tracing(self) -> Level {
+        match self {
+            LogLevelArg::Error => Level::ERROR,
+            LogLevelArg::Warn => Level::WARN,
+            LogLevelArg::Info => Level::INFO,
+            LogLevelArg::Debug => Level::DEBUG,
+            LogLevelArg::Trace => Level::TRACE,
+        }
+    }
+}
+
+/// Resolve the tracing verbosity: an explicit `--log-level` wins over the
+/// `RUST_LOG` environment variable, falling back to `INFO` when neither names
+/// a recognized level.
+fn resolve_log_level(cli_level: Option<LogLevelArg>) -> Level {
+    match cli_level {
+        Some(level) => level.to_tracing(),
+        None => std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|v| parse_rust_log(&v))
+            .unwrap_or(Level::INFO),
+    }
+}
+
+/// Parse a `RUST_LOG` value into a `tracing::Level`. Unknown values return
+/// `None` so the caller can apply its own default rather than mis-tagging a
+/// typo as a specific level.
+fn parse_rust_log(value: &str) -> Option<Level> {
+    match value.to_lowercase().as_str() {
+        "trace" => Some(Level::TRACE),
+        "debug" => Some(Level::DEBUG),
+        "info" => Some(Level::INFO),
+        "warn" => Some(Level::WARN),
+        "error" => Some(Level::ERROR),
+        _ => None,
+    }
+}
+
+/// Open the `--log-file` target in append mode, creating parent directories so
+/// a mounted-but-empty log directory works on first run. torrentfs itself never
+/// drops privileges: when launched through the container entrypoint it already
+/// runs as the daemon user (UID 1000), so the path must be writable by that
+/// identity — the entrypoint creates and re-owns the log directory before its
+/// `setpriv` drop (see `fix_state_dir_ownership`).
+fn open_log_file(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 fn fuse_allow_other_enabled() -> io::Result<bool> {
@@ -300,22 +377,28 @@ fn wait_for_shutdown(
 }
 
 fn main() {
-    let log_level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "trace" => Some(Level::TRACE),
-            "debug" => Some(Level::DEBUG),
-            "info" => Some(Level::INFO),
-            "warn" => Some(Level::WARN),
-            "error" => Some(Level::ERROR),
-            _ => None,
-        })
-        .unwrap_or(Level::INFO);
-
-    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
-    tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
-
     let args = Args::parse();
+
+    let log_level = resolve_log_level(args.log_level);
+    match &args.log_file {
+        Some(path) => {
+            let file = open_log_file(path).unwrap_or_else(|e| {
+                eprintln!("Failed to open log file {:?}: {}", path, e);
+                std::process::exit(1);
+            });
+            let subscriber = FmtSubscriber::builder()
+                .with_max_level(log_level)
+                .with_writer(Mutex::new(file))
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("Failed to set tracing subscriber");
+        }
+        None => {
+            let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("Failed to set tracing subscriber");
+        }
+    }
 
     // --config-check: validate the TOML file and exit. No FUSE, no DB, no mount.
     if args.config_check {
@@ -553,5 +636,54 @@ mod tests {
         let err = Args::try_parse_from(["torrentfs", "--config-check"])
             .expect_err("--config-check must require --config");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn parse_rust_log_recognizes_known_levels_case_insensitively() {
+        assert_eq!(parse_rust_log("debug"), Some(Level::DEBUG));
+        assert_eq!(parse_rust_log("DEBUG"), Some(Level::DEBUG));
+        assert_eq!(parse_rust_log("trace"), Some(Level::TRACE));
+        assert_eq!(parse_rust_log("info"), Some(Level::INFO));
+    }
+
+    #[test]
+    fn parse_rust_log_returns_none_for_unknown_level() {
+        assert_eq!(parse_rust_log("bogus"), None);
+        assert_eq!(parse_rust_log(""), None);
+    }
+
+    #[test]
+    fn log_level_arg_maps_to_tracing_level() {
+        assert_eq!(LogLevelArg::Error.to_tracing(), Level::ERROR);
+        assert_eq!(LogLevelArg::Warn.to_tracing(), Level::WARN);
+        assert_eq!(LogLevelArg::Info.to_tracing(), Level::INFO);
+        assert_eq!(LogLevelArg::Debug.to_tracing(), Level::DEBUG);
+        assert_eq!(LogLevelArg::Trace.to_tracing(), Level::TRACE);
+    }
+
+    #[test]
+    fn log_flags_parse_with_mountpoint() {
+        let args = Args::try_parse_from([
+            "torrentfs",
+            "--log-level",
+            "debug",
+            "--log-file",
+            "/var/log/torrentfs.log",
+            "/mnt",
+        ])
+        .expect("--log-level/--log-file must parse alongside the mountpoint");
+        assert_eq!(args.log_level, Some(LogLevelArg::Debug));
+        assert_eq!(
+            args.log_file.as_deref(),
+            Some(Path::new("/var/log/torrentfs.log"))
+        );
+        assert_eq!(args.mountpoint.as_deref(), Some(Path::new("/mnt")));
+    }
+
+    #[test]
+    fn log_level_rejects_unknown_value() {
+        let err = Args::try_parse_from(["torrentfs", "--log-level", "bogus", "/mnt"])
+            .expect_err("--log-level must reject an unknown level");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 }
