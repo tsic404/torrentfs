@@ -176,30 +176,26 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
     false
 }
 
-/// Upper bound on the whole graceful-shutdown teardown: engine stop + cache
-/// flush + worker drain + FUSE unmount + session join.
+/// Grace period for the FUSE session thread to exit on its own after the
+/// mount is detached.
 ///
-/// The session join receives only the part of this budget left after the
-/// earlier steps (`SHUTDOWN_TIMEOUT.saturating_sub(elapsed_since_signal)`), so
-/// the total time from SIGTERM to process exit is bounded.  The bound matters
-/// in containers where the FUSE superblock can be held alive by an external
-/// bind mount (entrypoint.sh's rootful path publishes `/mnt-inner` via
-/// `mount --bind`): that reference keeps the kernel from aborting the
-/// connection, so the session thread stays blocked in `read()` on `/dev/fuse`
-/// and would otherwise hang until the container engine SIGKILLs.  Past this
-/// window the thread is abandoned and process exit closes `/dev/fuse`,
-/// leaving the now-stale bind mount for the entrypoint to unmount.
-///
-/// A container stop grace period should therefore exceed this budget (e.g.
-/// `docker stop -t 10`) so teardown finishes before SIGKILL.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// A lazy detach aborts the FUSE connection, so in the direct-mount path the
+/// session thread exits within milliseconds and can be joined immediately.  In
+/// the rootful path entrypoint.sh publishes the internal mount at `/mnt` with
+/// `mount --bind`, which keeps the FUSE superblock alive after the detach: the
+/// session thread stays blocked in `read()` on `/dev/fuse` until the
+/// entrypoint releases that reference after this process exits.  The download
+/// engine and cache have already been shut down by then, so neither case needs
+/// a long wait — this grace period only has to outlast the immediate exit.
+const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// Outcome of waiting for the FUSE session thread to exit during shutdown.
 #[derive(Debug, PartialEq, Eq)]
 enum JoinOutcome {
-    /// The session thread exited within the timeout — safe to join.
+    /// The session thread exited within the grace period — safe to join.
     Finished,
-    /// The session thread did not exit — abandon it so the process can exit.
+    /// The session thread is still blocked — the external bind mount keeps the
+    /// superblock alive, so the process exits and the entrypoint unmounts it.
     TimedOut,
 }
 
@@ -226,10 +222,9 @@ where
 /// Park the main thread until SIGINT/SIGTERM, then run graceful shutdown:
 /// stop the download engine, drain the download worker queue, unmount the FUSE
 /// session, and join the session thread (which drops the libtorrent session).
-/// The whole teardown is bounded by [`SHUTDOWN_TIMEOUT`], measured from the
-/// signal.  If the unmount fails, the process exits non-zero.  If the unmount
-/// succeeds but the session thread does not exit within the remaining budget —
-/// possible when an external bind mount keeps the superblock alive — the
+/// If the unmount fails, the process exits non-zero.  If the unmount succeeds
+/// but the session thread does not exit within [`SESSION_DRAIN_GRACE`] —
+/// expected when an external bind mount keeps the superblock alive — the
 /// thread is abandoned and process exit closes `/dev/fuse`.
 fn wait_for_shutdown(
     worker_pool: Arc<WorkerPool>,
@@ -240,9 +235,6 @@ fn wait_for_shutdown(
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::park();
     }
-    // The shutdown deadline starts when the signal arrives; every subsequent
-    // teardown step (engine stop, flush, drain, unmount) consumes part of it.
-    let shutdown_started = Instant::now();
     info!("shutdown requested — stopping download engine");
     if let Some(ds) = &download_service {
         ds.shutdown();
@@ -275,15 +267,13 @@ fn wait_for_shutdown(
         std::process::exit(1);
     }
     info!("joining FUSE session");
-    // The join gets only the shutdown budget left after the steps above, so
-    // the total teardown time is bounded.  Normal path: the unmount aborts the
-    // connection and the session thread exits immediately.  With an external
-    // bind mount holding the superblock alive it never exits — abandon it so
-    // the process can terminate (see SHUTDOWN_TIMEOUT).
-    let join_budget = SHUTDOWN_TIMEOUT.saturating_sub(shutdown_started.elapsed());
+    // Normal path: the unmount aborts the connection and the session thread
+    // exits immediately.  With an external bind mount holding the superblock
+    // alive it never exits until the entrypoint releases that reference after
+    // the process exits — so only drain briefly, then proceed regardless.
     match wait_bounded(
         || bg.guard.is_finished(),
-        join_budget,
+        SESSION_DRAIN_GRACE,
         Duration::from_millis(20),
     ) {
         JoinOutcome::Finished => {
@@ -291,9 +281,11 @@ fn wait_for_shutdown(
             info!("torrentfs unmounted successfully");
         }
         JoinOutcome::TimedOut => {
-            warn!(
-                "FUSE session thread did not exit within the {}s shutdown window; abandoning it so the process can exit",
-                SHUTDOWN_TIMEOUT.as_secs()
+            // Expected in the rootful bind-mount path: the engine and cache are
+            // already shut down, so the process can exit and the entrypoint will
+            // release the bind mount afterwards.
+            info!(
+                "FUSE session thread still blocked after unmount (external bind mount keeping the superblock alive); exiting and letting the entrypoint release it"
             );
         }
     }
