@@ -1120,6 +1120,14 @@ impl EngineState {
                 }
 
                 if piece_wait_start.elapsed() >= piece_wait_timeout {
+                    // The piece-wait window expired, but libtorrent's custom
+                    // storage may have already written partial piece data to
+                    // disk for the requested range. Record it as incomplete
+                    // metadata so `.stats` reflects the download progress the
+                    // failed read actually made — regardless of whether we
+                    // return a completed prefix or an error below.
+                    self.register_incomplete_on_disk_pieces(&info_hash, start_piece, end_piece);
+
                     // Instead of empty (ENODATA) after the piece-wait window,
                     // return the contiguous prefix of completed pieces. The loop
                     // advances `piece_idx` in order, so every piece before it is
@@ -1505,6 +1513,25 @@ impl EngineState {
         if let Some(handle) = self.handles.get(info_hash) {
             self.scheduler.piece_ready(handle, info_hash, piece_idx);
         }
+    }
+
+    /// After a read's piece-wait window times out, record any
+    /// partial piece data that libtorrent's custom storage already wrote to
+    /// disk for the requested range as *incomplete* cache metadata.
+    ///
+    /// The bytes on disk are real download progress; without this, `.stats`
+    /// reports zero cached pieces and the failed read leaves no trace of the
+    /// work it actually did.  Verified pieces are left untouched, and a later
+    /// successful `register_piece` upgrades the incomplete entries to
+    /// verified.
+    fn register_incomplete_on_disk_pieces(
+        &self,
+        info_hash: &str,
+        start_piece: i32,
+        end_piece: i32,
+    ) {
+        self.store
+            .register_incomplete_pieces_in_range(info_hash, start_piece, end_piece);
     }
 
     fn release_reader(&mut self, info_hash: &str) {

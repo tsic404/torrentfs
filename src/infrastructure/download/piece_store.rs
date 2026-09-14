@@ -123,6 +123,77 @@ impl PieceStore {
         cache.add_piece(&key, size)
     }
 
+    /// Register a piece that is on disk but incomplete (partial
+    /// download) in the cache metadata, at its *actual* on-disk size, without
+    /// marking it verified.  Used after a read's piece-wait times out so the
+    /// partially-downloaded bytes still show up in `.stats` instead of
+    /// vanishing.  Returns `Ok(false)` when the piece has no on-disk bytes to
+    /// register.
+    pub fn register_incomplete_piece(
+        &self,
+        info_hash: &str,
+        piece_index: i32,
+    ) -> TorrentResult<bool> {
+        let key = Self::piece_key(info_hash, piece_index);
+        let path = {
+            let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
+            cache.piece_path(&key)
+        };
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        };
+        if size == 0 {
+            return Ok(false);
+        }
+        let mut cache = self.cache.lock().map_err(|_| Self::poisoned())?;
+        cache.register_incomplete_piece(&key, size)?;
+        Ok(true)
+    }
+
+    /// Whether a piece is marked verified (a complete, hash-checked download).
+    pub fn is_piece_verified(&self, info_hash: &str, piece_index: i32) -> bool {
+        let key = Self::piece_key(info_hash, piece_index);
+        self.cache
+            .lock()
+            .map(|c| c.is_piece_verified(&key))
+            .unwrap_or(false)
+    }
+
+    /// Record the on-disk partial-download state for every piece in
+    /// a piece-index range, the way the engine does after a read's piece-wait
+    /// times out.
+    ///
+    /// For each piece in the range that has on-disk bytes: verified (complete)
+    /// pieces are left untouched; everything else — already-registered
+    /// incomplete pieces (re-stat'd so their metadata size tracks continued
+    /// download progress) and unregistered partials — is (re)registered as
+    /// incomplete at its current on-disk size.
+    pub fn register_incomplete_pieces_in_range(
+        &self,
+        info_hash: &str,
+        start_piece: i32,
+        end_piece: i32,
+    ) {
+        for piece_index in start_piece..=end_piece {
+            let piece_key = Self::piece_key(info_hash, piece_index);
+            if !self.has_piece_on_disk(&piece_key) {
+                continue;
+            }
+            if self.is_piece_verified(info_hash, piece_index) {
+                continue;
+            }
+            if let Err(e) = self.register_incomplete_piece(info_hash, piece_index) {
+                tracing::warn!(
+                    "register_incomplete_pieces_in_range: failed for {}:piece:{}: {:?}",
+                    info_hash,
+                    piece_index,
+                    e
+                );
+            }
+        }
+    }
+
     fn poisoned() -> TorrentError {
         TorrentError::Unknown {
             code: -1,
@@ -410,6 +481,62 @@ mod tests {
             "read_piece must fail after delete_piece so read_from_disk \
              returns PieceNotReady instead of silently skipping"
         );
+
+        Ok(())
+    }
+
+    /// The timeout→registration glue — partial on-disk
+    /// pieces are registered incomplete, verified pieces are left untouched,
+    /// and re-running the scan refreshes a growing partial's size.
+    #[test]
+    fn register_incomplete_pieces_in_range_records_partial_skips_verified() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "tsi3130range";
+        let verified_idx = 0;
+        let partial_idx = 1;
+
+        // Piece 0: verified / complete.
+        let v_path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&PieceStore::piece_key(info_hash, verified_idx))?
+        };
+        std::fs::write(&v_path, vec![0xAAu8; 16_384])?;
+        store.register_piece(info_hash, verified_idx, 16_384)?;
+
+        // Piece 1: partial file on disk, not yet registered.
+        let p_path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&PieceStore::piece_key(info_hash, partial_idx))?
+        };
+        std::fs::write(&p_path, vec![0xBBu8; 4096])?;
+
+        store.register_incomplete_pieces_in_range(info_hash, 0, 1);
+
+        // Partial piece → registered incomplete.
+        assert!(store.has_piece(info_hash, partial_idx));
+        assert!(!store.is_piece_verified(info_hash, partial_idx));
+
+        // Verified piece → untouched (still verified, not downgraded).
+        assert!(store.is_piece_verified(info_hash, verified_idx));
+
+        // Grow the partial on disk and re-run — the
+        // metadata size must track the new download progress.
+        std::fs::write(&p_path, vec![0xBBu8; 8192])?;
+        store.register_incomplete_pieces_in_range(info_hash, 0, 1);
+        {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            assert_eq!(
+                c.piece_metadata_size(&PieceStore::piece_key(info_hash, partial_idx)),
+                Some(8192),
+                "incomplete piece size must refresh on re-scan"
+            );
+        }
 
         Ok(())
     }
