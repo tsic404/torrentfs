@@ -48,8 +48,7 @@ const MAX_PENDING: usize = 256;
 
 /// Dispatch margin (seconds) added to the engine's read budget when computing
 /// the deferred-read deadline: covers worker-pool scheduling and the alert
-/// consumer latency.  This is a heuristic safety pad, not a hard guarantee
-/// (TSI-2751).
+/// consumer latency.  This is a heuristic safety pad, not a hard guarantee.
 const READ_DEADLINE_MARGIN_SECS: u64 = 5;
 
 /// A reply that can be resolved exactly once — either with data or an errno.
@@ -72,17 +71,13 @@ impl PendingReply for ReplyData {
     }
 }
 
-/// Byte-range identity of a deferred read.
-///
-/// Two reads with the same key resolve to identical bytes, so they coalesce
-/// onto a single engine download and the result fans out to every waiter
-/// (TSI-2896: concurrent first reads of the same uncached piece previously
-/// serialized on the engine thread, so later readers' tickets expired with
-/// ENODATA while waiting their turn).
-///
-/// Keyed by `info_hash` (content identity) rather than `torrent_id`, so
-/// duplicate torrents sharing an info_hash also coalesce; `file_index`,
-/// `offset` and `size` select the exact byte range the engine downloads.
+/// Byte-range identity of a deferred read. Two reads with the same key
+/// resolve to identical bytes, so they coalesce onto one engine download and
+/// the result fans out to every waiter (previously the uncached piece's
+/// concurrent readers serialized on the engine thread and later tickets
+/// expired with ENODATA). Keyed by `info_hash` (content identity) so
+/// duplicate torrents sharing an info_hash coalesce too; `file_index`,
+/// `offset` and `size` select the exact byte range.
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct RangeKey {
     info_hash: String,
@@ -95,7 +90,7 @@ struct RangeKey {
 /// (`torrent_id`), and its own deadline.  Waiters in a group share one engine
 /// download but may belong to different torrents (duplicate info_hash) and
 /// arrive at different times, so cancellation and deadline expiry are both
-/// tracked per waiter, not per group (TSI-2896 review: a late joiner must not
+/// tracked per waiter, not per group (a late joiner must not
 /// inherit the leader's earlier deadline).
 struct PendingEntry<R: PendingReply> {
     reply: R,
@@ -109,22 +104,14 @@ struct PendingGroup<R: PendingReply> {
     waiters: Vec<PendingEntry<R>>,
 }
 
-/// Bounded table of FUSE read replies that are waiting for pieces to download.
-///
-/// * Capacity is bounded at `MAX_PENDING` concurrent *ranges* (groups).  When
-///   full, [`insert`](Self::insert) blocks the caller (the FUSE dispatch
-///   thread) on a condvar until a worker or the deadline checker removes a
-///   group — the design §9 backpressure model: block briefly, never error and
-///   never return truncated data.
-/// * Concurrent readers of the same byte range coalesce onto one group and
-///   share a single engine download; the result fans out to every waiter
-///   (TSI-2896).
+/// Bounded table of FUSE read replies waiting for pieces to download.
+/// * Capacity is `MAX_PENDING` ranges; when full, `insert` blocks the FUSE
+///   dispatch thread on a condvar until a slot frees (backpressure: block
+///   briefly, never error, never truncate).
 /// * Each waiter carries a deadline; a background thread expires overdue
-///   waiters with ENODATA ("no data available" — the piece-wait limit elapsed
-///   with no seeder to serve it).
-/// * `unlink` / `remove_torrent` cancels in-flight reads for the removed
-///   torrent and resolves their tickets with EIO.
-/// * Every reply is consumed exactly once (ok or error), zero leak.
+///   waiters with ENODATA (piece-wait limit elapsed, no seeder).
+/// * `unlink`/`remove_torrent` cancels in-flight reads for the removed
+///   torrent (EIO). Every reply is consumed exactly once.
 struct PendingTable<R: PendingReply = ReplyData> {
     inner: Mutex<Inner<R>>,
     /// Signalled whenever a group is removed, so a blocked `insert` can retry
@@ -303,8 +290,8 @@ impl<R: PendingReply> PendingTable<R> {
     /// Expire every waiter whose own deadline has passed, resolving each with
     /// `ENODATA` ("no data available"): a deferred read only expires when the
     /// piece-wait limit elapsed without the data arriving, i.e. the swarm has
-    /// no seeder to serve it (TSI-2483).  Expiry is per waiter (TSI-2896
-    /// review): a late joiner keeps its own later deadline instead of
+    /// no seeder to serve it.  Expiry is per waiter:
+    /// a late joiner keeps its own later deadline instead of
     /// inheriting the leader's.  A group is dropped only when all its waiters
     /// are gone.  Returns the number of waiters expired.
     fn expire(&self) -> usize {
@@ -350,23 +337,13 @@ impl<R: PendingReply> PendingTable<R> {
         count
     }
 
-    /// Resolve a pending group with data, or with `ENODATA` when the data is
-    /// empty but a non-zero `size` was requested (TSI-2293).  Returns the
-    /// number of waiters resolved.
-    ///
-    /// The deferred-read worker job calls this instead of `resolve` so that
-    /// an `Ok(Vec::new())` from `read_file_range_blocking` — which happens
-    /// when the engine's internal `file_offset` computation disagrees with
-    /// `pieces_on_disk`'s summed-file-sizes computation, landing on an
-    /// early-return that yields 0 bytes without error — is translated into
-    /// `ENODATA` rather than a 0-byte reply.  A 0-byte reply makes the
-    /// kernel see EOF, so `dd` exits 0 and the user never learns the
-    /// download failed.
-    ///
-    /// The `size` parameter is the originally requested read size (always
-    /// greater than zero for deferred reads: `fs_service::read` verifies
-    /// `offset < actual_size` before entering the Pending path).  When
-    /// `size == 0` the empty data is a legitimate EOF and is passed
+    /// Resolve a pending group with data, or `ENODATA` when the data is empty
+    /// but a non-zero `size` was requested; returns the waiters resolved. The
+    /// deferred worker calls this instead of `resolve` so an `Ok(Vec::new())`
+    /// from `read_file_range_blocking` (the engine's `file_offset` disagreeing
+    /// with `pieces_on_disk`'s summed sizes) becomes `ENODATA`, not a 0-byte
+    /// reply — which the kernel reads as EOF (`dd` exits 0, hiding the failure).
+    /// `size > 0` for deferred reads; `size == 0` is a legitimate EOF, passed
     /// through unchanged.
     fn resolve_or_enodata(&self, id: u64, data: &[u8], size: u32) -> usize {
         if data.is_empty() && size > 0 {
@@ -511,7 +488,7 @@ impl TorrentFs {
         self.worker_pool.clone()
     }
 
-    /// TSI-2454: clone the `Arc<OnceLock<Option<Notifier>>>` handle before
+    /// clone the `Arc<OnceLock<Option<Notifier>>>` handle before
     /// `spawn_mount2` moves `self`.  After the session is live, `main`
     /// calls `notifier.set(Some(bg.notifier()))` on this handle to wire
     /// the kernel invalidation channel.
@@ -621,7 +598,7 @@ impl Filesystem for TorrentFs {
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         match self.service.open(ino) {
             Ok(OpenOutcome { fh, direct_io }) => {
-                // TSI-2246: data/ torrent files set direct_io so the kernel
+                // data/ torrent files set direct_io so the kernel
                 // bypasses its page cache; otherwise `filemap_read_folio`
                 // converts any failed read into EIO, masking the daemon's
                 // real errno (e.g. ENODATA for "no seeder").
@@ -676,7 +653,7 @@ impl Filesystem for TorrentFs {
                 info_hash,
                 torrent_id,
             }) => {
-                // TSI-2751: the deadline must cover the engine's worst-case
+                // the deadline must cover the engine's worst-case
                 // read budget (state wait + recheck wait + peer-discovery wait
                 // + piece wait), not just `read_timeout_secs`.  The old
                 // `read_timeout + 5` (35s default) expired tickets before the
@@ -692,18 +669,13 @@ impl Filesystem for TorrentFs {
                 let deadline = Instant::now()
                     + Duration::from_secs(budget_secs.saturating_add(READ_DEADLINE_MARGIN_SECS));
 
-                // TSI-2896: coalesce concurrent readers of the same byte range
-                // onto a single engine download so the piece is fetched once
-                // and the result fans out to every waiter.  `insert` blocks the
-                // FUSE dispatch thread while the table is full (design §9
-                // backpressure): never error, never return truncated data.
-                //
-                // The pending-reads counter is bumped *before* `insert` so the
-                // waiter is counted before it becomes visible to any resolver
-                // (worker, deadline checker, or `cancel_by_torrent_id`); the
-                // old order (inc after insert) left a window where a resolver
-                // could `dec` first, then the late `inc` permanently inflated
-                // the gauge (TOCTOU, TSI-2896 review).
+                // Coalesce concurrent readers of the same range onto one engine
+                // download; `insert` blocks the FUSE dispatch thread while the
+                // table is full (backpressure: never error, never truncate).
+                // Bump the pending-reads counter *before* `insert` so the waiter
+                // is counted before any resolver (worker, deadline checker,
+                // `cancel_by_torrent_id`) can see it — the old order let a
+                // resolver `dec` first, permanently inflating the gauge (TOCTOU).
                 self.service.metrics.pending_reads_inc();
                 let key = RangeKey {
                     info_hash: info_hash.clone(),
@@ -745,11 +717,11 @@ impl Filesystem for TorrentFs {
                                                     id, size
                                                 );
                                             }
-                                            // TSI-2293: `resolve_or_enodata`
+                                            // `resolve_or_enodata`
                                             // guards against `Ok(empty)` for a
                                             // non-zero `size`.  Resolves every
                                             // coalesced waiter with the shared
-                                            // result (TSI-2896).
+                                            // result.
                                             let n = pt.resolve_or_enodata(id, &data, size);
                                             metrics.pending_reads_dec_n(n);
                                         }
@@ -902,16 +874,13 @@ impl Filesystem for TorrentFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        // TSI-2533/TSI-2536: chmod on a virtual/read-only namespace must not
-        // silently succeed — `FsService::setattr` returns EROFS for `data/`
-        // and EPERM for `metadata/`, `.stats`, and the root directory.
-        //
-        // TSI-3064: a *pure truncate* (the `O_TRUNC` overwrite path, e.g.
-        // `cp` onto an existing `metadata/` file) is a legitimate write, not
-        // an attribute change — it must reach the service with `size =
-        // Some(n)` instead of being folded into the blanket EPERM. A request
-        // that also carries a mode/uid/gid/timestamp change is treated as an
-        // attribute change (truncate = None) and still returns EPERM.
+        // chmod on a virtual/read-only namespace must not silently succeed —
+        // `FsService::setattr` returns EROFS for `data/`, EPERM for `metadata/`,
+        // `.stats`, and root. A *pure truncate* (the `O_TRUNC` `cp` overwrite
+        // path) is a legitimate write, so it must reach the service with
+        // `size = Some(n)` rather than the blanket EPERM; a request that also
+        // carries a mode/uid/gid/timestamp change stays an attribute change
+        // (truncate = None) and returns EPERM.
         let attr_change = mode.is_some()
             || uid.is_some()
             || gid.is_some()
@@ -964,7 +933,7 @@ impl Filesystem for TorrentFs {
         _target: &std::path::Path,
         reply: ReplyEntry,
     ) {
-        // TSI-2537: `symlink` is unsupported.  `data/` must return `EROFS`
+        // `symlink` is unsupported.  `data/` must return `EROFS`
         // (matching chmod/write), every other namespace `EPERM` — the fuser
         // default returns `EPERM` for all parents, which never reached the
         // read-only-namespace guard.
@@ -1127,7 +1096,7 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 3);
     }
 
-    /// TSI-2483: an expired (piece-wait-elapsed) deferred read resolves with
+    /// an expired (piece-wait-elapsed) deferred read resolves with
     /// ENODATA, not EIO, so `dd`/`cat` see "no data available" instead of
     /// "input/output error" when the swarm has no seeder.
     #[test]
@@ -1166,7 +1135,7 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 2);
     }
 
-    /// TSI-2293: when a deferred read's worker returns `Ok(empty)` for a
+    /// when a deferred read's worker returns `Ok(empty)` for a
     /// non-zero-size request, `resolve_or_enodata` must resolve the reply
     /// with `ENODATA` — not 0 bytes (which the kernel interprets as EOF
     /// and `dd` exits 0).  This tests the production method directly.
@@ -1197,7 +1166,7 @@ mod pending_tests {
         );
     }
 
-    /// TSI-2293: empty data for a zero-size read is a legitimate EOF —
+    /// empty data for a zero-size read is a legitimate EOF —
     /// `resolve_or_enodata` must pass it through as data, not ENODATA.
     #[test]
     fn empty_data_for_zero_size_resolves_as_data() {
@@ -1224,7 +1193,7 @@ mod pending_tests {
         );
     }
 
-    /// TSI-2293: non-empty data is always resolved as data, regardless of
+    /// non-empty data is always resolved as data, regardless of
     /// `size`.
     #[test]
     fn nonempty_data_resolves_as_data() {
@@ -1246,7 +1215,7 @@ mod pending_tests {
         );
     }
 
-    /// TSI-2896: concurrent readers of the same byte range coalesce onto one
+    /// concurrent readers of the same byte range coalesce onto one
     /// group sharing a single engine download; resolving the leader fans the
     /// data out to every waiter exactly once.
     #[test]
@@ -1284,7 +1253,7 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 3);
     }
 
-    /// TSI-2896: a coalesced group resolves every waiter with the same errno
+    /// a coalesced group resolves every waiter with the same errno
     /// when the shared download fails, not just the leader.
     #[test]
     fn coalesced_group_fans_out_error() {
@@ -1327,7 +1296,7 @@ mod pending_tests {
         assert!(!got_data.load(Ordering::Relaxed));
     }
 
-    /// TSI-2896: a coalesced group expires together — every waiter gets
+    /// a coalesced group expires together — every waiter gets
     /// ENODATA, and `expire` reports the waiter count, not the group count.
     #[test]
     fn coalesced_group_expires_together() {
@@ -1355,7 +1324,7 @@ mod pending_tests {
         assert_eq!(last_errno.load(Ordering::Relaxed), libc::ENODATA);
     }
 
-    /// TSI-2896: cancellation is per waiter — cancelling one torrent in a
+    /// cancellation is per waiter — cancelling one torrent in a
     /// coalesced group leaves the other torrent's waiter in flight.
     #[test]
     fn coalesced_group_cancels_only_matching_torrent() {
@@ -1389,7 +1358,7 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 2);
     }
 
-    /// TSI-2896 review: after a group is resolved (removing its `by_range`
+    /// after a group is resolved (removing its `by_range`
     /// entry), re-inserting the same range key must create a fresh group, not
     /// hit a stale coalescing index entry.
     #[test]
@@ -1421,7 +1390,7 @@ mod pending_tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 2);
     }
 
-    /// TSI-2896 review: a waiter that joins after the leader's deadline keeps
+    /// a waiter that joins after the leader's deadline keeps
     /// its own later deadline — expiry removes only the overdue leader, not the
     /// still-fresh joiner.
     #[test]

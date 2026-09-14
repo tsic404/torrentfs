@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
-# Host-side smoke test for the torrentfs daemon user's login shell (TSI-3043).
-#
-# Runs on the CI runner AFTER the image is built, alongside entrypoint_smoke.sh.
-# It starts a container with a plain sleep (no /dev/fuse, no mount needed), then
-# asserts the observable behaviors the shell fix delivers:
-#
-#   1. /etc/passwd gives the torrentfs daemon user a login shell (/bin/sh),
-#      not /usr/sbin/nologin.
-#   2. `docker exec --user torrentfs <c> /bin/sh -c 'id -u; id -g'` succeeds
-#      and runs as UID/GID 1000 — the operator debugging workflow from the
-#      issue.
-#   3. `su - torrentfs` (login shell) succeeds inside the container. This is
-#      what /usr/sbin/nologin actually breaks: nologin makes su/login reject
-#      the account ("This account is currently not available.").
-#
-# Usage:
-#   ./ci/tests/user_shell_smoke.sh [IMAGE]
-#
-# Exit code: 0 = pass, non-zero = fail.
+# Host-side smoke test for the torrentfs daemon user's login shell. Runs on
+# the CI runner after the image is built; starts a container with a plain
+# sleep (no /dev/fuse, no mount) and asserts the shell fix's observable
+# behaviors: (1) /etc/passwd gives `torrentfs` a login shell (/bin/sh), not
+# /usr/sbin/nologin; (2) `docker exec --user torrentfs <c> /bin/sh -c 'id -u;
+# id -g'` succeeds as UID/GID 1000; (3) `su - torrentfs` succeeds inside the
+# container — what nologin breaks ("This account is currently not available.").
+# Usage: ./ci/tests/user_shell_smoke.sh [IMAGE]    Exit: 0 = pass, non-zero = fail.
 
 set -euo pipefail
 

@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-# Unit tests for entrypoint.sh detection helpers (TSI-2469).
-#
-# Tests the pure-logic functions that determine container environment and
-# mount-propagation capabilities — without requiring a real FUSE mount or a
-# running torrentfs process.
-#
-# The entrypoint script has `set -euo pipefail` and executes main at the
-# bottom, so we cannot simply `source` it. Instead we extract the helper
-# functions (everything before the "# ── main" marker) into a temp file and
-# source that prefix.
-#
-# Usage: ./ci/tests/entrypoint_test.sh
-# Exit code: 0 = all pass, 1 = any failure.
+# Unit tests for entrypoint.sh detection helpers — the pure-logic functions that
+# determine container environment and mount-propagation capabilities, without a
+# real FUSE mount or a running torrentfs process.
+# The entrypoint script runs main at the bottom, so we cannot `source` it;
+# extract the helper functions (before the "# ── main" marker) into a temp file
+# and source that prefix.
+# Usage: ./ci/tests/entrypoint_test.sh   Exit: 0 = pass, 1 = fail.
 
 set -euo pipefail
 
@@ -151,7 +145,7 @@ run_test "needs_fuse --config /foo.toml /mnt needs FUSE" \
 # has_config_check drives the --config-check diagnostic short-circuit: unlike
 # --help/--version, --config-check conflicts with the mountpoint positional in
 # clap, so the entrypoint must forward the parsed args (mountpoint stripped)
-# instead of "$@" (TSI-3113).
+# instead of "$@".
 
 run_test "has_config_check --config-check is true" \
     'has_config_check --config-check'
@@ -165,7 +159,7 @@ run_test "has_config_check --help is false" \
 run_test "has_config_check /mnt is false" \
     'if has_config_check /mnt; then exit 1; else exit 0; fi'
 
-# --- parse_args (mountpoint identification, TSI-2902) ---
+# --- parse_args (mountpoint identification) ---
 # parse_args splits the command line into $mountpoint (first positional) and
 # $torrentfs_args (everything else), validating --config values. It must skip
 # option values so the mountpoint may precede or follow --config/--db/--cache.
@@ -227,7 +221,7 @@ run_test "parse_args --log-level debug /mnt does not treat debug as mountpoint" 
 run_test "parse_args --log-level=debug /mnt keeps mountpoint" \
     'parse_args --log-level=debug /mnt; [ "$mountpoint" = /mnt ]'
 
-# --- validate_mountpoint (mountpoint guard, TSI-2902) ---
+# --- validate_mountpoint (mountpoint guard) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
 # before the FUSE device check. The nested subshell captures the exit code so
 # `set -e` does not abort the test on the expected non-zero status.
@@ -294,7 +288,7 @@ run_test "mountpoint_has_fuse false for fuse mount at another target" \
 run_test "mountpoint_has_fuse false for empty mountinfo" \
     'setup_mountinfo ""; if mountpoint_has_fuse /mnt; then exit 1; else exit 0; fi'
 
-# --- mountpoint_has_fuse canonicalization / escape decoding (TSI-2942) ---
+# --- mountpoint_has_fuse canonicalization / escape decoding ---
 # mountinfo records the kernel-normalized mount point (symlinks resolved,
 # `.`/`..` merged, trailing `/` dropped) with space/tab/newline/backslash
 # octal-escaped.
@@ -435,7 +429,7 @@ start_torrentfs "$mnt"
 grep -q ROOTLESS "$mnt/dispatch"
 rm -rf "$mnt"'
 
-# --- start_torrentfs_rootless fail-fast (TSI-2976) ---
+# --- start_torrentfs_rootless fail-fast ---
 # Under rootless podman running as container root (is_root), a bind mount on
 # the mountpoint is the ':shared' host-visibility recipe whose propagation
 # cannot be honored — the entrypoint must exit 102 instead of silently mounting
@@ -648,7 +642,7 @@ XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
 
-# --- prepare_log_file_parent (TSI-3118) ---
+# --- prepare_log_file_parent ---
 # --log-file's parent must exist and be daemon-owned before the setpriv drop.
 # A relative path (bare filename or subdir) resolves against the root-owned
 # WORKDIR and is rejected; an absolute path gets its parent mkdir -p'd and the

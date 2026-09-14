@@ -1,12 +1,9 @@
-//! Regression test for TSI-2225: pieces served from the local disk must be
-//! registered in the cache metadata.
-//!
-//! Before the fix, a piece downloaded eagerly by the access-window prefetch
-//! (not through the read's piece-wait loop) was written to disk but never
-//! registered in `CacheManager` metadata.  `pieces_on_disk` therefore kept
-//! returning `false` for it, forcing every subsequent read down the deferred
-//! slow path, and after a restart the piece was treated as unverified and
-//! re-downloaded — which timed out with EIO when no peer was available.
+//! Regression test: pieces served from the local disk must be registered in
+//! cache metadata. Before the fix, a piece fetched eagerly by the
+//! access-window prefetch was written to disk but never registered, so
+//! `pieces_on_disk` kept returning `false` (forcing the slow path), and after
+//! a restart it was treated as unverified and re-downloaded — timing out with
+//! EIO when no peer was available.
 
 mod common;
 
@@ -126,7 +123,7 @@ fn test_read_registers_prefetched_pieces() {
     assert_eq!(assembled, content);
 
     // Every piece that was read must now be registered (verified) in the
-    // cache metadata — this is the TSI-2225 regression.
+    // cache metadata — this is the regression.
     let info_hash = hex::encode(info.info_hash().unwrap());
     let cm = engine.cache_manager();
     let guard = cm.lock().unwrap();

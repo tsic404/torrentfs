@@ -53,7 +53,7 @@ impl PieceStore {
             .unwrap_or(false)
     }
 
-    /// TSI-2258: whether a piece is stale — libtorrent's `have_piece` says
+    /// whether a piece is stale — libtorrent's `have_piece` says
     /// true but the on-disk piece file has been purged (deleted by cache
     /// verification or manual `delete_piece`).  This is the unified stale
     /// detection primitive used by the engine's `has_stale_pieces`,
@@ -62,15 +62,11 @@ impl PieceStore {
         !self.has_piece_on_disk(piece_key)
     }
 
-    /// Read a whole piece from the on-disk cache, recording an access.
-    ///
-    /// TSI-2262: acquires a per-info-hash shared read lock (via the C++
-    /// FFI `lt_lock_piece_read`/`lt_unlock_piece_read`) before reading the
-    /// piece file. This prevents reading a partially-written piece file
-    /// while libtorrent's `PieceStorage::write_piece` is still writing
-    /// blocks to it on the disk thread. Without this lock, concurrent
-    /// readers during active download could get inconsistent data (some
-    /// readers saw partial piece files before all blocks were flushed).
+    /// Read a whole piece from the on-disk cache, recording an access. Takes
+    /// a per-info-hash shared read lock (C++ `lt_lock_piece_read`) before
+    /// reading, so a concurrent `PieceStorage::write_piece` on the disk thread
+    /// can't expose a partially-written file — without it, concurrent readers
+    /// during an active download saw inconsistent (partial) data.
     pub fn read_piece(&self, piece_key: &str) -> TorrentResult<Vec<u8>> {
         let path = {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
@@ -97,7 +93,7 @@ impl PieceStore {
 
     /// Read a byte range from a piece file without loading the whole piece.
     ///
-    /// TSI-2262: same shared read lock as `read_piece` to prevent reading
+    /// same shared read lock as `read_piece` to prevent reading
     /// a partially-written piece file during active download.
     pub fn read_piece_range(
         &self,
@@ -134,7 +130,7 @@ impl PieceStore {
         }
     }
 
-    /// TSI-2048: whether a piece is genuinely complete in cache.  Both
+    /// whether a piece is genuinely complete in cache.  Both
     /// conditions must hold:
     /// 1. the piece was registered via `register_piece` (a successful
     ///    libtorrent download), not merely discovered by a startup scan;
@@ -225,16 +221,11 @@ impl PieceStore {
     }
 }
 
-/// RAII guard for the C++ per-info-hash shared read lock (TSI-2262).
-///
-/// Acquires a shared (read) lock on the C++ `g_piece_locks` mutex for the
-/// given info_hash on construction, and releases it on drop. This prevents
-/// `PieceStorage::write_piece` (which holds the exclusive lock) from writing
-/// blocks to a piece file while the Rust side is reading it.
-///
-/// The lock is a no-op (skipped) when `info_hash_hex` is empty — this happens
-/// in unit tests that use synthetic piece keys without a real libtorrent
-/// session, or when the piece key format is malformed.
+/// RAII guard for the C++ per-info-hash shared read lock: acquires on
+/// construction, releases on drop, so `PieceStorage::write_piece` (exclusive
+/// lock) can't write blocks while the Rust side reads. The lock is a no-op
+/// when `info_hash_hex` is empty (unit tests with synthetic piece keys, or a
+/// malformed piece key).
 struct PieceReadLockGuard {
     info_hash_hex: String,
     locked: bool,
@@ -279,7 +270,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// TSI-2258: after `delete_piece` purges a piece (file + metadata), the
+    /// after `delete_piece` purges a piece (file + metadata), the
     /// `has_piece_on_disk` check must return `false` — this is the signal the
     /// engine's stale-bitmask detection uses to decide that `have_piece == true`
     /// is stale and a `force_recheck` is needed before the read proceeds.
@@ -329,7 +320,7 @@ mod tests {
         Ok(())
     }
 
-    /// TSI-2258: `has_stale_piece` is the unified stale-detection primitive
+    /// `has_stale_piece` is the unified stale-detection primitive
     /// used by the engine's `has_stale_pieces`, `all_pieces_local`, the
     /// piece-wait loop, and the deadline-setting section.  After a purge,
     /// it must return `true` (piece file gone) so the engine knows the
@@ -377,7 +368,7 @@ mod tests {
         Ok(())
     }
 
-    /// TSI-2258: `read_piece` must fail (Err) when the piece file was purged.
+    /// `read_piece` must fail (Err) when the piece file was purged.
     /// The engine's `read_from_disk` uses this Err to return `PieceNotReady`
     /// instead of silently skipping, which would produce a short-read EIO.
     #[test]

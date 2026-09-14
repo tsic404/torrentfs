@@ -48,20 +48,12 @@ pub struct TrackerEntry {
 
 impl TorrentInfo {
     #[allow(dead_code)]
-    /// Parse a `.torrent` file from the filesystem.
-    ///
-    /// TSI-2278: On Unix, file paths are arbitrary byte sequences — they are
-    /// not required to be valid UTF-8.  The previous implementation called
-    /// `Path::to_str()`, which returns `None` for non-UTF-8 paths, causing
-    /// `from_file` to fail with `InvalidFile("Path contains invalid UTF-8")`
-    /// for torrents whose names contain non-ASCII bytes (e.g. GBK-encoded
-    /// Chinese filenames from legacy BT sites).
-    ///
-    /// The fix uses `OsStrExt::as_bytes()` (Unix) to obtain the raw path
-    /// bytes and constructs a `CString` directly, bypassing the UTF-8
-    /// validation.  libtorrent's `torrent_info(const std::string&)`
-    /// constructor accepts arbitrary bytes, so no encoding conversion is
-    /// needed.
+    /// Parse a `.torrent` file from the filesystem. On Unix, paths are
+    /// arbitrary bytes (not necessarily UTF-8): `Path::to_str()` returns
+    /// `None` for non-UTF-8 paths, which failed torrents with non-ASCII names
+    /// (e.g. GBK filenames). Use `OsStrExt::as_bytes()` (Unix) to build a
+    /// `CString` directly — libtorrent's `torrent_info(const std::string&)`
+    /// accepts arbitrary bytes, so no encoding conversion is needed.
     pub fn from_file<P: AsRef<Path>>(path: P) -> TorrentResult<Self> {
         #[cfg(unix)]
         {
@@ -261,19 +253,12 @@ impl TorrentInfo {
         }
     }
 
-    /// Whether the torrent's info dict has the `private` flag set (BEP-27).
-    ///
-    /// PT (Private Tracker) torrents set `private=1` in the info dict to
-    /// signal that peers must only use trackers (no DHT/PEX). torrentfs
-    /// uses this to **isolate** private torrents: they must never
-    /// participate in cross-site tracker merging, because merged trackers
-    /// would expose passkeys across swarms and cross-pollinate peers
-    /// (TSI-2277).
-    ///
-    /// On FFI error (-1: null handle / exception), returns `true` — the
-    /// conservative default is "treat as private" so the PT isolation guard
-    /// in `engine.rs:merge_trackers` skips the merge rather than risking
-    /// passkey leakage on an uncertain private flag.
+    /// Whether the info dict sets `private=1` (BEP-27). torrentfs isolates
+    /// private torrents: they never join cross-site tracker merging, which
+    /// would expose passkeys and cross-pollinate peers. On FFI error (-1:
+    /// null handle/exception) returns `true` — treat as private — so
+    /// `merge_trackers` skips the merge rather than risk passkey leakage on an
+    /// uncertain flag.
     pub fn is_private(&self) -> bool {
         // SAFETY: `self.inner` is a valid handle; the FFI call is a pure
         // getter with no side effects. Returns 1 if private, 0 if not,
@@ -286,7 +271,7 @@ impl TorrentInfo {
     /// for every piece except the last, which is the trailing remainder of
     /// `total_size`. Returns `None` when the index is out of range.
     ///
-    /// Used by the background cache verification (TSI-2199 / TSI-2222) to
+    /// Used by the background cache verification to
     /// distinguish an incomplete/crash-interrupted piece (wrong size → leave
     /// it unverified for on-demand re-download) from a complete piece whose
     /// SHA-1 must still be checked.
@@ -381,7 +366,7 @@ impl Drop for TorrentInfo {
 unsafe impl Send for TorrentInfo {}
 unsafe impl Sync for TorrentInfo {}
 
-/// TSI-2278: Shared test helper — build a multi-file bencoded torrent
+/// Shared test helper — build a multi-file bencoded torrent
 /// with arbitrary byte-string file names. Used by both `metadata::tests`
 /// and `fs_service::tests` to avoid duplication.
 #[cfg(test)]
@@ -671,7 +656,7 @@ mod tests {
         assert!(json.contains("\\n"));
     }
 
-    // ── TSI-2277: private flag tests ──────────────────────────────────
+    // ── private flag tests ──────────────────────────────────
 
     /// Build a torrent with the `private` flag set inside the info dict.
     /// `private=1` marks the torrent as a PT (Private Tracker) torrent.
@@ -798,7 +783,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_from_file_non_utf8_path() {
-        // TSI-2278: from_file must not fail on non-UTF-8 file paths.
+        // from_file must not fail on non-UTF-8 file paths.
         // On Unix, file paths are arbitrary bytes.  A path with non-UTF-8
         // bytes should be passed through to libtorrent as raw bytes, not
         // rejected with "Path contains invalid UTF-8".

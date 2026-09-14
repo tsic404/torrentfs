@@ -34,7 +34,7 @@ impl From<FsError> for libc::c_int {
             // ── persistence ──
             FsError::Database(_) | FsError::Migration(_) => EIO,
             // ── remote / network (BitTorrent domain) ──
-            // TSI-2246/TSI-2483: NoPeers and DownloadTimeout map to ENODATA
+            // NoPeers and DownloadTimeout map to ENODATA
             // ("No data available") so the user sees a meaningful error
             // ("no available seeder" / "waiting for a seeder timed out")
             // instead of the generic EIO ("Input/output error") when the
@@ -76,7 +76,7 @@ mod tests {
         assert_ne!(e, libc::EIO);
     }
 
-    /// TSI-2483: `DownloadTimeout` ("waiting for a seeder timed out") maps to
+    /// `DownloadTimeout` ("waiting for a seeder timed out") maps to
     /// ENODATA so a read that blocks out the piece-wait limit surfaces as
     /// "no data available", not the generic EIO.
     #[test]
@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(e, libc::EIO);
     }
 
-    /// TSI-2261: when the piece-wait times out with zero seeders, the engine
+    /// when the piece-wait times out with zero seeders, the engine
     /// returns `NoPeers` (not `Timeout`). This must still map to ENODATA, not
     /// EIO, so the user sees "no data available" instead of "I/O error".
     #[test]

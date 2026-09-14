@@ -16,7 +16,7 @@ pub struct ProxyConfig {
     /// `socks5_pw`/`http`/`http_pw`/`i2p_proxy`); `none` is expressed on the
     /// Rust side as `None`. The config models the kind as a free-form string
     /// (TOML `type = "socks5"`) and `apply_str_setting` in the C wrapper
-    /// converts it to the `proxy_type` int_types setting (TSI-2529).
+    /// converts it to the `proxy_type` int_types setting.
     /// Enum-domain validation is applied in `ProxyConfig::validate()`.
     #[serde(rename = "type", alias = "proxy_type")]
     pub proxy_type: Option<String>,
@@ -28,20 +28,13 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// Validate `proxy_type` (canonical `type` / alias `proxy_type`).
-    ///
-    /// The field is optional, but once present — including as an empty
-    /// string — it MUST name a real libtorrent proxy kind. Empty or
-    /// unknown values are rejected here rather than being silently
-    /// dropped in `write_json` and falling back to libtorrent's default,
-    /// which the user would never notice.
-    ///
-    /// The accepted domain also tracks the wrapper's compile-time capability:
-    /// `i2p_proxy` is only legal when libtorrent was built with
-    /// `TORRENT_USE_I2P=1`. On I2P-disabled builds the C++ wrapper's
-    /// `apply_str_setting` has no `i2p_proxy` branch and silently ignores the
-    /// value, so rejecting it here turns that silent drop into a config-time
-    /// error (TSI-2547).
+    /// Validate `proxy_type` (canonical `type` / alias `proxy_type`). The field
+    /// is optional, but once present it MUST name a real libtorrent proxy kind;
+    /// empty/unknown values are rejected here rather than silently dropped in
+    /// `write_json`. The accepted domain tracks the wrapper's compile-time
+    /// capability: `i2p_proxy` is only legal when libtorrent was built with
+    /// `TORRENT_USE_I2P=1` — otherwise `apply_str_setting` silently ignores it,
+    /// so rejecting here turns that silent drop into a config-time error.
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.validate_with(crate::infrastructure::config::i2p_enabled())
     }
@@ -79,7 +72,7 @@ impl WriteJson for ProxyConfig {
         // `host`/`port` are the user-facing TOML keys; libtorrent's real
         // settings_pack names are `proxy_hostname`/`proxy_port`. The wrapper
         // only recognizes the latter — emitting `host`/`port` made both values
-        // silently dropped (TSI-2538). The other fields already use their
+        // silently dropped. The other fields already use their
         // libtorrent names verbatim, so only these two need explicit keys.
         if let Some(val) = &self.host {
             if !val.is_empty() {

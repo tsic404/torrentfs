@@ -12,16 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Build libtorrent-rasterbar from source, statically, with -fno-gnu-unique.
-#
-# TSI-2171: Debian experimental's prebuilt libtorrent-rasterbar2.1 emits the
-# boost::system `*_cat_holder<void>::instance` error-category statics as GNU
-# unique (STB_GNU_UNIQUE) symbols. When torrentfs (which also carries those
-# statics) links against that shared library, the dynamic linker coalesces them
-# incorrectly and `system_category()` dereferences a null vtable → SIGSEGV on
-# the first disk-I/O callback. Building libtorrent from source with
-# -fno-gnu-unique (WEAK symbols) and linking it statically removes the
-# cross-DSO GNU-unique conflict entirely.
+# Build libtorrent-rasterbar from source, statically, with -fno-gnu-unique:
+# Debian's prebuilt libtorrent emits the error-category statics as GNU-unique
+# symbols; linking torrentfs against it coalesces them wrongly, so
+# `system_category()` dereferences a null vtable → SIGSEGV on first disk I/O.
+# Building from source with -fno-gnu-unique (WEAK) plus static linking removes
+# the cross-DSO conflict.
 ARG LIBTORRENT_VERSION=2.1.1
 # SHA256 of the release tarball, pinned for supply-chain integrity. Bump together
 # with LIBTORRENT_VERSION (digest from the GitHub release asset metadata).
@@ -61,7 +57,7 @@ FROM debian:sid-slim
 #
 # The daemon user gets /bin/sh (not /usr/sbin/nologin) as its login shell:
 # a container has no login(1)/PAM path for nologin to guard, and operators
-# need `docker exec --user torrentfs sh` to debug the mount (TSI-3043).
+# need `docker exec --user torrentfs sh` to debug the mount.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 \
     libstdc++6 \

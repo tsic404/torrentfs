@@ -24,17 +24,17 @@ pub struct CacheManager {
     pub miss_count: u64,
     pub hit_count: u64,
     evict_callbacks: Vec<Box<dyn Fn(String, i32) + Send + Sync>>,
-    /// TSI-2491: pieces with an on-disk `.incomplete` marker — written by the
+    /// pieces with an on-disk `.incomplete` marker — written by the
     /// C++ `PieceStorage::write_piece` while a piece is still being filled.
     /// Rebuilt by `scan_pieces_subdirectory` on restart and cleared by
     /// `add_piece` / `remove_piece` / `mark_verified`.
     incomplete_piece_keys: HashSet<String>,
-    /// TSI-2048: pieces whose integrity was verified via add_piece
+    /// pieces whose integrity was verified via add_piece
     /// (called after a successful libtorrent read_piece).  Pieces
     /// registered solely by scan_pieces_subdirectory at startup are
     /// NOT in this set — they may be incomplete sparse files.
     verified_piece_keys: HashSet<String>,
-    /// TSI-2274: metadata dirtied since the last `save_metadata_file`.
+    /// metadata dirtied since the last `save_metadata_file`.
     /// Mutating methods (`record_access`, `add_piece`, `remove_piece`,
     /// `drop_infohash_state`, `mark_verified`) set this instead of
     /// fsyncing on every call; the engine loop calls
@@ -148,16 +148,12 @@ impl CacheManager {
         Ok(())
     }
 
-    /// TSI-2263 / TSI-2274: persist the cache metadata to disk with fsync.
-    ///
-    /// Mutating methods only flag `metadata_dirty` instead of fsyncing on
-    /// every call (TSI-2274: `record_access` was fsyncing on every piece
-    /// read, limiting throughput to ~1.2 MB/s).  This flush is called on
-    /// shutdown (graceful) and periodically by the engine loop so the
-    /// metadata state is durable before the process exits.  Without fsync,
-    /// a container restart can leave `cache_metadata.txt` stale, causing
-    /// the restart scan to register pieces at wrong sizes and the verifier
-    /// to purge them.
+    /// Persist cache metadata to disk with fsync. Mutators only flag
+    /// `metadata_dirty` instead of fsyncing each call (that limited throughput
+    /// to ~1.2 MB/s); this flush runs on shutdown and periodically so metadata
+    /// is durable. Without fsync a restart can leave `cache_metadata.txt`
+    /// stale, making the restart scan register wrong sizes and the verifier
+    /// purge pieces.
     pub fn flush(&mut self) -> TorrentResult<()> {
         let result = self.save_metadata_file();
         if result.is_ok() {
@@ -166,7 +162,7 @@ impl CacheManager {
         result
     }
 
-    /// TSI-2274: write the metadata file only if dirty since the last
+    /// write the metadata file only if dirty since the last
     /// flush.  Called periodically from the engine loop so the on-disk
     /// metadata does not lag too far behind the in-memory state.  Returns
     /// `Ok(())` when nothing needs writing.
@@ -300,7 +296,7 @@ impl CacheManager {
                     continue;
                 }
 
-                // TSI-2491: `.incomplete` files are markers, not piece data.
+                // `.incomplete` files are markers, not piece data.
                 // They are consumed below to tag their sibling piece as
                 // incomplete; never register them as pieces themselves.
                 if filename.ends_with(INCOMPLETE_SUFFIX) {
@@ -327,7 +323,7 @@ impl CacheManager {
                     .map(|m| m.hit_count)
                     .unwrap_or(0);
 
-                // TSI-2491: a sibling `<piece_key>.incomplete` marker means
+                // a sibling `<piece_key>.incomplete` marker means
                 // the C++ write path is still filling this piece. Keep it in
                 // metadata (so has_piece/size stay consistent) but exclude it
                 // from background SHA-1 verification.
@@ -365,7 +361,7 @@ impl CacheManager {
             .map_err(|e| TorrentError::IoError(format!("Failed to write metadata: {}", e)))?;
         }
 
-        // TSI-2263: flush the BufWriter into the OS page cache, then
+        // flush the BufWriter into the OS page cache, then
         // fsync the underlying file descriptor so the metadata reaches
         // disk.  BufWriter::flush only pushes bytes to the OS buffer;
         // without fsync a container restart can leave cache_metadata.txt
@@ -399,7 +395,7 @@ impl CacheManager {
             )));
         }
 
-        // TSI-2274: do not fsync on every read — mark dirty and let
+        // do not fsync on every read — mark dirty and let
         // the engine loop flush periodically / on shutdown.
         self.metadata_dirty = true;
         Ok(())
@@ -408,7 +404,7 @@ impl CacheManager {
     pub fn add_piece(&mut self, piece_key: &str, size: u64) -> TorrentResult<()> {
         let now = current_timestamp_ms();
 
-        // TSI-2231: insert returns the previous metadata if the piece_key
+        // insert returns the previous metadata if the piece_key
         // already existed (e.g. after restart scan_pieces_subdirectory
         // already counted the on-disk piece into current_size).  Account
         // only for the size delta instead of re-adding the full size,
@@ -431,12 +427,12 @@ impl CacheManager {
 
         let old_size = prev.map(|m| m.size).unwrap_or(0);
 
-        // TSI-2048: mark as verified — add_piece is only called after
+        // mark as verified — add_piece is only called after
         // a successful libtorrent read_piece, which is the authoritative
         // proof of piece completeness.
         self.verified_piece_keys.insert(piece_key.to_string());
 
-        // TSI-2491: the piece is now provably complete — clear any
+        // the piece is now provably complete — clear any
         // in-progress marker left by the C++ write path.
         self.incomplete_piece_keys.remove(piece_key);
         let marker = self.piece_marker_path(piece_key);
@@ -456,7 +452,7 @@ impl CacheManager {
             self.evict_lru()?;
         }
 
-        // TSI-2274: mark dirty — the engine loop flushes periodically
+        // mark dirty — the engine loop flushes periodically
         // and on shutdown instead of fsyncing on every add_piece.
         self.metadata_dirty = true;
         Ok(())
@@ -497,17 +493,12 @@ impl CacheManager {
     fn remove_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
         let piece_path = self.piece_path(piece_key);
 
-        // TSI-2242: debit the registered PieceMetadata.size — the same
-        // value credited by add_piece / scan_pieces_subdirectory — so
-        // current_size stays symmetric on add and remove.  Using the
-        // on-disk file length here caused permanent upward drift when a
-        // piece's disk file was shorter than its registered size
-        // (partial write / crash-restart, the scenario the tests at
-        // test_has_piece_true_but_disk_file_empty and
-        // test_metadata_size_mismatch_disk_size document): the full
-        // registered size was credited on add but only the actual disk
-        // length was debited on remove, so current_size never returned
-        // to zero and the cache over-evicted.
+        // Debit the registered `PieceMetadata.size` — the same value credited
+        // by add_piece / scan_pieces_subdirectory — so current_size stays
+        // symmetric. Using the on-disk file length here drifted upward on
+        // partial writes: the full registered size was credited on add but only
+        // the disk length debited on remove, so current_size never returned to
+        // zero and the cache over-evicted.
         let registered_size = self.metadata.get(piece_key).map(|m| m.size).unwrap_or(0);
 
         if piece_path.exists() {
@@ -516,7 +507,7 @@ impl CacheManager {
             })?;
         }
 
-        // TSI-2491: drop the in-progress marker alongside the piece file so
+        // drop the in-progress marker alongside the piece file so
         // a stale marker never tags a future re-download of the same piece.
         let marker_path = self.piece_marker_path(piece_key);
         if marker_path.exists() {
@@ -534,7 +525,7 @@ impl CacheManager {
         self.verified_piece_keys.remove(piece_key);
         self.incomplete_piece_keys.remove(piece_key);
 
-        // TSI-2274: mark dirty instead of fsyncing on every removal.
+        // mark dirty instead of fsyncing on every removal.
         self.metadata_dirty = true;
         Ok(())
     }
@@ -564,7 +555,7 @@ impl CacheManager {
         let pieces_dir = self.cache_dir.join("pieces").join(info_hash);
         pieces_dir.join(piece_key)
     }
-    /// TSI-2491: path of the `.incomplete` marker for a piece.
+    /// path of the `.incomplete` marker for a piece.
     fn piece_marker_path(&self, piece_key: &str) -> PathBuf {
         let mut os = self.piece_path(piece_key).into_os_string();
         os.push(INCOMPLETE_SUFFIX);
@@ -639,7 +630,7 @@ impl CacheManager {
             .unwrap_or(0)
     }
 
-    /// TSI-2048: whether a piece's metadata was registered via add_piece
+    /// whether a piece's metadata was registered via add_piece
     /// (verified by a successful libtorrent read_piece).  Pieces
     /// registered only by scan_pieces_subdirectory at startup are NOT
     /// verified — they could be incomplete sparse files from a crash.
@@ -649,9 +640,9 @@ impl CacheManager {
 
     /// All piece keys present in cache metadata but not yet marked verified.
     /// These are candidates for background SHA-1 verification after a restart
-    /// (TSI-2199): pieces discovered by `scan_pieces_subdirectory` that may be
+    /// pieces discovered by `scan_pieces_subdirectory` that may be
     /// complete, or may be incomplete/corrupt files left by a crash.
-    /// TSI-2491: pieces tagged with an `.incomplete` marker are excluded —
+    /// pieces tagged with an `.incomplete` marker are excluded —
     /// the C++ write path is still filling them, so verifying them now would
     /// always fail and purge a piece that was never corrupt.
     pub fn unverified_pieces(&self) -> Vec<String> {
@@ -665,18 +656,18 @@ impl CacheManager {
             .collect()
     }
     /// Mark a piece as verified after its on-disk content passed SHA-1
-    /// verification against the torrent's expected piece hash (TSI-2199).
+    /// verification against the torrent's expected piece hash.
     pub fn mark_verified(&mut self, piece_key: &str) {
         self.verified_piece_keys.insert(piece_key.to_string());
         self.incomplete_piece_keys.remove(piece_key);
-        // TSI-2274: mark dirty so the periodic flush persists the
+        // mark dirty so the periodic flush persists the
         // verified flag without fsyncing on every verification.
         self.metadata_dirty = true;
     }
 
     /// Delete a piece from the cache (metadata + on-disk file + verified set).
     /// Used to purge pieces that failed SHA-1 verification so they can be
-    /// re-downloaded on demand (TSI-2199).
+    /// re-downloaded on demand.
     pub fn delete_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
         self.remove_piece(piece_key)
     }
@@ -716,7 +707,7 @@ impl CacheManager {
         let removed_size = self.infohash_total_size(info_hash);
         self.current_size = self.current_size.saturating_sub(removed_size);
         self.remove_infohash_metadata(info_hash);
-        // TSI-2274: mark dirty instead of fsyncing on every purge.
+        // mark dirty instead of fsyncing on every purge.
         self.metadata_dirty = true;
     }
 
@@ -823,7 +814,7 @@ impl CacheManager {
     }
 }
 
-/// TSI-2274: flush dirty metadata when the CacheManager is dropped, so
+/// flush dirty metadata when the CacheManager is dropped, so
 /// tests and other callers that do not run the engine loop still persist
 /// metadata mutations.  In production the engine loop flushes every tick
 /// and `main.rs` flushes on shutdown; this is the safety net for
@@ -1326,7 +1317,7 @@ mod tests {
     //
     // These tests cover the scenario where cache metadata (has_piece) and
     // the on-disk piece file are out of sync — a key root-cause suspect
-    // for the premature-EOF bug (TSI-2018).  When metadata says a piece
+    // for the premature-EOF bug.  When metadata says a piece
     // exists but the file is empty or truncated, the assembly loop in
     // read_file_range reads empty/short data and silently skips the piece.
 
@@ -1451,7 +1442,7 @@ mod tests {
         );
         assert!(!cache.has_piece(piece_key), "no metadata registered");
 
-        // TSI-2048: the fast-path no longer consults has_piece_on_disk;
+        // the fast-path no longer consults has_piece_on_disk;
         // it only trusts metadata (has_piece) with size validation.
         // An empty file on disk without metadata registration will fall
         // through to read_piece (the authoritative source).
@@ -1488,7 +1479,7 @@ mod tests {
         Ok(())
     }
 
-    // ── TSI-2048 regression: restart with partial piece files ─────────
+    // ── restart with partial piece files ─────────
     //
     // These tests verify that `scan_pieces_subdirectory`'s blind
     // registration of every on-disk file does not make incomplete
@@ -1573,7 +1564,7 @@ mod tests {
             "complete piece registered by scan should have the correct size"
         );
 
-        // TSI-2048: scanned pieces are NOT verified — only add_piece
+        // scanned pieces are NOT verified — only add_piece
         // (after a successful read_piece) marks them as verified.
         assert!(
             !cache.is_piece_verified(&piece_key),
@@ -1614,7 +1605,7 @@ mod tests {
 
     #[test]
     fn test_add_piece_re_registration_no_double_count() -> TorrentResult<()> {
-        // TSI-2231: after restart scan_pieces_subdirectory already
+        // after restart scan_pieces_subdirectory already
         // counted an on-disk piece into current_size.  When the engine
         // poll loop re-registers the same piece via add_piece (have ==
         // true), current_size must not re-add the full size.
@@ -1648,7 +1639,7 @@ mod tests {
         Ok(())
     }
 
-    // ── TSI-2242 regression: current_size add/remove symmetry ─────────
+    // ── current_size add/remove symmetry ─────────
     //
     // remove_piece must debit the same value that add_piece /
     // scan_pieces_subdirectory credited (PieceMetadata.size), not the
@@ -1727,7 +1718,7 @@ mod tests {
         Ok(())
     }
 
-    // ── TSI-2263: cache flush durability ──────────────────────────────
+    // ── cache flush durability ──────────────────────────────
 
     #[test]
     fn test_flush_persists_metadata_for_restart() -> TorrentResult<()> {
@@ -1786,7 +1777,7 @@ mod tests {
         Ok(())
     }
 
-    // ── TSI-2274: record_access must not fsync on every read ───────────
+    // ── record_access must not fsync on every read ───────────
 
     #[test]
     fn test_record_access_does_not_persist_until_flush() -> TorrentResult<()> {
@@ -1843,7 +1834,7 @@ mod tests {
         Ok(())
     }
 
-    // ── TSI-2491 regression: incomplete-marker exclusion ─────────────
+    // ── incomplete-marker exclusion ─────────────
     //
     // The C++ write path drops `<piece_key>.incomplete` next to the piece
     // file while blocks are still being written.  On restart, those pieces

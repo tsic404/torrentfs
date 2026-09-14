@@ -251,7 +251,7 @@ impl PieceScheduler {
     /// Remove all per-torrent state for an info_hash (priority vector,
     /// piece length, reader ranges).  Called when the download engine drops
     /// a torrent handle so the scheduler does not leak state for a removed
-    /// torrent (TSI-2232).
+    /// torrent.
     pub fn remove_torrent(&mut self, info_hash: &str) {
         self.elevated.remove(info_hash);
         self.piece_lengths.remove(info_hash);

@@ -1,34 +1,12 @@
 #!/usr/bin/env bash
-# Self-seeding QA environment for torrentfs (TSI-2418).
-#
-# The public Ubuntu/Debian .torrent samples under /workspace/testdata/torrents/
-# routinely have zero reachable seeders on the current network, which makes any
-# read against them fail with the (correct) ENODATA/NoPeers error.  This script
-# builds a deterministic, self-contained test swarm so QA can exercise real
-# downloads without depending on external infrastructure:
-#
-#   - a local HTTP tracker on 127.0.0.1:<TRACKER_PORT>
-#   - a single-file torrent built from a fixed 4 MiB payload
-#   - a libtorrent seeder serving that payload from ci/selfseed/seed_data/
-#
-# By default everything is loopback-only: no DHT, no LSD, no UPnP, no NAT-PMP,
-# no public trackers.  To let a container reach the host's loopback services,
-# override the defaults with `--tracker-bind <host IP>` /
-# `--announce-host <host-reachable IP>` so the tracker binds and the .torrent
-# announce URL points at a non-loopback address.  The tracker is IPv4-only, so
-# IPv6 literals are rejected rather than silently breaking the swarm.
-# Run this before starting torrentfs, then drop ./output/selfseed.torrent into
-# the mounted torrentfs directory and read files through the mount — pieces are
-# served by the local seeder.
-#
-# Usage:
-#   ./ci/run_self_seed_env.sh [--payload-mib N] [--port PORT]
-#                             [--tracker-bind IP] [--announce-host IP]
-#
-# Outputs (relative to the repo's ci/selfseed/ directory):
-#   output/selfseed.torrent — the .torrent to copy into torrentfs
-#   output/payload.txt      — exact expected content (for diffing)
-#   output/tracker.url      — announce URL of the local tracker
+# Self-seeding QA environment for torrentfs. Public sample torrents usually
+# have no reachable seeders, so this builds a deterministic loopback swarm —
+# a local HTTP tracker, a single-file 4 MiB torrent, and a libtorrent seeder —
+# for real downloads without external infrastructure. Loopback-only by default
+# (no DHT/LSD/UPnP/NAT-PMP/public trackers); pass --tracker-bind/--announce-host
+# to reach it from a container (IPv4 only).
+# Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--port PORT]
+#        [--tracker-bind IP] [--announce-host IP]  → outputs under ci/selfseed/
 
 set -euo pipefail
 

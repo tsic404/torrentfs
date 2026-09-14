@@ -42,7 +42,7 @@ impl DownloadService {
         })
     }
 
-    /// Shared observability counters (TSI-2139).
+    /// Shared observability counters.
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
     }
@@ -59,25 +59,25 @@ impl DownloadService {
 
     /// Remove a torrent handle from the download engine session and clear
     /// its scheduler state.  Call only when the last DB reference to the
-    /// info_hash is deleted (TSI-2232).
+    /// info_hash is deleted.
     pub fn remove_handle(&self, info_hash: &str) -> TorrentResult<()> {
         self.engine.remove_handle(info_hash)
     }
 
     /// Merge trackers from a duplicate-info_hash torrent into the existing
-    /// handle (TSI-2275 / TSI-2277). Fire-and-forget: the engine checks the
+    /// handle. Fire-and-forget: the engine checks the
     /// private flag and skips the merge for private torrents (PT isolation).
     /// Call this from `add_torrent` when a duplicate info_hash is detected.
     pub fn merge_trackers(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
         self.engine.merge_trackers(info)
     }
 
-    /// Non-blocking private-flag check for `.stats` (TSI-2277).
+    /// Non-blocking private-flag check for `.stats`.
     pub fn try_is_private(&self, info_hash: &str) -> Option<bool> {
         self.engine.try_is_private(info_hash)
     }
 
-    /// Query the current tracker list on a torrent handle (TSI-2277).
+    /// Query the current tracker list on a torrent handle.
     /// Synchronous. Used by tests to verify PT isolation.
     #[cfg(test)]
     pub fn get_trackers(&self, info_hash: &str) -> TorrentResult<Vec<crate::TrackerEntry>> {
@@ -103,7 +103,7 @@ impl DownloadService {
 
     /// Worst-case seconds a single blocking read may occupy the engine thread
     /// before returning.  The FUSE deferred-read deadline derives from this
-    /// budget (TSI-2751).
+    /// budget.
     pub fn read_wait_budget_secs(&self) -> u64 {
         self.engine.read_wait_budget_secs()
     }

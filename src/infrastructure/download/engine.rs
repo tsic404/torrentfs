@@ -1,15 +1,11 @@
 //! `DownloadEngine` — single-owner-thread actor for the download subsystem.
-//!
-//! The engine thread exclusively owns the libtorrent `Session`, all torrent
-//! `TorrentHandle`s, the [`PieceStore`] (data plane) and the [`PieceScheduler`]
-//! (control plane / priority).  External callers send [`Command`]s over an
-//! `mpsc` channel and receive results on a `sync_channel`; the raw libtorrent
-//! pointers therefore never cross a thread boundary, which lets `Session` and
-//! `TorrentHandle` drop their `unsafe impl Send`.
-//!
-//! Non-blocking `.stats` reads go through a shared [`DownloadSnapshot`] that
-//! the engine refreshes each tick, replacing the old `try_lock` on the
-//! `DownloadManager` big lock (TSI-2119).
+//! The engine thread exclusively owns the libtorrent `Session`, all
+//! `TorrentHandle`s, [`PieceStore`] (data plane) and [`PieceScheduler`]
+//! (control plane). Callers send [`Command`]s over `mpsc` and receive on a
+//! `sync_channel`, so raw libtorrent pointers never cross a thread boundary
+//! (hence the dropped `unsafe impl Send`). Non-blocking `.stats` reads use a
+//! shared [`DownloadSnapshot`] refreshed each tick, replacing the old big-lock
+//! `try_lock`.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -63,15 +59,15 @@ pub enum Command {
     /// Remove a torrent handle from the engine session and clear its
     /// scheduler state.  Used by the unlink/remove path when the last DB
     /// reference to an info_hash is deleted, so the engine stops
-    /// announcing/seeding a removed torrent (TSI-2232).
+    /// announcing/seeding a removed torrent.
     RemoveHandle { info_hash: String },
     /// Merge trackers from a duplicate-info_hash torrent into the existing
-    /// handle (TSI-2275). The engine checks the private flag (TSI-2277):
+    /// handle. The engine checks the private flag:
     /// if either the existing or incoming torrent is private, the merge is
     /// skipped to prevent PT passkey leakage and peer cross-pollination.
     /// Fire-and-forget: the result is logged, not returned to the caller.
     MergeTrackers { info: Arc<TorrentInfo> },
-    /// Query the current tracker list on a torrent handle (TSI-2277 test
+    /// Query the current tracker list on a torrent handle (test
     /// support). Used by tests to verify PT isolation: private torrent
     /// trackers must not be merged into the existing handle.
     GetTrackers {
@@ -89,7 +85,7 @@ pub struct DownloadSnapshot {
     pub statuses: HashMap<String, TorrentStatus>,
     /// Per-info_hash `(piece_length, piece statuses)`.
     pub pieces: HashMap<String, (u64, Vec<PieceStatus>)>,
-    /// Per-info_hash private flag (TSI-2277). A torrent is "private" when
+    /// Per-info_hash private flag. A torrent is "private" when
     /// its info dict has `private=1` (BEP-27). Private torrents are isolated
     /// from cross-site tracker merging to prevent passkey leakage and peer
     /// cross-pollination across PT swarms.
@@ -112,7 +108,7 @@ pub struct DownloadEngine {
 struct EngineState {
     session: Session,
     handles: HashMap<String, TorrentHandle>,
-    /// Per-info_hash private flag (TSI-2277). Populated at handle creation
+    /// Per-info_hash private flag. Populated at handle creation
     /// time from `TorrentInfo::is_private()`. Used to guard tracker merging:
     /// if either the existing or incoming torrent is private, the merge is
     /// skipped to prevent PT passkey leakage and peer cross-pollination.
@@ -272,8 +268,8 @@ impl DownloadEngine {
             .cloned()
     }
 
-    /// Non-blocking private-flag check from the last engine snapshot
-    /// (TSI-2277). Returns `Some(true)` if the torrent's info dict has
+    /// Non-blocking private-flag check from the last engine snapshot.
+    /// Returns `Some(true)` if the torrent's info dict has
     /// `private=1`, `Some(false)` if not, `None` if the info_hash has no
     /// handle in the snapshot. Used by `.stats` to display the PT isolation
     /// state.
@@ -298,7 +294,7 @@ impl DownloadEngine {
     /// engine thread before returning its own result.  The FUSE deferred-read
     /// deadline must cover this budget (plus dispatch margin) so a ticket is
     /// never expired with ENODATA while the engine is still legitimately
-    /// waiting for a slow seeder (TSI-2751).
+    /// waiting for a slow seeder.
     pub fn read_wait_budget_secs(&self) -> u64 {
         read_wait_budget_secs(self.read_timeout_secs)
     }
@@ -339,7 +335,7 @@ impl DownloadEngine {
     /// scheduler state.  Fire-and-forget: the command is queued and
     /// executed eventually on the engine thread; this call does not block.
     /// Safe to call from the FUSE unlink path — it will never stall the
-    /// dispatch loop on a busy engine (TSI-2232).
+    /// dispatch loop on a busy engine.
     pub fn remove_handle(&self, info_hash: &str) -> TorrentResult<()> {
         self.send(Command::RemoveHandle {
             info_hash: info_hash.to_string(),
@@ -347,7 +343,7 @@ impl DownloadEngine {
     }
 
     /// Merge trackers from a duplicate-info_hash torrent into the existing
-    /// handle (TSI-2275 / TSI-2277). Fire-and-forget: the command is queued
+    /// handle. Fire-and-forget: the command is queued
     /// and executed on the engine thread; this call does not block. The
     /// engine checks the private flag — if either the existing or incoming
     /// torrent is private, the merge is skipped (PT isolation).
@@ -355,7 +351,7 @@ impl DownloadEngine {
         self.send(Command::MergeTrackers { info })
     }
 
-    /// Query the current tracker list on a torrent handle (TSI-2277).
+    /// Query the current tracker list on a torrent handle.
     /// Synchronous: blocks until the engine thread responds. Used by tests
     /// to verify PT isolation — private torrent trackers must not be merged.
     pub fn get_trackers(&self, info_hash: &str) -> TorrentResult<Vec<crate::TrackerEntry>> {
@@ -429,15 +425,15 @@ impl Drop for DownloadEngine {
 /// libtorrent `torrent_flags::upload_mode` numeric value (`1 << 1`).
 const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 
-/// Upper bound (seconds) on the peer-discovery wait in the slow read path
-/// (TSI-2417).  The engine's worst-case read budget sums the state-transition
+/// Upper bound (seconds) on the peer-discovery wait in the slow read path.
+/// The engine's worst-case read budget sums the state-transition
 /// wait, the recheck wait, this peer-discovery wait and the piece-wait window —
-/// the FUSE deferred-read deadline must exceed that sum (TSI-2751).
+/// the FUSE deferred-read deadline must exceed that sum.
 pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
 
 /// Upper bound (seconds) on the `force_recheck_and_wait` synchronous wait in
-/// the stale-piece path (TSI-2258).  It runs before peer discovery on the same
-/// engine thread, so it adds to the read budget (TSI-2751).
+/// the stale-piece path.  It runs before peer discovery on the same
+/// engine thread, so it adds to the read budget.
 pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
 
 /// Worst-case seconds a single `read_file_range` call may block on the engine
@@ -459,7 +455,7 @@ pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
 }
 
 /// Format the stderr hint emitted when a read times out with zero connected
-/// seeders (TSI-2975).  The message describes the *current* swarm state at
+/// seeders.  The message describes the *current* swarm state at
 /// timeout — a seeder that connected and left during the wait also lands here,
 /// so it says "no seeder connected", not "no seeder ever connected".  The
 /// daemon writes the line to its own stderr (operator-facing; a FUSE daemon
@@ -473,21 +469,14 @@ pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
     )
 }
 
-/// Compute the partial-read bounds returned when the piece-wait window
-/// elapses (TSI-3128).
-///
-/// The piece-wait loop advances `piece_idx` strictly in order, so when it
-/// times out on `piece_idx`, every piece in `[start_piece, piece_idx - 1]`
-/// has completed.  Rather than returning an empty read (which the client
-/// cannot distinguish from EOF), return the contiguous prefix of completed
-/// pieces `[start_piece, last_complete]` as a short read — faster degraded
-/// feedback during peers establishment.
-///
-/// Returns `(partial_end, partial_size)` covering `[absolute_offset,
-/// partial_end)`, or `None` when even the first requested piece is missing.
-/// `partial_end` 取请求终点与最后已完成 piece 完整边界的最小值；超时路径下
-/// 恒为完整边界（`last_complete` 恒为非末 piece，其完整边界不被末 piece
-/// 截断缩短）。Pure so it is unit-testable without a running engine.
+/// Compute the partial-read bounds when the piece-wait window elapses. The
+/// loop advances `piece_idx` in order, so on timeout every piece before it is
+/// complete; return that contiguous prefix `[start_piece, last_complete]` as a
+/// short read (visible progress) instead of 0 bytes the client can't tell from
+/// EOF. Returns `(partial_end, partial_size)` covering `[absolute_offset,
+/// partial_end)`, or `None` when the first requested piece is missing.
+/// `partial_end` is the min of the request end and the last complete piece's
+/// boundary (on the timeout path always a full piece boundary).
 fn partial_read_bounds(
     start_piece: i32,
     last_complete: i32,
@@ -508,7 +497,7 @@ fn partial_read_bounds(
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
 /// thread (`set_alert_notify`), so this interval bounds `.stats` staleness
 /// for per-torrent status/pieces and also drives the session-stats sample
-/// request (TSI-2344): each tick fires `post_session_stats`, whose alert
+/// request: each tick fires `post_session_stats`, whose alert
 /// the consumer drains into the shared stats snapshot.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -521,13 +510,13 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Ok(cmd) => {
                 let stop = state.handle_command(cmd);
                 state.publish_snapshot();
-                // TSI-3041: do NOT flush cache metadata per command.  Every
+                // do NOT flush cache metadata per command.  Every
                 // cached read marks the piece metadata dirty
                 // (`record_access`), so a per-command flush fsync'd
                 // `cache_metadata.txt` once per 1-byte read — the dominant
                 // cost that made `dd bs=1 count=4096` hang on a cached file.
                 // Flushing on the periodic tick (timeout branch) and on
-                // shutdown is the TSI-2274 "periodic flush" intent.
+                // shutdown is the "periodic flush" intent.
                 if stop {
                     break;
                 }
@@ -540,7 +529,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    // TSI-2274: final flush so metadata mutations that happened since the
+    // final flush so metadata mutations that happened since the
     // last tick are durable before the engine thread exits.
     state.flush_cache_metadata();
     // Unregister the alert-notify hook before the session is dropped.
@@ -551,7 +540,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
 }
 
 impl EngineState {
-    /// TSI-2344: request a fresh session-stats sample. Fire-and-forget —
+    /// request a fresh session-stats sample. Fire-and-forget —
     /// libtorrent answers with a `session_stats_alert` on the normal alert
     /// queue, which the alert-consumer thread drains into `shared_stats`.
     /// This is the sole producer for the `.stats` Global Rates counters.
@@ -631,7 +620,7 @@ impl EngineState {
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
-        // Record the private flag (TSI-2277) so that tracker merging can
+        // Record the private flag so that tracker merging can
         // check it without re-parsing the torrent_info on every duplicate
         // add. The flag is immutable for the lifetime of the info_hash.
         self.private_torrents
@@ -643,7 +632,7 @@ impl EngineState {
     /// Remove a torrent handle from the session and clear its scheduler
     /// state.  Idempotent: a missing info_hash is a no-op.  Called on the
     /// engine thread when the last DB reference to an info_hash is deleted
-    /// (TSI-2232), so the engine stops announcing/seeding a removed torrent
+    /// so the engine stops announcing/seeding a removed torrent
     /// and its handle/scheduler entries do not leak across add/remove cycles.
     fn remove_handle(&mut self, info_hash: &str) -> TorrentResult<()> {
         if let Some(handle) = self.handles.remove(info_hash) {
@@ -655,25 +644,13 @@ impl EngineState {
     }
 
     /// Merge trackers from a duplicate-info_hash torrent into the existing
-    /// handle (TSI-2275), with PT isolation guard (TSI-2277).
-    ///
-    /// Called when `add_torrent` detects a duplicate info_hash (a second
-    /// torrent with the same content hash but potentially different trackers).
-    /// The new torrent's trackers are deduplicated against the existing
-    /// handle's trackers and merged in, then `force_reannounce` is called to
-    /// immediately contact the new trackers.
-    ///
-    /// **PT isolation**: if either the existing handle's torrent or the
-    /// incoming torrent has the `private` flag set (BEP-27), the merge is
-    /// **skipped entirely**. Private torrents embed passkeys in their
-    /// announce URLs; merging trackers across PT sites would leak passkeys
-    /// to foreign swarms and cross-pollinate peers, risking account bans.
-    /// Private torrents keep their independent tracker lists and only share
-    /// the local piece cache.
-    ///
-    /// All failures are non-fatal (warn-logged): the torrent is already in
-    /// the DB and the handle exists, so a merge failure only means the new
-    /// trackers won't be announced — the existing behavior is unchanged.
+    /// handle, with PT isolation guard. Called when `add_torrent` sees a
+    /// duplicate info_hash: the new trackers are deduplicated and merged, then
+    /// `force_reannounce` contacts them. **PT isolation**: if either torrent is
+    /// `private` (BEP-27), the merge is skipped entirely — private announce URLs
+    /// embed passkeys, and merging would leak them across swarms and
+    /// cross-pollinate peers. Failures are non-fatal (warn-logged): the row and
+    /// handle already exist.
     fn merge_trackers(&mut self, info: &TorrentInfo) {
         let info_hash = match info.info_hash() {
             Ok(h) => hex::encode(h),
@@ -683,7 +660,7 @@ impl EngineState {
             }
         };
 
-        // PT isolation guard (TSI-2277): if the incoming torrent is private,
+        // PT isolation guard: if the incoming torrent is private,
         // do not merge its trackers into the existing handle.
         let incoming_private = info.is_private();
 
@@ -892,16 +869,12 @@ impl EngineState {
             }
         }
 
-        // ── Detect stale libtorrent piece state (TSI-2258) ───────────────
-        // A piece can be purged from cache (file deleted + metadata cleared by
-        // the background SHA-1 verification) while libtorrent's internal
-        // piece bitmask still marks it as complete (resume state not
-        // updated).  Without intervention, `all_pieces_local` would take the
-        // fast path, `read_from_disk` would find the file missing, silently
-        // skip it, and return a short read → EIO.  Detect this: if any piece
-        // in the range has `have_piece == true` but the on-disk file is gone,
-        // call `force_recheck` so libtorrent re-verifies via the custom storage
-        // and clears the stale bit, then wait for the recheck to finish.
+        // ── Detect stale libtorrent piece state ───────────────
+        // A piece can be purged from cache while libtorrent's bitmask still
+        // marks it complete; the fast path would then find the file missing,
+        // silently skip it, and return a short read → EIO. If any piece has
+        // `have_piece == true` but no on-disk file, `force_recheck` clears the
+        // stale bit (via the custom storage) and we wait for the recheck.
         if self.has_stale_pieces(&info_hash, start_piece, end_piece) {
             tracing::info!(
                 "read_file_range: stale libtorrent piece state detected for \
@@ -914,14 +887,11 @@ impl EngineState {
         }
 
         // ── Fast path: all pieces available locally ────────────────────
-        // TSI-3041: a fully-cached read must not run the download machinery.
-        // `reader_added` (priority gradient), `publish_snapshot`
-        // (`post_torrent_updates` + a full piece-status rebuild) and
-        // `release_reader` (`reset_all` = `set_piece_priority` over every
-        // non-default piece) all scale with torrent size and exist only to
-        // drive a piece download.  For a cached range they added per-read FFI
-        // overhead that made byte-granular reads (`dd bs=1 count=4096`)
-        // pathologically slow.  Read straight from the piece store instead.
+        // A fully-cached read must not run the download machinery:
+        // `reader_added`/`publish_snapshot`/`release_reader` scale with torrent
+        // size and exist only to drive a download. For a cached range their
+        // per-read FFI overhead made byte-granular reads (`dd bs=1`) slow, so
+        // read straight from the piece store.
         if self.all_pieces_local(
             &info_hash,
             start_piece,
@@ -957,7 +927,7 @@ impl EngineState {
             }
         }
         // Publish the snapshot immediately so `.stats` reflects the elevated
-        // piece priorities while this read is in progress (TSI-2224).  Without
+        // piece priorities while this read is in progress.  Without
         // this, `publish_snapshot` only runs in the engine loop between
         // commands — but this handler blocks the engine thread until the read
         // completes, by which point `release_reader` has already reset all
@@ -982,7 +952,7 @@ impl EngineState {
             }
         }
 
-        // TSI-2468: publish the snapshot after switching to download mode so
+        // publish the snapshot after switching to download mode so
         // `.stats` reflects the state change immediately. Without this, the
         // snapshot published at reader_added (line 822) is the last refresh
         // before the engine blocks in the peer-wait / piece-wait loops —
@@ -993,23 +963,13 @@ impl EngineState {
         std::thread::sleep(Duration::from_millis(100));
 
         // ── Slow path: peer discovery + piece-wait ─────────────────────
-        // TSI-2358: previously we failed fast with `NoPeers` after the
-        // peer-wait probe (≤ min(read_timeout, 9s)).  Now we fall through
-        // to the piece-wait loop below, so a cold torrent's total wait is
-        // peer-wait(≤9s) + piece-wait(read_timeout_secs).  This avoids
-        // returning 0 bytes (ENODATA) for cold torrents whose peers may
-        // appear later.  Cost: reads are synchronous on the engine thread,
-        // so concurrent cold-torrent reads now serialize for up to
-        // read_timeout_secs each instead of ≤9s.
-        //
-        // TSI-2417: with zero connected peers/seeds, kick the swarm
-        // immediately instead of waiting for libtorrent's own announce
-        // schedule.  After delete + re-add of the same info_hash, the fresh
-        // handle's first announce can land outside the tracker's
-        // min-interval window (or after an LSD cycle), leaving this read to
-        // time out even though the swarm is healthy.  A forced announce at
-        // peer-wait start (and once more mid-wait) pulls peers in within one
-        // tracker round-trip; failures are non-fatal.
+        // We no longer fail fast with `NoPeers` after the peer-wait probe:
+        // falling through to the piece-wait loop lets cold torrents wait
+        // peer-wait(≤9s) + piece-wait(read_timeout_secs) for peers that appear
+        // late (cost: engine-thread reads serialize up to read_timeout each).
+        // With zero connected peers/seeds, kick the swarm immediately: after a
+        // delete + re-add the fresh handle's first announce can land outside
+        // the tracker's min-interval, timing out an otherwise-healthy read.
         {
             let handle = self
                 .handles
@@ -1037,14 +997,14 @@ impl EngineState {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
-                    // TSI-2468: also refresh session stats so the global
+                    // also refresh session stats so the global
                     // `Connected:` counter (SharedSessionStats) stays
                     // fresh during the blocked read.
                     self.refresh_session_stats();
                     match handle.status() {
                         Ok(s) => {
                             status = s;
-                            // TSI-2468: refresh the shared snapshot so
+                            // refresh the shared snapshot so
                             // `.stats` shows peers/seeds as they connect
                             // during the peer-wait phase. Without this,
                             // the snapshot stays stale from the upload_mode
@@ -1055,7 +1015,7 @@ impl EngineState {
                                 break;
                             }
                         }
-                        // TSI-2246 review: `handle.status()` failed — return
+                        // `handle.status()` failed — return
                         // the actual error instead of masking it behind a
                         // misleading "no seeder" message.
                         Err(e) => {
@@ -1075,7 +1035,7 @@ impl EngineState {
         }
 
         // ── Set piece deadlines ────────────────────────────────────────
-        // TSI-2258 review: `have_piece` can be stale (true but file purged).
+        // `have_piece` can be stale (true but file purged).
         // Only skip the deadline for pieces that are truly available —
         // `have_piece` true AND the file exists on disk.  Stale pieces
         // still need a deadline so libtorrent re-requests them.
@@ -1095,7 +1055,7 @@ impl EngineState {
         }
 
         // ── Wait for each missing piece ────────────────────────────────
-        // TSI-2751: the deadline is shared across ALL pieces in the range —
+        // the deadline is shared across ALL pieces in the range —
         // `read_timeout_secs` bounds the whole read, not each piece.  This
         // keeps `read_wait_budget_secs()` in lockstep with the engine's true
         // worst-case wait (state wait + peer-discovery wait + one piece-wait
@@ -1117,7 +1077,7 @@ impl EngineState {
                     .get(&info_hash)
                     .map(|h| h.have_piece(piece_idx))
                     .unwrap_or(false);
-                // TSI-2258: `have_piece` can be stale (resume state marks the
+                // `have_piece` can be stale (resume state marks the
                 // piece as complete, but the file was purged from cache).
                 // In that case, do not treat it as ready — instead, fall
                 // through to the download path so libtorrent re-requests
@@ -1160,16 +1120,12 @@ impl EngineState {
                 }
 
                 if piece_wait_start.elapsed() >= piece_wait_timeout {
-                    // TSI-3128: instead of returning empty (ENODATA) after
-                    // the piece-wait window elapses, return the contiguous
-                    // prefix of pieces that completed during the wait.  The
-                    // loop above advances `piece_idx` strictly in order, so
-                    // every piece before it has completed; `piece_idx` itself
-                    // is the first still-missing piece.  Returning that prefix
-                    // as a short read gives the client faster degraded
-                    // feedback (visible progress) instead of 0 bytes that it
-                    // cannot distinguish from EOF while peers are still being
-                    // established.
+                    // Instead of empty (ENODATA) after the piece-wait window,
+                    // return the contiguous prefix of completed pieces. The loop
+                    // advances `piece_idx` in order, so every piece before it is
+                    // complete (`piece_idx` is the first missing one); returning
+                    // that prefix as a short read gives visible progress instead
+                    // of 0 bytes the client can't tell from EOF.
                     if let Some((partial_end, partial_size)) = partial_read_bounds(
                         start_piece,
                         piece_idx - 1,
@@ -1193,19 +1149,13 @@ impl EngineState {
                     }
 
                     self.release_reader(&info_hash);
-                    // TSI-2261/TSI-2483: when the piece-wait times out,
-                    // distinguish "no seeder available" from "slow download".
-                    // If the torrent has zero connected seeders after the
-                    // full timeout, the swarm has no seeder — return NoPeers
-                    // (→ ENODATA). Seeders present but slow return Timeout,
-                    // which also maps to ENODATA ("waiting for a seeder timed
-                    // out") at the FUSE layer.
-                    //
-                    // If status is unavailable (handle gone or status()
-                    // failed), fall back to Timeout — do NOT fabricate a
-                    // zero-seeder swarm that would mislead the user into
-                    // checking tracker health for what is really a stale
-                    // handle.
+                    // On piece-wait timeout, distinguish "no seeder" from "slow
+                    // download": zero connected seeders → `NoPeers`; seeders
+                    // present but slow → `Timeout` (both map to ENODATA at FUSE).
+                    // If status is unavailable (handle gone, status() failed),
+                    // fall back to `Timeout` — don't fabricate a zero-seeder
+                    // swarm and mislead the user into checking tracker health
+                    // for a stale handle.
                     let (progress, num_peers, num_seeds) =
                         match self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
                             Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
@@ -1219,17 +1169,13 @@ impl EngineState {
                             }
                         };
                     if num_seeds == 0 {
-                        // TSI-2975: a read that blocks out the piece-wait
-                        // window with zero connected seeders currently has no
-                        // seeder to serve it, unlike the `Timeout` branch
-                        // below ("seeder present but slow").  Write a one-line
-                        // hint to the daemon's own stderr (operator-facing; a
-                        // FUSE daemon has no channel into the reading client's
-                        // stderr).  Use a direct, non-panicking write and drop
-                        // its result: `eprintln!` panics on a closed/broken
-                        // stderr, which would abort this engine thread (no
-                        // `catch_unwind` here), and `tracing` is not used
-                        // because its default writer is stdout, not stderr.
+                        // A zero-seeder read has no seeder to serve it, unlike
+                        // the `Timeout` branch below. Write a one-line hint to
+                        // the daemon's own stderr (operator-facing; FUSE has no
+                        // channel into the client's stderr) via a direct,
+                        // non-panicking write: `eprintln!` panics on a broken
+                        // stderr (aborting this thread), and `tracing` writes
+                        // to stdout, not stderr.
                         let _ = writeln!(
                             std::io::stderr(),
                             "{}",
@@ -1253,9 +1199,9 @@ impl EngineState {
                 }
 
                 // Refresh the snapshot so `.stats` shows pieces becoming
-                // cached and priority changes during long reads (TSI-2224).
+                // cached and priority changes during long reads.
                 self.publish_snapshot();
-                // TSI-2468: refresh session stats for global counters.
+                // refresh session stats for global counters.
                 self.refresh_session_stats();
 
                 std::thread::sleep(Duration::from_millis(200));
@@ -1307,7 +1253,7 @@ impl EngineState {
                     )
                 })
                 .unwrap_or(false);
-            // TSI-2258: use the unified stale detection — `have_piece` true
+            // use the unified stale detection — `have_piece` true
             // but the on-disk file is gone means the bit is stale; the
             // piece is NOT available locally and must be re-downloaded.
             let have = handle.have_piece(piece_idx);
@@ -1323,7 +1269,7 @@ impl EngineState {
         true
     }
 
-    /// TSI-2258: detect whether any piece in the range has a stale
+    /// detect whether any piece in the range has a stale
     /// libtorrent bitmask — `have_piece == true` but the on-disk piece file
     /// is gone (purged by cache verification or manual `delete_piece`).
     /// Returns `true` if at least one such piece exists.
@@ -1343,7 +1289,7 @@ impl EngineState {
         false
     }
 
-    /// TSI-2258: force libtorrent to re-verify all pieces for a torrent and
+    /// force libtorrent to re-verify all pieces for a torrent and
     /// wait for the recheck to complete (or time out).  After `force_recheck`,
     /// libtorrent transitions through `CheckingFiles` and, via the custom
     /// storage's `async_check_files`, discovers that purged pieces are gone
@@ -1361,17 +1307,12 @@ impl EngineState {
             );
             return;
         }
-        // TSI-2258 review: wait for the recheck to finish.  Two subtleties:
-        // 1. TOCTOU — `force_recheck()` is asynchronous; libtorrent may not
-        //    have transitioned to `QueuedForChecking` by the time we first
-        //    poll.  Without a grace period, the first `status()` would see
-        //    the old state (Seeding/Downloading), conclude "recheck done",
-        //    and return while stale bits still persist.  Fix: sleep a grace
-        //    period before the first poll, then track whether we *ever*
-        //    observed a checking state — only return after observing the
-        //    transition OUT of checking.
-        // 2. Poll interval — 200ms reduces syscall overhead while keeping
-        //    recheck latency (typically <1s) acceptable.
+        // Wait for the recheck to finish. Two subtleties: (1) TOCTOU —
+        // `force_recheck()` is async, so without a grace period the first
+        // `status()` may see the old state and conclude "done" with stale bits
+        // intact; sleep a grace period, then only return after observing the
+        // transition OUT of a checking state. (2) A 200ms poll keeps syscall
+        // overhead low while recheck latency (<1s) stays acceptable.
         let max_wait =
             Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
         let start = Instant::now();
@@ -1442,15 +1383,12 @@ impl EngineState {
             let piece_data = match self.store.read_piece(&piece_key) {
                 Ok(d) => d,
                 Err(_) => {
-                    // TSI-2258: the piece file is gone but we reached
-                    // read_from_disk — either the fast path (have_piece was
-                    // true but file purged) or the piece-wait loop broke
-                    // on `have_piece` without verifying disk presence.
-                    // Rather than silently skipping (which leads to a
-                    // short-read EIO), return PieceNotReady so the caller
+                    // The piece file is gone but we reached read_from_disk
+                    // (fast path or piece-wait loop broke on `have_piece`
+                    // without checking disk). Return `PieceNotReady` rather
+                    // than silently skipping (a short-read EIO): the caller
                     // sees a transient error and can retry, and the stale
-                    // libtorrent bitmask is caught by the recheck guard
-                    // on the next attempt.
+                    // bitmask is caught by the recheck guard next attempt.
                     let piece_start = (piece_idx as u64) * piece_length;
                     let piece_end_theoretical = piece_start + piece_length;
                     if absolute_offset < piece_end_theoretical && end_offset > piece_start {
@@ -1475,7 +1413,7 @@ impl EngineState {
                 }
                 continue;
             }
-            // TSI-2262: verify the piece data length matches the expected
+            // verify the piece data length matches the expected
             // piece size. A shorter file means the piece was read while
             // libtorrent's write_piece was still writing blocks to it
             // (the write-during-read race). The shared read lock should
@@ -1505,7 +1443,7 @@ impl EngineState {
                 }
                 continue;
             }
-            // TSI-2225: the piece is being served from the local disk. If it is
+            // the piece is being served from the local disk. If it is
             // not yet registered in the cache metadata (e.g. it was downloaded
             // eagerly by the access-window prefetch rather than through this
             // read's piece-wait loop), register it now so `pieces_on_disk` and
@@ -1630,7 +1568,7 @@ impl EngineState {
     fn publish_snapshot(&self) {
         let mut statuses = HashMap::new();
         let mut pieces = HashMap::new();
-        // TSI-2468: request libtorrent to refresh per-torrent statistics
+        // request libtorrent to refresh per-torrent statistics
         // before reading status. Without this, `status().num_peers` can
         // return 0 even when peers are connected — the internal peer list
         // is only refreshed on session tick or post_torrent_updates.
@@ -1655,7 +1593,7 @@ impl EngineState {
         }
     }
 
-    /// TSI-2274: periodically persist dirty cache metadata so the on-disk
+    /// periodically persist dirty cache metadata so the on-disk
     /// state does not lag too far behind the in-memory state.  Mutating
     /// cache methods (`record_access`, `add_piece`, `remove_piece`, …)
     /// only flag `metadata_dirty` instead of fsyncing on every call; this
@@ -1703,7 +1641,7 @@ impl EngineState {
 mod tests {
     use super::{no_seeder_stderr_hint, partial_read_bounds, read_wait_budget_secs};
 
-    /// TSI-2975: the no-seeder stderr hint must use the exact message the
+    /// the no-seeder stderr hint must use the exact message the
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
     /// live peer/seed counts — so a currently-empty swarm is distinguishable
     /// from "seeder slow" (which surfaces as `DownloadTimeout`, not this hint).
@@ -1720,7 +1658,7 @@ mod tests {
         );
     }
 
-    /// TSI-2751: the read budget must cover all four synchronous phases —
+    /// the read budget must cover all four synchronous phases —
     /// state-transition wait + recheck wait (capped) + peer-discovery wait
     /// (capped) + piece wait — so the FUSE deferred-read deadline never
     /// expires a ticket while the engine is still legitimately waiting.
@@ -1743,7 +1681,7 @@ mod tests {
         assert!(read_wait_budget_secs(30) > 30 + 5);
     }
 
-    /// TSI-3128: with the first piece missing, the partial read is empty —
+    /// With the first piece missing, the partial read is empty —
     /// the read must keep its existing NoPeers/Timeout error, not fabricate
     /// a short read out of nothing.
     #[test]
@@ -1755,7 +1693,7 @@ mod tests {
         );
     }
 
-    /// TSI-3128: the completed prefix clamps to the requested end and to the
+    /// The completed prefix clamps to the requested end and to the
     /// piece boundary of the last completed piece — a full piece length.
     #[test]
     fn partial_bounds_cover_completed_prefix() {
@@ -1767,7 +1705,7 @@ mod tests {
         );
     }
 
-    /// TSI-3128: when the requested end lands before the piece boundary, the
+    /// When the requested end lands before the piece boundary, the
     /// partial end must clamp to the request end, not overrun it into the
     /// still-missing piece's span.
     #[test]

@@ -1,4 +1,4 @@
-//! Bounded download worker pool (TSI-2144).
+//! Bounded download worker pool.
 //!
 //! Replaces the unbounded per-read `thread::spawn` with a fixed pool of
 //! workers fed by a bounded `sync_channel`. `submit` is blocking: when the

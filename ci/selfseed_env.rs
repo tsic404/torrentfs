@@ -1,19 +1,11 @@
-//! `torrentfs-selfseed-env` — self-contained QA seeder environment (TSI-2418).
-//!
-//! Public Ubuntu/Debian sample torrents frequently have no reachable seeders,
-//! so reads against them legitimately fail with `NoPeers` → ENODATA.  This
-//! binary builds a deterministic single-file torrent from a fixed payload and
-//! serves it via a local tracker + libtorrent seeder, giving QA a swarm that
-//! works fully offline.
-//! Flow:
-//!  1. start a minimal HTTP tracker on a loopback port
-//!  2. stream the payload into the seed directory, hashing each piece
-//!  3. bencode a single-file .torrent from those piece hashes
-//!  4. run a libtorrent session in seeding state until killed
-//!
-//! The tracker and seeder logic mirror `tests/common/mod.rs` (`MiniTracker`,
-//! `TestHarness`) so QA gets the same loopback-only swarm the CI tests use,
-//! without needing the test tree.
+//! `torrentfs-selfseed-env` — self-contained QA seeder environment. Public
+//! sample torrents frequently have no reachable seeders, so reads fail with
+//! `NoPeers` → ENODATA; this binary builds a deterministic single-file torrent
+//! and serves it via a local tracker + libtorrent seeder, fully offline.
+//! Flow: (1) start a minimal HTTP tracker, (2) stream the payload into the seed
+//! directory hashing each piece, (3) bencode a single-file .torrent, (4) run a
+//! libtorrent session in seeding state until killed. The tracker/seeder mirror
+//! `tests/common/mod.rs` (`MiniTracker`, `TestHarness`).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -53,14 +45,14 @@ struct Peer {
     /// Bytes remaining to download (0 = seeder).  Part of the peer identity:
     /// two distinct clients can share the same IP:port when a downloader runs
     /// behind pasta/slirp NAT while the seeder runs on the host — both then
-    /// appear to the tracker as `127.0.0.1:<same listen port>` (TSI-2417).
+    /// appear to the tracker as `127.0.0.1:<same listen port>`.
     left: u64,
     /// Last announce time (Instant::now at registration).  Entries not
     /// re-announced within [`PEER_EXPIRY`] are dropped — without expiry, every
     /// delete + re-add of the same info_hash leaves the previous handle's
     /// entry behind, and the new handle's peer list fills with stale
     /// self-referential entries (`127.0.0.1:<own listen port>`) that it then
-    /// wastes its connection attempts on (TSI-2417).
+    /// wastes its connection attempts on.
     seen: std::time::Instant,
 }
 
@@ -70,7 +62,7 @@ const PEER_EXPIRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Bound on the wait for the first announce bytes.  A client that connects
 /// and sends nothing would otherwise park `handle_announce` in `read`
-/// forever (TSI-2621); on timeout the empty request is answered with the
+/// forever; on timeout the empty request is answered with the
 /// same `400 Bad Request` as a malformed announce.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -119,7 +111,7 @@ fn percent_decode(input: &str) -> Vec<u8> {
 /// bytes, or bare ASCII hex (`info_hash=6be64a…`).  `percent_decode` only
 /// handles the former; the latter comes through as 40 ASCII bytes, so the
 /// direct `[u8; 20]` conversion rejects it and the announce wrongly gets a
-/// `400 Bad Request` (TSI-2623).  Fall back to hex decoding when the
+/// `400 Bad Request`.  Fall back to hex decoding when the
 /// percent-decoded value is not already 20 raw bytes.
 fn decode_info_hash(value: &str) -> Option<[u8; 20]> {
     let raw = percent_decode(value);
@@ -142,7 +134,7 @@ fn decode_info_hash(value: &str) -> Option<[u8; 20]> {
 ///
 /// Malformed announces used to fall through to a silent `return`, which
 /// closed the socket with no response at all — libtorrent only saw
-/// `End of file` and retried, hiding the reason (TSI-2582).
+/// `End of file` and retried, hiding the reason.
 fn write_bad_request(stream: &mut std::net::TcpStream) {
     let _ = stream
         .write_all(b"HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -152,8 +144,8 @@ fn write_bad_request(stream: &mut std::net::TcpStream) {
 /// excluding the requester itself.
 fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
     // Bound the first read: a client that connects and sends no bytes must
-    // get the same 400 as a malformed announce, not a silent hang
-    // (TSI-2621).  `read` returns `Err` on timeout, which the existing
+    // get the same 400 as a malformed announce, not a silent hang.
+    // `read` returns `Err` on timeout, which the existing
     // `unwrap_or(0)` folds into an empty request below.
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut buf = [0u8; 4096];
@@ -186,7 +178,7 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
             return;
         }
     };
-    // `left` is part of the peer identity (see `Peer::left`, TSI-2417).
+    // `left` is part of the peer identity.
     let left: u64 = query_param(&raw_query, "left")
         .and_then(|v| v.parse().ok())
         .unwrap_or(u64::MAX);
@@ -199,16 +191,13 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         }
     };
 
-    // `event`: BEP-3 announce events.  Only `stopped` matters here —
-    // libtorrent sends it when a handle is removed (delete/replace), and
-    // pre-TSI-2417 this tracker ignored it, so the stopped announce *refreshed*
-    // the leaving peer's `seen` timer instead of deleting the entry.  The
-    // ghost entry (e.g. the previous handle's `left=0` self-reference at
-    // `127.0.0.1:<own listen port>`) then survived long enough to be handed
-    // back to a freshly re-added handle as a peer, and under libtorrent's
-    // default `allow_multiple_connections_per_ip=false` that self-target
-    // consumed the single per-IP connection slot — blocking the real seeder
-    // and surfacing as a 30s NoPeers timeout (TSI-2417).
+    // `event`: BEP-3 announce events.  Only `stopped` matters here — libtorrent
+    // sends it when a handle is removed (delete/replace). Previously this
+    // tracker ignored it, so the stopped announce *refreshed* the leaving
+    // peer's `seen` timer instead of deleting the entry; the ghost
+    // self-reference survived and, under `allow_multiple_connections_per_ip=false`,
+    // consumed the single per-IP slot — blocking the real seeder and surfacing
+    // as a 30s NoPeers timeout.
     let event = query_param(&raw_query, "event").unwrap_or_default();
 
     // `event=stopped`: the announcing peer is leaving the swarm.  Delete its
@@ -242,8 +231,7 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
                 list.iter()
                     // Exclude only the requester's own (ip, port, left)
                     // identity — same IP:port with a different `left` is a
-                    // different client and must stay in the response
-                    // (TSI-1977 / TSI-2417).
+                    // different client and must stay in the response.
                     .filter(|p| !(p.ip == ip && p.port == peer_port && p.left == left))
                     .flat_map(|p| {
                         [
@@ -324,7 +312,7 @@ fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
 /// Returns the concatenated SHA-1 digests (one 20-byte digest per piece, in
 /// order) and the total payload length.  Memory stays bounded by one piece
 /// buffer plus the digest list — the previous `std::fs::read` held the whole
-/// payload resident, which OOM'd at 1024/2048 MiB (TSI-2745).
+/// payload resident, which OOM'd at 1024/2048 MiB.
 fn hash_and_seed(payload: &std::path::Path, seed_file: &std::path::Path) -> (Vec<u8>, u64) {
     use sha1_smol::Sha1;
 
@@ -434,8 +422,7 @@ fn main() {
     }
 
     // 1. Validate the payload up front: an empty payload must fail before the
-    // tracker is started or tracker.url is written, leaving no residue behind
-    // (TSI-2746).
+    // tracker is started or tracker.url is written, leaving no residue behind.
     let payload_len = std::fs::metadata(&args.payload)
         .expect("failed to read payload")
         .len();
@@ -451,7 +438,7 @@ fn main() {
 
     // 3. Deterministic single-file torrent over the fixed payload. Hashing
     // and seeding share one bounded pass: the payload is streamed into the
-    // seed file piece-by-piece and never held whole in memory (TSI-2745).
+    // seed file piece-by-piece and never held whole in memory.
 
     let seed_dir = args
         .torrent_out
@@ -520,7 +507,7 @@ fn main() {
     loop {
         // A signal arriving during warmup must not wait out the 60s deadline:
         // the supervisor's SIGTERM→SIGKILL grace (podman/docker: 10s) would
-        // fire first, killing the process silently (TSI-2704).
+        // fire first, killing the process silently.
         if SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("[seeder] shutdown signal received — stopping");
             return;
@@ -551,7 +538,7 @@ fn main() {
         // of sleeping the full hour: a supervisor that escalates SIGTERM to
         // SIGKILL (podman/docker's 10s default grace period) would otherwise
         // kill the process mid-sleep with no error line, surfacing as an
-        // intermittent silent exit after "ready" (TSI-2704).
+        // intermittent silent exit after "ready".
         for _ in 0..(3600 * 1000 / 500) {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 eprintln!("[seeder] shutdown signal received — stopping");
@@ -569,7 +556,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Removes a temp directory on drop so a failing assertion does not leak
-    /// it in `/tmp` (TSI-2745 review).
+    /// it in `/tmp`.
     struct TempDirGuard(std::path::PathBuf);
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
@@ -577,7 +564,7 @@ mod tests {
         }
     }
 
-    /// TSI-2745: the seeder must hash and seed the payload in one bounded
+    /// the seeder must hash and seed the payload in one bounded
     /// pass.  Verify `hash_and_seed` yields piece digests identical to an
     /// in-memory reference, copies the payload verbatim into the seed file,
     /// and handles a trailing partial piece.
@@ -614,12 +601,12 @@ mod tests {
         assert_eq!(pieces, expected);
     }
 
-    /// TSI-2417 regression: a downloader whose (ip, port) collides with the
+    /// a downloader whose (ip, port) collides with the
     /// seeder's (pasta/slirp NAT shares the host IP and both default to port
     /// 6881 in separate network namespaces) must NOT evict the seeder from
     /// the swarm.  Identity is (ip, port, left): the seeder announces left=0,
     /// the leecher left>0, so both entries coexist and every announce returns
-    /// the seeder.  Mirrors the TSI-1977 fix in tests/common/mod.rs.
+    /// the seeder.  Mirrors the fix in tests/common/mod.rs.
     #[test]
     fn same_ip_port_different_left_keeps_seeder_entry() {
         let state = Arc::new(TrackerState {
@@ -655,7 +642,7 @@ mod tests {
         assert_eq!(visible[0].left, 0, "the seeder must remain visible");
     }
 
-    /// TSI-2417 regression: peers that stop re-announcing (handles from
+    /// peers that stop re-announcing (handles from
     /// deleted torrents whose `event=stopped` was lost) must be expired,
     /// otherwise delete + re-add cycles accumulate stale self-referential
     /// entries that crowd the downloader's peer list.
@@ -694,16 +681,12 @@ mod tests {
         assert!(list.iter().all(|p| p.seen.elapsed() < PEER_EXPIRY));
     }
 
-    /// TSI-2417 core fix: a `event=stopped` announce (the one libtorrent
-    /// sends when a handle is removed on delete/replace) must delete the
-    /// leaving peer's entry immediately, not refresh it.  Pre-fix the
-    /// tracker ignored `event` and the stopped announce *refreshed* the
-    /// leaving handle's `left=0` self-reference at `127.0.0.1:<own port>`,
-    /// so it survived long enough to be returned to the freshly re-added
-    /// handle as a peer — and under libtorrent's default
-    /// `allow_multiple_connections_per_ip=false` that self-target consumed
-    /// the single per-IP connection slot, blocking the real seeder and
-    /// surfacing as a 30s NoPeers timeout (Verity QA_FAILED).
+    /// An `event=stopped` announce (sent on handle delete/replace) must delete
+    /// the leaving peer's entry immediately, not refresh it. Pre-fix the
+    /// tracker ignored `event`, so the stopped announce refreshed the leaving
+    /// handle's `left=0` self-reference; it survived to be returned to the
+    /// re-added handle as a peer and, under `allow_multiple_connections_per_ip=false`,
+    /// consumed the single per-IP slot — blocking the real seeder (30s NoPeers).
     #[test]
     fn stopped_event_deletes_peer_entry() {
         let state = Arc::new(TrackerState {
@@ -741,7 +724,7 @@ mod tests {
         assert_eq!(list[0].left, 0);
     }
 
-    /// TSI-2582: a malformed announce must get an explicit `400 Bad Request`
+    /// a malformed announce must get an explicit `400 Bad Request`
     /// instead of a silent close, so libtorrent logs the reason rather than
     /// a bare `End of file`.
     #[test]
@@ -767,7 +750,7 @@ mod tests {
         assert!(response.ends_with("\r\n\r\n"), "response must end headers");
     }
 
-    /// TSI-2621: a client that connects and sends no bytes must not park
+    /// a client that connects and sends no bytes must not park
     /// `handle_announce` in `read` forever.  The first read times out and
     /// the empty request gets the same `400 Bad Request` as a malformed
     /// announce.
@@ -806,7 +789,7 @@ mod tests {
         );
     }
 
-    /// TSI-2623: `%XX`-encoded info_hash still decodes to 20 raw bytes.
+    /// `%XX`-encoded info_hash still decodes to 20 raw bytes.
     #[test]
     fn percent_encoded_info_hash_decodes() {
         let encoded = "%01%23%45%67%89%AB%CD%EF%01%23%45%67%89%AB%CD%EF%FE%DC%BA%98";
@@ -820,7 +803,7 @@ mod tests {
         );
     }
 
-    /// TSI-2623: bare ASCII hex info_hash (libtorrent's alternate form) must
+    /// bare ASCII hex info_hash (libtorrent's alternate form) must
     /// decode via the `from_str_radix` fallback instead of being rejected.
     #[test]
     fn bare_hex_info_hash_decodes() {
@@ -835,7 +818,7 @@ mod tests {
         );
     }
 
-    /// TSI-2623: uppercase hex digits are accepted too; anything that is not
+    /// uppercase hex digits are accepted too; anything that is not
     /// 20 raw bytes or exactly 40 hex digits stays rejected.
     #[test]
     fn malformed_info_hash_rejected() {

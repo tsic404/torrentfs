@@ -1,9 +1,9 @@
-//! TSI-2275: tracker merge for duplicate info_hash torrents.
+//! tracker merge for duplicate info_hash torrents.
 //!
 //! When two torrents share the same info_hash but advertise different
 //! trackers, the download engine handle must merge the new trackers into
 //! the existing handle and force-reannounce, so download/seeding reach
-//! every site the swarm was published to. Private torrents (TSI-2277)
+//! every site the swarm was published to. Private torrents
 //! are isolated: their trackers are never cross-merged.
 
 mod common;

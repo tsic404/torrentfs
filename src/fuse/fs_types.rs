@@ -57,7 +57,7 @@ pub struct Created {
 ///
 /// `direct_io` requests the adapter to set `FOPEN_DIRECT_IO`, bypassing the
 /// kernel page cache so the daemon's errno reaches userspace directly
-/// (TSI-2246: without this, the kernel's `filemap_read_folio` converts any
+/// (without this, the kernel's `filemap_read_folio` converts any
 /// failed read into EIO, masking the real error such as ENODATA).
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOutcome {

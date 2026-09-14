@@ -41,7 +41,7 @@ struct PeerInfo {
     ip: [u8; 4],
     port: u16,
     /// Bytes remaining to download (0 = seeder).  Used to distinguish different
-    /// clients that may share the same IP:port on localhost (TSI-1977).
+    /// clients that may share the same IP:port on localhost.
     left: u64,
 }
 
@@ -244,7 +244,7 @@ fn handle_announce(
 
         // Deduplicate by ip:port AND left — two distinct clients on the
         // same IP:port with different `left` values (seeder vs downloader)
-        // must both be kept.  This fixes TSI-1977.
+        // must both be kept.
         let already_exists = entry
             .iter()
             .any(|p| p.ip == peer_ip && p.port == port && p.left == left);
@@ -261,7 +261,7 @@ fn handle_announce(
     // Build response: bencoded dict with interval + compact peer list
     // IMPORTANT: exclude the announcing peer from the response.
     // Use (ip, port, left) identity — same IP:port but different `left`
-    // means a different client (TSI-1977).
+    // means a different client.
     let compact_peers: Vec<u8> = {
         let map = peers.lock().unwrap();
         let list = map.get(&info_hash).map(|v| v.clone()).unwrap_or_default();
@@ -400,7 +400,7 @@ pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>
 /// Build a multi-piece single-file `.torrent` (4 × 256 KiB = 1 MiB) pointing
 /// at `announce_url`.  Returns `(torrent_bytes, file_content)`.
 ///
-/// TSI-3041: the multi-piece fixture exposes the per-read O(num_pieces)
+/// the multi-piece fixture exposes the per-read O(num_pieces)
 /// download-machinery overhead that the single-piece 16 KiB fixture hides —
 /// a byte-granular read on a cached file previously paid `post_torrent_updates`
 /// + a full piece-priority sweep on every read, regardless of the 1-byte size.
