@@ -55,6 +55,20 @@ impl From<FsError> for libc::c_int {
 mod tests {
     use super::*;
 
+    /// The path/namespace errno mappings must stay precise: `NotFound` is
+    /// "no such file or directory" (ENOENT) while `NotDirectory` is "not a
+    /// directory" (ENOTDIR). Swapping them misreports a missing destination
+    /// parent (a rename with an absent `newparent`) as a type error.
+    #[test]
+    fn not_found_maps_to_enoent_not_enotdir() {
+        let e: libc::c_int = FsError::NotFound.into();
+        assert_eq!(e, libc::ENOENT);
+        assert_ne!(e, libc::ENOTDIR);
+
+        let e: libc::c_int = FsError::NotDirectory.into();
+        assert_eq!(e, libc::ENOTDIR);
+    }
+
     #[test]
     fn no_peers_maps_to_enodata_not_eio() {
         let e: libc::c_int = FsError::NoPeers("no seeder".to_string()).into();
