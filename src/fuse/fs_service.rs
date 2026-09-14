@@ -1586,6 +1586,17 @@ impl FsService {
             Ok(())
         } else {
             // --- File rename ---
+            // When both parents and the source exist and the destination
+            // name does not already resolve (the preceding guards return
+            // ENOENT/EEXIST otherwise), `metadata/` only accepts `.torrent`
+            // files — also enforced in `create` — so dropping the suffix on
+            // either side is rejected with `PermissionDenied` → EACCES, not
+            // `NotFound`/ENOENT: the destination parent exists, only the
+            // target name is invalid. A missing destination *parent* fails
+            // the kernel VFS intermediate LOOKUP with ENOENT regardless of
+            // trailing slash; a missing *final* name reaches FUSE without a
+            // slash (this EACCES path) and yields ENOTDIR only under a
+            // trailing slash.
             if !name.ends_with(".torrent") || !newname.ends_with(".torrent") {
                 return Err(FsError::PermissionDenied);
             }
