@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{TorrentError, TorrentResult};
 
@@ -36,7 +36,7 @@ pub struct CacheManager {
     verified_piece_keys: HashSet<String>,
     /// TSI-2274: metadata dirtied since the last `save_metadata_file`.
     /// Mutating methods (`record_access`, `add_piece`, `remove_piece`,
-    /// `remove_infohash_pieces`, `mark_verified`) set this instead of
+    /// `drop_infohash_state`, `mark_verified`) set this instead of
     /// fsyncing on every call; the engine loop calls
     /// `flush_metadata_if_dirty` periodically and `flush` on shutdown.
     metadata_dirty: bool,
@@ -48,6 +48,65 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+/// Bounded retry budget for removing a pieces directory tree that a
+/// concurrent writer may still be filling.
+pub(crate) const PURGE_REMOVE_MAX_ATTEMPTS: u32 = 6;
+pub(crate) const PURGE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Remove a directory tree, tolerating a concurrent writer.
+///
+/// libtorrent's custom storage keeps filling piece files into
+/// `cache/pieces/<info_hash>/` while a torrent is re-checked or a piece is
+/// being written.  When a stale info_hash directory is purged right after a
+/// restart, `fs::remove_dir_all` walks the tree and then fails with
+/// `DirectoryNotEmpty` (ENOTEMPTY) because a piece file landed after the walk
+/// but before the directory itself was removed.  Retry a bounded number of
+/// times so a transient writer finishes before giving up.
+pub(crate) fn remove_dir_all_tolerating_writers(path: &Path) -> std::io::Result<()> {
+    remove_dir_all_with_retry(
+        path,
+        PURGE_REMOVE_MAX_ATTEMPTS,
+        PURGE_REMOVE_RETRY_DELAY,
+        |p| fs::remove_dir_all(p),
+    )
+}
+
+/// Retry loop shared by [`remove_dir_all_tolerating_writers`].  The attempt
+/// count, delay, and removal operation are parameters so tests can drive the
+/// control flow deterministically (an injected `remove` that returns
+/// `DirectoryNotEmpty` a few times before succeeding) instead of relying on a
+/// real filesystem race.
+fn remove_dir_all_with_retry(
+    path: &Path,
+    max_attempts: u32,
+    retry_delay: Duration,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut last_error = None;
+    for attempt in 0..max_attempts {
+        match remove(path) {
+            Ok(()) => return Ok(()),
+            // Already gone: the goal ("directory removed") is met.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                last_error = Some(e);
+                if attempt + 1 < max_attempts {
+                    tracing::debug!(
+                        "remove_dir_all on {} raced a writer (attempt {}/{}); retrying",
+                        path.display(),
+                        attempt + 1,
+                        max_attempts
+                    );
+                    std::thread::sleep(retry_delay);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_error.expect("loop iterated at least once"))
+}
+
 impl CacheManager {
     pub fn new(cache_dir: &Path, max_cache_size: u64) -> TorrentResult<Self> {
         let cache_dir = cache_dir.to_path_buf();
@@ -621,18 +680,17 @@ impl CacheManager {
     pub fn delete_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
         self.remove_piece(piece_key)
     }
-    /// Remove every cached piece belonging to `info_hash`: recursively delete
-    /// the `cache/pieces/<info_hash>/` directory and purge all matching
-    /// metadata entries.  Used when a torrent is deleted so its pieces do not
-    /// linger as orphans (TSI-2205).
-    pub fn remove_infohash_pieces(&mut self, info_hash: &str) -> TorrentResult<()> {
+    /// Compute the on-disk pieces directory for `info_hash`, or `None` when
+    /// the hash is empty or would escape the pieces root.  Pure path
+    /// computation + validation — no filesystem I/O.
+    pub(crate) fn pieces_dir_for(&self, info_hash: &str) -> Option<PathBuf> {
         // Defensive guard: only ever touch a leaf directory whose name is
         // literally this info_hash.  A path with separators (e.g. `../x`)
         // would change the leaf name and is refused, so this can never escape
         // the pieces directory.
         if info_hash.is_empty() {
             tracing::warn!("Refusing to purge pieces for empty info_hash");
-            return Ok(());
+            return None;
         }
 
         let pieces_dir = self.cache_dir.join("pieces").join(info_hash);
@@ -646,33 +704,39 @@ impl CacheManager {
                 pieces_dir.display(),
                 info_hash
             );
-            return Ok(());
+            return None;
         }
+        Some(pieces_dir)
+    }
 
-        if pieces_dir.exists() {
-            if !pieces_dir.is_dir() {
-                tracing::warn!(
-                    "Refusing to purge non-directory pieces path {}",
-                    pieces_dir.display()
-                );
-                return Ok(());
-            }
-
-            let removed_size = self.infohash_total_size(info_hash);
-            fs::remove_dir_all(&pieces_dir).map_err(|e| {
-                TorrentError::IoError(format!(
-                    "Failed to remove pieces directory {}: {}",
-                    pieces_dir.display(),
-                    e
-                ))
-            })?;
-            self.current_size = self.current_size.saturating_sub(removed_size);
-        }
-
+    /// Drop the in-memory state for `info_hash`: metadata entries,
+    /// verified/incomplete keys, and the current-size debit.  No filesystem
+    /// I/O — the caller must have already removed the on-disk directory.
+    pub(crate) fn drop_infohash_state(&mut self, info_hash: &str) {
+        let removed_size = self.infohash_total_size(info_hash);
+        self.current_size = self.current_size.saturating_sub(removed_size);
         self.remove_infohash_metadata(info_hash);
         // TSI-2274: mark dirty instead of fsyncing on every purge.
         self.metadata_dirty = true;
-        Ok(())
+    }
+
+    /// Drop `info_hash`'s in-memory state only if its pieces directory is
+    /// absent, returning `true` when the state was actually dropped.
+    ///
+    /// The on-disk directory removal runs lock-free (and may retry against a
+    /// concurrent writer), so a same-info_hash re-add can recreate the
+    /// directory in that window.  When the directory is back, keep the
+    /// re-add's registration and skip the drop — the stale entries re-heal via
+    /// re-download.
+    pub(crate) fn drop_infohash_state_if_absent(&mut self, info_hash: &str) -> bool {
+        let Some(pieces_dir) = self.pieces_dir_for(info_hash) else {
+            return false;
+        };
+        if pieces_dir.exists() {
+            return false;
+        }
+        self.drop_infohash_state(info_hash);
+        true
     }
 
     /// Sum of registered piece sizes for a given info_hash.
@@ -930,7 +994,9 @@ mod tests {
         cache.add_piece(key_b, 50)?;
         assert_eq!(cache.current_size(), 150);
 
-        cache.remove_infohash_pieces("aaaa1111")?;
+        let pieces_dir = cache.pieces_dir_for("aaaa1111").unwrap();
+        remove_dir_all_tolerating_writers(&pieces_dir)?;
+        cache.drop_infohash_state("aaaa1111");
 
         assert!(!cache.has_piece(key_a));
         assert!(!path_a.exists());
@@ -949,22 +1015,169 @@ mod tests {
     #[test]
     fn test_remove_infohash_pieces_idempotent_and_refuses_escape() -> TorrentResult<()> {
         let temp_dir = TempDir::new().unwrap();
-        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
 
-        // No pieces for this hash: a no-op, not an error.
-        cache.remove_infohash_pieces("missing_hash")?;
+        // No pieces for this hash: removing an absent directory is a no-op,
+        // not an error (`remove_dir_all`'s NotFound is treated as success).
+        let pieces_dir = cache.pieces_dir_for("missing_hash").unwrap();
+        remove_dir_all_tolerating_writers(&pieces_dir)?;
 
         // A path with separators must be refused and never resolved against a
         // parent directory.
         let outside = temp_dir.path().join("outside.txt");
         std::fs::write(&outside, b"keep me")?;
 
-        cache.remove_infohash_pieces("../outside.txt")?;
-
+        assert!(cache.pieces_dir_for("../outside.txt").is_none());
         assert!(outside.exists());
         assert!(!temp_dir.path().join("outside").exists());
 
         Ok(())
+    }
+
+    /// The on-disk directory is gone → the state must be dropped and `true`
+    /// returned.
+    #[test]
+    fn test_drop_infohash_state_if_absent_drops_when_dir_absent() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let key = "dddd4444:piece:0";
+        let piece_path = cache.ensure_piece_dir(key)?;
+        std::fs::write(&piece_path, vec![0u8; 100])?;
+        cache.add_piece(key, 100)?;
+        assert!(cache.has_piece(key));
+
+        // Simulate the lock-free removal having already taken the directory.
+        let pieces_dir = cache.pieces_dir_for("dddd4444").unwrap();
+        fs::remove_dir_all(&pieces_dir)?;
+
+        assert!(cache.drop_infohash_state_if_absent("dddd4444"));
+        assert!(!cache.has_piece(key));
+        assert!(!cache.is_piece_verified(key));
+
+        Ok(())
+    }
+
+    /// The directory reappeared (a concurrent same-info_hash re-add) → skip
+    /// the drop, keep the registration, and return `false`.
+    #[test]
+    fn test_drop_infohash_state_if_absent_skips_when_dir_present() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let key = "eeee5555:piece:0";
+        let piece_path = cache.ensure_piece_dir(key)?;
+        std::fs::write(&piece_path, vec![0u8; 100])?;
+        cache.add_piece(key, 100)?;
+        assert!(cache.has_piece(key));
+
+        assert!(!cache.drop_infohash_state_if_absent("eeee5555"));
+        assert!(cache.has_piece(key));
+        assert!(cache.is_piece_verified(key));
+
+        Ok(())
+    }
+
+    /// The retry loop must re-attempt a transient ENOTEMPTY and succeed once
+    /// the injected removal stops failing — this is the exact sequence a
+    /// concurrent writer produces.
+    #[test]
+    fn test_remove_dir_all_retries_transient_directory_not_empty() {
+        let path = Path::new("/unused");
+        let mut calls = 0u32;
+        let result = remove_dir_all_with_retry(path, 6, Duration::from_millis(1), |_| {
+            calls += 1;
+            if calls <= 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(calls, 3, "two transient failures then success");
+    }
+
+    /// A directory already removed by a racer is not an error.
+    #[test]
+    fn test_remove_dir_all_treats_not_found_as_success() {
+        let result =
+            remove_dir_all_with_retry(Path::new("/unused"), 6, Duration::from_millis(1), |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            });
+
+        assert!(result.is_ok());
+    }
+
+    /// A persistent ENOTEMPTY (a writer that never stops) exhausts the budget
+    /// and surfaces the last error rather than looping forever.
+    #[test]
+    fn test_remove_dir_all_gives_up_after_budget() {
+        let mut calls = 0u32;
+        let result =
+            remove_dir_all_with_retry(Path::new("/unused"), 3, Duration::from_millis(1), |_| {
+                calls += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty))
+            });
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(calls, 3, "bounded attempts, no infinite loop");
+    }
+
+    /// Purging a stale info_hash directory races libtorrent's custom storage,
+    /// which keeps writing piece files right after a restart.  The writer
+    /// proves it is writing via a handshake before the purge starts, then
+    /// keeps adding files while the (pre-filled, slow-to-walk) directory is
+    /// removed; the retry must win once the writer finishes.
+    #[test]
+    fn test_remove_dir_all_tolerates_racing_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().join("pieces").join("cccc3333");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-fill so `remove_dir_all`'s walk is long enough for a writer to
+        // land a file mid-walk; otherwise the purge wins in microseconds and
+        // the retry path is never exercised.
+        for i in 0..3000 {
+            std::fs::write(dir.join(format!("f{:04}", i)), b"x").unwrap();
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            let mut wrote = 0u32;
+            let mut signaled = false;
+            for i in 0..20 {
+                match std::fs::write(writer_dir.join(format!("racer{:04}", i)), b"y") {
+                    Ok(()) => {
+                        wrote += 1;
+                        if !signaled {
+                            signaled = true;
+                            let _ = tx.send(());
+                        }
+                    }
+                    // Directory removed: the purge won, stop racing.
+                    Err(_) => break,
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            wrote
+        });
+
+        // Handshake: wait until the writer has actually landed a file.
+        rx.recv().unwrap();
+
+        // Drive the retry with a short injectable delay; the writer's bounded
+        // window is well under this budget, so the purge wins afterward.
+        remove_dir_all_with_retry(&dir, 20, Duration::from_millis(5), |p| {
+            fs::remove_dir_all(p)
+        })
+        .unwrap();
+
+        let wrote = writer.join().expect("writer thread panicked");
+        assert!(wrote >= 1, "writer must have written at least one file");
+        assert!(!dir.exists());
     }
 
     #[test]
