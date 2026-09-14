@@ -192,9 +192,11 @@ fn user_in_fuse_group() -> bool {
 /// returns.  A lazy detach makes the device read return `ENODEV` so the
 /// session thread exits.
 ///
-/// Strategy mirrors fuser's own `fuse_unmount_pure()`: try `umount2(MNT_DETACH)`
-/// first (root / rootful container), then fall back to the setuid `fusermount`
-/// helper when that returns `EPERM` (non-root mount owner).
+/// Strategy adapts fuser's `fuse_unmount_pure()` with a deliberate divergence:
+/// root (rootful container, or a user namespace with CAP_SYS_ADMIN) detaches
+/// directly via `umount2(MNT_DETACH)`, while non-root owners skip the
+/// guaranteed-`EPERM` syscall and unmount through the setuid `fusermount`
+/// helper directly — fuser itself always tries `umount2` first for everyone.
 ///
 /// Returns `true` when the mount was detached so clean shutdown can proceed,
 /// `false` when every attempt failed and the mount is still live.
@@ -211,19 +213,28 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
         }
     };
 
-    let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
-    if ret == 0 {
-        info!("unmounted {} (umount2 MNT_DETACH)", mountpoint.display());
-        return true;
+    // SAFETY: `geteuid()` has no preconditions.
+    if should_attempt_direct_unmount(unsafe { libc::geteuid() }) {
+        // Root detaches the mount directly. Non-root mounts always go through
+        // the setuid fusermount helper — AutoUnmount is only supported via the
+        // helper (see fuser's `fuse_mount_pure`) — so `umount2` would fail with
+        // EPERM on every shutdown: skip the doomed syscall and its spurious
+        // WARN, and unmount via the helper below.
+        // SAFETY: `c_path` is a valid NUL-terminated string owned by this frame.
+        let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
+        if ret == 0 {
+            info!("unmounted {} (umount2 MNT_DETACH)", mountpoint.display());
+            return true;
+        }
+        warn!(
+            "umount2({}) failed ({}), falling back to fusermount",
+            mountpoint.display(),
+            std::io::Error::last_os_error()
+        );
     }
-    warn!(
-        "umount2({}) failed ({}), falling back to fusermount",
-        mountpoint.display(),
-        std::io::Error::last_os_error()
-    );
 
-    // Non-root fallback: torrentfs mounts via the setuid fusermount helper
-    // (auto_unmount + allow_other), so unmount must go through `fusermount -u`.
+    // Unmount via the setuid fusermount helper: the correct path for non-root
+    // owners, and the fallback for root when `umount2` failed above.
     for bin in ["fusermount3", "fusermount"] {
         match std::process::Command::new(bin)
             .arg("-u")
@@ -251,6 +262,14 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
     }
     warn!("all unmount attempts failed for {}", mountpoint.display());
     false
+}
+
+/// Decide whether a direct `umount2(MNT_DETACH)` is worth attempting before
+/// falling back to the `fusermount` helper. Only root (or a user namespace with
+/// CAP_SYS_ADMIN) can detach a mount it does not own; non-root owners mount
+/// through the helper and must unmount through it too.
+fn should_attempt_direct_unmount(euid: u32) -> bool {
+    euid == 0
 }
 
 /// Grace period for the FUSE session thread to exit on its own after the
@@ -572,6 +591,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_attempt_direct_unmount_only_for_root() {
+        assert!(should_attempt_direct_unmount(0));
+        assert!(!should_attempt_direct_unmount(1000));
+        assert!(!should_attempt_direct_unmount(u32::MAX));
+    }
 
     #[test]
     fn wait_bounded_returns_finished_when_thread_exits() {
