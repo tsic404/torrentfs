@@ -1487,6 +1487,12 @@ impl FsService {
             return Err(FsError::NotFound);
         }
 
+        // Destination parent missing → ENOENT, not ENOTDIR: the kernel
+        // resolved the path but forwarded a stale or absent `newparent`
+        // inode. The trailing-slash form (`mv x missing/`) returns ENOTDIR
+        // from the kernel VFS itself during destination resolution, before
+        // this handler runs — standard Linux semantics, not interceptable
+        // from FUSE.
         let newparent_exists = self.inode_mgr.inodes.contains_key(&newparent)
             || self.inode_mgr.data_inodes.contains_key(&newparent);
         if !newparent_exists {
