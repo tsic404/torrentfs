@@ -31,8 +31,13 @@ jobs:
           apt-get update
           echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
           apt-get update
+          # libtorrent-rasterbar-dev is only packaged in experimental. Install it
+          # in its own command so `-t experimental` does not also resolve clang,
+          # libssl-dev and curl from experimental, whose clang/OpenSSL are
+          # mid-transition and unsatisfiable alongside sid.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev \
+            -t experimental libtorrent-rasterbar-dev
+          apt-get install -y --no-install-recommends \
             libssl-dev \
             pkg-config \
             clang \

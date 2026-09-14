@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
 use crate::domain::fs_error::{FsError, FsResult};
+use crate::infrastructure::cache::remove_dir_all_tolerating_writers;
 use crate::metadata::TorrentInfo;
 use tracing::{error, info, warn};
 
@@ -360,6 +361,27 @@ impl TorrentService {
         let Some(cache) = ds.get_cache_manager() else {
             return;
         };
+
+        // Resolve the pieces directory under a brief lock.
+        let pieces_dir = match cache.lock() {
+            Ok(guard) => match guard.pieces_dir_for(info_hash) {
+                Some(dir) => dir,
+                None => return,
+            },
+            Err(_) => {
+                error!(
+                    "Cache lock poisoned during pieces purge for info_hash={}",
+                    info_hash
+                );
+                return;
+            }
+        };
+
+        // Remove the directory tree WITHOUT holding the cache lock — the
+        // bounded retry may sleep against libtorrent's still-flushing storage,
+        // and must not block concurrent cache reads (e.g. FUSE reads).
+        let removal = remove_dir_all_tolerating_writers(&pieces_dir);
+
         let mut guard = match cache.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -370,11 +392,23 @@ impl TorrentService {
                 return;
             }
         };
-        if let Err(e) = guard.remove_infohash_pieces(info_hash) {
-            warn!(
+        match removal {
+            Ok(()) => {
+                // The directory removal ran lock-free, so a concurrent
+                // same-info_hash re-add may have recreated the directory while
+                // we were retrying.  Drop metadata only if it is still absent;
+                // otherwise keep the re-add's registration.
+                if !guard.drop_infohash_state_if_absent(info_hash) {
+                    info!(
+                        "Skipping pieces metadata drop for info_hash={} (re-written during purge)",
+                        info_hash
+                    );
+                }
+            }
+            Err(e) => warn!(
                 "Failed to purge pieces cache for info_hash={}: {:?}",
                 info_hash, e
-            );
+            ),
         }
     }
 
