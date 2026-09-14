@@ -473,6 +473,38 @@ pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
     )
 }
 
+/// Compute the partial-read bounds returned when the piece-wait window
+/// elapses (TSI-3128).
+///
+/// The piece-wait loop advances `piece_idx` strictly in order, so when it
+/// times out on `piece_idx`, every piece in `[start_piece, piece_idx - 1]`
+/// has completed.  Rather than returning an empty read (which the client
+/// cannot distinguish from EOF), return the contiguous prefix of completed
+/// pieces `[start_piece, last_complete]` as a short read — faster degraded
+/// feedback during peers establishment.
+///
+/// Returns `(partial_end, partial_size)` covering `[absolute_offset,
+/// partial_end)`, or `None` when even the first requested piece is missing.
+/// `partial_end` 取请求终点与最后已完成 piece 完整边界的最小值；超时路径下
+/// 恒为完整边界（`last_complete` 恒为非末 piece，其完整边界不被末 piece
+/// 截断缩短）。Pure so it is unit-testable without a running engine.
+fn partial_read_bounds(
+    start_piece: i32,
+    last_complete: i32,
+    piece_length: u64,
+    absolute_offset: u64,
+    end_offset: u64,
+) -> Option<(u64, u32)> {
+    if last_complete < start_piece {
+        return None;
+    }
+    let partial_end = std::cmp::min(end_offset, (last_complete as u64 + 1) * piece_length);
+    if partial_end <= absolute_offset {
+        return None;
+    }
+    Some((partial_end, (partial_end - absolute_offset) as u32))
+}
+
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
 /// thread (`set_alert_notify`), so this interval bounds `.stats` staleness
 /// for per-torrent status/pieces and also drives the session-stats sample
@@ -1128,6 +1160,38 @@ impl EngineState {
                 }
 
                 if piece_wait_start.elapsed() >= piece_wait_timeout {
+                    // TSI-3128: instead of returning empty (ENODATA) after
+                    // the piece-wait window elapses, return the contiguous
+                    // prefix of pieces that completed during the wait.  The
+                    // loop above advances `piece_idx` strictly in order, so
+                    // every piece before it has completed; `piece_idx` itself
+                    // is the first still-missing piece.  Returning that prefix
+                    // as a short read gives the client faster degraded
+                    // feedback (visible progress) instead of 0 bytes that it
+                    // cannot distinguish from EOF while peers are still being
+                    // established.
+                    if let Some((partial_end, partial_size)) = partial_read_bounds(
+                        start_piece,
+                        piece_idx - 1,
+                        piece_length,
+                        absolute_offset,
+                        end_offset,
+                    ) {
+                        let result = self.read_from_disk(
+                            &info_hash,
+                            start_piece,
+                            piece_idx - 1,
+                            piece_length,
+                            num_pieces,
+                            total_size,
+                            absolute_offset,
+                            partial_end,
+                            partial_size,
+                        );
+                        self.release_reader(&info_hash);
+                        return result;
+                    }
+
                     self.release_reader(&info_hash);
                     // TSI-2261/TSI-2483: when the piece-wait times out,
                     // distinguish "no seeder available" from "slow download".
@@ -1637,7 +1701,7 @@ impl EngineState {
 
 #[cfg(test)]
 mod tests {
-    use super::{no_seeder_stderr_hint, read_wait_budget_secs};
+    use super::{no_seeder_stderr_hint, partial_read_bounds, read_wait_budget_secs};
 
     /// TSI-2975: the no-seeder stderr hint must use the exact message the
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
@@ -1677,5 +1741,47 @@ mod tests {
         // than the engine's 79s worst-case budget and even its ~39s
         // peer-wait+piece-wait path. The new budget must exceed it.
         assert!(read_wait_budget_secs(30) > 30 + 5);
+    }
+
+    /// TSI-3128: with the first piece missing, the partial read is empty —
+    /// the read must keep its existing NoPeers/Timeout error, not fabricate
+    /// a short read out of nothing.
+    #[test]
+    fn partial_bounds_none_when_first_piece_missing() {
+        // Timed out on start_piece itself → last_complete = start_piece - 1.
+        assert_eq!(
+            partial_read_bounds(4, 3, 262_144, 1_048_576, 2_097_152),
+            None
+        );
+    }
+
+    /// TSI-3128: the completed prefix clamps to the requested end and to the
+    /// piece boundary of the last completed piece — a full piece length.
+    #[test]
+    fn partial_bounds_cover_completed_prefix() {
+        // 256 KiB pieces; read [1 MiB, 2 MiB) spans pieces 4..=7.  Timed out
+        // on piece 6 → pieces 4-5 completed: return [1 MiB, 1.5 MiB).
+        assert_eq!(
+            partial_read_bounds(4, 5, 262_144, 1_048_576, 2_097_152),
+            Some((1_572_864, 524_288))
+        );
+    }
+
+    /// TSI-3128: when the requested end lands before the piece boundary, the
+    /// partial end must clamp to the request end, not overrun it into the
+    /// still-missing piece's span.
+    #[test]
+    fn partial_bounds_clamp_to_request_end() {
+        // end_offset (1_200_000) is inside piece 4's span and short of the
+        // piece-5 boundary (1_310_720): the clamp must stop at the request.
+        assert_eq!(
+            partial_read_bounds(4, 4, 262_144, 1_048_576, 1_200_000),
+            Some((1_200_000, 151_424))
+        );
+        // First piece missing → None, regardless of how the end clamps.
+        assert_eq!(
+            partial_read_bounds(4, 3, 262_144, 1_048_576, 1_200_000),
+            None
+        );
     }
 }
