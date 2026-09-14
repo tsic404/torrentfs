@@ -3701,6 +3701,31 @@ mod tests {
         );
     }
 
+    /// Renaming into a destination whose parent inode is absent must surface
+    /// `NotFound` (→ `ENOENT`, "no such file or directory"), not
+    /// `NotDirectory` (→ `ENOTDIR`): the destination parent does not exist,
+    /// so "not a directory" misdescribes the failure. This is the contract
+    /// `mv metadata/seed metadata/nonexistent/` relies on when the kernel
+    /// forwards the rename with an already-resolved, but stale, parent inode.
+    #[test]
+    fn rename_missing_destination_parent_returns_not_found() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "seed").expect("mkdir seed");
+
+        // A parent inode absent from both tables and outside every reserved
+        // range (below DATA_TORRENT_INO_BASE, so the data-namespace guard
+        // does not preempt it with EROFS).
+        let missing_newparent = 999_999;
+        assert!(!svc.inode_mgr.inodes.contains_key(&missing_newparent));
+        assert!(!svc.inode_mgr.data_inodes.contains_key(&missing_newparent));
+
+        let err = svc
+            .rename(METADATA_INO, "seed", missing_newparent, "seed")
+            .expect_err("rename into a missing destination parent must fail");
+
+        assert_eq!(err, FsError::NotFound);
+    }
+
     #[test]
     fn data_namespace_inodes_correctly_identified() {
         // Unit-test the helper itself.
