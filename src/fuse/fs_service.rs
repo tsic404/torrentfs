@@ -45,33 +45,25 @@ use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
 use super::lookup::DataResolver;
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
-/// TSI-2274: maximum number of entries in the L1 range cache.  Each entry
+/// maximum number of entries in the L1 range cache.  Each entry
 /// caches a `(offset, size)` slice read from a torrent file.  When the
 /// cache is full, inserting a new entry clears all existing entries —
 /// coarse but bounded: the L1 cache is a hot-zone optimization, and
 /// clearing it only causes a few L2 disk re-reads.
 const MAX_L1_ENTRIES: usize = 256;
 
-/// TSI-2378: how long `rename` waits for a concurrently in-flight
-/// `add_torrent` (spawned detached by `release`, TSI-2247) to settle its DB
+/// how long `rename` waits for a concurrently in-flight
+/// `add_torrent` (spawned detached by `release`) to settle its DB
 /// insert before giving up and failing the rename.
 const PENDING_ADD_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// TSI-2293: guard against a silent 0-byte EOF from `read_file_range`.
-///
-/// When `pieces_on_disk` (using `info.files()` summed sizes) and the
-/// engine's `read_file_range` (using libtorrent `file_offset` FFI)
-/// disagree on `file_start_offset`, the engine can return `Ok(Vec::new())`
-/// for a range that `pieces_on_disk` said was on disk (or not on disk).
-/// Returning empty data for a non-zero `size` would make the kernel see
-/// EOF and `dd` exits 0 — the user never learns the download failed.
-///
-/// `fs_service::read` verifies `offset < actual_size` before entering
-/// either the sync or the deferred read path, so `size` is always
-/// greater than zero when data is expected.  This function translates
-/// empty data for a non-zero `size` into `Err(FsError::NoPeers)` (→
-/// ENODATA), letting the user see a meaningful error instead of a
-/// silent EOF.
+/// Guard against a silent 0-byte EOF: when `read_file_range` returns empty
+/// data for a non-zero `size`, translate it into `Err(FsError::NoPeers)` (→
+/// ENODATA). An empty result can happen when `pieces_on_disk` and the
+/// engine's `file_offset` FFI disagree on `file_start_offset`; returning it
+/// as EOF would make the kernel (and `dd`) see a clean end-of-file and the
+/// user never learn the download failed. `read` guarantees `size > 0`
+/// whenever data is expected.
 fn guard_empty_read(data: &[u8], size: u32) -> Result<(), FsError> {
     if data.is_empty() && size > 0 {
         Err(FsError::NoPeers(format!(
@@ -89,11 +81,11 @@ pub struct FsService {
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
     pub processing_torrents: Arc<Mutex<HashMap<(String, String), ()>>>,
-    /// TSI-2378: signalled whenever an entry is removed from
+    /// signalled whenever an entry is removed from
     /// `processing_torrents`, so a `rename` blocked on an in-flight
     /// `add_torrent` wakes immediately instead of polling.
     pub processing_torrents_cv: Arc<Condvar>,
-    /// TSI-3114: `(source_path, filename) -> error message` for `.torrent`
+    /// `(source_path, filename) -> error message` for `.torrent`
     /// files whose async DB persistence failed.  `lookup`/`readdir` on the
     /// `data/` mirror consult this to surface the failure as EIO instead of
     /// silently omitting the torrent (FUSE_RELEASE errors are ignored by the
@@ -105,7 +97,7 @@ pub struct FsService {
     pub torrent_info_cache: Arc<Mutex<HashMap<String, Arc<TorrentInfo>>>>,
     pub listen_addr: String,
     pub metrics: Arc<Metrics>,
-    /// TSI-2454: kernel cache invalidation handle.  Set once after
+    /// kernel cache invalidation handle.  Set once after
     /// `fuser::spawn_mount2` returns (main wires `bg.notifier()` into
     /// here).  When set, `unlink`/`rmdir`/`rename` call
     /// `Notifier::inval_entry` to immediately purge the kernel dentry
@@ -114,19 +106,13 @@ pub struct FsService {
     pub notifier: Arc<OnceLock<Option<Notifier>>>,
 }
 
-// ── Kernel cache invalidation (TSI-2454) ─────────────────────────────────
-//
-// `fuser::Notifier::inval_entry(parent, name)` sends `FUSE_NOTIFY_INVAL_ENTRY`
-// to the kernel, immediately purging its cached dentry for `name` under
-// `parent`.  Without this, the kernel serves its cached `data/` mirror entry
-// for the full 1s TTL (`const TTL` in `fuse/mod.rs`), so the user sees a stale
-// directory after `rm metadata/foo.torrent` until the TTL expires.
-//
-// The `Notifier` is obtained from `BackgroundSession::notifier()` *after*
-// `spawn_mount2` returns — `TorrentFs` is moved into the session, so `main`
-// extracts the `Arc<OnceLock<Option<Notifier>>>` handle before the move and
-// sets it once the session is live.  All calls are best-effort: a failure
-// (kernel already evicted, ENOENT) is swallowed by `Notifier::send_inval`.
+// ── Kernel cache invalidation ─────────────────────────────────
+// `Notifier::inval_entry` sends `FUSE_NOTIFY_INVAL_ENTRY`, purging the kernel's
+// cached dentry immediately — otherwise the kernel serves a stale `data/` entry
+// for the full 1s TTL after `rm metadata/foo.torrent`. The `Notifier` is
+// extracted from `BackgroundSession` before `TorrentFs` is moved into the
+// session and set once it is live; all calls are best-effort (a failure is
+// swallowed by `Notifier::send_inval`).
 impl FsService {
     /// Invalidate the kernel's cached dentry for `name` under `parent` in the
     /// `data/` subtree.  No-op when the notifier isn't wired (tests).
@@ -187,7 +173,7 @@ impl FsService {
 
         // Create the SeedingManager and register it as the CacheManager
         // eviction callback.  The Arc is kept on FsService so it can be
-        // shared with TorrentService for seed removal on unlink (TSI-2232).
+        // shared with TorrentService for seed removal on unlink.
         let seeding_manager = match &download_service {
             Some(_) => match SeedingService::new(&cache_path, config) {
                 Ok(seeding_svc) => {
@@ -271,7 +257,7 @@ impl FsService {
 
         // Recreate lightweight libtorrent handles for all persisted torrents so
         // peer/seed information and `.stats` piece status are visible without a
-        // read (TSI-2112 / TSI-2133).
+        // read.
         let mut infos_by_hash: HashMap<String, Arc<TorrentInfo>> = HashMap::new();
         if let Some(ds) = &svc.download_service {
             for data in torrent_datas {
@@ -296,7 +282,7 @@ impl FsService {
             }
         }
 
-        // TSI-2199: background SHA-1 verification of on-disk cached pieces that
+        // background SHA-1 verification of on-disk cached pieces that
         // the startup scan re-registered as unverified. Runs asynchronously so
         // FUSE mount readiness is never blocked.
         if !infos_by_hash.is_empty() {
@@ -317,7 +303,7 @@ impl FsService {
 
     // ── Namespace-agnostic queries ──────────────────────────────────────────
 
-    /// TSI-3114: map a `data/` torrent-root lookup `(parent, name)` to its
+    /// map a `data/` torrent-root lookup `(parent, name)` to its
     /// `(source_path, filename)` persist-error key, or `None` when `parent`
     /// is not a torrent-root parent (DATA_INO or a SourcePathDir).
     fn torrent_root_lookup_key(&self, parent: u64, name: &str) -> Option<(String, String)> {
@@ -332,7 +318,7 @@ impl FsService {
         Some((source_path, name.to_string()))
     }
 
-    /// TSI-3114: the `source_path` a `data/` directory inode lists, or `None`
+    /// the `source_path` a `data/` directory inode lists, or `None`
     /// when `ino` is not a directory whose children are torrent roots (i.e.
     /// DATA_INO or a SourcePathDir).
     fn data_dir_source_path(&self, ino: u64) -> Option<String> {
@@ -411,7 +397,7 @@ impl FsService {
         }
 
         if parent == DATA_INO || InodeManager::is_data_ino(parent) {
-            // TSI-3114: surface a previously-failed async persist as EIO
+            // surface a previously-failed async persist as EIO
             // (FUSE_RELEASE errors are dropped by the kernel, so `release`
             // cannot propagate the DB failure itself).
             if let Some(key) = self.torrent_root_lookup_key(parent, name) {
@@ -524,29 +510,21 @@ impl FsService {
         }
     }
 
-    /// `setattr` on a namespace whose attributes are virtual and immutable
-    /// (`metadata/`, `.stats`, root) must never silently succeed for an
-    /// attribute change (chmod/chown/utimens) — those return `EPERM`.
-    ///
-    /// A *truncate* (size change) is different: it is a legitimate write on
-    /// a `metadata/` `.torrent` buffer. `cp` overwriting an existing
-    /// `.torrent` opens it with `O_TRUNC`; the kernel sends `FUSE_OPEN`
-    /// first and the `SETATTR(size=0)` truncate follows it (fs/fuse/file.c),
-    /// so the daemon sees `open` → `setattr`. Rejecting that truncate with
-    /// `EPERM` broke the overwrite path (TSI-3064): creating a new file
-    /// worked, but overwriting an existing one failed. So a pure truncate on
-    /// a `metadata/` file resizes its in-memory buffer and returns the
-    /// updated attributes; `data/` stays `EROFS`, `.stats`/root stay `EPERM`.
-    ///
-    /// `size` is `Some(n)` only for a pure truncate — the adapter filters
-    /// out requests that also carry a mode/uid/gid/timestamp change.
+    /// `setattr` on a virtual/immutable namespace must not silently succeed
+    /// for an attribute change (chmod/chown/utimens) — those return `EPERM`.
+    /// A *truncate* (size change) is different: `cp` overwriting a `.torrent`
+    /// opens with `O_TRUNC`, so the kernel sends `open` → `SETATTR(size=0)`;
+    /// rejecting it broke the overwrite path (new files worked, overwrites
+    /// failed). A pure truncate on `metadata/` therefore resizes the in-memory
+    /// buffer and returns updated attributes; `data/` stays `EROFS`, `.stats`
+    /// and root stay `EPERM`. `size` is `Some(n)` only for a pure truncate.
     pub fn setattr(&mut self, ino: u64, size: Option<u64>) -> FsResult<Attr> {
         // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
         // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
         // be classified as stats *before* the data/ guard — otherwise they
         // would wrongly return EROFS instead of EPERM.
         // Invariant: data base + slot width < STATS_INO_OFFSET (compile-time
-        // asserts in `src/fuse/inodes.rs`, TSI-2580).
+        // asserts in `src/fuse/inodes.rs`).
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
             return Err(FsError::NotPermitted);
         }
@@ -586,7 +564,7 @@ impl FsService {
     /// regular files.  The read-only `data/` namespace must return `EROFS`
     /// (`ReadOnlyFileSystem`) to match `write`/`chmod`/`rmdir`/`unlink`/`rename`;
     /// every other namespace returns `EPERM` (`NotPermitted`) because the
-    /// operation is unsupported, not a permissions question (TSI-2537).
+    /// operation is unsupported, not a permissions question.
     pub fn symlink(&mut self, parent: u64) -> FsError {
         if InodeManager::is_data_namespace(parent) {
             FsError::ReadOnlyFileSystem
@@ -597,7 +575,7 @@ impl FsService {
 
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
-            // TSI-3114: surface failed persists in this directory as EIO.
+            // surface failed persists in this directory as EIO.
             if let Some(sp) = self.data_dir_source_path(ino) {
                 let failed = self
                     .persist_errors
@@ -720,7 +698,7 @@ impl FsService {
     /// Data torrent files set `direct_io: true` so the adapter applies
     /// `FOPEN_DIRECT_IO`, bypassing the kernel page cache — this lets the
     /// daemon's errno (e.g. ENODATA for "no seeder") reach userspace instead
-    /// of being converted to EIO by `filemap_read_folio` (TSI-2246).
+    /// of being converted to EIO by `filemap_read_folio`.
     pub fn open(&mut self, ino: u64) -> FsResult<OpenOutcome> {
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Ok(0.into()),
@@ -859,7 +837,7 @@ impl FsService {
     pub fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> FsResult<u32> {
         // `.stats` files have virtual, immutable attributes — not a read-only
         // namespace — so a write is rejected with `EPERM` (`NotPermitted`),
-        // matching `setattr` (TSI-2536) and `symlink` (TSI-2537). Stats-derived
+        // matching `setattr` and `symlink`. Stats-derived
         // inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000) also satisfy
         // `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must be classified
         // as stats *before* the data/ guard below — otherwise they would
@@ -868,7 +846,7 @@ impl FsService {
             return Err(FsError::NotPermitted);
         }
 
-        // TSI-2228: data/ namespace is read-only. Data inodes live in
+        // data/ namespace is read-only. Data inodes live in
         // `data_inodes`, not `inodes`, so without this guard `write` would
         // fall through to the `None` arm and return `ENOENT` — the inode
         // exists, it is just not writable. Return `EROFS` instead.
@@ -882,7 +860,7 @@ impl FsService {
                 name,
                 ..
             }) => {
-                // TSI-2233: FUSE hands us `offset: i64`. A negative offset
+                // FUSE hands us `offset: i64`. A negative offset
                 // casts to a huge `usize` and a super-large offset makes
                 // `Vec::resize` attempt a multi-GB allocation (OOM/abort on
                 // the FUSE dispatch thread), while `offset + data.len()` can
@@ -940,7 +918,7 @@ impl FsService {
     pub fn flush(&mut self, ino: u64) -> FsResult<()> {
         if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
             if name.ends_with(".torrent") {
-                // TSI-2918: a zero-byte `.torrent` has nothing to validate.
+                // a zero-byte `.torrent` has nothing to validate.
                 // Surfacing EINVAL here made `touch` report a spurious write
                 // error on close for a file that was never written. Let it
                 // pass; `release` discards the empty inode (ENOENT).
@@ -977,7 +955,7 @@ impl FsService {
     /// Persist a closed `.torrent` into the database (release).
     pub fn release(&mut self, fh: u64) -> FsResult<()> {
         if let Some(ino) = self.inode_mgr.open_files.remove(&fh) {
-            // TSI-2234: the file handle is now closed. If the inode was
+            // the file handle is now closed. If the inode was
             // unlinked while still open, this `release` is the "last close"
             // point at which the inode is finally destroyed (unless another
             // handle is still open). An unlinked `.torrent` was already
@@ -1000,11 +978,11 @@ impl FsService {
 
                     if data.is_empty() {
                         warn!("Zero-byte torrent file {} removed", name);
-                        // TSI-3080: overwriting an existing `metadata/` file
+                        // overwriting an existing `metadata/` file
                         // with empty content removes the metadata inode but
                         // left the DB row behind, orphaning the
                         // `data/<seed>.torrent/` mirror.  Wait for an in-flight
-                        // `add_torrent` first (TSI-2967) so its row lands
+                        // `add_torrent` first so its row lands
                         // before we delete it, then drop the row + inode.
                         self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
                         self.remove_torrent_and_data_state(&source_path, &name)?;
@@ -1027,7 +1005,7 @@ impl FsService {
 
                     if TorrentInfo::from_bytes(data.clone()).is_err() {
                         warn!("Torrent {} invalid, removing inode", name);
-                        // TSI-3080: same orphan fix + pending-add wait for
+                        // same orphan fix + pending-add wait for
                         // unparseable content (the oversized-`cp` case lands
                         // here: `write` rejects the tail with EFBIG, leaving
                         // partial invalid bytes behind).
@@ -1037,16 +1015,14 @@ impl FsService {
                         return Ok(());
                     }
 
-                    // TSI-2247: Dedup guard — check + insert atomically, then
-                    // DROP the lock before spawning background work.  The key
-                    // is `(source_path, filename)` so torrents in the same
-                    // directory (especially the root, where `source_path` is
-                    // `""`) don't collide.  Persistence + handle registration
-                    // run on a detached thread so the single-threaded FUSE
-                    // dispatcher is never blocked (TSI-3114): a DB write
-                    // failure is recorded and surfaced as EIO by the next
-                    // `lookup`/`readdir` of `data/`, because the kernel drops
-                    // the FUSE_RELEASE reply error.
+                    // Dedup guard — check + insert atomically, then DROP the
+                    // lock before spawning background work. Keyed by
+                    // `(source_path, filename)` so same-directory torrents
+                    // (root has `source_path == ""`) don't collide. Persistence
+                    // + handle registration run detached so the FUSE
+                    // dispatcher is never blocked: a DB write failure is
+                    // recorded and surfaced as EIO by the next lookup/readdir
+                    // of `data/` (the kernel drops the FUSE_RELEASE error).
                     {
                         let mut processing = self.processing_torrents.lock().map_err(|e| {
                             error!("Mutex poisoned in release(): {}", e);
@@ -1066,7 +1042,7 @@ impl FsService {
 
                     // The inode is NOT removed here: if persistence fails, the
                     // file must remain visible so the user can retry or delete
-                    // it, and the failure is recorded (TSI-3114) for
+                    // it, and the failure is recorded for
                     // `lookup`/`readdir` to surface as EIO.  On success the
                     // DB-backed entry supersedes this inode (lookup queries the
                     // DB), so keeping it is harmless.
@@ -1087,7 +1063,7 @@ impl FsService {
                                 }
                                 Err(e) => {
                                     error!("Failed to persist torrent {}: {}", name, e);
-                                    // TSI-3114: record the failure so the next
+                                    // record the failure so the next
                                     // user-visible lookup/readdir of data/
                                     // surfaces it as EIO.
                                     if let Ok(mut guard) = persist_errors.lock() {
@@ -1098,7 +1074,7 @@ impl FsService {
                             if let Ok(mut guard) = processing.lock() {
                                 guard.remove(&key);
                             }
-                            // TSI-2378: wake a rename blocked on this pending add.
+                            // wake a rename blocked on this pending add.
                             processing_cv.notify_one();
                         });
                     } else {
@@ -1109,7 +1085,7 @@ impl FsService {
                         if let Ok(mut guard) = self.processing_torrents.lock() {
                             guard.remove(&dedup_key);
                         }
-                        // TSI-2378: wake any waiter (defensive; no-DB path).
+                        // wake any waiter (defensive; no-DB path).
                         self.processing_torrents_cv.notify_one();
                     }
                 }
@@ -1119,29 +1095,20 @@ impl FsService {
         Ok(())
     }
 
-    /// TSI-3080: remove a torrent by `(source_path, filename)` and clean up
-    /// every `data/`-side trace — cached data inodes, kernel dentry entries,
-    /// the processing-lock key, and the L1 range cache.  Shared by `unlink`
-    /// and by `release`'s invalid-content path, where overwriting an existing
-    /// `metadata/` `.torrent` with invalid/oversized/empty bencode removed the
-    /// metadata inode but left the DB row behind, orphaning the
-    /// `data/<seed>.torrent/` mirror until a restart re-synced it.
-    ///
-    /// Both callers (`unlink`, `release`'s invalid-content path) call
-    /// `wait_for_pending_add` before invoking this so a detached
-    /// `add_torrent` on the same `(source_path, filename)` settles first
-    /// (TSI-2967) — otherwise the in-flight add lands its row *after* the
-    /// removal and rebuilds the orphan this method is meant to clear.
-    ///
-    /// Returns `Ok(Some((torrent_id, info_hash)))` when a row was removed, or
-    /// `Ok(None)` when no row existed (a freshly-written file that never
-    /// landed in the DB).  A DB error propagates.
+    /// Remove a torrent by `(source_path, filename)` and clean up every
+    /// `data/`-side trace: cached data inodes, kernel dentries, the
+    /// processing-lock key, and the L1 range cache. Shared by `unlink` and
+    /// `release`'s invalid-content path (where an overwrite removed the
+    /// metadata inode but left the DB row behind). Callers run
+    /// `wait_for_pending_add` first so an in-flight add lands its row *before*
+    /// the removal, not after. Returns `Ok(Some((torrent_id, info_hash)))` when
+    /// a row was removed, `Ok(None)` when none existed; DB errors propagate.
     fn remove_torrent_and_data_state(
         &mut self,
         source_path: &str,
         filename: &str,
     ) -> FsResult<Option<(i64, String)>> {
-        // TSI-3114: clear any recorded persistence failure for this
+        // clear any recorded persistence failure for this
         // (source_path, filename) — the torrent is being removed, so the
         // `data/` mirror must not keep surfacing a stale EIO for it.
         if let Ok(mut guard) = self.persist_errors.lock() {
@@ -1156,7 +1123,7 @@ impl FsService {
             Some(pair) => pair,
             None => {
                 // No DB row (never added): still invalidate any stale pending
-                // TorrentRoot cached from a prior lookup (TSI-2454).
+                // TorrentRoot cached from a prior lookup.
                 let data_parent = if source_path.is_empty() {
                     DATA_INO
                 } else {
@@ -1167,7 +1134,7 @@ impl FsService {
             }
         };
 
-        // TSI-3119: empty metadata directories must persist (and be restored
+        // empty metadata directories must persist (and be restored
         // on restart), so no directory rows are pruned here. Only the removed
         // torrent's data/ mirror entries are evicted; source-path directory
         // rows and their cached SourcePathDir entries stay valid — the
@@ -1187,7 +1154,7 @@ impl FsService {
                 DataInode::SourcePathDir { .. } => true,
             });
 
-        // TSI-2454: purge the kernel dentry cache for the removed torrent root
+        // purge the kernel dentry cache for the removed torrent root
         // so the stale mirror vanishes at once instead of lingering for the
         // 1s FUSE TTL.
         let data_parent = if source_path.is_empty() {
@@ -1216,7 +1183,7 @@ impl FsService {
                 );
                 FsError::LockPoisoned
             })?;
-            // TSI-2274: L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
+            // L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
             // drop every range cached for this torrent.
             let prefix = format!("{}:", info_hash);
             cache.retain(|k, _| !k.starts_with(&prefix));
@@ -1321,7 +1288,7 @@ impl FsService {
                         _ => true,
                     });
 
-                // TSI-2454: purge the kernel dentry cache for the removed
+                // purge the kernel dentry cache for the removed
                 // `data/` SourcePathDir so the stale mirror vanishes at
                 // once instead of lingering for the 1s FUSE TTL.
                 let (dir_parent, dir_name) = Self::split_data_dir_parent(&source_path);
@@ -1346,7 +1313,7 @@ impl FsService {
         self.unlink_with_pending_timeout(parent, name, PENDING_ADD_TIMEOUT)
     }
 
-    /// TSI-2967: like `unlink`, but the pending-add wait timeout is
+    /// like `unlink`, but the pending-add wait timeout is
     /// injectable so tests can exercise the timeout path in milliseconds
     /// instead of hard-waiting out the production 5s deadline.
     pub(crate) fn unlink_with_pending_timeout(
@@ -1357,10 +1324,10 @@ impl FsService {
     ) -> FsResult<Option<i64>> {
         let mut removed_id = None;
 
-        // TSI-3044: `.stats` is a reserved virtual filename whose files have
+        // `.stats` is a reserved virtual filename whose files have
         // immutable attributes — `rm` on it returns `EPERM` (`NotPermitted`),
-        // matching `write` (TSI-2579), `setattr` (TSI-2536), and `symlink`
-        // (TSI-2537).  The root `.stats` (`STATS_INO`) previously fell
+        // matching `write`, `setattr`, and `symlink`.
+        // The root `.stats` (`STATS_INO`) previously fell
         // through the metadata-child guard below → `EACCES`; the `data/`
         // subtree `.stats` (derived stats inode) previously hit the data/
         // guard → `EROFS`.  Both are rejections, but `.stats` must return a
@@ -1396,31 +1363,26 @@ impl FsService {
                 let source_path = self.inode_mgr.extract_source_path(*file_parent);
 
                 if self.torrent_service.is_some() {
-                    // TSI-2967: a fast `cp` followed immediately by `rm` races
-                    // the detached `add_torrent` thread spawned by `release`
-                    // (TSI-2247). `remove_torrent` finds no DB row yet and
-                    // returns `Ok(None)`, so the inode is marked unlinked;
-                    // then the in-flight add lands the row AFTER the unlink and
-                    // `data/` serves an orphaned torrent root with no
-                    // metadata/ counterpart. Wait (bounded) for the pending
-                    // add to settle first so the subsequent remove finds and
-                    // deletes the row. On timeout, fail cleanly — the inode is
-                    // untouched, so the user can retry.
+                    // A fast `cp` followed by `rm` races the detached
+                    // `add_torrent` from `release`: remove finds no row yet and
+                    // marks the inode unlinked, then the in-flight add lands
+                    // the row after the unlink and `data/` serves an orphaned
+                    // root. Wait (bounded) for the pending add to settle so the
+                    // remove finds and deletes the row; on timeout fail cleanly
+                    // (inode untouched, user can retry).
                     let dedup_key = (source_path.clone(), filename.clone());
                     self.wait_for_pending_add(&dedup_key, pending_timeout, "unlink")?;
 
                     match self.remove_torrent_and_data_state(&source_path, &filename) {
                         Ok(Some((torrent_id, _info_hash))) => {
                             removed_id = Some(torrent_id);
-                            // TSI-2234: defer inode destruction. Mark the
-                            // inode unlinked (so its directory name vanishes
-                            // from lookup/readdir) but keep the inode + any
-                            // open handles alive: read/write/flush/release
-                            // on a still-open handle must keep working until
-                            // the last handle is released. If no handle is
-                            // open, `unlink_file` destroys the inode now.
-                            // open_files is NOT stripped: that would orphan
-                            // the handle and silently drop buffered bytes.
+                            // Defer inode destruction: mark it unlinked (so the
+                            // name vanishes from lookup/readdir) but keep the
+                            // inode + open handles alive — read/write/flush/
+                            // release must keep working until the last handle
+                            // closes. With no open handle, `unlink_file`
+                            // destroys it now; `open_files` is NOT stripped (it
+                            // would orphan the handle and drop buffered bytes).
                             self.inode_mgr.unlink_file(ino);
                             info!(
                                 "Deleted torrent '{}' (id={}, source_path='{}')",
@@ -1428,7 +1390,7 @@ impl FsService {
                             );
                         }
                         Ok(None) => {
-                            // TSI-2234: same deferred-destruction logic.
+                            // same deferred-destruction logic.
                             self.inode_mgr.unlink_file(ino);
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
@@ -1438,7 +1400,7 @@ impl FsService {
                         }
                     }
                 } else {
-                    // TSI-2234: same deferred-destruction logic (no DB).
+                    // same deferred-destruction logic (no DB).
                     self.inode_mgr.unlink_file(ino);
                     info!("Deleted file '{}' (no database)", filename);
                 }
@@ -1460,7 +1422,7 @@ impl FsService {
         self.rename_with_pending_timeout(parent, name, newparent, newname, PENDING_ADD_TIMEOUT)
     }
 
-    /// TSI-2378 (review): the pending-add wait timeout is injectable so
+    /// the pending-add wait timeout is injectable so
     /// tests can exercise the timeout/rollback path in milliseconds instead
     /// of hard-waiting out the 5s production deadline.
     pub(crate) fn rename_with_pending_timeout(
@@ -1471,7 +1433,7 @@ impl FsService {
         newname: &str,
         pending_timeout: Duration,
     ) -> FsResult<()> {
-        // TSI-2228: data/ is a read-only namespace — renames into or out
+        // data/ is a read-only namespace — renames into or out
         // of it must return `EROFS`, not `ENOENT` or `EPERM`. Check this
         // before parent existence: an inode number in the data range is
         // inherently read-only, regardless of whether it is currently
@@ -1617,9 +1579,9 @@ impl FsService {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
 
-                // TSI-2378: a fast `cp` followed immediately by `mv` races
+                // a fast `cp` followed immediately by `mv` races
                 // with the detached `add_torrent` thread spawned by
-                // `release` (TSI-2247): the DB row may not exist yet, so
+                // `release`: the DB row may not exist yet, so
                 // `rename_torrent` silently no-ops (`Ok(None)`) and the row
                 // later lands at the OLD name — the data/ mirror then keeps
                 // serving the stale filename and the rename is lost on
@@ -1645,7 +1607,7 @@ impl FsService {
 
                 ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
 
-                // TSI-3119: a cross-directory move leaves the old source-path
+                // a cross-directory move leaves the old source-path
                 // directory empty, but empty directories must persist (and be
                 // restored on restart) — so no directory rows are pruned
                 // here. Only the moved torrent's stale TorrentRoot cache
@@ -1664,7 +1626,7 @@ impl FsService {
                             _ => true,
                         });
 
-                    // TSI-2454: purge the kernel dentry cache for the old
+                    // purge the kernel dentry cache for the old
                     // data/ location so the stale name vanishes at once
                     // instead of lingering for the 1s FUSE TTL.
                     let old_data_parent = if old_source_path.is_empty() {
@@ -1674,7 +1636,7 @@ impl FsService {
                     };
                     self.inval_data_entry(old_data_parent, &old_name);
                 } else {
-                    // TSI-2378 (review): an intra-directory rename keeps the
+                    // an intra-directory rename keeps the
                     // source_path but changes the filename — a cached
                     // TorrentRoot entry still carries the old `filename`, so
                     // data/ would keep listing the stale name (and the DB row
@@ -1691,7 +1653,7 @@ impl FsService {
                             _ => true,
                         });
 
-                    // TSI-2454: purge the kernel dentry cache for the old
+                    // purge the kernel dentry cache for the old
                     // filename so the stale name vanishes from `data/` at
                     // once instead of lingering for the 1s FUSE TTL.
                     let data_parent = if old_source_path.is_empty() {
@@ -1712,15 +1674,11 @@ impl FsService {
         }
     }
 
-    /// TSI-2378: wait (bounded by `timeout`) for a pending `add_torrent` at
-    /// `dedup_key` to clear. The background add signals
-    /// `processing_torrents_cv` when it removes its entry, so this sleeps on
-    /// the Condvar instead of polling the map. On timeout the caller has
-    /// already rolled back any inode state and must fail the operation.
-    /// `timeout` is a parameter so tests can use a short deadline instead of
-    /// the production 5s. `op` names the calling operation (`"rename"` /
-    /// `"unlink"`) so the timeout log and error message read correctly for
-    /// whichever path hit the wait.
+    /// Wait (bounded by `timeout`) for a pending `add_torrent` at `dedup_key`
+    /// to clear, sleeping on `processing_torrents_cv` rather than polling the
+    /// map. On timeout the caller has already rolled back inode state and must
+    /// fail. `timeout` is a parameter so tests can use a short deadline; `op`
+    /// names the calling operation ("rename"/"unlink") for the timeout message.
     fn wait_for_pending_add(
         &self,
         dedup_key: &(String, String),
@@ -1867,17 +1825,11 @@ impl FsService {
             FsError::Internal(format!("file index not found for file_id: {}", file_id))
         })? as i32;
 
-        // TSI-2274: L1 range cache — keyed by
-        // `{info_hash}:{file_id}:{offset}:{size}` so repeated reads of the
-        // same range hit RAM and bypass L2 disk + the (now throttled)
-        // metadata fsync.  Before this fix the L1 cache was only ever read
-        // and removed, never populated, so every read went to L2 disk +
-        // fsync.
-        //
-        // The `size` is part of the key to prevent silent data truncation
-        // (review issue 1): if a smaller read cached N bytes and a larger
-        // read hits that entry, it would return only N bytes instead of
-        // the requested size.
+        // L1 range cache — keyed by `{info_hash}:{file_id}:{offset}:{size}` so
+        // repeated reads of the same range hit RAM and bypass L2 disk + the
+        // (now throttled) metadata fsync. `size` is in the key to prevent
+        // silent truncation: a smaller cached read must not satisfy a larger
+        // one with fewer bytes than requested.
         let cache_key = format!("{}:{}:{}:{}", info_hash, file_id, offset, size);
         {
             let cache = self
@@ -1902,16 +1854,13 @@ impl FsService {
                     self.metrics.l2_hit();
                     match ds.read_file_range(info.clone(), file_index, offset, size) {
                         Ok(data) => {
-                            // TSI-2293 + TSI-3017: `pieces_on_disk` said the
-                            // range was on disk, but `read_file_range` returned
-                            // empty.  Defer to the download engine instead of
-                            // failing immediately.  The two sub-scenarios both
-                            // converge on ENODATA in the deferred worker:
-                            // no seeder waits the 30s timeout window then
-                            // surfaces `NoPeers` (resolved via `resolve_error`),
-                            // while a file_offset mismatch (TSI-2293) returns
-                            // `Ok(Vec::new())` immediately (resolved via
-                            // `resolve_or_enodata`) — no 30s wait.
+                            // `pieces_on_disk` said on-disk but `read_file_range`
+                            // returned empty: defer to the download engine. Both
+                            // sub-scenarios converge on ENODATA in the deferred
+                            // worker — no seeder waits the 30s window then
+                            // surfaces `NoPeers` (`resolve_error`), while a
+                            // file_offset mismatch returns `Ok(Vec::new())`
+                            // immediately (`resolve_or_enodata`), no 30s wait.
                             if guard_empty_read(&data, size).is_err() {
                                 warn!(
                                     "Sync read returned 0 bytes for non-zero \
@@ -1929,7 +1878,7 @@ impl FsService {
                                     torrent_id,
                                 });
                             }
-                            // TSI-2274: populate the L1 range cache so a
+                            // populate the L1 range cache so a
                             // repeated read of this exact range is served
                             // from RAM, bypassing L2 disk + metadata fsync.
                             // Bounded: when the cache is full, clear all
@@ -2075,7 +2024,7 @@ impl FsService {
                 ..
             } = data
             {
-                // TSI-2234: skip unlinked-but-open inodes — their torrent_id
+                // skip unlinked-but-open inodes — their torrent_id
                 // was already removed from the DB by `unlink`, so matching
                 // their buffered bytes here would be a stale dirty read.
                 if !*unlinked && name.ends_with(".torrent") && !file_data.is_empty() {
@@ -2106,7 +2055,7 @@ impl FsService {
     fn generate_global_stats_content(&self) -> Vec<u8> {
         let get_cm = || self.get_cache_manager();
         let session_stats = self.download_service.as_ref().map(|ds| ds.snapshot_stats());
-        // TSI-2274: report the current L1 range cache depth so `.stats`
+        // report the current L1 range cache depth so `.stats`
         // reflects the now-populated memory cache.
         let l1_entries = self
             .torrent_data_cache
@@ -2172,22 +2121,13 @@ impl FsService {
     }
 }
 
-/// TSI-2199: background SHA-1 verification of on-disk cached pieces.
-///
-/// After a restart, [`CacheManager::scan_pieces_subdirectory`] re-registers
-/// every on-disk piece but leaves it unverified — it may be a complete piece
-/// or an incomplete/corrupt file left by a crash. This worker recomputes each
-/// candidate's SHA-1 and compares it against the torrent's expected piece
-/// hash: matches are marked verified (so subsequent reads serve from local
-/// cache), mismatches and incomplete pieces (wrong size / sparse partial
-/// write) are purged so they can be re-downloaded on demand (TSI-2257).
-///
-/// TSI-2491: pieces still being written carry a `.incomplete` marker and are
-/// excluded from the candidate list by `CacheManager::unverified_pieces` —
-/// only pieces that are actually possibly-complete are verified here.
-///
-/// Runs on a detached background thread so it never blocks FUSE mount
-/// readiness.
+/// Background SHA-1 verification of on-disk cached pieces. After a restart,
+/// [`CacheManager::scan_pieces_subdirectory`] re-registers every piece
+/// unverified (it may be complete or a crash-leftover); this worker recomputes
+/// each SHA-1 against the torrent's expected hash, marking matches verified
+/// and purging mismatches/incomplete pieces so they re-download on demand.
+/// Pieces still being written (`.incomplete` marker) are excluded via
+/// `unverified_pieces`. Runs detached so it never blocks mount readiness.
 fn spawn_cache_verification(
     cache: Arc<Mutex<CacheManager>>,
     infos_by_hash: HashMap<String, Arc<TorrentInfo>>,
@@ -2315,7 +2255,7 @@ fn verify_single_piece(
         return VerifyOutcome::Purged;
     }
 
-    // TSI-2229 / TSI-2257: a piece file may have the correct *logical* size
+    // a piece file may have the correct *logical* size
     // but still be incomplete — `write_piece` writes blocks at arbitrary
     // offsets, and a crash between block writes leaves a sparse file whose
     // zero-filled gaps make st_size match piece_length while the physical
@@ -2360,22 +2300,13 @@ fn split_piece_key(key: &str) -> Option<(&str, i32)> {
     Some((info_hash, index))
 }
 
-/// Whether a piece file is *sparse* — its physical disk allocation is smaller
-/// than its logical size.
-///
-/// `write_piece` writes blocks at arbitrary offsets via `seekp`; a crash
-/// between block writes leaves a file whose `st_size` matches the expected
-/// piece length but whose interior has zero-filled gaps (the filesystem does
-/// not allocate blocks for the unwritten regions). Such a file is not a
-/// complete piece even though its logical size is correct.
-///
-/// Comparing `st_blocks * 512` (physical) against `st_size` (logical) detects
-/// this condition. A fully-written all-zero piece also appears sparse; it
-/// is purged along with genuine partial writes — the next read re-downloads
-/// it, `register_piece` marks it verified, and no data is lost (TSI-2257).
-///
-/// Takes the already-fetched `Metadata` so the caller avoids a duplicate
-/// `stat` syscall (one per piece — significant at 987+ pieces).
+/// Whether a piece file is *sparse* (physical allocation < logical size).
+/// `write_piece` writes blocks at arbitrary offsets; a crash between writes
+/// leaves `st_size` correct but zero-filled gaps the filesystem never
+/// allocated — not a complete piece. Compare `st_blocks * 512` (physical)
+/// against `st_size` (logical) to detect it; an all-zero piece also looks
+/// sparse and is purged too, then re-downloaded and re-verified with no data
+/// loss. Takes the already-fetched `Metadata` to avoid a duplicate `stat`.
 fn is_sparse_file(meta: &std::fs::Metadata, logical_size: u64) -> bool {
     if logical_size == 0 {
         return false;
@@ -2503,7 +2434,7 @@ mod tests {
         assert_eq!(split_piece_key(""), None);
     }
 
-    /// TSI-2933 P0: an unwritable cache directory must leave the download
+    /// an unwritable cache directory must leave the download
     /// engine unset (`download_service == None`) instead of crashing or
     /// silently mounting a filesystem that can only browse metadata.  `main`
     /// turns this `None` into a fatal exit before mounting, so the behavior
@@ -2524,7 +2455,7 @@ mod tests {
         );
     }
 
-    /// TSI-2228: Bare service without any torrents — sufficient for testing
+    /// Bare service without any torrents — sufficient for testing
     /// that mutating operations on the read-only `data/` namespace return
     /// `EROFS` (`ReadOnlyFileSystem`), not `ENOENT` or `EACCES`.
     fn bare_service() -> FsService {
@@ -2561,7 +2492,7 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
-    /// TSI-2533: `setattr` (chmod/chown/truncate/utimens) on the read-only
+    /// `setattr` (chmod/chown/truncate/utimens) on the read-only
     /// `data/` namespace must return `EROFS`. Before this guard, `getattr`
     /// returned the current attributes (exit 0) and left the mode untouched —
     /// a silent success that differed from `write`/`rmdir`/`unlink`/`rename`.
@@ -2579,12 +2510,12 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
-    /// TSI-2536: an *attribute change* (chmod/chown/utimens) on the
+    /// an *attribute change* (chmod/chown/utimens) on the
     /// `metadata/` namespace must return `EPERM` — never a silent success.
     /// `metadata/` is writable (create/write/rename/unlink work), so `EROFS`
     /// would be misleading; `EPERM` reflects "attributes are virtual and
     /// immutable". A truncate (size change) is *not* an attribute change —
-    /// it must succeed (see `metadata_file_truncate_succeeds`, TSI-3064).
+    /// it must succeed (see `metadata_file_truncate_succeeds`).
     #[test]
     fn metadata_namespace_setattr_returns_eperm() {
         let mut svc = bare_service();
@@ -2603,7 +2534,7 @@ mod tests {
         assert_eq!(err, FsError::NotPermitted);
     }
 
-    /// TSI-3064: a *truncate* (size change) on a `metadata/` file is a
+    /// a *truncate* (size change) on a `metadata/` file is a
     /// legitimate write — `cp` overwriting an existing `.torrent` opens it
     /// with `O_TRUNC`, which the kernel turns into `setattr(size=0)`. That
     /// must resize the in-memory buffer and succeed, not return `EPERM`.
@@ -2642,7 +2573,7 @@ mod tests {
         assert_eq!(file_data, &minimal_torrent_bytes());
     }
 
-    /// TSI-3064 (review): truncating to `MAX_TORRENT_SIZE + 1` must be
+    /// truncating to `MAX_TORRENT_SIZE + 1` must be
     /// rejected with `FileTooLarge` (→ EFBIG), mirroring the write-path
     /// guard — never a silent cap or an over-limit allocation.
     #[test]
@@ -2664,7 +2595,7 @@ mod tests {
             .unwrap());
     }
 
-    /// TSI-3064 (review): truncating to exactly `MAX_TORRENT_SIZE` is the
+    /// truncating to exactly `MAX_TORRENT_SIZE` is the
     /// positive boundary the reject test hovers around — the guard uses
     /// strict `>`, so the limit itself must be accepted.
     #[test]
@@ -2684,7 +2615,7 @@ mod tests {
         );
     }
 
-    /// TSI-3064 (review): truncating to a *larger* size (grow) must
+    /// truncating to a *larger* size (grow) must
     /// zero-fill the extended region and make `getattr` report the new size;
     /// a subsequent write past the grown tail must still append correctly.
     #[test]
@@ -2714,7 +2645,7 @@ mod tests {
         assert_eq!(data.as_deref(), Some(b"AB\0\0CD".as_slice()));
     }
 
-    /// TSI-3064: the complete host-side `cp`-overwrite sequence on an existing
+    /// the complete host-side `cp`-overwrite sequence on an existing
     /// `metadata/` file. The first `cp` creates the file (create → write →
     /// flush → release); the second `cp` overwrites it (lookup → O_TRUNC
     /// truncate → open → write → flush → release). Every step — especially
@@ -2781,19 +2712,13 @@ mod tests {
         );
     }
 
-    /// TSI-3064: concurrent host-side overwrites of an existing `metadata/`
-    /// file (the shared-mount-propagation scenario) must never surface
-    /// `EPERM`. Each writer performs the full `cp`-overwrite sequence under a
-    /// shared mutex.
-    ///
-    /// The mutex is *not* a test-only simplification: the production FUSE
-    /// dispatcher is single-threaded (fuser 0.16 takes `&mut self` on every
-    /// `Filesystem` method), so concurrent host requests are already
-    /// serialized at exactly this boundary. The test therefore mirrors the
-    /// real dispatch interleaving — writers never overlap *inside* FsService
-    /// — and asserts only that the serialized truncate→write sequence never
-    /// surfaces `EPERM` and always leaves one writer's full payload. It does
-    /// not test torn writes, because the dispatcher itself precludes them.
+    /// Concurrent host-side overwrites of an existing `metadata/` file must
+    /// never surface `EPERM`; each writer does the full `cp`-overwrite under
+    /// a shared mutex. The mutex mirrors production: the FUSE dispatcher is
+    /// single-threaded (`&mut self` on every `Filesystem` method), so host
+    /// requests are serialized at exactly this boundary. The test asserts the
+    /// serialized truncate→write sequence never returns `EPERM` and always
+    /// leaves one writer's full payload (torn writes are precluded by design).
     #[test]
     fn concurrent_overwrite_existing_torrent_never_eperm() {
         let svc = Arc::new(Mutex::new(bare_service()));
@@ -2854,7 +2779,7 @@ mod tests {
         assert_eq!(data, payload);
     }
 
-    /// TSI-2536: the root directory and the `.stats` virtual files have
+    /// the root directory and the `.stats` virtual files have
     /// fixed modes (0o555 / 0o444) just like `metadata/`, so `setattr` on
     /// them must also return `EPERM` instead of silently returning the
     /// current attributes (exit 0) while leaving the mode untouched.
@@ -2878,10 +2803,10 @@ mod tests {
         assert_eq!(err, FsError::NotPermitted);
     }
 
-    /// TSI-2579: `write` on the `.stats` virtual files must return `EPERM`
+    /// `write` on the `.stats` virtual files must return `EPERM`
     /// (`NotPermitted`) — their attributes are virtual and immutable, not a
-    /// read-only namespace — matching `setattr` (TSI-2536) and `symlink`
-    /// (TSI-2537). Before the change it wrongly returned `EROFS`.
+    /// read-only namespace — matching `setattr` and `symlink`.
+    /// Before the change it wrongly returned `EROFS`.
     #[test]
     fn stats_write_returns_eperm() {
         let mut svc = bare_service();
@@ -2899,8 +2824,8 @@ mod tests {
         assert_eq!(err, FsError::NotPermitted);
     }
 
-    /// TSI-3044: `unlink` (`rm`) on the `.stats` virtual files must return
-    /// `EPERM` (`NotPermitted`), matching `write` (TSI-2579) — not `EACCES`
+    /// `unlink` (`rm`) on the `.stats` virtual files must return
+    /// `EPERM` (`NotPermitted`), matching `write` — not `EACCES`
     /// (the root `.stats` previously fell through the metadata-child guard)
     /// nor `EROFS` (the `data/` subtree `.stats` previously hit the data/
     /// guard).
@@ -2931,7 +2856,7 @@ mod tests {
             .ino
     }
 
-    /// TSI-2233: a negative offset must be rejected before any allocation
+    /// a negative offset must be rejected before any allocation
     /// rather than cast to a huge `usize` and fed to `Vec::resize` (OOM).
     #[test]
     fn write_rejects_negative_offset() {
@@ -2949,7 +2874,7 @@ mod tests {
         );
     }
 
-    /// TSI-2233: an offset that would grow the buffer past MAX_TORRENT_SIZE
+    /// an offset that would grow the buffer past MAX_TORRENT_SIZE
     /// is rejected with `FileTooLarge` (→ EFBIG) instead of allocating.
     #[test]
     fn write_rejects_offset_beyond_max_size() {
@@ -2970,7 +2895,7 @@ mod tests {
             .unwrap());
     }
 
-    /// TSI-2233: `offset + data.len()` exceeding `MAX_TORRENT_SIZE` (even
+    /// `offset + data.len()` exceeding `MAX_TORRENT_SIZE` (even
     /// when offset alone is within bounds) is rejected, not silently capped.
     #[test]
     fn write_rejects_end_beyond_max_size() {
@@ -2983,7 +2908,7 @@ mod tests {
         assert!(matches!(err, FsError::FileTooLarge(_)));
     }
 
-    /// TSI-2233: a write whose `end` lands exactly on MAX_TORRENT_SIZE is
+    /// a write whose `end` lands exactly on MAX_TORRENT_SIZE is
     /// allowed (the guard uses strict `>`, mirroring `flush`'s `>`). This
     /// is the positive boundary the reject tests hover around.
     #[test]
@@ -3003,7 +2928,7 @@ mod tests {
         );
     }
 
-    /// TSI-2233: a normal write at a positive offset still works and grows
+    /// a normal write at a positive offset still works and grows
     /// the buffer with a zero gap (regression guard for the guard logic).
     #[test]
     fn write_at_positive_offset_grows_with_gap() {
@@ -3018,7 +2943,7 @@ mod tests {
         assert_eq!(data.as_deref(), Some(b"\0\0\0\0AB".as_slice()));
     }
 
-    /// TSI-2233: a huge positive offset (would cast to a multi-GB `usize`
+    /// a huge positive offset (would cast to a multi-GB `usize`
     /// and trigger a runaway `Vec::resize`) is rejected by the size cap
     /// before any allocation. This is the local-DoS vector the guard closes.
     #[test]
@@ -3060,15 +2985,12 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
-    /// TSI-2248: `rmdir`/`unlink` on the read-only `data/` namespace must
-    /// return `EROFS` **without any side effect** — no inode table mutation,
-    /// no `data_inodes` mutation, no cache eviction.  A mutation here would
-    /// corrupt FUSE session state: subsequent `readdir`/`lookup` on the
-    /// data/ subtree could serve stale or missing entries, and in the worst
-    /// case the dispatcher thread could dereference a half-removed inode,
-    /// aborting the FUSE session (mount disappears while the process lives).
-    /// This test pins the early-return contract so the guard can never be
-    /// accidentally bypassed by a future refactor.
+    /// `rmdir`/`unlink` on the read-only `data/` namespace must return `EROFS`
+    /// with no side effect — no inode/`data_inodes` mutation, no cache
+    /// eviction. A mutation would corrupt FUSE session state (stale/missing
+    /// readdir entries, or a half-removed inode dereference aborting the
+    /// session). Pins the early-return contract so a future refactor can't
+    /// bypass the guard.
     #[test]
     fn data_namespace_unlink_rmdir_return_erofs() {
         let mut svc = bare_service();
@@ -3089,7 +3011,7 @@ mod tests {
         let err = svc.rmdir(data_dir_ino, "foo").unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
 
-        // TSI-2248: No side effects — the early-return guard must not
+        // No side effects — the early-return guard must not
         // mutate inode state, which would corrupt the FUSE session.
         assert_eq!(
             svc.inode_mgr.inodes.len(),
@@ -3127,7 +3049,7 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
-    /// TSI-2537: `symlink` is unsupported everywhere, but the read-only
+    /// `symlink` is unsupported everywhere, but the read-only
     /// `data/` namespace must return `EROFS` (matching `write`/`chmod`/
     /// `rmdir`/`unlink`/`rename`), while every other namespace returns
     /// `EPERM`.  Before the guard, `symlink` never reached the service: the
@@ -3231,7 +3153,7 @@ mod tests {
         );
     }
 
-    /// TSI-3119: a cross-directory mv of a `.torrent` empties the old
+    /// a cross-directory mv of a `.torrent` empties the old
     /// source-path directory, but empty directories must persist (and be
     /// restored on restart) — so the `cat-a` row survives in
     /// `metadata_directories`, while only the moved torrent's stale
@@ -3333,7 +3255,7 @@ mod tests {
         );
     }
 
-    /// TSI-3119: removing the last torrent from a directory must NOT prune
+    /// removing the last torrent from a directory must NOT prune
     /// the now-empty directory from `metadata_directories` — the empty
     /// directory persists so it is restored on restart.
     #[test]
@@ -3378,7 +3300,7 @@ mod tests {
         );
     }
 
-    /// TSI-2373 guard: an intra-directory rename (same parent) must NOT run
+    /// an intra-directory rename (same parent) must NOT run
     /// orphan cleanup — only the filename changes.
     #[test]
     fn intra_directory_rename_skips_orphan_cleanup() {
@@ -3420,7 +3342,7 @@ mod tests {
         );
     }
 
-    /// TSI-2378: a fast `cp` (release → detached add_torrent) followed
+    /// a fast `cp` (release → detached add_torrent) followed
     /// immediately by a rename must wait for the pending add to settle, so
     /// the DB row lands at the NEW name instead of the old one. Simulate the
     /// race by inserting a pending entry in `processing_torrents` before
@@ -3490,7 +3412,7 @@ mod tests {
         );
     }
 
-    /// TSI-2378: while the add is still pending past the timeout, the rename
+    /// while the add is still pending past the timeout, the rename
     /// must FAIL rather than silently no-op the DB update (which would leave
     /// the data/ mirror on the stale filename).
     #[test]
@@ -3551,7 +3473,7 @@ mod tests {
         }
     }
 
-    /// TSI-2378 (review suggestion): the 5s production timeout must not be
+    /// the 5s production timeout must not be
     /// baked into the wait loop — exercise the timeout path with a short
     /// injected deadline so this test stays fast.
     #[test]
@@ -3579,7 +3501,7 @@ mod tests {
         );
     }
 
-    /// TSI-2378: an intra-directory rename must evict the cached TorrentRoot
+    /// an intra-directory rename must evict the cached TorrentRoot
     /// carrying the OLD filename — otherwise data/ keeps listing the stale
     /// name until restart even though the DB row is updated.
     #[test]
@@ -3643,15 +3565,12 @@ mod tests {
         }
     }
 
-    /// TSI-2381: `cp` over an existing metadata torrent, then a fast `mv`.
-    ///
-    /// The `cp` releases a NEW info-hash under the OLD filename while a DB
-    /// row still exists at `(source_path, old_filename)` from the previous
-    /// content — so the background `add_torrent` takes the `Duplicate`
-    /// branch and keeps that stale row (old name/info_hash) instead of
-    /// inserting anything. The immediate rename then finds no row at the
-    /// new name and silently no-ops; on restart the OLD torrent is
-    /// restored and metadata/ + data/ show unexpected duplicates.
+    /// `cp` over an existing metadata torrent, then a fast `mv`. The `cp`
+    /// releases a NEW info-hash under the OLD filename while the previous
+    /// DB row still exists, so the background `add_torrent` takes the
+    /// `Duplicate` branch and keeps the stale row; the rename then finds no
+    /// row at the new name and no-ops. On restart the OLD torrent is restored
+    /// and metadata/ + data/ show unexpected duplicates.
     #[test]
     fn rename_after_overwrite_syncs_stale_row() {
         let mut svc = service_with_db();
@@ -3751,7 +3670,7 @@ mod tests {
         ));
     }
 
-    /// TSI-2246: opening a `data/` torrent file must set `direct_io: true`
+    /// opening a `data/` torrent file must set `direct_io: true`
     /// so the kernel bypasses its page cache and the daemon's errno
     /// (e.g. ENODATA) reaches userspace instead of being converted to EIO.
     #[test]
@@ -3777,7 +3696,7 @@ mod tests {
         assert_ne!(outcome.fh, 0, "data torrent file must get a real fh");
     }
 
-    /// TSI-2988: an out-of-bounds read (`offset >= file_size`) must return
+    /// an out-of-bounds read (`offset >= file_size`) must return
     /// 0 bytes (EOF), never dirty piece data. The `read` handler's guard is
     /// the first line of defense before any piece is read from cache/network.
     #[test]
@@ -3823,7 +3742,7 @@ mod tests {
         );
     }
 
-    /// TSI-2246: non-data files (e.g. metadata) must NOT set direct_io —
+    /// non-data files (e.g. metadata) must NOT set direct_io —
     /// page cache is fine for static in-memory content.
     #[test]
     fn open_metadata_file_does_not_set_direct_io() {
@@ -3845,7 +3764,7 @@ mod tests {
         );
     }
 
-    /// TSI-2246: stats inodes must NOT set direct_io.
+    /// stats inodes must NOT set direct_io.
     #[test]
     fn open_stats_file_does_not_set_direct_io() {
         let mut svc = bare_service();
@@ -3932,7 +3851,7 @@ mod tests {
     /// `piece_length` but whose physical allocation is smaller — simulating an
     /// interrupted multi-block write where only the trailing block was
     /// flushed to disk.  The tail starts at `piece_length / 4` so it never
-    /// underflows for small pieces (TSI-2257 review: the prior `piece_length -
+    /// underflows for small pieces (the prior `piece_length -
     /// 4096` could underflow when `piece_length < 4096`).
     fn write_sparse_piece_file(piece_path: &std::path::Path, content: &[u8], piece_length: u64) {
         use std::io::{Seek, Write};
@@ -3968,7 +3887,7 @@ mod tests {
         assert!(cache.has_piece(&piece_key));
         assert!(!cache.is_piece_verified(&piece_key));
 
-        // TSI-2257: a sparse (partial-write) piece is purged, not skipped.
+        // a sparse (partial-write) piece is purged, not skipped.
         let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
         assert!(
             matches!(outcome, VerifyOutcome::Purged),
@@ -4040,7 +3959,7 @@ mod tests {
         );
     }
 
-    /// TSI-2257: a purged incomplete piece must be deleted from the cache
+    /// a purged incomplete piece must be deleted from the cache
     /// (metadata + on-disk file) so the disk space is reclaimed.  This
     /// exercises the full `spawn_cache_verification` purge contract by
     /// applying `VerifyOutcome::Purged` via `delete_piece` — the same path
@@ -4084,7 +4003,7 @@ mod tests {
         assert_eq!(cache.current_size(), 0, "current_size must drop to zero");
     }
 
-    // ── TSI-2247: release must not block the FUSE dispatch thread ─────────
+    // ── release must not block the FUSE dispatch thread ─────────
 
     /// Build a service backed by an in-memory DB + TorrentService so
     /// `release` can exercise the full add_torrent path.
@@ -4132,7 +4051,7 @@ mod tests {
         }
     }
 
-    /// TSI-2247/TSI-2918: Closing an empty `.torrent` file hits the fast path.
+    /// Closing an empty `.torrent` file hits the fast path.
     /// `release` discards the inode and returns `NotFound` (ENOENT) — a
     /// zero-byte file is treated as if it never existed — without touching
     /// `processing_torrents` or the DB.
@@ -4153,7 +4072,7 @@ mod tests {
         assert!(svc.processing_torrents.lock().unwrap().is_empty());
     }
 
-    /// TSI-2247: Closing a `.torrent` with invalid (non-parseable) data must
+    /// Closing a `.torrent` with invalid (non-parseable) data must
     /// also hit the fast path — no DB insert, no background spawn.
     #[test]
     fn release_invalid_torrent_is_fast_path() {
@@ -4168,11 +4087,11 @@ mod tests {
         assert!(svc.processing_torrents.lock().unwrap().is_empty());
     }
 
-    /// TSI-3080: overwriting an existing `metadata/` `.torrent` (already in the
+    /// overwriting an existing `metadata/` `.torrent` (already in the
     /// DB) with invalid bencode removes the metadata inode but must ALSO delete
     /// the existing DB row, so the `data/<seed>.torrent/` mirror does not
     /// become an orphan.  The overwrite path is `open` → `setattr(size=0)`
-    /// (O_TRUNC) → `write` bad bytes → `release` (TSI-3064).
+    /// (O_TRUNC) → `write` bad bytes → `release`.
     #[test]
     fn release_invalid_overwrite_removes_existing_db_row() {
         let mut svc = service_with_db();
@@ -4218,7 +4137,7 @@ mod tests {
         );
     }
 
-    /// TSI-3080: overwriting an existing torrent with empty content
+    /// overwriting an existing torrent with empty content
     /// (`cp /dev/null` onto it) hits `release`'s empty-data branch and must
     /// also remove the existing DB row.
     #[test]
@@ -4248,8 +4167,8 @@ mod tests {
         );
     }
 
-    /// TSI-3080: an invalid-content overwrite racing a detached `add_torrent`
-    /// (the same race `unlink` guards via `wait_for_pending_add`, TSI-2967)
+    /// an invalid-content overwrite racing a detached `add_torrent`
+    /// (the same race `unlink` guards via `wait_for_pending_add`)
     /// must block until the add settles, then delete the row it landed —
     /// otherwise the in-flight add rebuilds the `data/` orphan this fix clears.
     #[test]
@@ -4300,7 +4219,7 @@ mod tests {
         );
     }
 
-    /// TSI-2247: Closing a valid `.torrent` file must NOT block the caller.
+    /// Closing a valid `.torrent` file must NOT block the caller.
     /// `add_torrent` runs on a background thread; `release` returns `Ok(())`
     /// immediately.  The `processing_torrents` entry is cleaned up by the
     /// background thread after the DB insert completes, and the torrent is
@@ -4353,9 +4272,9 @@ mod tests {
         assert_eq!(torrent.unwrap().filename, "valid.torrent");
     }
 
-    /// TSI-3114: a DB write failure (e.g. disk full → SQLite
+    /// a DB write failure (e.g. disk full → SQLite
     /// `SystemIoFailure`) must not be silent.  Persistence runs on a detached
-    /// thread (TSI-2247 keeps the FUSE dispatcher unblocked) and records the
+    /// thread (keeping the FUSE dispatcher unblocked) and records the
     /// failure; the next user-visible `lookup`/`readdir` of `data/` surfaces
     /// it as `FsError::Database` → EIO.  The kernel drops the FUSE_RELEASE
     /// reply error, so `release` itself cannot propagate it.
@@ -4419,7 +4338,7 @@ mod tests {
         );
     }
 
-    /// TSI-2247: `processing_torrents` is NOT held during `add_torrent` —
+    /// `processing_torrents` is NOT held during `add_torrent` —
     /// the lock is released before the background thread is spawned.  Two
     /// `.torrent` files in the root directory (both `source_path == ""`)
     /// must both be processed and persisted — the dedup key is
@@ -4474,7 +4393,7 @@ mod tests {
         assert!(t2.is_some(), "b.torrent should be in DB");
     }
 
-    /// TSI-2918: `flush` for an empty `.torrent` returns `Ok` — a zero-byte
+    /// `flush` for an empty `.torrent` returns `Ok` — a zero-byte
     /// file has nothing to validate. Discarding it is `release`'s job, so
     /// `touch` no longer surfaces a spurious EINVAL on close.
     #[test]
@@ -4485,7 +4404,7 @@ mod tests {
         svc.flush(ino).expect("empty torrent flush ok");
     }
 
-    /// TSI-2923: a non-empty but unparseable `.torrent` fails `flush` with a
+    /// a non-empty but unparseable `.torrent` fails `flush` with a
     /// reason-carrying `CorruptTorrent` (→ EINVAL), so the user sees
     /// `Invalid .torrent file: <reason>` rather than a bare "Invalid
     /// argument" that cannot distinguish an invalid seed from other I/O
@@ -4508,9 +4427,9 @@ mod tests {
         }
     }
 
-    // ── TSI-2234: unlink-while-open keeps the inode alive ───────────────
+    // ── unlink-while-open keeps the inode alive ───────────────
 
-    /// TSI-2234: `unlink` on a file with no open handle destroys the
+    /// `unlink` on a file with no open handle destroys the
     /// inode immediately — the name is gone and the inode is absent.
     #[test]
     fn unlink_closed_file_destroys_inode() {
@@ -4539,7 +4458,7 @@ mod tests {
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
     }
 
-    /// TSI-2234: an open handle keeps read/write working after unlink, and
+    /// an open handle keeps read/write working after unlink, and
     /// the inode is destroyed only on the LAST release (not the first).
     #[test]
     fn unlink_while_open_keeps_handle_until_last_release() {
@@ -4583,7 +4502,7 @@ mod tests {
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
     }
 
-    /// TSI-2234: after unlink, `readdir` no longer lists the file even
+    /// after unlink, `readdir` no longer lists the file even
     /// though its inode lingers for an open handle.
     #[test]
     fn unlink_hides_name_from_readdir_while_open() {
@@ -4616,7 +4535,7 @@ mod tests {
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
     }
 
-    /// TSI-2234: a second `unlink` of the same name returns `ENOENT`
+    /// a second `unlink` of the same name returns `ENOENT`
     /// because `find_child_by_name` skips the unlinked inode.
     #[test]
     fn unlink_twice_returns_not_found() {
@@ -4629,7 +4548,7 @@ mod tests {
         assert_eq!(err, FsError::NotFound);
     }
 
-    /// TSI-2234: creating a new file with the same name as an unlinked-but-
+    /// creating a new file with the same name as an unlinked-but-
     /// still-open inode succeeds (the old name is freed even though the
     /// old inode lingers).
     #[test]
@@ -4648,7 +4567,7 @@ mod tests {
         assert!(!svc.inode_mgr.is_unlinked_file(created2.attr.ino));
     }
 
-    /// TSI-2234: an unlinked `.torrent` is NOT re-persisted on release —
+    /// an unlinked `.torrent` is NOT re-persisted on release —
     /// the torrent was already removed from the DB by `unlink`, so
     /// `release` just destroys the buffered inode.
     #[test]
@@ -4667,9 +4586,9 @@ mod tests {
         assert!(!svc.inode_mgr.inodes.contains_key(&ino));
     }
 
-    /// TSI-2967: a fast `cp` immediately followed by `rm` must not leave an
+    /// a fast `cp` immediately followed by `rm` must not leave an
     /// orphaned DB row. `unlink` waits (bounded) for the detached
-    /// `add_torrent` (spawned by `release`, TSI-2247) to settle before calling
+    /// `add_torrent` (spawned by `release`) to settle before calling
     /// `remove_torrent`, so the row the add just landed is found and deleted
     /// instead of surviving as a ghost `data/` entry with no metadata/.
     #[test]
@@ -4686,7 +4605,7 @@ mod tests {
 
         // Simulate the detached `add_torrent` thread: after a short delay it
         // lands the DB row, then clears the pending key (signalling unlink to
-        // proceed). Without the TSI-2967 wait, unlink would observe no row
+        // proceed). Without the pending-add wait, unlink would observe no row
         // yet, return `Ok(None)`, and this row would be orphaned.
         let db = svc.db.as_ref().unwrap().clone();
         let processing = svc.processing_torrents.clone();
@@ -4722,7 +4641,7 @@ mod tests {
         );
     }
 
-    /// TSI-2967: if the pending add never settles (stuck), `unlink` must fail
+    /// if the pending add never settles (stuck), `unlink` must fail
     /// cleanly (leaving the inode visible) instead of returning `Ok(None)` and
     /// letting the eventual add land an orphaned row. Exercises the
     /// injected-deadline path without hard-waiting the 5s production timeout.
@@ -4759,7 +4678,7 @@ mod tests {
         assert!(svc.inode_mgr.inodes.contains_key(&ino));
     }
 
-    /// TSI-2234 (review blocking #1): a directory whose only remaining
+    /// a directory whose only remaining
     /// child is an unlinked-but-still-open file must be removable — POSIX
     /// treats "only unlinked-but-open files" as empty. Before the fix,
     /// `rmdir` saw the lingering unlinked `File` inode as a child and
@@ -4781,7 +4700,7 @@ mod tests {
         assert!(!svc.inode_mgr.inodes.contains_key(&dir));
     }
 
-    /// TSI-2274 (review issue 2): the L1 range cache is bounded by
+    /// the L1 range cache is bounded by
     /// `MAX_L1_ENTRIES`.  When full, inserting a new entry clears the
     /// cache so memory does not grow unboundedly.
     #[test]
@@ -4812,7 +4731,7 @@ mod tests {
         assert!(cache.contains_key("hash:file:999:4096"));
     }
 
-    /// TSI-2274 (review issue 1): L1 cache keys include `size` so a
+    /// L1 cache keys include `size` so a
     /// read with a different size at the same offset does not collide.
     #[test]
     fn l1_cache_key_includes_size() {
@@ -4830,7 +4749,7 @@ mod tests {
 
     #[test]
     fn test_non_ascii_filenames_db_round_trip() {
-        // TSI-2278: Verify that multi-file torrents with non-ASCII (UTF-8)
+        // Verify that multi-file torrents with non-ASCII (UTF-8)
         // file names can be inserted, retrieved, and looked up by name
         // through the DB — the same path FUSE lookup/readdir uses.
         let name = "测试种子".as_bytes();
@@ -4892,16 +4811,12 @@ mod tests {
         let found = dir_files.iter().find(|f| f.name == "你好.txt");
         assert!(found.is_some(), "lookup should find 你好.txt");
 
-        // TSI-2278: The read path maps file_id → file_index via
-        // `files.iter().position(|f| f.id == file_id)` where `files`
-        // comes from `get_files_by_torrent_id` (ordered by `id`).  This
-        // must match the libtorrent file index order (the order
-        // `info.files()` returns).  If the orderings diverge, the read
-        // path would use the wrong file_index → wrong piece range → EIO.
-        //
-        // Both the DB insertion (`insert_torrent_with_files`) and
-        // `info.files()` iterate the torrent's file list in the same
-        // order, so the DB `id` order must match the libtorrent index.
+        // The read path maps file_id → file_index via `files.iter().position`,
+        // where `files` comes from `get_files_by_torrent_id` (ordered by `id`).
+        // This must match libtorrent's `info.files()` order — a divergence
+        // would use the wrong file_index → wrong piece range → EIO. Both DB
+        // insertion (`insert_torrent_with_files`) and `info.files()` iterate
+        // the file list in the same order.
         let all_files = db
             .get_files_by_torrent_id(torrent_id)
             .expect("get all files");
@@ -4929,7 +4844,7 @@ mod tests {
 
     #[test]
     fn test_non_utf8_filenames_db_round_trip() {
-        // TSI-2278: Non-UTF-8 (e.g. GBK) file names are sanitized by
+        // Non-UTF-8 (e.g. GBK) file names are sanitized by
         // libtorrent to '_' before reaching Rust.  The sanitized names
         // are valid UTF-8 and can be stored/retrieved from the DB.
         let name: &[u8] = b"\xb2\xe2\xca\xd4"; // 测试 in GBK
@@ -4986,7 +4901,7 @@ mod tests {
         assert_eq!(all_files.len(), 2);
     }
 
-    /// TSI-2293: `guard_empty_read` must reject empty data for a non-zero
+    /// `guard_empty_read` must reject empty data for a non-zero
     /// `size` with `FsError::NoPeers` (→ ENODATA), preventing the silent
     /// 0-byte EOF that `read_data`'s sync path would otherwise produce.
     #[test]
@@ -4995,7 +4910,7 @@ mod tests {
         let err = guard_empty_read(&[], 4096).unwrap_err();
         assert!(matches!(err, FsError::NoPeers(_)));
     }
-    /// TSI-3017: when `pieces_on_disk` reports the range as on-disk but
+    /// when `pieces_on_disk` reports the range as on-disk but
     /// `read_file_range` returns empty, `read_data` must defer to the download
     /// engine (`Pending`) rather than fail immediately with ENODATA.  Reading
     /// at `offset == file_size` makes `pieces_on_disk` short-circuit to `true`
@@ -5078,7 +4993,7 @@ mod tests {
         );
     }
 
-    /// TSI-2293: `guard_empty_read` must pass through non-empty data and
+    /// `guard_empty_read` must pass through non-empty data and
     /// zero-size reads without error.
     #[test]
     fn sync_empty_data_guard_passes_nonempty_and_zero_size() {
@@ -5088,7 +5003,7 @@ mod tests {
         assert!(guard_empty_read(&[], 0).is_ok());
     }
 
-    /// TSI-2454: `split_data_dir_parent` maps a top-level source-path to
+    /// `split_data_dir_parent` maps a top-level source-path to
     /// `DATA_INO` and a nested path to its parent's `SourcePathDir` inode.
     #[test]
     fn split_data_dir_parent_maps_correctly() {
@@ -5108,7 +5023,7 @@ mod tests {
         assert_eq!(name, "c");
     }
 
-    /// TSI-2454: `inval_data_entry` is a no-op when no `Notifier` is wired
+    /// `inval_data_entry` is a no-op when no `Notifier` is wired
     /// (the test/constructor path — `OnceLock` is empty).  The call must
     /// not panic.
     #[test]

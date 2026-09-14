@@ -1,12 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// Torrentfs-level concurrency limits (TSI-2144).
-///
-/// These bound the number of OS threads used by the FUSE download worker pool
-/// and the capacity of its submission queue. Unlike the libtorrent settings
-/// sections (which implement `WriteJson`), this section is deliberately absent
-/// from `to_settings_json()` — it is a torrentfs-level knob, not a libtorrent
-/// `settings_pack` key.
+/// Torrentfs-level concurrency limits — the number of OS threads in the FUSE
+/// download worker pool and its submission-queue capacity. Unlike the
+/// libtorrent settings sections (which implement `WriteJson`), this section is
+/// absent from `to_settings_json()`: it is a torrentfs-level knob, not a
+/// libtorrent `settings_pack` key.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyConfig {

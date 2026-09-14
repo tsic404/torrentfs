@@ -1,4 +1,4 @@
-//! Tests for the --config parameter (TSI-1949, scenario 10).
+//! Tests for the --config parameter.
 //!
 //! Validates the full config loading pipeline:
 //! 1. TOML parsing succeeds with all sections
@@ -156,7 +156,7 @@ port = 1080
 "#;
     let cfg = load_config_from_str(toml).expect("Failed to load proxy config");
     let json = cfg.to_settings_json();
-    // TSI-2538: the TOML keys `host`/`port` must reach libtorrent under its
+    // the TOML keys `host`/`port` must reach libtorrent under its
     // real settings_pack names — emitting `host`/`port` was silently dropped.
     assert!(
         json.contains("\"proxy_hostname\":\"127.0.0.1\""),
@@ -180,7 +180,7 @@ port = 1080
     );
 }
 
-// TSI-2510: `proxy_type` (canonical `type` / alias `proxy_type`) must be
+// `proxy_type` (canonical `type` / alias `proxy_type`) must be
 // validated once present — including the empty string, which used to be
 // silently dropped and fall back to libtorrent's default.
 #[test]
@@ -347,7 +347,7 @@ fn test_load_config_nonexistent_file_returns_error() {
     assert!(result.is_err(), "Nonexistent file should return error");
 }
 
-/// TSI-2394: the CLI must expose `--config-check` so the container entrypoint
+/// the CLI must expose `--config-check` so the container entrypoint
 /// can fail fast on an invalid --config instead of reaching the FUSE mount
 /// stage. Exit code contract: 0 = valid, non-zero = invalid/missing.
 #[test]
@@ -397,7 +397,7 @@ fn test_config_check_flag_requires_config_option() {
     );
 }
 
-/// TSI-2490: `--config-check` must reject unknown keys and sections instead
+/// `--config-check` must reject unknown keys and sections instead
 /// of silently ignoring them (rc=0 with "config is valid").
 #[test]
 fn test_config_check_flag_rejects_unknown_section() {
@@ -450,7 +450,7 @@ fn test_config_check_flag_rejects_invalid_value_type() {
     );
 }
 
-/// TSI-2494: `--config-check` must reject integer config fields whose value is
+/// `--config-check` must reject integer config fields whose value is
 /// unambiguously invalid (negative counts, negative rate limits, values that
 /// would truncate at the i32 FFI boundary), while preserving legal sentinel
 /// values such as `rate_limit = 0` ("unlimited").
@@ -493,7 +493,7 @@ fn assert_accepted(out: &std::process::Output, case: &str) {
     );
 }
 
-/// TSI-2496: enum fields must reject out-of-domain integers (e.g.
+/// enum fields must reject out-of-domain integers (e.g.
 /// `choking_algorithm = 999`) via `--config-check` instead of silently
 /// forwarding them to libtorrent. Exit code 1, and the error must name the
 /// offending field plus its legal value domain.
@@ -834,7 +834,7 @@ fn test_config_to_settings_json_default_is_empty() {
     assert_eq!(json, "{}");
 }
 
-/// Regression test for TSI-2297: the config `cache.cache_size` value is
+/// Regression test: the config `cache.cache_size` value is
 /// plumbed through to the CacheManager (previously hardcoded 1 GiB).
 #[test]
 fn test_engine_passes_cache_size_to_cache_manager() {

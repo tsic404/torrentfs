@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
-# Unit tests for ci/deploy_rootful.sh (TSI-2759).
-#
-# Tests the pure logic of the rootful deployment helper — argument parsing,
-# engine probing, and the --dry-run command sequence — without requiring root,
+# Unit tests for ci/deploy_rootful.sh — the pure logic of the rootful helper
+# (argument parsing, engine probing, --dry-run command sequence), without root,
 # /dev/fuse, or a running container engine.
-#
-# The script has `set -euo pipefail` and executes main at the bottom, so we
-# cannot simply `source` it. Instead we extract everything before the
-# "# ── main" marker into a temp file and source that prefix, mirroring
-# entrypoint_test.sh.
-#
-# Usage: ./ci/tests/deploy_rootful_test.sh
-# Exit code: 0 = all pass, 1 = any failure.
+# The script runs main at the bottom, so we cannot `source` it; extract
+# everything before the "# ── main" marker into a temp file and source that
+# prefix (mirrors entrypoint_test.sh).
+# Usage: ./ci/tests/deploy_rootful_test.sh   Exit: 0 = pass, 1 = fail.
 
 set -euo pipefail
 

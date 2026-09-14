@@ -335,7 +335,7 @@ fn wait_for_shutdown(
     if let Some(ds) = &download_service {
         ds.shutdown();
     }
-    // TSI-2263: flush the cache metadata to disk (with fsync) before
+    // flush the cache metadata to disk (with fsync) before
     // unmounting.  The download engine has already stopped, so no new
     // pieces are being registered.  Without this explicit flush, a
     // container restart can leave cache_metadata.txt stale, causing
@@ -556,7 +556,7 @@ fn main() {
 
     match fuser::spawn_mount2(fs, &mountpoint, &options) {
         Ok(bg) => {
-            // TSI-2454: wire the kernel cache invalidation channel so
+            // wire the kernel cache invalidation channel so
             // `unlink`/`rmdir`/`rename` can immediately purge stale
             // `data/` dentries instead of waiting for the 1s TTL.
             notifier.set(Some(bg.notifier())).ok();

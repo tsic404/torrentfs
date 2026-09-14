@@ -1,4 +1,4 @@
-//! Integration tests for settings readback API (TSI-2013).
+//! Integration tests for settings readback API.
 //!
 //! Custom-storage tests validate that settings are correctly applied
 //! when creating a session with PieceStorageDiskIO from the start
@@ -74,7 +74,7 @@ fn proxy_type_maps_to_libtorrent_proxy_type() {
     assert!(session.get_int_setting("nonexistent_key").is_err());
 }
 
-/// TSI-2566: `proxy_type` must round-trip through the production
+/// `proxy_type` must round-trip through the production
 /// `new_with_custom_storage` path, not just `Session::new`. Both bake the
 /// config JSON through the C wrapper's `build_settings_pack`, so the
 /// readback must be asserted on the custom-storage path that the daemon
@@ -109,7 +109,7 @@ fn proxy_host_port_reach_libtorrent() {
 
 #[test]
 fn peer_fingerprint_still_reaches_libtorrent() {
-    // TSI-2538 regression: restoring the proxy_hostname branch must not
+    // restoring the proxy_hostname branch must not
     // clobber the existing peer_fingerprint mapping (wrapper apply_str_setting).
     let mut config = TorrentfsConfig::default_config();
     config.user_agent.peer_fingerprint = Some("TS".to_string());
@@ -124,7 +124,7 @@ fn peer_fingerprint_still_reaches_libtorrent() {
 
 #[test]
 fn handshake_client_version_reaches_libtorrent() {
-    // TSI-2954: the peer wire-protocol handshake client version string must
+    // the peer wire-protocol handshake client version string must
     // reach the live session, not be silently dropped as an unknown string key.
     let mut config = TorrentfsConfig::default_config();
     config.user_agent.handshake_client_version = Some("4.6.5".to_string());
@@ -145,14 +145,14 @@ fn settings_work_with_custom_storage_session() {
         let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
         assert_setting(&session, "allow_multiple_connections_per_ip", true);
         assert_setting(&session, "enable_dht", false);
-        // TSI-2467: close_redundant_connections must be false in custom
+        // close_redundant_connections must be false in custom
         // storage sessions to prevent seed peer disconnection when
         // torrent_finished fires prematurely during selective downloading.
         assert_setting(&session, "close_redundant_connections", false);
     });
 }
 
-/// Regression test for TSI-2042: verify that an unwritable cache directory
+/// Regression test: verify that an unwritable cache directory
 /// causes session creation to fail gracefully instead of SIGSEGV.
 ///
 /// Uses a file-as-directory-blocker: create a regular file at a path
@@ -181,7 +181,7 @@ fn custom_storage_readonly_dir_rejected() {
     });
 }
 
-/// TSI-2467: When the user explicitly sets close_redundant_connections=true
+/// When the user explicitly sets close_redundant_connections=true
 /// in config, the custom storage session must respect it instead of
 /// forcing false. The default (unset) injects false to prevent seed
 /// peer disconnection during premature torrent_finished.
@@ -196,7 +196,7 @@ fn close_redundant_connections_user_override_respected() {
     });
 }
 
-/// TSI-2529: a configured `proxy_type` string must survive the C wrapper's
+/// a configured `proxy_type` string must survive the C wrapper's
 /// `apply_str_setting` mapping and land in the live session as the matching
 /// `proxy_type_t` value — not be silently dropped as an unknown string key.
 #[test]
@@ -225,7 +225,7 @@ fn proxy_type_applies_to_session() {
     }
 }
 
-/// TSI-2798: `listen_interfaces` / `outgoing_interfaces` are wired to the
+/// `listen_interfaces` / `outgoing_interfaces` are wired to the
 /// settings_pack (connections.rs → JSON → wrapper `apply_str_setting`) but
 /// previously had no readback path, so the wiring could never be verified.
 /// Read them back from the live session to prove both settings reach libtorrent.
@@ -249,7 +249,7 @@ fn listen_and_outgoing_interfaces_reach_libtorrent() {
     );
 }
 
-/// TSI-2798: same readback assertion on the production path — the daemon
+/// same readback assertion on the production path — the daemon
 /// creates sessions via `new_with_custom_storage`, which bakes settings into
 /// `session_params` on the C++ side rather than applying them post-hoc.
 #[test]

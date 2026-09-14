@@ -104,7 +104,7 @@ impl Database {
     }
 
     /// Insert a torrent, its files, AND its raw `.torrent` bytes in one
-    /// transaction (TSI-3114).  Writing `torrent_data` here — instead of a
+    /// transaction.  Writing `torrent_data` here — instead of a
     /// separate `set_torrent_data` follow-up outside the insert transaction —
     /// makes the row complete on commit: a disk-full between the two used to
     /// leave a row with `torrent_data = NULL` that a same-content re-copy
@@ -250,14 +250,11 @@ impl Database {
         Ok(InsertTorrentResult::Inserted(torrent_id))
     }
 
-    /// Replace the content of an existing torrent row in place (TSI-2381).
-    ///
-    /// Used when a `.torrent` file is overwritten with different content
-    /// under the same `(source_path, filename)`: the row keeps its id and
-    /// location, but its name, info_hash, size, file list, and raw bytes are
-    /// re-pointed at the new torrent. Atomic: the row and its files are
-    /// updated inside one transaction so a crash cannot leave a torrent
-    /// without matching file entries.
+    /// Replace the content of an existing torrent row in place. Used when a
+    /// `.torrent` is overwritten under the same `(source_path, filename)`: the
+    /// row keeps its id/location but its name, info_hash, size, file list, and
+    /// raw bytes point at the new torrent. Atomic — row + files update in one
+    /// transaction so a crash can't leave a torrent without matching files.
     #[allow(clippy::too_many_arguments)]
     pub fn replace_torrent_content(
         &mut self,

@@ -41,19 +41,14 @@ pub const STATS_INO_OFFSET: u64 = 10_000_000;
 /// do NOT bound the row ids actually handed to the derive functions.
 const MAX_DATA_ROWS: u64 = 1_000_000;
 
-// ── Compile-time invariants (TSI-2580 / TSI-2591) ──
-// Every data inode range must end below `STATS_INO_OFFSET`; otherwise a
-// real data inode would fall inside `is_stats_ino`'s
-// `[STATS_INO_OFFSET, STATS_INO_OFFSET + 10_000_000)` window and — because
-// the stats guard runs before the data/ guard in `FsService::setattr` — be
-// silently classified as a stats inode (EPERM instead of EROFS). These
-// assertions turn any future base that crosses the boundary into a compile
-// error.
-//
-// Hash-derived ranges (`SOURCE_PATH_DIR` / `PENDING_TORRENT*`) are capped
-// by `% 1_000_000` to `base + 999_999`, so their `+ 1_000_000` slot is
-// exact. ID-derived ranges use `MAX_DATA_ROWS` instead of the nominal
-// slot width, since `base + id` has no intrinsic upper bound.
+// ── Compile-time invariants ──
+// Every data inode range must end below `STATS_INO_OFFSET`; otherwise a real
+// data inode would fall inside `is_stats_ino`'s window and — since the stats
+// guard runs before the data/ guard in `setattr` — be misclassified as a stats
+// inode (EPERM instead of EROFS). These assertions turn a future boundary
+// crossing into a compile error. Hash-derived ranges are capped by
+// `% 1_000_000` (exact `+ 1_000_000` slot); ID-derived ranges use
+// `MAX_DATA_ROWS` since `base + id` has no intrinsic bound.
 const _: () = assert!(DATA_TORRENT_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
 const _: () = assert!(DATA_DIR_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
 const _: () = assert!(DATA_FILE_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
@@ -77,7 +72,7 @@ pub enum InodeData {
         parent: u64,
         name: String,
         data: Vec<u8>,
-        /// TSI-2234: `true` once `unlink` removed the directory entry.
+        /// `true` once `unlink` removed the directory entry.
         /// The inode + buffered data stay alive (readable/writable via
         /// still-open handles) until the last handle is `release`d, then
         /// the inode is destroyed. `find_child_by_name` / `readdir` skip
@@ -103,12 +98,12 @@ pub enum DataInode {
         torrent_id: i64,
         dir_id: i64,
         name: String,
-        /// TSI-2448: full path of this directory relative to the torrent
+        /// full path of this directory relative to the torrent
         /// root (e.g. `subdir/deeper`).  Empty for DB-backed dirs (which
         /// resolve via `dir_id`); set for pending torrent dirs so the
         /// bencode file list can be filtered by path.
         dir_path: String,
-        /// TSI-2448: the owning torrent's `(source_path, filename)`.
+        /// the owning torrent's `(source_path, filename)`.
         /// For DB-backed dirs these are empty (resolved via
         /// `torrent_id` → DB).  For pending torrent dirs (`torrent_id ==
         /// 0`), they identify the `.torrent` metadata inode so the
@@ -121,7 +116,7 @@ pub enum DataInode {
         file_id: i64,
         name: String,
         size: i64,
-        /// TSI-2448 (review): the owning torrent's `(source_path,
+        /// the owning torrent's `(source_path,
         /// filename)`.  For DB-backed files these are empty (resolved
         /// via `torrent_id` → DB).  For pending torrent files
         /// (`torrent_id == 0`), they identify the `.torrent` metadata
@@ -223,7 +218,7 @@ impl InodeManager {
         SOURCE_PATH_DIR_INO_BASE + (hasher.finish() % 1_000_000)
     }
 
-    /// TSI-2443: deterministic inode for a pending torrent (background
+    /// deterministic inode for a pending torrent (background
     /// add_torrent in-flight, no DB row yet).  Hashes `(source_path,
     /// filename)` into the `PENDING_TORRENT_INO_BASE` range so each
     /// pending torrent gets a unique inode — two simultaneous cp's of
@@ -235,7 +230,7 @@ impl InodeManager {
         PENDING_TORRENT_INO_BASE + (hasher.finish() % 1_000_000)
     }
 
-    /// TSI-2448: deterministic inode for a directory *inside* a pending
+    /// deterministic inode for a directory *inside* a pending
     /// torrent (e.g. `data/seed.torrent/subdir/`).  Hashes
     /// `(source_path, filename, dir_path)` into the
     /// `PENDING_TORRENT_DIR_INO_BASE` range so each pending directory
@@ -248,7 +243,7 @@ impl InodeManager {
         PENDING_TORRENT_DIR_INO_BASE + (hasher.finish() % 1_000_000)
     }
 
-    /// TSI-2448: deterministic inode for a file *inside* a pending
+    /// deterministic inode for a file *inside* a pending
     /// torrent (e.g. `data/seed.torrent/subdir/file.txt`).  Hashes
     /// `(source_path, filename, file_path)` into the
     /// `PENDING_TORRENT_FILE_INO_BASE` range so each pending file gets a
@@ -275,7 +270,7 @@ impl InodeManager {
     /// data inodes (torrent roots, directories, files, source-path dirs).
     /// Mutating operations on these inodes must return `EROFS` ("read-only
     /// file system"), not `ENOENT` or `EACCES` — the inode exists, it is
-    /// just not writable (TSI-2228).
+    /// just not writable.
     pub fn is_data_namespace(ino: u64) -> bool {
         ino == DATA_INO || Self::is_data_ino(ino)
     }
@@ -498,7 +493,7 @@ impl InodeManager {
         }
     }
 
-    // ── Open-handle / unlink lifecycle helpers (TSI-2234) ──
+    // ── Open-handle / unlink lifecycle helpers ──
 
     /// Count how many open file handles currently reference `ino`.
     /// `open_files` maps `fh -> ino`; this is the live reference count
@@ -519,7 +514,7 @@ impl InodeManager {
         )
     }
 
-    /// Retire a `File` inode's directory entry (TSI-2234).
+    /// Retire a `File` inode's directory entry.
     ///
     /// If no open handle references the inode, the inode is destroyed
     /// immediately. Otherwise it is marked `unlinked`: it stays alive
@@ -601,7 +596,7 @@ mod tests {
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET - 1));
     }
 
-    // ── ID-derived inode row-id bound (TSI-2591) ──
+    // ── ID-derived inode row-id bound ──
 
     #[test]
     fn test_is_valid_row_id_boundaries() {

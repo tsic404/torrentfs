@@ -749,7 +749,7 @@ fn test_insert_torrent_with_files_atomic() {
     assert_eq!(root_dirs.len(), 2);
 }
 
-/// TSI-3114: `insert_torrent_with_files_and_data` writes `torrent_data` in the
+/// `insert_torrent_with_files_and_data` writes `torrent_data` in the
 /// SAME transaction as the row + file tree, so a failure cannot leave a
 /// `torrent_data = NULL` row behind (the old `set_torrent_data` follow-up ran
 /// outside the insert transaction and could be split by a disk-full).

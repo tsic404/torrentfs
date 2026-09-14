@@ -1,7 +1,7 @@
 //! End-to-end test: validate file read via DownloadEngine::read_file_range
 //! using a local tracker + seeder (TestHarness).
 //!
-//! This test addresses TSI-1947 (Gap1): scenario 4 file reading fails when
+//! This test addresses scenario 4: file reading fails when
 //! no real peers are available. By using a self-hosted tracker + seeder,
 //! we validate the full lazy-loading flow without external infrastructure.
 
@@ -37,7 +37,7 @@ fn test_read_file_range_with_local_seeder() {
     // ── Create DownloadEngine pointing at the tracker ──────────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // TSI-2383: force the downloader onto a distinct listen port so the
+    // force the downloader onto a distinct listen port so the
     // MiniTracker can distinguish it from the seeder (which defaults to
     // 6881 via Session::new with NULL listen_interfaces).  When both
     // sessions collide on the same port the tracker deduplicates by
@@ -100,7 +100,7 @@ fn test_read_file_range_with_local_seeder() {
     }
 }
 
-/// Regression test (TSI-2151 P0): a lightweight handle created at torrent-add
+/// Regression test: a lightweight handle created at torrent-add
 /// time (upload_mode, no pieces downloaded) must switch to download mode and
 /// fetch data from a tracker-only peer when a read arrives later — not stay
 /// stuck in a "Finished" state with no peer connections.
@@ -113,7 +113,7 @@ fn test_read_file_range_after_idle_handle() {
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // TSI-2068: force the downloader onto a distinct listen port so the
+    // force the downloader onto a distinct listen port so the
     // MiniTracker can distinguish it from the seeder (which defaults to
     // 6881 via Session::new with NULL listen_interfaces).  When both
     // sessions collide on the same port the tracker deduplicates by
@@ -166,7 +166,7 @@ fn test_read_file_range_after_idle_handle() {
     }
 }
 
-/// Regression test (TSI-2622): an idle handle (upload_mode, no read yet) must
+/// Regression test: an idle handle (upload_mode, no read yet) must
 /// establish a peer/seed connection on its own once the tracker returns the
 /// seeder.  Before the fix the libtorrent session never connected while the
 /// handle stayed idle, so `.stats` persistently showed `Peers: 0 Seeds: 0`
@@ -181,7 +181,7 @@ fn test_idle_handle_connects_to_seeder_without_read() {
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // TSI-2068: distinct downloader listen port so the MiniTracker can tell
+    // distinct downloader listen port so the MiniTracker can tell
     // it apart from the seeder (which binds 6881).
     config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
 
@@ -241,7 +241,7 @@ fn test_read_file_range_boundaries() {
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // TSI-2068: force the downloader onto a distinct listen port so the
+    // force the downloader onto a distinct listen port so the
     // MiniTracker can distinguish it from the seeder (which defaults to
     // 6881 via Session::new with NULL listen_interfaces).  When both
     // sessions collide on the same port the tracker deduplicates by
@@ -344,7 +344,7 @@ fn test_read_file_range_no_peers_error() {
     }
 }
 
-/// TSI-2358 contract: with no peers at all, a read must NOT return early
+/// with no peers at all, a read must NOT return early
 /// (the old ≤9s fast-fail) — it must block for the full
 /// `read_timeout_secs` and only then return `NoPeers`.
 ///
@@ -407,7 +407,7 @@ fn test_no_peers_read_blocks_full_timeout_then_errors() {
     );
 }
 
-/// TSI-2358 contract: if a peer appears mid-read (while the engine is
+/// if a peer appears mid-read (while the engine is
 /// still inside peer-wait/piece-wait), the read must return the correct
 /// data instead of erroring out.
 ///
@@ -438,21 +438,17 @@ fn test_peer_appearing_mid_read_returns_data() {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
-    // TSI-2383: force the downloader onto a distinct listen port so the
+    // force the downloader onto a distinct listen port so the
     // MiniTracker can distinguish it from the seeder (which defaults to
     // 6881 via Session::new with NULL listen_interfaces).  When both
     // sessions collide on the same port the tracker deduplicates by
     // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
     config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
-    // TSI-2945: the seeder is introduced 6s after the read starts, and its
-    // libtorrent session startup + tracker announce + peer connect must all
-    // complete before the read's piece-wait window (`read_timeout_secs`)
-    // expires.  On slow CI (arm64/amd64) 30s occasionally elapsed before the
-    // seeder could serve the piece, firing NoPeers and failing the merge gate.
-    // Bump to 120s so the seeder has ample budget; the peer-wait cap
-    // (PEER_WAIT_CAP_SECS = 9) is unchanged, so the TSI-2358 regression
-    // (fail-fast at <=9s) is still exercised.  The happy path is unaffected:
-    // the read returns as soon as the piece arrives, long before the deadline.
+    // The seeder is introduced 6s after the read starts; its session startup +
+    // announce + peer connect must finish before the piece-wait window. On slow
+    // CI 30s occasionally elapsed first (NoPeers, failing the gate), so bump to
+    // 120s. The peer-wait cap (9s) is unchanged, so the fail-fast regression is
+    // still exercised; the happy path returns as soon as the piece arrives.
     config.timeouts.read_timeout_secs = Some(120);
 
     let engine = Arc::new(
@@ -474,23 +470,13 @@ fn test_peer_appearing_mid_read_returns_data() {
         engine_reader.read_file_range(info_reader, 0, 0, 50)
     });
 
-    // TSI-2468: poll the shared snapshot from a separate thread while the
-    // engine is blocked in peer-wait. The snapshot must be refreshed by
-    // `publish_snapshot` during peer-wait so that `.stats` shows the live
-    // download state — not stale zeros from before upload_mode was cleared.
-    //
-    // We assert that `try_torrent_status` returns `Some` with state
-    // `Downloading`. Before the fix, `publish_snapshot` was not called
-    // during peer-wait, so the snapshot stayed stale from the pre-download
-    // `publish_snapshot` at reader_added — which would show `Allocating`
-    // or `CheckingFiles`, never `Downloading`.
-    //
-    // Note: `num_peers`/`num_seeds` from `status()` are not asserted here
-    // because libtorrent's per-torrent peer list is not refreshed
-    // synchronously by `status()` — the internal session tick updates it
-    // asynchronously, and a single-piece torrent's peer connection is too
-    // brief to catch. The state transition to `Downloading` is the reliable
-    // signal that the snapshot is fresh.
+    // Poll the shared snapshot while the engine blocks in peer-wait: it must be
+    // refreshed by `publish_snapshot` so `.stats` shows the live `Downloading`
+    // state, not stale zeros. Before the fix `publish_snapshot` wasn't called
+    // during peer-wait (the snapshot stayed `Allocating`/`CheckingFiles`).
+    // `num_peers`/`num_seeds` aren't asserted — libtorrent refreshes them
+    // asynchronously and a single-piece peer connection is too brief to catch;
+    // the `Downloading` transition is the reliable freshness signal.
     let engine_poller = Arc::clone(&engine);
     let info_hash_poll = info_hash.clone();
     let snapshot_fresh = thread::spawn(move || {
@@ -571,7 +557,7 @@ fn test_peer_appearing_mid_read_returns_data() {
         })
     };
 
-    // TSI-2468: assert the snapshot was refreshed during peer-wait.
+    // assert the snapshot was refreshed during peer-wait.
     // The poller thread (started above, before the seeder) polls
     // `try_torrent_status` and returns true once the state transitions
     // to Downloading — proving `publish_snapshot` ran after upload_mode
@@ -617,7 +603,7 @@ fn distinct_torrent(name: &str) -> Vec<u8> {
     t
 }
 
-/// Regression test (TSI-2226 P0): creating a lightweight handle through the
+/// Regression test: creating a lightweight handle through the
 /// fire-and-forget `ensure_handle_async` path must not block the caller while
 /// the engine thread is busy downloading.  The FUSE release path calls this
 /// when a `.torrent` is written to metadata/; a blocking round-trip would
@@ -676,17 +662,12 @@ fn test_ensure_handle_async_does_not_block_on_busy_engine() {
     engine.shutdown();
 }
 
-/// Regression test (TSI-2238): `shutdown()` must abort an in-flight
-/// `read_file_range` that is blocked in a wait loop (state-transition,
-/// peer-discovery, or piece-wait) instead of stalling until
-/// `read_timeout_secs` elapses.  Before the fix, the state-transition and
-/// peer-wait loops never checked `self.stopping`, so `shutdown()`'s
-/// `handle.join()` blocked for up to `read_timeout_secs` (default 30s).
-///
-/// Here the torrent has no tracker and no peers, so the read blocks in the
-/// peer-discovery wait loop.  A read timeout of 30s makes the contrast
-/// sharp: with the fix `shutdown()` returns in well under a second; without
-/// it the test would hang ~30s on the join.
+/// Regression test: `shutdown()` must abort an in-flight `read_file_range`
+/// blocked in a wait loop (state-transition/peer-discovery/piece-wait) instead
+/// of stalling until `read_timeout_secs`. Before the fix those loops never
+/// checked `self.stopping`, so `handle.join()` blocked up to 30s. Here the
+/// torrent has no tracker/peers (peer-discovery wait); with the fix `shutdown()`
+/// returns in well under a second, without it the join hangs ~30s.
 #[test]
 fn test_shutdown_aborts_blocked_read() {
     let _session_guard = common::acquire_session_lock();
@@ -744,18 +725,12 @@ fn test_shutdown_aborts_blocked_read() {
     read_thread.join().expect("read thread panicked");
 }
 
-/// TSI-2262: Concurrent readers during active download must get consistent
-/// data. The bug was a write-during-read race: Rust's `PieceStore::read_piece`
-/// (engine thread) read a piece file via `std::fs::read` while libtorrent's
-/// `PieceStorage::write_piece` (disk thread) was still writing blocks to it,
-/// with no synchronization between the two. The fix adds a per-info-hash
-/// shared mutex: `write_piece` holds an exclusive lock, `read_piece` holds a
-/// shared lock.
-///
-/// This test spawns 5 threads that each call `read_file_range` on the same
-/// file while the download is in progress. All 5 must return identical data
-/// matching the seed content. Before the fix, reader 1 often got different
-/// (partial) data than readers 2-5.
+/// Concurrent readers during an active download must get consistent data. The
+/// bug was a write-during-read race: `read_piece` (engine thread) read via
+/// `std::fs::read` while `write_piece` (disk thread) was still writing blocks,
+/// unsynchronized. The fix is a per-info-hash shared mutex (write = exclusive,
+/// read = shared). This test spawns 5 readers on the same file; all must return
+/// identical seed data (before the fix, reader 1 saw partial data).
 #[test]
 fn test_concurrent_reads_during_download_are_consistent() {
     let _session_guard = common::acquire_session_lock();
@@ -764,7 +739,7 @@ fn test_concurrent_reads_during_download_are_consistent() {
     let harness = TestHarness::new();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // TSI-2383: force the downloader onto a distinct listen port so the
+    // force the downloader onto a distinct listen port so the
     // MiniTracker can distinguish it from the seeder (which defaults to
     // 6881 via Session::new with NULL listen_interfaces).  When both
     // sessions collide on the same port the tracker deduplicates by
@@ -838,24 +813,14 @@ fn test_concurrent_reads_during_download_are_consistent() {
     );
 }
 
-/// TSI-3041: byte-granular reads (`dd bs=1 count=4096`) from a fully-cached
-/// file must complete fast — a 1-byte read must not pay per-read machinery
-/// costs that scale with the read *count* rather than the read size.
-///
-/// Two per-read costs made this pathological before the fix: (1) the cached
-/// read path ran `reader_added` (priority gradient), `publish_snapshot`
-/// (`post_torrent_updates` + a full piece-status rebuild) and `release_reader`
-/// (`reset_all` = `set_piece_priority` over every non-default piece) on every
-/// read; (2) every cached read marked the piece metadata dirty, and the engine
-/// loop flushed (fsync'd) `cache_metadata.txt` after every command — once per
-/// 1-byte read.  Together a single byte read carried the same overhead as a
-/// full download, making byte-granular reads pathologically slow.
-///
-/// This test uses a 4 × 256 KiB (4-piece) fixture so the O(num_pieces)
-/// per-read overhead is visible, warms the cache with one full read, then reads
-/// `BYTE_READS` bytes one at a time and asserts they complete within a loose
-/// wall-clock bound.  The pre-fix per-read machinery exceeds the bound by
-/// orders of magnitude.
+/// Byte-granular reads (`dd bs=1`) from a fully-cached file must complete
+/// fast: a 1-byte read must not pay machinery that scales with read *count*.
+/// Before the fix, every cached read ran `reader_added`/`publish_snapshot`/
+/// `release_reader` (O(num_pieces)) and marked metadata dirty, and the engine
+/// fsync'd `cache_metadata.txt` after every command — one full-download's
+/// overhead per byte. Uses a 4-piece fixture, warms the cache with one read,
+/// then asserts `BYTE_READS` single-byte reads finish within a loose bound
+/// (pre-fix machinery exceeds it by orders of magnitude).
 #[test]
 fn test_cached_byte_granular_reads() {
     let _session_guard = common::acquire_session_lock();

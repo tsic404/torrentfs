@@ -243,7 +243,7 @@ fn hit_rate(hits: u64, misses: u64) -> f64 {
     }
 }
 
-/// Render the observability counters (TSI-2139). Absent counters (no
+/// Render the observability counters. Absent counters (no
 /// metrics wired, e.g. unit tests) render as zeroes/`—`.
 fn write_observability(output: &mut String, metrics: Option<&MetricsSnapshot>) {
     output.push_str("\n-- Observability --\n");
@@ -333,18 +333,13 @@ fn piece_marker(status: &PieceStatus) -> String {
     }
 }
 
-/// Compute download progress as a fraction `[0.0, 1.0]` from actual cached pieces.
-///
-/// libtorrent's `status.progress` is unreliable under the custom `PieceStorageDiskIO`
-/// backend: it reflects `total_wanted_done / total_wanted` as seen by libtorrent's
-/// piece bitmap, which can report 1.0 (100%) even when pieces have not been
-/// downloaded — because `async_check_files` reports success without feeding the
-/// piece bitmap back to libtorrent, and `async_hash` failures are treated as
-/// "not present" rather than resetting progress.
-///
-/// This helper recomputes progress from the **authoritative** piece availability
-/// (`is_cached` in the piece snapshot), so `.stats` never shows 100% while reads
-/// still time out waiting for pieces (TSI-2223).
+/// Download progress `[0.0, 1.0]` from actual cached pieces. libtorrent's
+/// `status.progress` is unreliable under the custom `PieceStorageDiskIO`
+/// backend — its piece bitmap can report 1.0 even when nothing is downloaded,
+/// because `async_check_files` reports success without feeding the bitmap back
+/// and `async_hash` failures count as "not present". Recompute from the
+/// authoritative `is_cached` snapshot so `.stats` never shows 100% while
+/// reads still time out waiting for pieces.
 fn piece_progress(pieces: &[PieceStatus]) -> f64 {
     if pieces.is_empty() {
         return 0.0;
@@ -353,16 +348,11 @@ fn piece_progress(pieces: &[PieceStatus]) -> f64 {
     cached as f64 / pieces.len() as f64
 }
 
-/// Compute downloaded bytes from actual cached pieces.
-///
-/// libtorrent's `status.total_done` is unreliable under the custom
-/// `PieceStorageDiskIO` backend for the same reason as `progress`
-/// (see [`piece_progress`]): the piece bitmap is never fed back to
-/// libtorrent, so `total_done` stays at 0 even after pieces are cached.
-///
-/// This helper recomputes the downloaded byte count from the
-/// **authoritative** piece availability (`is_cached`), so `.stats` shows
-/// non-zero Downloaded once pieces are cached (TSI-2227).
+/// Downloaded bytes from actual cached pieces. libtorrent's `status.total_done`
+/// is unreliable under the custom `PieceStorageDiskIO` backend for the same
+/// reason as [`piece_progress`]: the piece bitmap is never fed back, so
+/// `total_done` stays 0 after caching. Recompute from the authoritative
+/// `is_cached` snapshot so `.stats` shows non-zero Downloaded once cached.
 fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
     if pieces.is_empty() || piece_length == 0 {
         return 0;
@@ -374,35 +364,30 @@ fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
 /// Whether a torrent is fully downloaded, judged by **actual** piece
 /// availability (`is_cached`). Returns `false` for an empty piece list — no
 /// pieces means the snapshot is absent or the torrent has no content, neither
-/// of which counts as a completed download (TSI-2603).
+/// of which counts as a completed download.
 fn is_download_complete(pieces: &[PieceStatus]) -> bool {
     !pieces.is_empty() && pieces.iter().all(|p| p.is_cached)
 }
 
 /// Whether any piece is cached (`is_cached`) — the torrent has already
 /// pulled down some bytes. Partial progress, distinct from the all-cached
-/// state covered by [`is_download_complete`] (TSI-2650).
+/// state covered by [`is_download_complete`].
 fn has_cached_piece(pieces: &[PieceStatus]) -> bool {
     pieces.iter().any(|p| p.is_cached)
 }
 
 /// Whether any piece is currently wanted by an active reader (`priority > 0`).
-/// An elevated piece means a reader is actively fetching bytes (TSI-2650).
+/// An elevated piece means a reader is actively fetching bytes.
 fn has_active_reader(pieces: &[PieceStatus]) -> bool {
     pieces.iter().any(|p| p.priority > 0)
 }
 
-/// Render the `.stats` Pieces block for a torrent.
-///
-/// The header line (`-- Pieces (N pieces, X each) --`) is kept verbatim for
-/// human readers and existing consumers. The piece-marker line that follows
-/// is prefixed with a `Pieces:` label so machine parsers can locate the data
-/// line without matching the header's `Pieces (` literal (TSI-2681).
-///
-/// `PieceSize` / `PieceCount` key-value lines are appended after the marker
-/// line so metadata consumers can read piece dimensions structurally instead
-/// of regex-parsing the prose header (TSI-2691). The header itself must stay
-/// byte-for-byte unchanged.
+/// Render the `.stats` Pieces block. The header line is kept verbatim for
+/// humans and existing consumers; the piece-marker line is prefixed with a
+/// `Pieces:` label so parsers don't match the header's `Pieces (` literal.
+/// `PieceSize`/`PieceCount` key-value lines follow the marker so metadata can
+/// be read structurally instead of regex-parsing the header (which must stay
+/// byte-for-byte unchanged).
 fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -422,29 +407,13 @@ fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
     out
 }
 
-/// Render the `.stats` health alert line for a single torrent.
-///
-/// The alert fires when the torrent has **no connected peers or seeds**
-/// (`num_peers == 0 && num_seeds == 0`). The counts come from the
-/// libtorrent session — they reflect live peer connections, not tracker
-/// reachability. A tracker can be reachable and have returned seeder
-/// entries, yet show zero connected peers during the window before the
-/// first peer handshake completes (TSI-2442).
-///
-/// The wording therefore describes the **observed connection state** and
-/// avoids the prior text ("tracker may be unreachable") which coupled the
-/// alert to a cause the data cannot establish.
-///
-/// `download_complete` suppresses the alert (TSI-2603): once every piece is
-/// cached the torrent is fully downloaded, so zero peers is the expected end
-/// state — the user no longer needs connections — and a health warning would
-/// misreport a healthy finished torrent as unhealthy.
-///
-/// `active_download` also suppresses the alert (TSI-2650): while a download
-/// is actively fetching bytes — at least one piece already cached, or at
-/// least one piece currently wanted by an active reader — the torrent is
-/// making progress, so the transient zero-peer window before the tracker
-/// announce returns must not be reported as a health degradation.
+/// Render the `.stats` health alert line. The alert fires on zero connected
+/// peers/seeds (`num_peers == 0 && num_seeds == 0`) — counts reflect live
+/// connections, not tracker reachability, so the wording describes observed
+/// state, not an unreachable tracker. `download_complete` suppresses it
+/// (zero peers is the expected end state of a finished torrent);
+/// `active_download` also suppresses it (the transient zero-peer window
+/// before the tracker announce returns is not a degradation).
 fn health_alert(
     num_peers: i32,
     num_seeds: i32,
@@ -565,7 +534,7 @@ pub fn generate_torrent_stats(
     // Override libtorrent's progress with piece-availability-based progress.
     // libtorrent's status.progress is unreliable under the custom storage
     // backend (can report 1.0 before pieces are downloaded). Use the actual
-    // cached piece count instead (TSI-2223).
+    // cached piece count instead.
     let piece_statuses = download_service
         .as_ref()
         .and_then(|ds| ds.try_get_pieces_status(info_hash));
@@ -580,9 +549,8 @@ pub fn generate_torrent_stats(
     };
 
     // Override libtorrent's total_done with piece-availability-based bytes.
-    // Same root cause as progress (TSI-2223): status.total_done stays 0
-    // under the custom storage backend. Recompute from cached pieces
-    // (TSI-2227).
+    // Same root cause as progress: status.total_done stays 0
+    // under the custom storage backend. Recompute from cached pieces.
     let total_done = piece_statuses
         .as_ref()
         .map(|(piece_length, pieces)| piece_downloaded(pieces, *piece_length))
@@ -590,9 +558,9 @@ pub fn generate_torrent_stats(
 
     // A fully cached torrent (all pieces present) is download-complete:
     // zero peers is then the expected end state, so suppress the health
-    // alert (TSI-2603). `piece_statuses` is the authoritative availability
+    // alert. `piece_statuses` is the authoritative availability
     // source — libtorrent's `progress` can report 1.0 prematurely
-    // (TSI-2223), so every piece must actually be cached, not merely
+    // so every piece must actually be cached, not merely
     // reported as such by libtorrent.
     let download_complete = piece_statuses
         .as_ref()
@@ -601,7 +569,7 @@ pub fn generate_torrent_stats(
     // A torrent actively fetching bytes — some piece already cached, or some
     // piece wanted by an active reader — is making progress, so suppress the
     // health alert during the transient zero-peer window before the tracker
-    // announce returns (TSI-2650). An absent piece snapshot yields no signal
+    // announce returns. An absent piece snapshot yields no signal
     // either way: neither flag suppresses the alert.
     let active_download = piece_statuses
         .as_ref()
@@ -647,7 +615,7 @@ pub fn generate_torrent_stats(
 
     // -- Pieces -- visualised piece lifecycle (GitHub commit-record grid).
     // Uses only non-blocking locks so `.stats` never blocks on an active
-    // download (TSI-2119).
+    // download.
     if let Some((piece_length, pieces)) = &piece_statuses {
         if !pieces.is_empty() {
             output.push_str(&piece_block(*piece_length, pieces));
@@ -668,7 +636,7 @@ pub fn generate_torrent_stats(
     output.push_str(&format!("info_hash: {}\n", t.info_hash));
     output.push_str(&format!("source_path: \"{}\"\n", t.source_path));
 
-    // PT isolation info (TSI-2277): show the private flag and whether
+    // PT isolation info: show the private flag and whether
     // tracker merging is isolated. Private torrents (private=1 in the info
     // dict) never participate in cross-site tracker merging.
     let is_private = download_service
@@ -747,9 +715,9 @@ pub fn generate_directory_stats(
         }
 
         // Override libtorrent's total_done with piece-availability-based
-        // bytes. Same root cause as progress (TSI-2223): status.total_done
+        // bytes. Same root cause as progress: status.total_done
         // stays 0 under the custom storage backend. Recompute from cached
-        // pieces (TSI-2227).
+        // pieces.
         if let Some((piece_length, pieces)) = download_service
             .as_ref()
             .and_then(|ds| ds.try_get_pieces_status(&t.info_hash))
@@ -842,7 +810,7 @@ pub fn generate_directory_stats(
             .unwrap_or((0, 0, 0, 0, 0.0, 0));
 
         // Override libtorrent progress with piece-availability-based progress
-        // (TSI-2223): libtorrent's progress can report 1.0 before pieces are
+        // libtorrent's progress can report 1.0 before pieces are
         // actually downloaded under the custom storage backend.
         let actual_progress = download_service
             .as_ref()
@@ -851,7 +819,7 @@ pub fn generate_directory_stats(
             .unwrap_or(progress as f64);
         let prog_pct = if ts > 0 { actual_progress * 100.0 } else { 0.0 };
 
-        // PT isolation indicator (TSI-2277): show a 🔒 marker for private
+        // PT isolation indicator: show a 🔒 marker for private
         // torrents so users can see at a glance which torrents are isolated
         // from cross-site tracker merging.
         let is_private = download_service
@@ -1106,7 +1074,7 @@ mod tests {
 
     #[test]
     fn test_piece_grid_shows_priority_during_active_read() {
-        // TSI-2224: during an active read, pieces with elevated priority
+        // during an active read, pieces with elevated priority
         // (not yet cached) must render as `[N]`, not `[]`.  The bug was that
         // the snapshot never captured elevated priorities, so every piece
         // showed `[]`.  This test locks the `piece_marker` rendering contract
@@ -1143,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_piece_block_has_label_line() {
-        // TSI-2681: the marker line carries a `Pieces:` label independent of
+        // the marker line carries a `Pieces:` label independent of
         // the header's `Pieces (` literal, so parsers can locate the data line.
         let pieces = vec![
             PieceStatus {
@@ -1158,10 +1126,10 @@ mod tests {
             },
         ];
         let block = piece_block(256 * 1024, &pieces);
-        // TSI-2681: header stays byte-for-byte verbatim for existing consumers.
+        // header stays byte-for-byte verbatim for existing consumers.
         assert!(block.contains("-- Pieces (2 pieces, 256.00 KB each) --\n"));
         assert!(block.contains("\n  Pieces: [x][7]\n"));
-        // TSI-2691: structured metadata lines appended after the marker line.
+        // structured metadata lines appended after the marker line.
         assert!(block.contains("\n  PieceSize: 256.00 KB\n"));
         assert!(block.contains("\n  PieceCount: 2\n"));
     }
@@ -1513,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_is_download_complete_empty_is_false() {
-        // TSI-2603: an absent/empty piece snapshot must not count as a
+        // an absent/empty piece snapshot must not count as a
         // completed download — that would suppress the health alert for a
         // torrent whose pieces were never queried.
         assert!(!is_download_complete(&[]));
@@ -1555,7 +1523,7 @@ mod tests {
 
     #[test]
     fn test_health_alert_zero_peers_zero_seeds() {
-        // TSI-2442: the alert fires on zero connected peers/seeds but must
+        // the alert fires on zero connected peers/seeds but must
         // not claim the tracker is unreachable — connected-peer count is not
         // a tracker-reachability signal.
         let line = health_alert(0, 0, false, false).expect("alert should fire at 0/0");
@@ -1599,7 +1567,7 @@ mod tests {
 
     #[test]
     fn test_health_alert_download_complete_suppresses() {
-        // TSI-2603: a fully downloaded torrent legitimately has zero peers;
+        // a fully downloaded torrent legitimately has zero peers;
         // the health alert must not fire when download is complete.
         assert!(
             health_alert(0, 0, true, false).is_none(),
@@ -1609,7 +1577,7 @@ mod tests {
 
     #[test]
     fn test_health_alert_active_download_suppresses() {
-        // TSI-2650: during the transient zero-peer window before the first
+        // during the transient zero-peer window before the first
         // tracker announce returns, a download that is actively fetching
         // bytes must not raise a health alert.
         assert!(

@@ -49,15 +49,12 @@ impl TorrentService {
         }
     }
 
-    /// Parse a `.torrent` and persist it into the database.
-    ///
-    /// Runs on a detached thread from `release` (TSI-2247), so the
-    /// single-threaded FUSE dispatcher is never blocked by the SQLite write.
-    /// A DB write failure (e.g. SQLite `SystemIoFailure` on a full disk) is
-    /// recorded in `FsService::persist_errors` and surfaced as
-    /// `FsError::Database` → `EIO` by the *next* `lookup`/`readdir` of
-    /// `data/` — not by `cp`'s `close()`, whose FUSE_RELEASE reply error the
-    /// kernel drops.  The non-fatal download-handle creation is split out
+    /// Parse a `.torrent` and persist it into the database. Runs on a detached
+    /// thread from `release` so the single-threaded FUSE dispatcher is never
+    /// blocked by the SQLite write. A DB write failure is recorded in
+    /// `FsService::persist_errors` and surfaced as `FsError::Database` → `EIO`
+    /// by the next `lookup`/`readdir` — not by `cp`'s `close()`, whose
+    /// FUSE_RELEASE reply error the kernel drops. Handle creation is split out
     /// into [`Self::register_torrent_handle`].
     pub fn persist_torrent(
         &self,
@@ -128,20 +125,14 @@ impl TorrentService {
                     (true, None)
                 }
                 InsertTorrentResult::Duplicate(existing_id) => {
-                    // TSI-2381: a `cp` over an existing metadata torrent
-                    // releases a NEW info-hash under the SAME
-                    // `(source_path, filename)` key. The Duplicate branch
-                    // used to keep the stale row untouched, so a rename
-                    // right after the overwrite looked up the NEW name,
-                    // found no row, and silently no-op'd — on restart the
-                    // OLD torrent resurfaced and metadata/ + data/ showed
-                    // unexpected duplicates. The file content changed, so
-                    // re-point the existing row at the new torrent: update
-                    // name/info_hash/size/file list and store the new bytes.
-
-                    // Review #3: same-content re-copy must stay a cheap
-                    // no-op — skip the full directory-tree rebuild when the
-                    // incoming info-hash matches the stored one.
+                    // A `cp` over an existing metadata torrent releases a NEW
+                    // info-hash under the SAME `(source_path, filename)` key. The
+                    // Duplicate branch used to keep the stale row untouched, so a
+                    // rename right after the overwrite found no row at the new name
+                    // and no-op'd — on restart the OLD torrent resurfaced. Re-point
+                    // the existing row at the new torrent (name/info_hash/size/file
+                    // list/bytes); same-content re-copy stays a cheap no-op by
+                    // skipping the rebuild when the info-hash matches.
                     let old_info_hash = db_guard
                         .get_torrent_by_id(existing_id)
                         .map_err(|e| {
@@ -202,14 +193,14 @@ impl TorrentService {
     ///
     /// Best-effort and non-fatal: the torrent is already in the DB and a
     /// handle is created lazily on first access, so every failure here is
-    /// logged and swallowed.  Runs off the FUSE dispatch thread (TSI-2247) so
+    /// logged and swallowed.  Runs off the FUSE dispatch thread so
     /// libtorrent FFI never blocks the single-threaded dispatcher.
     pub fn register_torrent_handle(&self, persisted: &PersistedTorrent) {
-        // TSI-2381 (review): the overwrite orphaned the OLD info-hash's
+        // the overwrite orphaned the OLD info-hash's
         // engine handle, scheduler, private_torrents entry, and on-disk
         // `cache/pieces/<old>/` — release them AFTER the DB row is updated
         // (no I/O under the DB lock), mirroring `remove_torrent`.
-        // TSI-2417: same ordering as remove_torrent — handle released before
+        // same ordering as remove_torrent — handle released before
         // pieces purged, so libtorrent never checks a torrent whose files
         // are vanishing underneath it.
         if let Some(old) = &persisted.stale_info_hash {
@@ -242,8 +233,8 @@ impl TorrentService {
             }
         } else {
             // Duplicate info_hash: merge trackers from this torrent into the
-            // existing handle (TSI-2275). The engine checks the private flag
-            // (TSI-2277) and skips the merge for private torrents — PT
+            // existing handle. The engine checks the private flag
+            // and skips the merge for private torrents — PT
             // isolation prevents passkey leakage and peer cross-pollination
             // across private tracker swarms.
             if let Some(ds) = &self.download_service {
@@ -279,7 +270,7 @@ impl TorrentService {
     /// the same info_hash: purge the on-disk pieces cache, release the
     /// DownloadEngine handle (and its scheduler state), and remove the
     /// SeedingManager seed — so a long-running daemon does not accumulate
-    /// handles or keep announcing a deleted torrent (TSI-2232).
+    /// handles or keep announcing a deleted torrent.
     pub fn remove_torrent(
         &self,
         filename: &str,
@@ -333,16 +324,12 @@ impl TorrentService {
             }
         };
         if purge_pieces {
-            // TSI-2417: release the libtorrent handle BEFORE purging the
-            // piece files.  `remove_torrent(handle)` is asynchronous inside
-            // libtorrent — while the old handle is still alive its custom
-            // storage can observe the piece files vanishing mid-check, and a
-            // same-info_hash re-add racing the pending removal inherits the
-            // stale have-piece bitmap (pieces "complete" but files gone).
-            // That state forces the recheck path and, if no peer has
-            // connected yet, surfaces as NoPeers after read_timeout_secs.
-            // Releasing first lets libtorrent tear down the old torrent
-            // against intact files; the subsequent purge is uncontended.
+            // Release the libtorrent handle BEFORE purging piece files:
+            // `remove_torrent` is async, so an old handle can observe files
+            // vanishing mid-check, and a same-info_hash re-add racing the
+            // removal inherits a stale have-piece bitmap (complete but gone),
+            // forcing the recheck path → NoPeers if no peer connected. Releasing
+            // first lets libtorrent tear down against intact files.
             self.release_engine_and_seeding(&info_hash);
             self.purge_pieces_cache(&info_hash);
         }
@@ -415,7 +402,7 @@ impl TorrentService {
     /// Release the DownloadEngine handle and the SeedingManager seed for an
     /// info_hash.  Best-effort: the DB row and pieces cache are already gone,
     /// so a transient engine/seeding failure only leaves a stale handle that a
-    /// restart clears — it never desyncs DB vs. cache (TSI-2232).
+    /// restart clears — it never desyncs DB vs. cache.
     fn release_engine_and_seeding(&self, info_hash: &str) {
         if let Some(ds) = &self.download_service {
             if let Err(e) = ds.remove_handle(info_hash) {
@@ -656,7 +643,7 @@ mod tests {
     }
 
     /// `release_engine_and_seeding` must be called when the last DB reference
-    /// to an info_hash is deleted (TSI-2232).  This test wires a real
+    /// to an info_hash is deleted.  This test wires a real
     /// SeedingManager into the service and asserts that after remove_torrent
     /// the seeding manager no longer tracks the info_hash.
     #[test]
@@ -697,7 +684,7 @@ mod tests {
         assert!(seeding_manager.get_all_seeds().is_empty());
     }
 
-    // ── TSI-2277: PT isolation tests ──────────────────────────────────
+    // ── PT isolation tests ──────────────────────────────────
 
     /// Build a minimal bencoded single-file torrent with a single tracker
     /// URL and optional `private=1` flag in the info dict.
@@ -801,7 +788,7 @@ mod tests {
         );
     }
 
-    /// TSI-2381 (review): overwriting a metadata torrent with DIFFERENT
+    /// overwriting a metadata torrent with DIFFERENT
     /// content must release the OLD info-hash's engine state — the pieces
     /// cache for `cache/pieces/<old>/` must be purged, not leaked. (The
     /// engine handle itself is released via the same

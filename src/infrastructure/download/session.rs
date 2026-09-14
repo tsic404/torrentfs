@@ -246,7 +246,7 @@ impl Session {
     /// Remove a torrent from the session.  The C++ wrapper (`lt_session_remove_torrent`)
     /// deletes the underlying `lt::torrent_handle*`, so we must prevent Rust's
     /// `TorrentHandle::Drop` from calling `lt_torrent_handle_destroy` on the
-    /// same pointer — otherwise double-free (TSI-2232).
+    /// same pointer — otherwise double-free.
     pub fn remove_torrent(&mut self, handle: TorrentHandle, remove_files: bool) {
         unsafe {
             libtorrent_sys::lt_session_remove_torrent(
@@ -263,14 +263,14 @@ impl Session {
         self.inner
     }
 
-    /// TSI-2344: request a fresh session-stats sample. The resulting
+    /// request a fresh session-stats sample. The resulting
     /// `session_stats_alert` is drained by the alert-consumer thread, which
     /// updates the shared stats snapshot. Fire-and-forget and never blocks.
     pub fn post_stats(&self) {
         unsafe { libtorrent_sys::lt_session_post_session_stats(self.inner) };
     }
 
-    /// TSI-2468: fire-and-forget request for libtorrent to refresh per-torrent
+    /// fire-and-forget request for libtorrent to refresh per-torrent
     /// statistics (num_peers, num_seeds, etc.). Without this, `status()` may
     /// return stale peer counts — the internal peer list is only refreshed
     /// when the session processes a tick or `post_torrent_updates`.
@@ -435,7 +435,7 @@ impl TorrentHandle {
     /// may still mark it as complete (stale resume state).  `force_recheck`
     /// puts the torrent back into the checking queue so libtorrent re-reads
     /// the custom storage and discovers the missing piece, clearing its
-    /// `have_piece` bit so the next read triggers a fresh download (TSI-2258).
+    /// `have_piece` bit so the next read triggers a fresh download.
     pub fn force_recheck(&self) -> bool {
         unsafe { libtorrent_sys::lt_torrent_handle_force_recheck(self.inner) == 0 }
     }
@@ -482,7 +482,7 @@ impl TorrentHandle {
         unsafe { libtorrent_sys::lt_torrent_handle_force_reannounce(self.inner) == 0 }
     }
 
-    /// Extract the current tracker list from the handle (TSI-2277).
+    /// Extract the current tracker list from the handle.
     ///
     /// Returns the live tracker list reflecting any prior `replace_trackers`
     /// calls. Used by the tracker merge logic to get the existing handle's

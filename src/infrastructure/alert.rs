@@ -1,18 +1,11 @@
-//! libtorrent alert dispatching for the download engine.
-//!
-//! A dedicated `AlertConsumer` thread drains libtorrent alerts event-driven
-//! (design §4.2): it registers a `set_alert_notify` callback that signals a
-//! condvar whenever the alert queue transitions 0→1, so the consumer blocks
-//! instead of polling a fixed interval.  Alert processing is:
-//! - `session_stats_alert` → updates the shared session-stats snapshot
-//! - `torrent_finished_alert` / `torrent_removed_alert` → logged
-//! - `read_piece_alert` and others → logged (piece data is read from disk)
-//!
-//! Only the consumer thread ever calls `pop_alerts`, so it is the single
-//! owner of the alert queue and the `set_alert_notify` 0→1 semantics hold.
-//! Shutdown ordering (TSI-2244): `stop()` joins the consumer thread *before*
-//! unregistering the notify hook, so `set_alert_notify(None)` never races
-//! with a concurrent `pop_alerts` on the same session.
+//! libtorrent alert dispatching for the download engine. A dedicated
+//! `AlertConsumer` thread drains alerts event-driven (design §4.2) via a
+//! `set_alert_notify` callback that signals a condvar on the 0→1 queue
+//! transition, blocking instead of polling. `session_stats_alert` updates the
+//! shared snapshot; the other alerts are logged. Only the consumer calls
+//! `pop_alerts`, so it is the single owner of the queue. Shutdown: `stop()`
+//! joins the consumer *before* unregistering the notify hook, avoiding a race
+//! with a concurrent `pop_alerts`.
 
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,10 +60,10 @@ impl From<i32> for AlertType {
         match value {
             // Patterns bind to the bindgen-generated constants of
             // `lt_alert_type_t` (libtorrent_wrapper.h), not hand-written
-            // literals. TSI-2145 drifted this mapping to 0-based and every
+            // literals. A prior change drifted this mapping to 0-based and every
             // alert was dispatched one slot early — `session_stats_alert`
             // never reached the `SessionStats` branch, leaving root
-            // `.stats` Total DL/UL at zero (TSI-2344). Deriving from the
+            // `.stats` Total DL/UL at zero. Deriving from the
             // generated constants makes any future header enum change a
             // compile error here instead of silent runtime misdispatch.
             x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_READ_PIECE as i32 => {
@@ -231,18 +224,12 @@ impl AlertConsumer {
         }
     }
 
-    /// Stop the alert consumer and unregister the notify callback.
-    ///
-    /// Must be called while the session is still alive. Ordering is critical
-    /// to eliminate the FFI race with `drain_alerts` (issue TSI-2244):
-    /// 1. Set the stop flag and notify the condvar — wakes the consumer.
-    /// 2. Join the consumer thread — once joined, no `pop_alerts` FFI call is
-    ///    in flight, so `set_alert_notify(None)` cannot race with it.
-    /// 3. Unregister the notify hook — safe because the consumer is gone and
-    ///    the session is still alive.
-    ///
-    /// `Drop` only does steps 1–2 (defensive); it cannot do step 3 because the
-    /// session may already be destroyed by the time `Drop` runs.
+    /// Stop the alert consumer and unregister the notify callback (must run
+    /// while the session is alive). Ordering eliminates the FFI race with
+    /// `drain_alerts`: (1) set the stop flag and notify the condvar, (2) join
+    /// the consumer — no `pop_alerts` FFI call is then in flight, so (3)
+    /// `set_alert_notify(None)` cannot race with it. `Drop` only does 1–2,
+    /// since the session may already be destroyed by then.
     pub fn stop(&mut self) {
         // 1. Signal the consumer thread to exit.
         self.stop_flag.store(true, Ordering::Relaxed);
@@ -344,7 +331,7 @@ pub(crate) fn dispatch(
         }
         AlertType::TorrentFinished => {
             let info_hash = cstr(&alert.info_hash);
-            // TSI-2467: With selective piece priorities (priority 0 for
+            // With selective piece priorities (priority 0 for
             // non-read-range pieces), libtorrent fires torrent_finished
             // prematurely when all non-filtered pieces in the current read
             // range have passed hash check. This is expected behavior —
@@ -436,7 +423,7 @@ mod tests {
 
     #[test]
     fn alert_type_mapping_matches_ffi_enum() {
-        // TSI-2344: the mapping must dispatch on the bindgen-generated
+        // the mapping must dispatch on the bindgen-generated
         // `lt_alert_type_t` constants (libtorrent_wrapper.h). A previous
         // off-by-one sent `session_stats_alert` to `TorrentFinished`, so
         // the shared session-stats snapshot never updated and root `.stats`
@@ -472,7 +459,7 @@ mod tests {
 
     #[test]
     fn session_stats_alert_updates_shared_snapshot() {
-        // TSI-2344 integration-level assertion: a `session_stats_alert`
+        // a `session_stats_alert`
         // (type = LT_ALERT_SESSION_STATS) flowing through dispatch must make
         // the shared snapshot readable with non-zero values — this is what
         // root `.stats` Global Rates renders. The engine's per-tick

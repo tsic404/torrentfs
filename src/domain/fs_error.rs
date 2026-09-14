@@ -138,7 +138,7 @@ mod tests {
         assert!(matches!(e, FsError::CorruptTorrent(_)));
     }
 
-    /// TSI-2923: the user-facing message names the file type and the cause,
+    /// the user-facing message names the file type and the cause,
     /// so an invalid seed is distinguishable from a generic I/O error.
     #[test]
     fn corrupt_torrent_display_names_file_and_reason() {

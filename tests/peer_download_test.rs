@@ -4,7 +4,7 @@
 //! This test starts a local HTTP tracker + seeder, then creates a
 //! downloader session that discovers the seeder via the tracker.
 //!
-//! This is the CI-level test infrastructure required by TSI-1938 to
+//! This is the CI-level test infrastructure required to
 //! validate file reads beyond cached data.
 
 mod common;
@@ -131,14 +131,10 @@ fn test_peer_discovery_via_tracker() {
     println!("\n=== Peer discovery test passed! ===");
 }
 
-/// Verify that the downloader detects transient peer disconnection
-/// and fails quickly instead of waiting for the full piece_wait timeout.
-///
-/// TSI-1975: Integration test for transient-peer fast-exit scenario.
-/// Start a seeder that announces to the tracker then immediately exits,
-/// then verify the downloader in piece_wait does NOT experience the
-/// full read_timeout_secs delay — it should return NoPeers quickly
-/// (within a few seconds, not the full timeout).
+/// Verify the downloader detects transient peer disconnection and fails fast
+/// instead of waiting the full piece_wait timeout: start a seeder that
+/// announces then immediately exits, and assert the downloader in piece_wait
+/// returns NoPeers within seconds (not `read_timeout_secs`).
 #[test]
 fn test_transient_peer_fast_exit() {
     use common::{create_test_torrent_with_tracker, MiniTracker};
@@ -243,7 +239,7 @@ fn test_transient_peer_fast_exit() {
     let mut config = local_test_config();
     // Short timeout to test fast exit — the downloader should fail
     // much sooner than this via the transient-peer detection.
-    // With TSI-2039, the inner piece-wait pre-check enters the wait loop
+    // The inner piece-wait pre-check enters the wait loop
     // instead of returning NoPeers immediately. Combined with the peer
     // discovery wait (capped at min(timeout, 9)), the total worst-case is
     // ~peer_wait + piece_wait_grace. Use a short timeout to keep total <10s.

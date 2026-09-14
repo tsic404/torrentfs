@@ -1,4 +1,4 @@
-//! Observability counters (TSI-2139).
+//! Observability counters.
 //!
 //! Zero-cost, lock-free metrics used to establish a quantitative baseline
 //! before the DDD refactor. All counters use `std::sync::atomic` so they
@@ -16,7 +16,7 @@ pub struct MetricsSnapshot {
     /// L1 (memory) cache: whole-file reads served from `torrent_data_cache`.
     pub l1_hits: u64,
     pub l1_misses: u64,
-    /// TSI-2274: number of entries currently in the L1 range cache.
+    /// number of entries currently in the L1 range cache.
     pub l1_entries: u64,
     /// L2 (disk piece) cache: reads whose pieces were all present on disk.
     pub l2_hits: u64,
@@ -48,7 +48,7 @@ pub struct Metrics {
     // L1 memory cache
     l1_hits: AtomicU64,
     l1_misses: AtomicU64,
-    /// TSI-2274: current L1 range cache entry count (gauge, not counter).
+    /// current L1 range cache entry count (gauge, not counter).
     l1_entries: AtomicU64,
     l2_hits: AtomicU64,
     l2_misses: AtomicU64,
@@ -114,7 +114,7 @@ impl Metrics {
         self.l1_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// TSI-2274: set the current L1 range cache entry count (gauge).
+    /// set the current L1 range cache entry count (gauge).
     pub fn set_l1_entries(&self, n: u64) {
         self.l1_entries.store(n, Ordering::Relaxed);
     }
@@ -160,7 +160,7 @@ impl Metrics {
 
     /// Record removal of `n` pending reads (FUSE deferred-read tickets) at
     /// once.  Used when a coalesced read group fans out its result to `n`
-    /// waiters (TSI-2896).  Saturating: a double-resolution race can decrement
+    /// waiters.  Saturating: a double-resolution race can decrement
     /// past zero; clamp at zero instead of wrapping the u64 gauge.
     pub fn pending_reads_dec_n(&self, n: usize) {
         let _ =
