@@ -93,10 +93,11 @@ validate_config() {
 mountpoint=""
 # Every argument except the mountpoint, forwarded to torrentfs in order.
 torrentfs_args=()
-# --cache / --db values, captured so the state-ownership fix can cover custom
-# state volumes in addition to the default XDG directory.
+# --cache / --db / --log-file values, captured so the state-ownership fix can
+# cover custom state and log volumes in addition to the default XDG directory.
 cache_arg=""
 db_arg=""
+log_file_arg=""
 
 parse_args() {
     local arg expect_value="" options_ended=0
@@ -104,6 +105,7 @@ parse_args() {
     torrentfs_args=()
     cache_arg=""
     db_arg=""
+    log_file_arg=""
 
     for arg in "$@"; do
         if [ "$options_ended" -eq 1 ]; then
@@ -117,11 +119,12 @@ parse_args() {
         fi
 
         if [ -n "$expect_value" ]; then
-            # Value of the preceding --config/--db/--cache option.
+            # Value of the preceding --config/--db/--cache/--log-file option.
             case "$expect_value" in
                 --config) validate_config "$arg" ;;
                 --db) db_arg="$arg" ;;
                 --cache) cache_arg="$arg" ;;
+                --log-file) log_file_arg="$arg" ;;
             esac
             torrentfs_args+=("$arg")
             expect_value=""
@@ -137,7 +140,7 @@ parse_args() {
                 validate_config "${arg#--config=}"
                 torrentfs_args+=("$arg")
                 ;;
-            --config|--db|--cache)
+            --config|--db|--cache|--log-file|--log-level)
                 torrentfs_args+=("$arg")
                 expect_value="$arg"
                 ;;
@@ -147,6 +150,10 @@ parse_args() {
                 ;;
             --cache=*)
                 cache_arg="${arg#--cache=}"
+                torrentfs_args+=("$arg")
+                ;;
+            --log-file=*)
+                log_file_arg="${arg#--log-file=}"
                 torrentfs_args+=("$arg")
                 ;;
             -*)
@@ -362,6 +369,63 @@ fix_state_dir_ownership() {
             *) rehome_ownership "$db_dir" ;;
         esac
         rehome_ownership "$db_arg"
+    fi
+    if [ -n "${log_file_arg:-}" ]; then
+        prepare_log_file_parent "$log_file_arg"
+    fi
+}
+
+# Prepare the --log-file parent directory for the privilege drop.
+#
+# torrentfs's open_log_file() runs as the daemon user (post-setpriv) and calls
+# create_dir_all() on the parent; every directory in that chain must already
+# exist and be traversable, and the leaf must be daemon-owned, or the daemon's
+# create/open fails with EACCES and torrentfs exits. rehome_ownership is the
+# wrong tool here: it skips missing paths and `chown -R`s a whole shared tree
+# like /var/log. Instead we (running as root) mkdir -p the full chain and chown
+# only the leaf directory (no -R): parent traversal only needs +x, which
+# mkdir -p leaves as 755 under the container umask.
+prepare_log_file_parent() {
+    local log_file="$1" log_dir
+    # A relative path resolves against the container WORKDIR (/, root-owned):
+    # the daemon can never write there, so fail fast with an actionable error
+    # rather than EACCES at startup.
+    case "$log_file" in
+        /*) : ;;
+        *)
+            echo "[entrypoint] ERROR: --log-file must be an absolute path (got '$log_file')" >&2
+            echo "[entrypoint]   A relative path resolves against the container WORKDIR (/)," >&2
+            echo "[entrypoint]   which the daemon user cannot write. Mount a log directory" >&2
+            echo "[entrypoint]   and pass an absolute path inside it, e.g. /logs/torrentfs.log." >&2
+            exit 1
+            ;;
+    esac
+    # Canonicalize the path so `//`, `.`, and `..` forms cannot bypass the
+    # root-parent guard below: `/../x` and `/logs/../x` would otherwise leave
+    # dirname as `/..`/`/logs/..` (not matched by the literal `/|.|''` check)
+    # and chown the container root. realpath -m canonicalizes without requiring
+    # the path to exist yet.
+    if normalized="$(realpath -m "$log_file" 2>/dev/null)"; then
+        log_file="$normalized"
+    fi
+    log_dir="$(dirname "$log_file")"
+    # chown'ing `/` or `.` would re-own the container root / WORKDIR — never do
+    # that. Those parents cannot be made daemon-writable, so require a real
+    # subdirectory instead.
+    case "$log_dir" in
+        /|.|'')
+            echo "[entrypoint] ERROR: --log-file parent '$log_dir' cannot be made writable for the daemon user" >&2
+            echo "[entrypoint]   Use a dedicated subdirectory, e.g. /logs/torrentfs.log," >&2
+            echo "[entrypoint]   or /var/log/torrentfs/torrentfs.log." >&2
+            exit 1
+            ;;
+    esac
+    if ! mkdir -p "$log_dir" 2>/dev/null; then
+        echo "[entrypoint] ERROR: cannot create log directory '$log_dir' for --log-file" >&2
+        exit 1
+    fi
+    if ! chown "$daemon_uid:$daemon_gid" "$log_dir" 2>/dev/null; then
+        echo "[entrypoint] WARNING: could not chown log directory '$log_dir' to $daemon_uid:$daemon_gid" >&2
     fi
 }
 

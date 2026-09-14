@@ -215,6 +215,18 @@ run_test "parse_args -- --mnt sets mountpoint=--mnt" \
 run_test "parse_args -- --config-check treats it as mountpoint (escape)" \
     'parse_args -- --config-check; [ "$mountpoint" = "--config-check" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
 
+run_test "parse_args --log-file /log/x.log /mnt captures log_file_arg and mountpoint" \
+    'parse_args --log-file /log/x.log /mnt; [ "$mountpoint" = /mnt ] && [ "$log_file_arg" = /log/x.log ]'
+
+run_test "parse_args --log-file=/log/x.log captures log_file_arg inline" \
+    'parse_args --log-file=/log/x.log /mnt; [ "$mountpoint" = /mnt ] && [ "$log_file_arg" = /log/x.log ]'
+
+run_test "parse_args --log-level debug /mnt does not treat debug as mountpoint" \
+    'parse_args --log-level debug /mnt; [ "$mountpoint" = /mnt ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
+
+run_test "parse_args --log-level=debug /mnt keeps mountpoint" \
+    'parse_args --log-level=debug /mnt; [ "$mountpoint" = /mnt ]'
+
 # --- validate_mountpoint (mountpoint guard, TSI-2902) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
 # before the FUSE device check. The nested subshell captures the exit code so
@@ -635,6 +647,50 @@ db_arg="metadata.db"
 XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
 rm -rf "$data_home"
 [ -z "$called" ]'
+
+# --- prepare_log_file_parent (TSI-3118) ---
+# --log-file's parent must exist and be daemon-owned before the setpriv drop.
+# A relative path (bare filename or subdir) resolves against the root-owned
+# WORKDIR and is rejected; an absolute path gets its parent mkdir -p'd and the
+# leaf directory chown'd (never -R, never the container root).
+
+run_test "prepare_log_file_parent rejects a relative --log-file" \
+    'rc=0; ( prepare_log_file_parent "logs/torrentfs.log" ) 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
+
+run_test "prepare_log_file_parent rejects a root-parent --log-file" \
+    'rc=0; ( prepare_log_file_parent "/torrentfs.log" ) 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
+
+run_test "prepare_log_file_parent mkdir -p's and chowns only the leaf directory" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir_calls=""; chown_calls=""
+mkdir() { mkdir_calls="$*"; }
+chown() { chown_calls="$*"; }
+prepare_log_file_parent "/logs/sub/torrentfs.log"
+[ "$mkdir_calls" = "-p /logs/sub" ] && [ "$chown_calls" = "1000:1000 /logs/sub" ]'
+
+run_test "prepare_log_file_parent warns when chown fails" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir() { return 0; }
+chown() { return 1; }
+warn_file="$(mktemp)"
+prepare_log_file_parent "/logs/torrentfs.log" 2>"$warn_file"
+grep -q "could not chown log directory" "$warn_file"
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
+
+run_test "prepare_log_file_parent normalizes // and rejects ..-traversal to root" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir() { :; }
+chown_calls=""
+chown() { chown_calls="$*"; }
+# `//` collapses to a single slash: the leaf is chowned at /logs, not //logs.
+prepare_log_file_parent "//logs/x.log"
+[ "$chown_calls" = "1000:1000 /logs" ] || exit 1
+# `..` traversal normalizes to a `/` parent, which the guard must reject.
+rc=0
+( prepare_log_file_parent "/logs/../x" ) 2>/dev/null || rc=$?
+[ "$rc" -eq 1 ]'
 
 # --- should_drop_privileges / resolve_daemon_ids / run_daemon ---
 # The privilege-drop decision: drop only when root AND not in a rootless-podman

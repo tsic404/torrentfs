@@ -81,7 +81,38 @@ Every key is optional (libtorrent defaults). Example `torrentfs-config.toml`:
 listen_interfaces = "0.0.0.0:6881"
 ```
 
-CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--config-check]`.
+CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
+
+### Logging
+
+torrentfs logs to stdout at `info` level by default. Verbosity follows
+`--log-level` (which overrides the `RUST_LOG` environment variable) across
+`error|warn|info|debug|trace`:
+
+```bash
+./target/release/torrentfs --log-level debug /mnt/torrentfs
+```
+
+`--log-file <path>` redirects logs to a file (appended; parent directories are
+created on first use) instead of stdout, so the log can be bind-mounted out of
+a container:
+
+```bash
+./target/release/torrentfs --log-file /var/log/torrentfs.log /mnt/torrentfs
+```
+
+Docker: mount a log directory and point `--log-file` at an absolute path inside
+it. The entrypoint creates the parent directory (as root) and re-owns it to the
+daemon user (UID 1000), so a root-owned bind mount stays writable after the
+privilege drop. `--log-file` must be an absolute path — a relative path resolves
+against the container WORKDIR (`/`), which the daemon user cannot write:
+
+```bash
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  -v /host/logs:/logs \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  ghcr.io/tsic404/torrentfs:main /mnt --log-file /logs/torrentfs.log --log-level debug
+```
 
 ## Architecture
 
