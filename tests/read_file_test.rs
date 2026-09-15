@@ -295,6 +295,21 @@ fn test_read_file_range_boundaries() {
     let data = retry_read(16378, 10);
     assert_eq!(data.len(), 6); // 16384 - 16378 = 6 bytes left
     assert_eq!(&data, &harness.file_content[16378..16384]);
+
+    // Out-of-bounds reads (`offset >= file_size`) must return 0 bytes
+    // regardless of requested size: the engine clamps before any piece
+    // download, so a 1-byte and a 4096-byte read past EOF behave alike.
+    let data = retry_read(16384, 4096); // offset == file_size
+    assert!(data.is_empty(), "read at offset == file_size must be empty");
+
+    let data = retry_read(999_999, 1); // past EOF, 1-byte read
+    assert!(data.is_empty(), "1-byte read past EOF must be empty");
+
+    let data = retry_read(999_999, 4096); // past EOF, large read
+    assert!(
+        data.is_empty(),
+        "large read past EOF must be empty (bs-independent)"
+    );
 }
 
 /// Test that read_file_range correctly returns an error when no
