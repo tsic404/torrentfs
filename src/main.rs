@@ -387,6 +387,60 @@ fn wait_for_shutdown(
     }
 }
 
+/// Advisory lock filename created inside the mountpoint to serialize exclusive
+/// ownership across processes (and across containers that bind-mount one host
+/// directory onto the same path).
+const MOUNTPOINT_LOCK_FILE: &str = ".torrentfs.lock";
+
+/// Exit status used when another torrentfs already holds the mountpoint lock.
+const EXIT_MOUNTPOINT_LOCKED: i32 = 101;
+
+/// Failure modes for [`acquire_mountpoint_lock`], split so the caller can map
+/// a held lock onto the distinct `exit 101` status instead of a generic error.
+#[derive(Debug)]
+enum MountpointLockError {
+    /// Another process already holds the exclusive lock.
+    AlreadyLocked,
+    /// The lock file at the carried path could not be opened or created.
+    Open(PathBuf, io::Error),
+    /// `flock` failed for a reason other than contention.
+    Flock(io::Error),
+}
+
+/// Take an exclusive, non-blocking `flock` on `<mountpoint>/.torrentfs.lock`,
+/// holding it for the process lifetime (drop the handle to release).
+///
+/// Two daemons mounting one directory must not both run: the second mount
+/// either stacks onto and severs the first, or lets both fight over one
+/// on-disk state tree. The lock arbitrates only processes resolving the same
+/// lock-file inode — a plain/rprivate bind of one host directory — not rshared
+/// propagation, whose stacked mounts the entrypoint detects separately.
+fn acquire_mountpoint_lock(mountpoint: &Path) -> Result<File, MountpointLockError> {
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = mountpoint.join(MOUNTPOINT_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| MountpointLockError::Open(lock_path.clone(), e))?;
+
+    // SAFETY: `file` owns a live fd; `flock` only marks that open description,
+    // and the lock is released automatically when `file` drops at exit.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret == 0 {
+        return Ok(file);
+    }
+    // `EWOULDBLOCK` and `EAGAIN` share a value on Linux; a contended
+    // non-blocking flock reports it, everything else is a genuine failure.
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Err(MountpointLockError::AlreadyLocked),
+        _ => Err(MountpointLockError::Flock(err)),
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -465,6 +519,30 @@ fn main() {
     if !mountpoint.exists() {
         std::fs::create_dir_all(&mountpoint).expect("Failed to create mountpoint");
     }
+
+    // Serialize mount ownership: two daemons (or two containers sharing one
+    // host directory) targeting the same mountpoint must not both mount. The
+    // handle is held for the process lifetime, releasing the lock on exit.
+    let _mountpoint_lock = match acquire_mountpoint_lock(&mountpoint) {
+        Ok(lock) => lock,
+        Err(MountpointLockError::AlreadyLocked) => {
+            error!(
+                "{} is already locked by another running torrentfs instance; \
+                 refusing to start. One directory supports a single torrentfs \
+                 mount — stop the other instance first.",
+                mountpoint.display()
+            );
+            std::process::exit(EXIT_MOUNTPOINT_LOCKED);
+        }
+        Err(MountpointLockError::Open(path, e)) => {
+            error!("Failed to open mountpoint lock file {:?}: {}", path, e);
+            std::process::exit(1);
+        }
+        Err(MountpointLockError::Flock(e)) => {
+            error!("Failed to lock mountpoint {:?}: {}", mountpoint, e);
+            std::process::exit(1);
+        }
+    };
 
     let cache_path = args.cache.clone().unwrap_or_else(|| {
         dirs::data_local_dir()
@@ -597,6 +675,21 @@ mod tests {
         assert!(should_attempt_direct_unmount(0));
         assert!(!should_attempt_direct_unmount(1000));
         assert!(!should_attempt_direct_unmount(u32::MAX));
+    }
+
+    #[test]
+    fn mountpoint_lock_is_exclusive_and_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = acquire_mountpoint_lock(dir.path()).unwrap();
+        // A second independent handle to the same lock file must contend, even
+        // within one process: flock is keyed on the open file description.
+        match acquire_mountpoint_lock(dir.path()) {
+            Err(MountpointLockError::AlreadyLocked) => {}
+            other => panic!("expected AlreadyLocked while held, got {other:?}"),
+        }
+        drop(first);
+        // After the holder drops, acquisition succeeds again.
+        acquire_mountpoint_lock(dir.path()).unwrap();
     }
 
     #[test]
