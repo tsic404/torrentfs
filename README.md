@@ -81,6 +81,8 @@ Every key is optional (libtorrent defaults). Example `torrentfs-config.toml`:
 listen_interfaces = "0.0.0.0:6881"
 ```
 
+Note: `[rate_limits] download_rate_limit` / `upload_rate_limit` (bytes per second, `0` = unlimited) do not apply to peers on the local network — libtorrent leaves loopback/local peers unthrottled by default. Use a peer address outside the local network (routable public address) to exercise rate limits.
+
 CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
 
 ### Logging
