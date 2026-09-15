@@ -8,6 +8,13 @@ use crate::json_field_int;
 // Rate Limits
 // ============================================================
 
+/// Session-global download/upload rate limits in bytes per second
+/// (`0` = unlimited, the libtorrent default).
+///
+/// libtorrent does not rate-limit peers on the local network (including
+/// loopback) by default, so these limits are inert in a loopback self-seed
+/// swarm. Use a peer address outside the local network (routable public
+/// address) to exercise them.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitsConfig {
