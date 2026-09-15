@@ -1,14 +1,38 @@
 #!/usr/bin/env bash
 # Self-seeding QA environment for torrentfs. Public sample torrents usually
-# have no reachable seeders, so this builds a deterministic loopback swarm —
+# have no reachable seeders, so this builds a deterministic local swarm —
 # a local HTTP tracker, a single-file 4 MiB torrent, and a libtorrent seeder —
-# for real downloads without external infrastructure. Loopback-only by default
-# (no DHT/LSD/UPnP/NAT-PMP/public trackers); pass --tracker-bind/--announce-host
-# to reach it from a container (IPv4 only).
+# for real downloads without external infrastructure (no DHT/LSD/UPnP/NAT-PMP/
+# public trackers). By default the tracker binds 0.0.0.0 and the announce host
+# is the host's primary non-loopback IPv4, so libtorrent's per-interface
+# announces (it expands a wildcard listen interface into one socket per local
+# address) can reach the tracker on multi-interface hosts; a loopback-only
+# fallback (127.0.0.1/127.0.0.1) is used when no non-loopback address is
+# detectable. NOTE: binding 0.0.0.0 exposes the unauthenticated tracker to the
+# LAN (any host may query or inject peers); acceptable for a synthesized QA
+# payload, but pass --tracker-bind 127.0.0.1 to stay loopback-only.
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP]  → outputs under ci/selfseed/
 
 set -euo pipefail
+
+# Announce host written into the .torrent (and reached by the seeder/client).
+# First probe: the default-route source IPv4 — the interface carrying the
+# default route (skipping VPN/bridge interfaces that don't). Second probe: the
+# first global IPv4 (best-effort when there is no default route; may itself be
+# a VPN/bridge address). Loopback as a last resort when `ip` is absent or no
+# non-loopback address exists.
+detect_announce_host() {
+    local ip=""
+    if command -v ip >/dev/null 2>&1; then
+        ip="$(ip -4 route show default 2>/dev/null \
+            | sed -n 's/.* src \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+        [ -n "$ip" ] || ip="$(ip -4 -o addr show scope global 2>/dev/null \
+            | sed -n 's/.* inet \([0-9][0-9.]*\)\/.*/\1/p' | head -n1)"
+    fi
+    [ -n "$ip" ] || ip="127.0.0.1"
+    printf '%s\n' "$ip"
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -28,6 +52,31 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+# Resolve the tracker-bind/announce-host pair so the announce URL always points
+# at an address the tracker actually listens on. A concrete --tracker-bind
+# (e.g. 127.0.0.1) pins the announce host to the same address; a wildcard/unset
+# bind listens on every interface and announces a detected primary IPv4 (the
+# loopback fallback keeps the old loopback-only default when undetectable).
+if [ -n "$TRACKER_BIND" ] && [ "$TRACKER_BIND" != "0.0.0.0" ]; then
+    if [ -z "$ANNOUNCE_HOST" ]; then
+        ANNOUNCE_HOST="$TRACKER_BIND"
+    elif [ "$ANNOUNCE_HOST" != "$TRACKER_BIND" ]; then
+        echo "self-seed: --announce-host '$ANNOUNCE_HOST' is unreachable at --tracker-bind '$TRACKER_BIND'; the announce host must match a concrete tracker bind" >&2
+        exit 2
+    fi
+else
+    if [ -z "$ANNOUNCE_HOST" ]; then
+        ANNOUNCE_HOST="$(detect_announce_host)"
+    fi
+    if [ -z "$TRACKER_BIND" ]; then
+        if [ "$ANNOUNCE_HOST" = "127.0.0.1" ]; then
+            TRACKER_BIND="127.0.0.1"
+        else
+            TRACKER_BIND="0.0.0.0"
+        fi
+    fi
+fi
 
 # The self-seed tracker is IPv4-only (`ci/selfseed_env.rs`): its announce
 # handler accepts only V4 peer addresses and the announce URL is written
