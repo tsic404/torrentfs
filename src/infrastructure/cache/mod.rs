@@ -458,6 +458,97 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Create (or truncate) the `.incomplete` marker for a piece and fsync it.
+    ///
+    /// The marker is the *only* on-disk signal `scan_pieces_subdirectory`
+    /// reads on restart to classify a piece as incomplete; without it a
+    /// partial piece is treated as an unverified SHA-1 verification candidate
+    /// and purged.  Writing and fsyncing it before the metadata entry is
+    /// inserted makes the registration atomic in the direction that matters:
+    /// metadata is only registered once the incomplete classification is
+    /// durably on disk.
+    fn ensure_incomplete_marker(&self, marker: &Path) -> TorrentResult<()> {
+        let file = File::create(marker).map_err(|e| {
+            TorrentError::IoError(format!(
+                "Failed to create incomplete marker {}: {}",
+                marker.display(),
+                e
+            ))
+        })?;
+        file.sync_all().map_err(|e| {
+            TorrentError::IoError(format!(
+                "Failed to fsync incomplete marker {}: {}",
+                marker.display(),
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Register a piece discovered on disk as *incomplete*.
+    ///
+    /// The C++ `PieceStorage::write_piece` writes blocks to a piece file and
+    /// drops a `<piece_key>.incomplete` marker alongside it while the piece is
+    /// still being filled.  When a read's piece-wait window times out before
+    /// libtorrent finishes the piece, the partially-downloaded bytes already
+    /// sit on disk but the Rust cache metadata has no entry for them — so
+    /// `.stats` reports zero cached pieces and the failed read leaves no
+    /// trace of the download progress it actually made.
+    ///
+    /// This records that on-disk state the same way
+    /// [`Self::scan_pieces_subdirectory`] does on restart: the piece enters
+    /// metadata at its *actual* on-disk size (so `.stats` reflects the real
+    /// download progress), it is tagged incomplete (excluded from background
+    /// SHA-1 verification), and it is explicitly NOT marked verified (so the
+    /// read fast-path never serves a partial piece).  A later successful
+    /// `add_piece` upgrades it to verified and clears the marker.
+    pub fn register_incomplete_piece(&mut self, piece_key: &str, size: u64) -> TorrentResult<()> {
+        // Write the marker durably *before* mutating
+        // metadata.  If the marker cannot be persisted, returning Err without
+        // registering is the safe fallback — a partial piece left unregistered
+        // degrades to the pre-fix behaviour instead of being mis-classified as
+        // a verification candidate on restart and purged.
+        let marker = self.piece_marker_path(piece_key);
+        self.ensure_incomplete_marker(&marker)?;
+
+        let now = current_timestamp_ms();
+        let prev_hit_count = self
+            .metadata
+            .get(piece_key)
+            .map(|m| m.hit_count)
+            .unwrap_or(0);
+        let prev = self.metadata.insert(
+            piece_key.to_string(),
+            PieceMetadata {
+                last_accessed: now,
+                size,
+                hit_count: prev_hit_count,
+            },
+        );
+        if prev.is_none() {
+            self.miss_count += 1;
+        }
+        let old_size = prev.map(|m| m.size).unwrap_or(0);
+
+        // The piece is NOT verified — it is incomplete.
+        self.verified_piece_keys.remove(piece_key);
+
+        // Tag it incomplete so it is excluded from background SHA-1
+        // verification and from the read fast-path (both key off the
+        // verified set, not just metadata presence).
+        self.incomplete_piece_keys.insert(piece_key.to_string());
+
+        self.current_size += size.saturating_sub(old_size);
+        if self.current_size > self.max_cache_size {
+            self.evict_lru()?;
+        }
+
+        // Mark dirty — the engine loop flushes periodically and on
+        // shutdown instead of fsyncing on every registration.
+        self.metadata_dirty = true;
+        Ok(())
+    }
+
     /// Register a callback that will be invoked when a piece is evicted.
     /// The callback receives the info_hash of the affected torrent and the piece_index.
     pub fn on_evict(&mut self, callback: Box<dyn Fn(String, i32) + Send + Sync>) {
@@ -466,11 +557,20 @@ impl CacheManager {
 
     pub fn evict_lru(&mut self) -> TorrentResult<()> {
         while self.current_size > self.max_cache_size && !self.metadata.is_empty() {
+            // Never evict a piece tagged incomplete —
+            // libtorrent's `write_piece` is still writing blocks to its file.
+            // `remove_piece` unlinks the file without the per-info-hash write
+            // lock, so evicting a live piece would silently orphan the
+            // in-flight blocks (lost progress + a stale `have_piece` bit that
+            // forces a re-download).  Skip incomplete pieces; if every
+            // remaining piece is incomplete, break and accept the temporary
+            // over-budget state until the next eviction pass.
             let oldest = self
                 .metadata
                 .iter()
+                .filter(|(key, _)| !self.incomplete_piece_keys.contains(*key))
                 .min_by_key(|(_, meta)| meta.last_accessed)
-                .map(|(k, _)| k.clone());
+                .map(|(key, _)| key.clone());
 
             if let Some(piece_key) = oldest {
                 let info_hash = self.extract_info_hash(&piece_key).to_string();
@@ -1892,6 +1992,131 @@ mod tests {
 
         assert!(!marker_path.exists(), "marker must be cleared by add_piece");
         assert!(cache.is_piece_verified(piece_key));
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_incomplete_piece_not_verified() -> TorrentResult<()> {
+        // register_incomplete_piece records a partially-downloaded
+        // piece at its actual on-disk size, tags it incomplete (so it is not
+        // a verification candidate) and leaves it unverified (so the read
+        // fast-path never serves a partial piece).  A later add_piece must
+        // upgrade it to verified and clear the marker.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi3130:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0xABu8; 32768])?;
+
+        cache.register_incomplete_piece(piece_key, 32768)?;
+
+        // Registered at the partial size, visible to `.stats`.
+        assert!(cache.has_piece(piece_key));
+        assert_eq!(cache.piece_metadata_size(piece_key), Some(32768));
+
+        // Not verified, and excluded from background verification.
+        assert!(!cache.is_piece_verified(piece_key));
+        assert!(
+            cache.unverified_pieces().is_empty(),
+            "incomplete-registered piece must not be a verification candidate"
+        );
+
+        // Marker written so a restart re-classifies it as incomplete.
+        let marker_path = piece_path.with_extension("incomplete");
+        assert!(marker_path.exists(), "marker must be created");
+
+        // A later successful download upgrades it to verified.
+        cache.add_piece(piece_key, 32768)?;
+        assert!(cache.is_piece_verified(piece_key));
+        assert!(!marker_path.exists(), "marker must be cleared by add_piece");
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_incomplete_piece_rolls_back_on_marker_failure() -> TorrentResult<()> {
+        // A marker write failure must surface as Err and
+        // leave the piece unregistered — a partial piece registered without a
+        // durable marker would be mis-classified as a verification candidate
+        // on restart and purged.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi3130_markerfail:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0xABu8; 32768])?;
+
+        // Occupy the marker path with a directory so File::create fails.
+        let marker_path = piece_path.with_extension("incomplete");
+        std::fs::create_dir(&marker_path)?;
+
+        let result = cache.register_incomplete_piece(piece_key, 32768);
+        assert!(
+            result.is_err(),
+            "marker write failure must surface as Err, not be swallowed"
+        );
+        assert!(
+            !cache.has_piece(piece_key),
+            "metadata must not be registered when the marker cannot be persisted"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_register_incomplete_piece_preserves_hit_count() -> TorrentResult<()> {
+        // Re-registering an existing entry must not reset
+        // its access count.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi3130_hitcount:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0xABu8; 32768])?;
+        cache.add_piece(piece_key, 32768)?;
+        for _ in 0..5 {
+            cache.record_access(piece_key)?;
+        }
+        assert_eq!(cache.piece_hit_count(piece_key), 5);
+
+        cache.register_incomplete_piece(piece_key, 32768)?;
+        assert_eq!(
+            cache.piece_hit_count(piece_key),
+            5,
+            "hit_count must survive re-registration"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_evict_lru_skips_incomplete_pieces() -> TorrentResult<()> {
+        // An over-budget eviction must evict a complete
+        // piece, never an incomplete one whose file libtorrent is still
+        // writing.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 64 * 1024)?;
+
+        let verified_key = "tsi3130_evict:piece:0";
+        let incomplete_key = "tsi3130_evict:piece:1";
+
+        let v_path = cache.ensure_piece_dir(verified_key)?;
+        std::fs::write(&v_path, vec![0x11u8; 32_768])?;
+        cache.add_piece(verified_key, 32_768)?;
+
+        let i_path = cache.ensure_piece_dir(incomplete_key)?;
+        std::fs::write(&i_path, vec![0x22u8; 40_960])?;
+        // Pushes over budget (72 KiB > 64 KiB); eviction must skip the
+        // incomplete piece.
+        cache.register_incomplete_piece(incomplete_key, 40_960)?;
+
+        assert!(
+            !cache.has_piece(verified_key),
+            "the complete LRU piece must be evicted"
+        );
+        assert!(
+            cache.has_piece(incomplete_key),
+            "the incomplete piece must survive eviction"
+        );
         Ok(())
     }
 
