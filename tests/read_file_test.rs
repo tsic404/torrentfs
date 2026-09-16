@@ -229,6 +229,105 @@ fn test_idle_handle_connects_to_seeder_without_read() {
     }
 }
 
+/// Regression test: creating the lightweight upload_mode handle at
+/// torrent-add time (`ensure_handle`) must trigger an immediate tracker
+/// announce and surface the seeder in the published snapshot — with no read
+/// (`read_file_range`) ever issued.
+///
+/// The fix (`force_reannounce` right after handle creation) makes the first
+/// announce deterministic.  Pre-fix the announce rode libtorrent's own
+/// scheduled first announce, which the QA multi-interface swarm observed as
+/// `Peers: 0 Seeds: 0` until a read drove the slow path's `force_reannounce`
+/// (that topology — a tracker reached via the host's non-loopback IPv4 — is
+/// not reproducible in CI; on a loopback tracker libtorrent's default announce
+/// also fires, so the pre-fix code would likely pass here too).  This test
+/// therefore pins the observable contract (announce + visible peers within a
+/// short window, no read) rather than the environment that surfaces it.
+///
+/// `announce_count` alone cannot distinguish the downloader's announce from
+/// the seeder's periodic re-announce, so `peer_count >= 2` is the definitive
+/// signal: the downloader listens on a distinct port (16881) and registers a
+/// second peer entry on top of the seeder's (6881).
+#[test]
+fn test_ensure_handle_triggers_announce_without_read() {
+    // Serialize libtorrent session creation to avoid resource contention.
+    let _session_guard = common::acquire_session_lock();
+
+    let harness = TestHarness::new();
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    // distinct downloader listen port so the tracker records the downloader
+    // as a second peer, separate from the seeder (which binds 6881).
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent for downloader"),
+    );
+    let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
+    let raw_info_hash = info.info_hash().expect("Failed to get info hash");
+
+    // Baseline: the seeder has announced (TestHarness guarantees this) and is
+    // the only registered peer.  `peer_count` distinguishes the downloader's
+    // announce from the seeder's re-announce, which keeps its own entry at 1.
+    let baseline_announces = harness.tracker.announce_count();
+    assert_eq!(
+        harness.tracker.peer_count(&raw_info_hash),
+        1,
+        "seeder must be the only registered peer before the downloader announces"
+    );
+
+    // Mirror the FUSE torrent-add path: create the upload_mode handle.  No
+    // read is ever issued in this test.
+    engine
+        .ensure_handle(info.clone())
+        .expect("Failed to ensure lightweight handle");
+
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+    loop {
+        // The downloader's own announce reaches the tracker (a second peer
+        // entry appears)...
+        let downloader_announced = harness.tracker.peer_count(&raw_info_hash) >= 2;
+        // ...and the engine snapshot exposes the seeder, which is what
+        // `.stats` renders as `Peers`/`Seeds`.
+        let peers_visible = engine
+            .try_torrent_status(&info_hash)
+            .map(|s| s.num_peers > 0 || s.num_seeds > 0)
+            .unwrap_or(false);
+
+        println!(
+            "ensure_handle announce: downloader_announced={downloader_announced} \
+             peers_visible={peers_visible} (announce_count={}, peer_count={})",
+            harness.tracker.announce_count(),
+            harness.tracker.peer_count(&raw_info_hash)
+        );
+
+        if downloader_announced && peers_visible {
+            println!(
+                "ensure_handle announced and exposed peers in {:.1}s",
+                start.elapsed().as_secs_f64()
+            );
+            return;
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "ensure_handle did not announce / expose peers within {}s \
+                 (announce_count baseline={}, now={}, peer_count={})",
+                timeout.as_secs(),
+                baseline_announces,
+                harness.tracker.announce_count(),
+                harness.tracker.peer_count(&raw_info_hash)
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Test that read_file_range returns correct data for different offset/size
 /// combinations, validating boundary handling.
 #[test]

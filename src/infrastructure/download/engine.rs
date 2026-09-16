@@ -617,6 +617,19 @@ impl EngineState {
             .session
             .add_torrent_upload_mode(info, &torrent_save_dir)?;
 
+        // Kick the tracker immediately instead of waiting for libtorrent's
+        // scheduled first announce.  An idle (upload_mode) handle otherwise
+        // announces only when libtorrent next ticks the tracker, so `.stats`
+        // can report `Peers: 0 Seeds: 0` after a torrent is added until a
+        // read drives the announce through the slow path.  Forcing it here
+        // makes peer/seed counts observable right away, with no read.
+        if !handle.force_reannounce() {
+            tracing::debug!(
+                "ensure_handle {}: force_reannounce rejected (non-fatal)",
+                info_hash
+            );
+        }
+
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
