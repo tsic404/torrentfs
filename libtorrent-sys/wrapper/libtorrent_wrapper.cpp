@@ -340,7 +340,8 @@ lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) 
             settings.set_str(lt::settings_pack::listen_interfaces, listen_interface);
         }
         settings.set_int(lt::settings_pack::alert_mask,
-            lt::alert_category::error | lt::alert_category::status);
+            lt::alert_category::error | lt::alert_category::status |
+                lt::alert_category::piece_progress);
         // TSI-2622: keep upload↔upload connections. torrentfs adds its idle
         // handles in upload_mode, so a torrentfs↔torrentfs pair has both
         // sides upload-only; libtorrent's default
@@ -1418,6 +1419,12 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
                 out.type = LT_ALERT_TORRENT_FINISHED;
                 alert_fill_info_hash_from_handle(tf->handle, out.info_hash);
             }
+            // ── piece_finished_alert ──
+            else if (auto* pf = lt::alert_cast<lt::piece_finished_alert>(alert)) {
+                out.type = LT_ALERT_PIECE_FINISHED;
+                alert_fill_info_hash_from_handle(pf->handle, out.info_hash);
+                out.piece_index = static_cast<int>(pf->piece_index);
+            }
             // ── torrent_removed_alert ──
             else if (auto* tr = lt::alert_cast<lt::torrent_removed_alert>(alert)) {
                 out.type = LT_ALERT_TORRENT_REMOVED;
@@ -2149,8 +2156,9 @@ lt_session_t lt_session_create_with_custom_storage(
         } else {
             // Minimal JSON so build_settings_pack initializes the
             // pack through normal parsing (apply_int_setting).
-            // alert_category::error (1) | alert_category::status (64) = 65.
-            effective_json = "{\"alert_mask\":65}";
+            // alert_category::error (1) | alert_category::status (64)
+            // | alert_category::piece_progress (4194304) = 4194369.
+            effective_json = "{\"alert_mask\":4194369}";
         }
         lt::session_params params;
         params.settings = build_settings_pack(effective_json.c_str());
@@ -2164,7 +2172,8 @@ lt_session_t lt_session_create_with_custom_storage(
                 strstr(settings_json, "\"alert_mask\"") != nullptr;
             if (!user_set_alert_mask) {
                 params.settings.set_int(lt::settings_pack::alert_mask,
-                    lt::alert_category::error | lt::alert_category::status);
+                    lt::alert_category::error | lt::alert_category::status |
+                        lt::alert_category::piece_progress);
             }
         }
         // TSI-2467: Disable close_redundant_connections by default. torrentfs

@@ -103,8 +103,15 @@ pub struct PieceScheduler {
     piece_lengths: HashMap<String, i64>,
     /// Priority configuration.
     config: PiecePriorityConfig,
-    /// Active readers per info_hash (reference counting).
+    /// Active readers per info_hash (reference counting).  The engine thread
+    /// is single-threaded and `read_file_range` blocks it, so at most one
+    /// reader per torrent is ever active; the LIFO `pop` in `reader_released`
+    /// therefore always removes the reader that just finished.
     readers: HashMap<String, Vec<ReadRange>>,
+    /// Per-info_hash retained prefetch gradient: the last reader's gradient,
+    /// kept after the final reader releases so the read-ahead window keeps
+    /// downloading and stays visible in `.stats` as `[N]` markers.
+    prefetch: HashMap<String, Vec<i32>>,
 }
 
 impl PieceScheduler {
@@ -114,6 +121,7 @@ impl PieceScheduler {
             piece_lengths: HashMap::new(),
             config,
             readers: HashMap::new(),
+            prefetch: HashMap::new(),
         }
     }
 
@@ -133,6 +141,7 @@ impl PieceScheduler {
             vec![DEFAULT_PRIORITY; num_pieces as usize],
         );
         self.piece_lengths.insert(info_hash.to_string(), piece_length);
+        self.prefetch.remove(info_hash);
         Ok(())
     }
 
@@ -158,32 +167,56 @@ impl PieceScheduler {
             .entry(info_hash.clone())
             .or_default()
             .push(ReadRange { gradient });
-        self.recompute(handle, &info_hash, store)
+        self.recompute(handle, &info_hash, store);
+        Ok(())
     }
 
     /// `ReaderReleased` event: a reader finished.  Decrements the reference
-    /// count and recomputes (or resets to zero when no readers remain).
-    pub fn reader_released(
-        &mut self,
-        handle: &TorrentHandle,
-        info_hash: &str,
-        store: &PieceStore,
-    ) -> TorrentResult<()> {
-        let empty = if let Some(ranges) = self.readers.get_mut(info_hash) {
-            ranges.pop();
-            ranges.is_empty()
+    /// count and recomputes.  When the last reader releases, its gradient is
+    /// retained as the prefetch window so the read-ahead download continues.
+    ///
+    /// Infallible: the engine is single-threaded (at most one reader per
+    /// torrent), so the LIFO `pop` removes the reader that just finished, and
+    /// `recompute` only mutates in-memory state and best-effort FFI priorities.
+    pub fn reader_released(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
+        let (empty, last_gradient) = if let Some(ranges) = self.readers.get_mut(info_hash) {
+            let popped = ranges.pop();
+            (ranges.is_empty(), popped.map(|r| r.gradient))
         } else {
-            true
+            (true, None)
         };
         if empty {
-            self.reset_all(handle, info_hash);
-            Ok(())
-        } else {
-            self.recompute(handle, info_hash, store)
+            // Retain the most recent reader's gradient as the prefetch window:
+            // pieces beyond the read range keep their descending priorities so
+            // libtorrent continues the read-ahead prefetch and `.stats` shows
+            // `[6][5][4][3]` for the queued pieces instead of resetting to `[]`.
+            if let Some(mut gradient) = last_gradient {
+                // Drop pieces already available locally from the retained
+                // window. `recompute` skips them, so they would never trigger
+                // `piece_ready` again and their entries would keep the gradient
+                // non-zero forever, blocking the all-zero cleanup that clears
+                // `prefetch`.
+                for (p, prio) in gradient.iter_mut().enumerate() {
+                    let piece_key = PieceStore::piece_key(info_hash, p as i32);
+                    if store.has_piece(info_hash, p as i32) || store.has_piece_on_disk(&piece_key) {
+                        *prio = 0;
+                    }
+                }
+                if gradient.iter().any(|&p| p != 0) {
+                    self.prefetch.insert(info_hash.to_string(), gradient);
+                } else {
+                    // The whole window is already cached — nothing to prefetch.
+                    self.prefetch.remove(info_hash);
+                }
+            }
         }
+        self.recompute(handle, info_hash, store);
     }
 
-    /// `PieceReady` event: a piece finished downloading.  Deprioritize it.
+    /// `PieceReady` event: a piece finished downloading.  Deprioritize it and
+    /// drop it from the retained prefetch window.  Once every wanted piece is
+    /// ready the whole prefetch state is cleared, so a later eviction cannot
+    /// re-elevate a stale gradient.
     pub fn piece_ready(&mut self, handle: &TorrentHandle, info_hash: &str, piece_index: i32) {
         if let Some(priorities) = self.elevated.get_mut(info_hash) {
             if piece_index >= 0 && (piece_index as usize) < priorities.len() {
@@ -192,6 +225,14 @@ impl PieceScheduler {
                     handle.set_piece_priority(piece_index, 0);
                 }
             }
+        }
+        let clear_prefetch = if let Some(pref) = self.prefetch.get_mut(info_hash) {
+            clear_ready_piece(pref, piece_index)
+        } else {
+            false
+        };
+        if clear_prefetch {
+            self.prefetch.remove(info_hash);
         }
     }
 
@@ -203,7 +244,8 @@ impl PieceScheduler {
         info_hash: &str,
         store: &PieceStore,
     ) -> TorrentResult<()> {
-        self.recompute(handle, info_hash, store)
+        self.recompute(handle, info_hash, store);
+        Ok(())
     }
     // ── Status queries ────────────────────────────────────────────────
 
@@ -248,6 +290,15 @@ impl PieceScheduler {
             .unwrap_or_default()
     }
 
+    /// Whether a torrent has converged to idle: no active reader and no
+    /// wanted piece.  The engine uses this (on reader release and on the
+    /// periodic tick) to restore `upload_mode` exactly when both the reader
+    /// count and the retained wanted set reach zero.
+    pub fn is_idle(&self, info_hash: &str) -> bool {
+        let has_readers = self.readers.get(info_hash).map_or(false, |r| !r.is_empty());
+        !has_readers && self.elevated_pieces(info_hash).is_empty()
+    }
+
     /// Remove all per-torrent state for an info_hash (priority vector,
     /// piece length, reader ranges).  Called when the download engine drops
     /// a torrent handle so the scheduler does not leak state for a removed
@@ -256,31 +307,17 @@ impl PieceScheduler {
         self.elevated.remove(info_hash);
         self.piece_lengths.remove(info_hash);
         self.readers.remove(info_hash);
+        self.prefetch.remove(info_hash);
     }
 
     // ── Internals ─────────────────────────────────────────────────────
 
-    /// Reset every piece of a torrent back to the idle baseline priority.
-    fn reset_all(&mut self, handle: &TorrentHandle, info_hash: &str) {
-        if let Some(priorities) = self.elevated.get_mut(info_hash) {
-            for (p, prio) in priorities.iter_mut().enumerate() {
-                if *prio != DEFAULT_PRIORITY {
-                    *prio = DEFAULT_PRIORITY;
-                    handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
-                }
-            }
-        }
-    }
-
     /// Recompute the priority gradient as the element-wise maximum over all
-    /// active readers' gradients, then apply it to the handle (skipping
-    /// already-cached pieces).
-    fn recompute(
-        &mut self,
-        handle: &TorrentHandle,
-        info_hash: &str,
-        store: &PieceStore,
-    ) -> TorrentResult<()> {
+    /// active readers' gradients (falling back to the retained prefetch
+    /// gradient once the last reader releases), then apply it to the handle
+    /// (skipping already-cached pieces).  Infallible: it only mutates
+    /// in-memory state and issues best-effort piece-priority FFI calls.
+    fn recompute(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
         let num_pieces = self
             .elevated
             .get(info_hash)
@@ -288,7 +325,7 @@ impl PieceScheduler {
             .unwrap_or(0);
 
         if num_pieces <= 0 {
-            return Ok(());
+            return;
         }
 
         let priorities = self
@@ -296,29 +333,25 @@ impl PieceScheduler {
             .entry(info_hash.to_string())
             .or_insert_with(|| vec![0i32; num_pieces as usize]);
 
-        // Union over active readers (element-wise max).
-        let mut target = vec![0i32; num_pieces as usize];
-        let mut any = false;
-        if let Some(ranges) = self.readers.get(info_hash) {
-            for range in ranges {
-                any = true;
-                for (i, &p) in range.gradient.iter().enumerate() {
-                    if p > target[i] {
-                        target[i] = p;
+        let readers = self
+            .readers
+            .get(info_hash)
+            .map(|r| r.as_slice())
+            .unwrap_or(&[]);
+        let prefetch = self.prefetch.get(info_hash).map(|p| p.as_slice());
+        let target = match resolve_target(readers, prefetch, num_pieces as usize) {
+            Some(t) => t,
+            None => {
+                // Nothing wanted (no readers, no prefetch): idle baseline.
+                for (p, prio) in priorities.iter_mut().enumerate() {
+                    if *prio != DEFAULT_PRIORITY {
+                        *prio = DEFAULT_PRIORITY;
+                        handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
                     }
                 }
+                return;
             }
-        }
-
-        if !any {
-            for (p, prio) in priorities.iter_mut().enumerate() {
-                if *prio != DEFAULT_PRIORITY {
-                    *prio = DEFAULT_PRIORITY;
-                    handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
-                }
-            }
-            return Ok(());
-        }
+        };
 
         for (p, &prio) in target.iter().enumerate() {
             let piece_key = PieceStore::piece_key(info_hash, p as i32);
@@ -329,8 +362,6 @@ impl PieceScheduler {
                 handle.set_piece_priority(p as i32, new_prio);
             }
         }
-
-        Ok(())
     }
 
     /// Compute the priority gradient for a single read range, as a full
@@ -392,6 +423,52 @@ impl PieceScheduler {
 
         Some(gradient)
     }
+}
+
+/// Resolve the target piece-priority gradient for a torrent: the element-wise
+/// maximum over all active readers' gradients, falling back to the retained
+/// prefetch gradient once the last reader releases.  Returns `None` when
+/// nothing is wanted (no readers, no prefetch) — the idle baseline.
+fn resolve_target(
+    readers: &[ReadRange],
+    prefetch: Option<&[i32]>,
+    num_pieces: usize,
+) -> Option<Vec<i32>> {
+    let mut target = vec![0i32; num_pieces];
+    let mut any = false;
+    for range in readers {
+        any = true;
+        for (i, &p) in range.gradient.iter().enumerate() {
+            if p > target[i] {
+                target[i] = p;
+            }
+        }
+    }
+    if !any {
+        if let Some(pref) = prefetch {
+            any = true;
+            for (i, &p) in pref.iter().enumerate() {
+                if p > target[i] {
+                    target[i] = p;
+                }
+            }
+        }
+    }
+    if any {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+/// Zero a newly-ready piece in the retained prefetch gradient and report
+/// whether the whole gradient is now satisfied (so the caller can drop the
+/// prefetch state).  Out-of-range indices leave the gradient untouched.
+fn clear_ready_piece(pref: &mut [i32], piece_index: i32) -> bool {
+    if piece_index >= 0 && (piece_index as usize) < pref.len() {
+        pref[piece_index as usize] = 0;
+    }
+    pref.iter().all(|&p| p == 0)
 }
 
 /// Piece priority decision for a single piece — pure and unit-testable.
@@ -524,5 +601,87 @@ mod tests {
         assert_eq!(f.window_edge_priority, 2);
         assert_eq!(f.rest_priority, 1);
         assert_eq!(f.backward_priority, 2);
+    }
+
+    #[test]
+    fn resolve_target_unions_active_readers_over_prefetch() {
+        let readers = vec![
+            ReadRange {
+                gradient: vec![7, 0, 6, 5],
+            },
+            ReadRange {
+                gradient: vec![0, 3, 0, 0],
+            },
+        ];
+        let prefetch = vec![1, 1, 1, 1];
+        // Active readers take precedence over any retained prefetch.
+        let target = resolve_target(&readers, Some(&prefetch), 4).unwrap();
+        assert_eq!(target, vec![7, 3, 6, 5]);
+    }
+
+    #[test]
+    fn resolve_target_falls_back_to_prefetch_when_idle() {
+        let prefetch = vec![1, 1, 0, 6, 5, 4, 3];
+        let no_readers: &[ReadRange] = &[];
+        let target = resolve_target(no_readers, Some(&prefetch), 7).unwrap();
+        assert_eq!(target, prefetch);
+    }
+
+    #[test]
+    fn resolve_target_none_when_nothing_wanted() {
+        let no_readers: &[ReadRange] = &[];
+        assert_eq!(resolve_target(no_readers, None, 4), None);
+    }
+
+    #[test]
+    fn clear_ready_piece_zeroes_and_reports_satisfied() {
+        let mut pref = vec![1, 6, 5, 4];
+        assert!(!clear_ready_piece(&mut pref, 0));
+        assert_eq!(pref, vec![0, 6, 5, 4]);
+        assert!(!clear_ready_piece(&mut pref, 1));
+        assert_eq!(pref, vec![0, 0, 5, 4]);
+        assert!(!clear_ready_piece(&mut pref, 2));
+        assert_eq!(pref, vec![0, 0, 0, 4]);
+        // The last wanted piece is now ready → the gradient is fully satisfied.
+        assert!(clear_ready_piece(&mut pref, 3));
+        assert_eq!(pref, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn clear_ready_piece_ignores_out_of_range_indices() {
+        let mut pref = vec![1, 1];
+        assert!(!clear_ready_piece(&mut pref, -1));
+        assert!(!clear_ready_piece(&mut pref, 2));
+        assert_eq!(pref, vec![1, 1]);
+    }
+
+    #[test]
+    fn is_idle_requires_no_readers_and_no_wanted_pieces() {
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        s.init_torrent("hash", 4, 256).unwrap();
+
+        // Fresh torrent: no readers, no wanted pieces.
+        assert!(s.is_idle("hash"));
+
+        // A wanted piece keeps it active.
+        s.elevated.insert("hash".to_string(), vec![0, 6, 0, 0]);
+        assert!(!s.is_idle("hash"));
+
+        // No wanted pieces but an active reader also keeps it active.
+        s.elevated.insert("hash".to_string(), vec![0, 0, 0, 0]);
+        s.readers.insert(
+            "hash".to_string(),
+            vec![ReadRange {
+                gradient: vec![7, 0, 0, 0],
+            }],
+        );
+        assert!(!s.is_idle("hash"));
+
+        // No readers, no wanted pieces → idle.
+        s.readers.remove("hash");
+        assert!(s.is_idle("hash"));
+
+        // An unknown torrent is trivially idle.
+        assert!(s.is_idle("other"));
     }
 }

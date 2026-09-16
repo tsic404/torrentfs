@@ -123,6 +123,33 @@ impl PieceStore {
         cache.add_piece(&key, size)
     }
 
+    /// Register a piece reported complete by the `piece_finished` alert at its
+    /// actual on-disk size, marking it verified.  Used for background/prefetch
+    /// downloads that complete outside any read's piece-wait loop.  Returns
+    /// `Ok(false)` when the piece file has vanished or is empty — nothing to
+    /// register.
+    pub fn register_finished_piece(
+        &self,
+        info_hash: &str,
+        piece_index: i32,
+    ) -> TorrentResult<bool> {
+        let key = Self::piece_key(info_hash, piece_index);
+        let path = {
+            let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
+            cache.piece_path(&key)
+        };
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(_) => return Ok(false),
+        };
+        if size == 0 {
+            return Ok(false);
+        }
+        let mut cache = self.cache.lock().map_err(|_| Self::poisoned())?;
+        cache.add_piece(&key, size)?;
+        Ok(true)
+    }
+
     /// Register a piece that is on disk but incomplete (partial
     /// download) in the cache metadata, at its *actual* on-disk size, without
     /// marking it verified.  Used after a read's piece-wait times out so the

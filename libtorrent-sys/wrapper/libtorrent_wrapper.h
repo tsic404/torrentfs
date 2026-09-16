@@ -39,6 +39,7 @@ typedef enum {
     LT_ALERT_SESSION_STATS = 2,
     LT_ALERT_TORRENT_FINISHED = 3,
     LT_ALERT_TORRENT_REMOVED = 4,
+    LT_ALERT_PIECE_FINISHED = 5,
     LT_ALERT_OTHER = 99,
 } lt_alert_type_t;
 
