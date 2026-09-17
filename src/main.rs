@@ -61,6 +61,13 @@ struct Args {
     db: Option<PathBuf>,
     #[arg(long, help = "Cache directory for downloaded pieces")]
     cache: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(i64).range(1..),
+        help = "Maximum on-disk piece cache size in bytes (overrides [cache] cache_size)"
+    )]
+    cache_size: Option<i64>,
     #[arg(long, help = "Configuration file path (TOML)")]
     config: Option<PathBuf>,
     #[arg(
@@ -441,6 +448,19 @@ fn acquire_mountpoint_lock(mountpoint: &Path) -> Result<File, MountpointLockErro
     }
 }
 
+/// Override `config.cache.cache_size` when the `--cache-size` CLI flag is set.
+///
+/// The TOML `[cache] cache_size` and this flag converge on the same
+/// `CacheManager::new` call site inside the download engine; the CLI wins when
+/// both are present so QA can force a small cache without editing a config file.
+/// clap's `1..` range parser guarantees `cache_size` is a positive `i64`, so the
+/// value needs no further validation or cast before it reaches the engine.
+fn apply_cache_size_override(config: &mut TorrentfsConfig, cache_size: Option<i64>) {
+    if let Some(bytes) = cache_size {
+        config.cache.cache_size = Some(bytes);
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -485,7 +505,7 @@ fn main() {
     install_shutdown_signal_handlers();
 
     // Load configuration from TOML file if provided
-    let config = match &args.config {
+    let mut config = match &args.config {
         Some(config_path) => match TorrentfsConfig::from_file(config_path) {
             Ok(cfg) => {
                 info!("Loaded configuration from {:?}", config_path);
@@ -498,6 +518,8 @@ fn main() {
         },
         None => TorrentfsConfig::default_config(),
     };
+
+    apply_cache_size_override(&mut config, args.cache_size);
 
     // Early check: /dev/fuse must exist for FUSE mounts to work.
     // On rootless containers this is the most common failure point.
@@ -796,5 +818,30 @@ mod tests {
         let err = Args::try_parse_from(["torrentfs", "--log-level", "bogus", "/mnt"])
             .expect_err("--log-level must reject an unknown level");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn cache_size_flag_parses_with_mountpoint() {
+        let args = Args::try_parse_from(["torrentfs", "--cache-size", "4194304", "/mnt"])
+            .expect("--cache-size must parse alongside the mountpoint");
+        assert_eq!(args.cache_size, Some(4194304));
+        assert_eq!(args.mountpoint.as_deref(), Some(Path::new("/mnt")));
+    }
+
+    #[test]
+    fn cache_size_flag_rejects_zero() {
+        let err = Args::try_parse_from(["torrentfs", "--cache-size", "0", "/mnt"]).expect_err(
+            "--cache-size 0 must be rejected instead of silently falling back to 1 GiB",
+        );
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn cache_size_flag_rejects_over_i64_max() {
+        // i64::MAX + 1 — must fail parsing, not wrap negative via a cast.
+        let err =
+            Args::try_parse_from(["torrentfs", "--cache-size", "9223372036854775808", "/mnt"])
+                .expect_err("--cache-size over i64::MAX must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 }
