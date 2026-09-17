@@ -12,7 +12,8 @@
 # LAN (any host may query or inject peers); acceptable for a synthesized QA
 # payload, but pass --tracker-bind 127.0.0.1 to stay loopback-only.
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
-#        [--tracker-bind IP] [--announce-host IP]  → outputs under ci/selfseed/
+#        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
+#        → outputs under ci/selfseed/output, or DIR when --output-dir is given
 
 set -euo pipefail
 
@@ -51,6 +52,22 @@ while [[ $# -gt 0 ]]; do
         --port) TRACKER_PORT="$2"; shift 2 ;;
         --tracker-bind) TRACKER_BIND="$2"; shift 2 ;;
         --announce-host) ANNOUNCE_HOST="$2"; shift 2 ;;
+        --output-dir)
+            # `$# -lt 2` catches a missing value (would otherwise trip `set -u`
+            # as an unbound-variable exit 1); `-z` catches an explicit empty
+            # value, which must not silently fall back to the caller's cwd.
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "self-seed: --output-dir requires a non-empty path" >&2
+                exit 2
+            fi
+            # Anchor a relative path to the invocation cwd now, before the
+            # `cd "$ROOT_DIR"` below, so the seeder (which runs from ROOT_DIR)
+            # writes to the same place mkdir created.
+            case "$2" in
+                /*) OUTPUT_DIR="$2" ;;
+                *) OUTPUT_DIR="$PWD/$2" ;;
+            esac
+            shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
