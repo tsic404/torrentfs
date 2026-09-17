@@ -221,11 +221,8 @@ run_test "parse_args --log-level debug /mnt does not treat debug as mountpoint" 
 run_test "parse_args --log-level=debug /mnt keeps mountpoint" \
     'parse_args --log-level=debug /mnt; [ "$mountpoint" = /mnt ]'
 
-run_test "parse_args --cache-size 4194304 /mnt does not treat value as mountpoint" \
-    'parse_args --cache-size 4194304 /mnt; [ "$mountpoint" = /mnt ] && [ "${#torrentfs_args[@]}" -eq 2 ] && [ "${torrentfs_args[0]}" = --cache-size ] && [ "${torrentfs_args[1]}" = 4194304 ]'
-
-run_test "parse_args --cache-size=4194304 /mnt keeps mountpoint" \
-    'parse_args --cache-size=4194304 /mnt; [ "$mountpoint" = /mnt ]'
+run_test "parse_args --cache-size 4194304 /mnt rejects with exit 2" \
+    'rc=0; ( parse_args --cache-size 4194304 /mnt ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
 
 # --- validate_mountpoint (mountpoint guard) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
