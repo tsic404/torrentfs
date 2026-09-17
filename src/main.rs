@@ -264,6 +264,61 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
     false
 }
 
+/// Return `true` when `/proc/self/mountinfo` still lists a FUSE mount at
+/// `mountpoint`, mirroring the entrypoint's `mountpoint_has_fuse` probe.  Used
+/// by the session-loss path to decide whether a residual mount needs detaching:
+/// the session thread usually ends because the kernel already detached the
+/// mount (ENODEV), in which case nothing remains and `unmount_fuse` would only
+/// log a spurious failure.
+fn mountpoint_has_fuse_mount(mountpoint: &Path) -> bool {
+    // A dead (ENOTCONN) mount makes `canonicalize` fail; normalize to an
+    // absolute path instead so a relative CLI mountpoint still matches the
+    // kernel's canonicalized mountinfo entry (whose mount point is always
+    // absolute).
+    let target = std::fs::canonicalize(mountpoint)
+        .or_else(|_| std::path::absolute(mountpoint))
+        .unwrap_or_else(|_| mountpoint.to_path_buf());
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mountinfo
+        .lines()
+        .any(|line| mountinfo_line_is_fuse(line, &target))
+}
+
+/// True when one `/proc/self/mountinfo` line records a FUSE mount at `target`.
+///
+/// Split out of [`mountpoint_has_fuse_mount`] so the field parsing — the
+/// mountpoint is field 5 and the fstype is the first field after the `-`
+/// separator, whose optional fields vary in number — is unit-testable against
+/// fixtures without a live mount.
+fn mountinfo_line_is_fuse(line: &str, target: &Path) -> bool {
+    let mut fields = line.split_whitespace();
+    let Some(raw_mountpoint) = fields.nth(4) else {
+        return false;
+    };
+    if decode_mountinfo_field(raw_mountpoint).as_os_str() != target.as_os_str() {
+        return false;
+    }
+    fields
+        .skip_while(|f| *f != "-")
+        .nth(1)
+        .map(|fstype| fstype == "fuse" || fstype.starts_with("fuse."))
+        .unwrap_or(false)
+}
+
+/// Decode the octal escapes the kernel uses for space/tab/newline/backslash in
+/// mountinfo mount points (`\040`, `\011`, `\012`, `\134`).  Backslash is
+/// decoded last so an escaped backslash is not re-read as an escape start.
+fn decode_mountinfo_field(raw: &str) -> PathBuf {
+    PathBuf::from(
+        raw.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\"),
+    )
+}
+
 /// Decide whether a direct `umount2(MNT_DETACH)` is worth attempting before
 /// falling back to the `fusermount` helper. Only root (or a user namespace with
 /// CAP_SYS_ADMIN) can detach a mount it does not own; non-root owners mount
@@ -284,6 +339,11 @@ fn should_attempt_direct_unmount(euid: u32) -> bool {
 /// engine and cache have already been shut down by then, so neither case needs
 /// a long wait — this grace period only has to outlast the immediate exit.
 const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// How often the main thread re-checks the FUSE session thread while parked,
+/// bounding the delay between an external unmount and the daemon noticing its
+/// session ended.  The check is a cheap `JoinHandle::is_finished` poll.
+const SESSION_END_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Outcome of waiting for the FUSE session thread to exit during shutdown.
 #[derive(Debug, PartialEq, Eq)]
@@ -322,15 +382,36 @@ where
 /// but the session thread does not exit within [`SESSION_DRAIN_GRACE`] —
 /// expected when an external bind mount keeps the superblock alive — the
 /// thread is abandoned and process exit closes `/dev/fuse`.
+///
+/// While parked, the FUSE session thread is also watched: an external unmount
+/// (`fusermount -u`) or a severed connection makes the session loop return
+/// cleanly, and a daemon that kept waiting would silently lose its mountpoint
+/// yet keep holding the mountpoint lock, serving ENOENT to every path.  When
+/// the session ends without a shutdown signal, the engine/cache are drained and
+/// the process exits [`EXIT_SESSION_LOST`] so the loss is visible.
 fn wait_for_shutdown(
     worker_pool: Arc<WorkerPool>,
     download_service: Option<Arc<DownloadService>>,
     bg: fuser::BackgroundSession,
     mountpoint: &Path,
 ) {
-    while !SHUTDOWN.load(Ordering::SeqCst) {
-        std::thread::park();
-    }
+    // Wait for either a shutdown signal or the FUSE session thread to end.
+    // `park_timeout` re-checks the cheap `is_finished` flag periodically so an
+    // external unmount is noticed within one poll interval instead of never.
+    let session_lost = loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            break false;
+        }
+        if bg.guard.is_finished() {
+            error!(
+                "FUSE session ended without a shutdown signal — mount {} was externally unmounted or the connection was severed; shutting down",
+                mountpoint.display()
+            );
+            break true;
+        }
+        std::thread::park_timeout(SESSION_END_POLL_INTERVAL);
+    };
+
     info!("shutdown requested — stopping download engine");
     if let Some(ds) = &download_service {
         ds.shutdown();
@@ -357,6 +438,31 @@ fn wait_for_shutdown(
     }
     info!("draining download worker queue");
     worker_pool.shutdown();
+
+    if session_lost {
+        // The session thread ended without a shutdown signal.  The kernel
+        // normally detaches the mount itself (ENODEV), but when the session
+        // loop errored out under a rootful bind mount a dead mount can linger
+        // because the bind mount keeps the superblock alive.  Check mountinfo
+        // and best-effort detach whatever is still there; an unmount failure
+        // must not mask the session-loss exit code.
+        if mountpoint_has_fuse_mount(mountpoint) {
+            if unmount_fuse(mountpoint) {
+                info!(
+                    "detached residual mount {} after session loss",
+                    mountpoint.display()
+                );
+            } else {
+                warn!(
+                    "residual mount {} could not be detached after session loss (exiting {})",
+                    mountpoint.display(),
+                    EXIT_SESSION_LOST
+                );
+            }
+        }
+        std::process::exit(EXIT_SESSION_LOST);
+    }
+
     info!("unmounting FUSE filesystem");
     if !unmount_fuse(mountpoint) {
         error!("FUSE unmount failed; the mountpoint is left in an inconsistent state");
@@ -394,6 +500,12 @@ const MOUNTPOINT_LOCK_FILE: &str = ".torrentfs.lock";
 
 /// Exit status used when another torrentfs already holds the mountpoint lock.
 const EXIT_MOUNTPOINT_LOCKED: i32 = 101;
+
+/// Exit status used when the FUSE session ends without a shutdown signal
+/// (external unmount or severed connection), leaving the daemon with nothing
+/// to serve.  Distinct from the lock-held code so a supervisor can tell the
+/// two failure modes apart.
+const EXIT_SESSION_LOST: i32 = 102;
 
 /// Failure modes for [`acquire_mountpoint_lock`], split so the caller can map
 /// a held lock onto the distinct `exit 101` status instead of a generic error.
@@ -709,6 +821,54 @@ mod tests {
             ),
             JoinOutcome::TimedOut
         );
+    }
+
+    #[test]
+    fn mountinfo_line_detects_fuse_with_varying_optional_fields() {
+        // fstype is the first field after the "-" separator, not a fixed
+        // column; optional fields (shared:X master:Y) may precede it.
+        assert!(mountinfo_line_is_fuse(
+            "36 35 98:0 /mnt-inner /mnt rw - fuse.torrentfs torrentfs rw",
+            Path::new("/mnt")
+        ));
+        assert!(mountinfo_line_is_fuse(
+            "36 35 98:0 /mnt-inner /mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw",
+            Path::new("/mnt")
+        ));
+        // The bare `fuse` fstype (no subtype) is what torrentfs's own mount
+        // publishes.
+        assert!(mountinfo_line_is_fuse(
+            "36 35 98:0 /mnt-inner /mnt rw shared:1 master:2 - fuse torrentfs rw",
+            Path::new("/mnt")
+        ));
+    }
+
+    #[test]
+    fn mountinfo_line_rejects_non_fuse_and_other_targets() {
+        assert!(!mountinfo_line_is_fuse(
+            "36 35 98:0 / /mnt rw shared:1 master:2 - ext4 /dev/sda1 rw",
+            Path::new("/mnt")
+        ));
+        assert!(!mountinfo_line_is_fuse(
+            "36 35 98:0 /mnt-inner /mnt-inner rw shared:1 master:2 - fuse.torrentfs torrentfs rw",
+            Path::new("/mnt")
+        ));
+        // A truncated line with no mountpoint field must not match.
+        assert!(!mountinfo_line_is_fuse(
+            "36 35 98:0 /mnt-inner",
+            Path::new("/mnt")
+        ));
+    }
+
+    #[test]
+    fn decode_mountinfo_field_unwraps_kernel_octal_escapes() {
+        assert_eq!(
+            decode_mountinfo_field("a\\040b\\011c\\012d\\134e"),
+            PathBuf::from("a b\tc\nd\\e")
+        );
+        // Backslash is decoded last: `\134012` stays a literal backslash
+        // followed by "012", never re-read as the start of a `\012` escape.
+        assert_eq!(decode_mountinfo_field("\\134012"), PathBuf::from("\\012"));
     }
 
     #[test]
