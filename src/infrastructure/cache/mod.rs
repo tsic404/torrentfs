@@ -23,6 +23,8 @@ pub struct CacheManager {
     current_size: u64,
     pub miss_count: u64,
     pub hit_count: u64,
+    /// Cumulative number of pieces evicted by `evict_lru`.
+    pub eviction_count: u64,
     evict_callbacks: Vec<Box<dyn Fn(String, i32) + Send + Sync>>,
     /// pieces with an on-disk `.incomplete` marker — written by the
     /// C++ `PieceStorage::write_piece` while a piece is still being filled.
@@ -122,6 +124,7 @@ impl CacheManager {
             current_size: 0,
             miss_count: 0,
             hit_count: 0,
+            eviction_count: 0,
             evict_callbacks: Vec::new(),
             incomplete_piece_keys: HashSet::new(),
             verified_piece_keys: HashSet::new(),
@@ -576,6 +579,7 @@ impl CacheManager {
                 let info_hash = self.extract_info_hash(&piece_key).to_string();
                 let piece_index = self.extract_piece_index(&piece_key);
                 self.remove_piece(&piece_key)?;
+                self.eviction_count += 1;
                 // Notify registered callbacks about the evicted piece
                 if info_hash != "unknown" {
                     for callback in &self.evict_callbacks {
@@ -2116,6 +2120,10 @@ mod tests {
         assert!(
             cache.has_piece(incomplete_key),
             "the incomplete piece must survive eviction"
+        );
+        assert_eq!(
+            cache.eviction_count, 1,
+            "evict_lru must count each evicted piece"
         );
         Ok(())
     }

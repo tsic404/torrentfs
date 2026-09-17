@@ -205,14 +205,18 @@ fn write_global_cache_summary(
     get_cache_manager: &impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
 ) {
     output.push_str("\n-- Cache --\n");
-    let (global_hits, global_misses) = if let Some(ref cm) = get_cache_manager() {
+    let (global_hits, global_misses, global_evictions) = if let Some(cm) = get_cache_manager() {
         if let Ok(cm_guard) = cm.try_lock() {
-            (cm_guard.hit_count, cm_guard.miss_count)
+            (
+                cm_guard.hit_count,
+                cm_guard.miss_count,
+                cm_guard.eviction_count,
+            )
         } else {
-            (0, 0)
+            (0, 0, 0)
         }
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     let global_total = global_hits + global_misses;
     let hit_rate = if global_total > 0 {
@@ -221,10 +225,11 @@ fn write_global_cache_summary(
         0.0
     };
     output.push_str(&format!(
-        "  Hits: {}  Misses: {}  Hit Rate: {:.1}%  Evictions: 0\n",
+        "  Hits: {}  Misses: {}  Hit Rate: {:.1}%  Evictions: {}\n",
         format_num(global_hits),
         format_num(global_misses),
-        hit_rate
+        hit_rate,
+        format_num(global_evictions)
     ));
 }
 
@@ -1175,6 +1180,43 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(!text.contains("[info_hash]"));
+    }
+
+    #[test]
+    fn test_global_stats_renders_eviction_count() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 64 * 1024).unwrap();
+
+        let first = "aaaa1111:piece:0";
+        let second = "bbbb2222:piece:0";
+
+        let first_path = cache.ensure_piece_dir(first).unwrap();
+        std::fs::write(&first_path, vec![0u8; 40_000]).unwrap();
+        cache.add_piece(first, 40_000).unwrap();
+
+        // The second piece pushes the cache over budget, evicting the first.
+        let second_path = cache.ensure_piece_dir(second).unwrap();
+        std::fs::write(&second_path, vec![0u8; 40_000]).unwrap();
+        cache.add_piece(second, 40_000).unwrap();
+        assert_eq!(cache.eviction_count, 1);
+
+        let cm = Arc::new(Mutex::new(cache));
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            None,
+            {
+                let cm = cm.clone();
+                move || Some(cm.clone())
+            },
+            "0.0.0.0:6881",
+            None,
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(
+            text.contains("Evictions: 1"),
+            "stats must render the actual eviction count, got:\n{text}"
+        );
     }
 
     #[test]
