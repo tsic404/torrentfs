@@ -8,7 +8,7 @@
 //! `tests/common/mod.rs` (`MiniTracker`, `TestHarness`).
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -313,6 +313,10 @@ fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
 /// order) and the total payload length.  Memory stays bounded by one piece
 /// buffer plus the digest list — the previous `std::fs::read` held the whole
 /// payload resident, which OOM'd at 1024/2048 MiB.
+///
+/// A full-size all-zero piece (the sparse >4 GiB QA payload) reuses one cached
+/// digest and is seeked over instead of written, so the seed file stays sparse
+/// instead of physically allocating the payload.
 fn hash_and_seed(payload: &std::path::Path, seed_file: &std::path::Path) -> (Vec<u8>, u64) {
     use sha1_smol::Sha1;
 
@@ -322,6 +326,7 @@ fn hash_and_seed(payload: &std::path::Path, seed_file: &std::path::Path) -> (Vec
     let mut pieces = Vec::new();
     let mut buf = vec![0u8; PIECE_LEN];
     let mut total: u64 = 0;
+    let mut zero_piece_digest: Option<[u8; 20]> = None;
     loop {
         let mut filled = 0;
         while filled < buf.len() {
@@ -336,12 +341,28 @@ fn hash_and_seed(payload: &std::path::Path, seed_file: &std::path::Path) -> (Vec
             break;
         }
         let chunk = &buf[..filled];
-        let mut h = Sha1::new();
-        h.update(chunk);
-        pieces.extend_from_slice(&h.digest().bytes());
-        output.write_all(chunk).expect("failed to write seed file");
+        if filled == PIECE_LEN && chunk.iter().all(|&b| b == 0) {
+            let digest = *zero_piece_digest.get_or_insert_with(|| {
+                let mut h = Sha1::new();
+                h.update(chunk);
+                h.digest().bytes()
+            });
+            pieces.extend_from_slice(&digest);
+            output
+                .seek(SeekFrom::Current(filled as i64))
+                .expect("failed to seek seed file");
+        } else {
+            let mut h = Sha1::new();
+            h.update(chunk);
+            pieces.extend_from_slice(&h.digest().bytes());
+            output.write_all(chunk).expect("failed to write seed file");
+        }
         total += filled as u64;
     }
+    // Seeked-over zero pieces do not extend the file (lseek past EOF leaves
+    // the size unchanged), so pin the full logical size; the holes read back
+    // as zeros and match the skipped pieces.
+    output.set_len(total).expect("failed to set seed file size");
     (pieces, total)
 }
 
@@ -599,6 +620,48 @@ mod tests {
             })
             .collect();
         assert_eq!(pieces, expected);
+    }
+
+    /// an all-zero (sparse) payload hashes every full piece to the same zero
+    /// digest and leaves the seed file sparse, not physically allocated —
+    /// the >4 GiB window-boundary seed must not consume disk space.
+    #[test]
+    fn hash_and_seed_keeps_zero_payload_sparse() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("selfseed-env-hash-sparse-{}", std::process::id()));
+        let _guard = TempDirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload_path = dir.join("payload.bin");
+        let seed_path = dir.join("seed_data").join("selfseed");
+        std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+
+        // 4 full zero pieces, created sparse via set_len (holes read as zero).
+        let size = (PIECE_LEN * 4) as u64;
+        let f = std::fs::File::create(&payload_path).unwrap();
+        f.set_len(size).unwrap();
+
+        let (pieces, total) = hash_and_seed(&payload_path, &seed_path);
+
+        assert_eq!(total, size);
+        let zero_piece = vec![0u8; PIECE_LEN];
+        let mut h = sha1_smol::Sha1::new();
+        h.update(&zero_piece);
+        let zero_digest = h.digest().bytes();
+        let mut expected = Vec::new();
+        for _ in 0..4 {
+            expected.extend_from_slice(&zero_digest);
+        }
+        assert_eq!(pieces, expected);
+
+        let meta = std::fs::metadata(&seed_path).unwrap();
+        assert_eq!(meta.len(), size);
+        assert!(
+            meta.blocks() * 512 < size,
+            "all-zero seed file must stay sparse, allocated {} bytes",
+            meta.blocks() * 512
+        );
     }
 
     /// a downloader whose (ip, port) collides with the

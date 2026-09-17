@@ -11,7 +11,7 @@
 # detectable. NOTE: binding 0.0.0.0 exposes the unauthenticated tracker to the
 # LAN (any host may query or inject peers); acceptable for a synthesized QA
 # payload, but pass --tracker-bind 127.0.0.1 to stay loopback-only.
-# Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--port PORT]
+# Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP]  → outputs under ci/selfseed/
 
 set -euo pipefail
@@ -39,6 +39,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_DIR="$SCRIPT_DIR/selfseed"
 OUTPUT_DIR="$ENV_DIR/output"
 PAYLOAD_MIB=4
+PAYLOAD_GIB=""
 TRACKER_PORT=16969
 TRACKER_BIND=""
 ANNOUNCE_HOST=""
@@ -46,6 +47,7 @@ ANNOUNCE_HOST=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --payload-mib) PAYLOAD_MIB="$2"; shift 2 ;;
+        --payload-gib) PAYLOAD_GIB="$2"; shift 2 ;;
         --port) TRACKER_PORT="$2"; shift 2 ;;
         --tracker-bind) TRACKER_BIND="$2"; shift 2 ;;
         --announce-host) ANNOUNCE_HOST="$2"; shift 2 ;;
@@ -119,9 +121,27 @@ cd "$ROOT_DIR"
 echo "[selfseed] building seeder (release)…"
 "$CARGO" build --locked --release --example torrentfs-selfseed-env --quiet
 
-echo "[selfseed] generating ${PAYLOAD_MIB} MiB deterministic payload…"
-head -c $((PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
-    | tr '\0' 'a' > "$OUTPUT_DIR/payload.txt"
+if [ -n "$PAYLOAD_GIB" ]; then
+    case "$PAYLOAD_GIB" in
+        ''|*[!0-9]*) echo "self-seed: --payload-gib must be a positive integer" >&2; exit 2 ;;
+    esac
+    # `10#` forces decimal so a leading-zero value (`08`/`09`) is not parsed as
+    # octal. Cap before multiplying: payload bytes must stay within signed
+    # 64-bit (2^33 GiB = 2^63 bytes wraps negative).
+    MAX_PAYLOAD_GIB=8589934591
+    if (( 10#$PAYLOAD_GIB <= 0 )); then
+        echo "self-seed: --payload-gib must be > 0" >&2; exit 2
+    fi
+    if (( 10#$PAYLOAD_GIB > MAX_PAYLOAD_GIB )); then
+        echo "self-seed: --payload-gib too large (max $MAX_PAYLOAD_GIB GiB)" >&2; exit 2
+    fi
+    echo "[selfseed] generating ${PAYLOAD_GIB} GiB sparse (all-zero) payload…"
+    truncate -s $((10#$PAYLOAD_GIB * 1024 * 1024 * 1024)) "$OUTPUT_DIR/payload.txt"
+else
+    echo "[selfseed] generating ${PAYLOAD_MIB} MiB deterministic payload…"
+    head -c $((PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
+        | tr '\0' 'a' > "$OUTPUT_DIR/payload.txt"
+fi
 
 echo "[selfseed] creating torrent + starting tracker…"
 SEED_ARGS=( \
