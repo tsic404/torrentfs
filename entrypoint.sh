@@ -140,7 +140,7 @@ parse_args() {
                 validate_config "${arg#--config=}"
                 torrentfs_args+=("$arg")
                 ;;
-            --config|--db|--cache|--log-file|--log-level)
+            --config|--db|--cache|--log-file|--log-level|--cache-size)
                 torrentfs_args+=("$arg")
                 expect_value="$arg"
                 ;;
