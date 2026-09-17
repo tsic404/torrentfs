@@ -35,7 +35,7 @@ use fuser::{
 use tracing::{debug, warn};
 
 use crate::cache::CacheManager;
-use crate::config::TorrentfsConfig;
+use crate::config::{TorrentfsConfig, DEFAULT_READ_TIMEOUT_SECS};
 use crate::db::Database;
 use crate::domain::fs_error::FsError;
 use crate::infrastructure::metrics::Metrics;
@@ -364,11 +364,7 @@ pub struct TorrentFs {
 }
 impl TorrentFs {
     fn read_timeout(config: &TorrentfsConfig) -> u64 {
-        config
-            .timeouts
-            .read_timeout_secs
-            .map(|v| if v > 0 { v as u64 } else { 30 })
-            .unwrap_or(30)
+        config.timeouts.resolved_read_timeout_secs()
     }
 
     /// Number of download worker threads (bounded pool). Defaults to the
@@ -446,7 +442,7 @@ impl TorrentFs {
         Self {
             service,
             pending_table,
-            read_timeout_secs: 30,
+            read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
             worker_pool,
         }
     }

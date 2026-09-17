@@ -44,7 +44,7 @@ pub use piece_priority::PiecePriorityToml;
 pub use pieces::PiecesConfig;
 pub use proxy::ProxyConfig;
 pub use rate_limits::RateLimitsConfig;
-pub use timeouts::TimeoutsConfig;
+pub use timeouts::{TimeoutsConfig, DEFAULT_READ_TIMEOUT_SECS};
 pub use tracker::TrackerConfig;
 pub use user_agent::UserAgentConfig;
 
@@ -390,14 +390,20 @@ lsd_enabled = false
 
     #[test]
     fn test_read_timeout_config() {
-        // Default: read_timeout_secs not set → defaults to 30
+        // Default: read_timeout_secs unset → resolves to DEFAULT_READ_TIMEOUT_SECS (60).
         let default_config = TorrentfsConfig::default_config();
-        let timeout = default_config
-            .timeouts
-            .read_timeout_secs
-            .map(|v| if v > 0 { v as u64 } else { 30 })
-            .unwrap_or(30);
-        assert_eq!(timeout, 30);
+        assert_eq!(
+            default_config.timeouts.resolved_read_timeout_secs(),
+            DEFAULT_READ_TIMEOUT_SECS
+        );
+
+        // Non-positive value falls back to the default.
+        let non_positive: TorrentfsConfig =
+            toml::from_str("[timeouts]\nread_timeout_secs = 0\n").unwrap();
+        assert_eq!(
+            non_positive.timeouts.resolved_read_timeout_secs(),
+            DEFAULT_READ_TIMEOUT_SECS
+        );
 
         // Custom timeout
         let toml_str = r#"
@@ -406,6 +412,7 @@ read_timeout_secs = 10
 "#;
         let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.read_timeout_secs, Some(10));
+        assert_eq!(config.timeouts.resolved_read_timeout_secs(), 10);
     }
     #[test]
     fn test_config_rejects_unknown_section() {

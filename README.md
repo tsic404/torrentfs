@@ -80,9 +80,16 @@ Every key is optional (libtorrent defaults). Example `torrentfs-config.toml`:
 [connections]
 listen_interfaces = "0.0.0.0:6881"
 
+[timeouts]
+read_timeout_secs = 60
+
 [cache]
 cache_size = 67108864
 ```
+
+The FUSE read timeout (`[timeouts] read_timeout_secs`, in seconds) sets the per-phase wait applied to torrent state transitions and piece downloads during a read. It defaults to 60s — raise it when reading the first piece of a large cold file on a slow-but-healthy swarm, or lower it to fail fast on dead torrents. It is a torrentfs-level timeout and is not passed to libtorrent.
+
+A read's worst-case wait exceeds this value: the engine waits up to `read_timeout_secs` for the state transition, up to 10s for a stale-piece recheck, up to 9s for peer discovery, and up to `read_timeout_secs` again for the piece download — ~139s at the default, plus a 5s FUSE dispatch margin before the read surfaces `ENODATA`.
 
 The on-disk piece cache size (`[cache] cache_size`, in bytes) defaults to 1 GiB. Set it below the torrent's total size to force LRU eviction and re-download on repeated reads.
 

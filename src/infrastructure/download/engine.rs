@@ -152,11 +152,7 @@ impl DownloadEngine {
         let store = PieceStore::new(cache_manager.clone());
         let scheduler = PieceScheduler::new(PiecePriorityConfig::from_toml(&config.piece_priority));
 
-        let read_timeout_secs = config
-            .timeouts
-            .read_timeout_secs
-            .map(|v| if v > 0 { v as u64 } else { 30 })
-            .unwrap_or(30);
+        let read_timeout_secs = config.timeouts.resolved_read_timeout_secs();
 
         let (tx, rx) = mpsc::channel::<Command>();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -1749,6 +1745,7 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{no_seeder_stderr_hint, partial_read_bounds, read_wait_budget_secs};
+    use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
 
     /// the no-seeder stderr hint must use the exact message the
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
@@ -1773,9 +1770,9 @@ mod tests {
     /// expires a ticket while the engine is still legitimately waiting.
     #[test]
     fn budget_covers_all_slow_path_phases() {
-        // Default read_timeout_secs = 30:
-        //   30 (state) + 10 (recheck cap) + 9 (peer cap) + 30 (piece) = 79s.
-        assert_eq!(read_wait_budget_secs(30), 79);
+        // Default read_timeout_secs = 60 (DEFAULT_READ_TIMEOUT_SECS):
+        //   60 (state) + 10 (recheck cap) + 9 (peer cap) + 60 (piece) = 139s.
+        assert_eq!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS), 139);
         // Short timeout still caps recheck + peer waits at the timeout itself.
         assert_eq!(read_wait_budget_secs(4), 4 + 4 + 4 + 4);
         // Timeout below both caps.
@@ -1784,10 +1781,11 @@ mod tests {
 
     #[test]
     fn budget_exceeds_legacy_deadline_for_default_timeout() {
-        // The old FUSE deadline was `read_timeout_secs + 5` (35s) — shorter
-        // than the engine's 79s worst-case budget and even its ~39s
-        // peer-wait+piece-wait path. The new budget must exceed it.
-        assert!(read_wait_budget_secs(30) > 30 + 5);
+        // The old FUSE deadline was `read_timeout_secs + 5` — shorter than
+        // the engine's worst-case budget and even its peer-wait+piece-wait
+        // path. At the default timeout the budget (139s) still exceeds the
+        // legacy deadline (65s), so a slow seeder is never expired early.
+        assert!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS) > DEFAULT_READ_TIMEOUT_SECS + 5);
     }
 
     /// With the first piece missing, the partial read is empty —
