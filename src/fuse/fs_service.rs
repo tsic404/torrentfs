@@ -918,12 +918,15 @@ impl FsService {
     pub fn flush(&mut self, ino: u64) -> FsResult<()> {
         if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
             if name.ends_with(".torrent") {
-                // a zero-byte `.torrent` has nothing to validate.
-                // Surfacing EINVAL here made `touch` report a spurious write
-                // error on close for a file that was never written. Let it
-                // pass; `release` discards the empty inode (ENOENT).
+                // Every close of a zero-byte `.torrent` fails with EINVAL:
+                // FUSE can't distinguish `cp` of an empty seed from `touch`,
+                // `>` redirection, or a truncate-to-zero then close. The
+                // `touch` failure is an accepted regression (a silent success
+                // would hide the invalid seed); `release` still discards the
+                // empty inode, so no ghost `data/` mirror survives.
                 if data.is_empty() {
-                    return Ok(());
+                    warn!("Zero-byte torrent file {} rejected", name);
+                    return Err(FsError::InvalidArgument);
                 }
 
                 if data.len() > MAX_TORRENT_SIZE {
@@ -4404,15 +4407,16 @@ mod tests {
         assert!(t2.is_some(), "b.torrent should be in DB");
     }
 
-    /// `flush` for an empty `.torrent` returns `Ok` — a zero-byte
-    /// file has nothing to validate. Discarding it is `release`'s job, so
-    /// `touch` no longer surfaces a spurious EINVAL on close.
+    /// `flush` for an empty `.torrent` returns `EINVAL` — a zero-byte seed
+    /// has no metadata to parse, so `cp` must fail on close with the
+    /// invalid-seed signal rather than silently succeeding.
     #[test]
-    fn flush_empty_torrent_is_allowed() {
+    fn flush_empty_torrent_returns_einval() {
         let mut svc = service_with_db();
         let (ino, _fh) = create_torrent_file(&mut svc, "empty.torrent");
 
-        svc.flush(ino).expect("empty torrent flush ok");
+        let err = svc.flush(ino).unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
     }
 
     /// a non-empty but unparseable `.torrent` fails `flush` with a
