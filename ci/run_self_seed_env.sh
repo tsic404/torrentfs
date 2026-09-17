@@ -35,12 +35,35 @@ detect_announce_host() {
     printf '%s\n' "$ip"
 }
 
+# Validate VALUE is a positive decimal integer ≤ MAX. Leading zeros are
+# stripped and the bound is compared by digit count then lexicographic order,
+# so out-of-range values never reach Bash's signed 64-bit arithmetic (which
+# wraps silently). Invalid input prints a self-seed: error and exits 2.
+validate_size_arg() {
+    local flag="$1" value="$2" max="$3" unit="$4" digits
+    case "$value" in
+        *[!0-9]*) echo "self-seed: $flag must be a positive integer" >&2; exit 2 ;;
+    esac
+    digits="${value#"${value%%[!0]*}"}"
+    if [ -z "$digits" ]; then
+        echo "self-seed: $flag must be > 0" >&2; exit 2
+    fi
+    if [ "${#digits}" -gt "${#max}" ] \
+        || { [ "${#digits}" -eq "${#max}" ] && [[ "$digits" > "$max" ]]; }; then
+        echo "self-seed: $flag too large (max $max $unit)" >&2; exit 2
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_DIR="$SCRIPT_DIR/selfseed"
 OUTPUT_DIR="$ENV_DIR/output"
 PAYLOAD_MIB=4
 PAYLOAD_GIB=""
+# Caps keep payload bytes within signed 64-bit (2^43 MiB = 2^33 GiB = 2^63
+# bytes), so the later * 1024*1024 / * 1024*1024*1024 arithmetic cannot wrap.
+MAX_PAYLOAD_MIB=8796093022207
+MAX_PAYLOAD_GIB=8589934591
 TRACKER_PORT=16969
 TRACKER_BIND=""
 ANNOUNCE_HOST=""
@@ -110,6 +133,13 @@ if [[ "$ANNOUNCE_HOST" == *:* ]]; then
     exit 2
 fi
 
+# Validate payload sizes before any side effect (creating OUTPUT_DIR or
+# building the seeder) so an invalid value fails with no directory/build work.
+validate_size_arg "--payload-mib" "$PAYLOAD_MIB" "$MAX_PAYLOAD_MIB" "MiB"
+if [ -n "$PAYLOAD_GIB" ]; then
+    validate_size_arg "--payload-gib" "$PAYLOAD_GIB" "$MAX_PAYLOAD_GIB" "GiB"
+fi
+
 # Resolve a *working* cargo by probing `--version` on every PATH candidate (in
 # order) and then the rustup default location.  `--version` rejects broken
 # rustup shims (toolchain without the cargo component) that shadow a working
@@ -139,24 +169,11 @@ echo "[selfseed] building seeder (release)…"
 "$CARGO" build --locked --release --example torrentfs-selfseed-env --quiet
 
 if [ -n "$PAYLOAD_GIB" ]; then
-    case "$PAYLOAD_GIB" in
-        ''|*[!0-9]*) echo "self-seed: --payload-gib must be a positive integer" >&2; exit 2 ;;
-    esac
-    # `10#` forces decimal so a leading-zero value (`08`/`09`) is not parsed as
-    # octal. Cap before multiplying: payload bytes must stay within signed
-    # 64-bit (2^33 GiB = 2^63 bytes wraps negative).
-    MAX_PAYLOAD_GIB=8589934591
-    if (( 10#$PAYLOAD_GIB <= 0 )); then
-        echo "self-seed: --payload-gib must be > 0" >&2; exit 2
-    fi
-    if (( 10#$PAYLOAD_GIB > MAX_PAYLOAD_GIB )); then
-        echo "self-seed: --payload-gib too large (max $MAX_PAYLOAD_GIB GiB)" >&2; exit 2
-    fi
     echo "[selfseed] generating ${PAYLOAD_GIB} GiB sparse (all-zero) payload…"
     truncate -s $((10#$PAYLOAD_GIB * 1024 * 1024 * 1024)) "$OUTPUT_DIR/payload.txt"
 else
     echo "[selfseed] generating ${PAYLOAD_MIB} MiB deterministic payload…"
-    head -c $((PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
+    head -c $((10#$PAYLOAD_MIB * 1024 * 1024)) /dev/zero \
         | tr '\0' 'a' > "$OUTPUT_DIR/payload.txt"
 fi
 
