@@ -121,6 +121,9 @@ struct EngineState {
     snapshot: Arc<Mutex<DownloadSnapshot>>,
     stopping: Arc<AtomicBool>,
     alert_consumer: Option<AlertConsumer>,
+    /// Piece-completion events forwarded by the alert consumer thread,
+    /// drained by the engine loop and turned into piece registration.
+    piece_finished_rx: mpsc::Receiver<(String, i32)>,
 }
 
 impl DownloadEngine {
@@ -191,11 +194,17 @@ impl DownloadEngine {
                 // SAFETY: `session` outlives the consumer — `engine_loop` calls
                 // `consumer.stop()` (unregistering the notify hook) before the
                 // session is dropped.
+                // Piece-completion events flow from the consumer thread back to
+                // this engine loop over a dedicated channel; the engine drains
+                // them and registers finished pieces (background/prefetch
+                // downloads never go through a read's piece-wait loop).
+                let (piece_finished_tx, piece_finished_rx) = mpsc::channel::<(String, i32)>();
                 let alert_consumer = unsafe {
                     AlertConsumer::spawn(
                         session.inner(),
                         shared_stats.clone(),
                         thread_metrics.clone(),
+                        piece_finished_tx,
                     )
                 };
                 let state = EngineState {
@@ -210,6 +219,7 @@ impl DownloadEngine {
                     snapshot: thread_snapshot,
                     stopping: thread_stopping,
                     alert_consumer: Some(alert_consumer),
+                    piece_finished_rx,
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -509,6 +519,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
         match rx.recv_timeout(SNAPSHOT_INTERVAL) {
             Ok(cmd) => {
                 let stop = state.handle_command(cmd);
+                state.drain_piece_finished();
                 state.publish_snapshot();
                 // do NOT flush cache metadata per command.  Every
                 // cached read marks the piece metadata dirty
@@ -523,6 +534,8 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             }
             Err(RecvTimeoutError::Timeout) => {
                 state.refresh_session_stats();
+                state.drain_piece_finished();
+                state.settle_idle_torrents();
                 state.publish_snapshot();
                 state.flush_cache_metadata();
             }
@@ -1549,20 +1562,76 @@ impl EngineState {
 
     fn release_reader(&mut self, info_hash: &str) {
         if let Some(handle) = self.handles.get(info_hash) {
-            // Return to idle upload_mode first so no eager piece requests leak
-            // out before the priority gradient is reset below.
+            self.scheduler
+                .reader_released(handle, info_hash, &self.store);
+        }
+        // Restore idle upload_mode when the reader count and the wanted set
+        // both reach zero. `reader_released` is infallible, so this decision
+        // does not depend on a recompute result.
+        self.maybe_restore_upload_mode(info_hash);
+    }
+
+    /// Restore idle `upload_mode` once a torrent has converged (no reader, no
+    /// wanted piece).  Called both on reader release and on the periodic
+    /// engine tick so convergence is also caught when the last wanted piece
+    /// becomes ready outside a reader release (e.g. a later cached read).
+    fn maybe_restore_upload_mode(&mut self, info_hash: &str) {
+        if !self.scheduler.is_idle(info_hash) {
+            return;
+        }
+        if let Some(handle) = self.handles.get(info_hash) {
             if !handle.set_flags(UPLOAD_MODE_FLAG) {
                 tracing::warn!(
-                    "release_reader: failed to re-enable upload_mode for {}",
+                    "maybe_restore_upload_mode: failed to re-enable upload_mode for {}",
                     info_hash
                 );
             }
-            if let Err(e) = self
-                .scheduler
-                .reader_released(handle, info_hash, &self.store)
-            {
-                tracing::warn!("release_reader: reader_released failed: {:?}", e);
-            }
+        }
+    }
+
+    /// On each engine tick, restore `upload_mode` for any torrent that has
+    /// converged to idle since its last read.  Without this, a read-ahead
+    /// window completed entirely through later cached reads would leave the
+    /// handle in download mode indefinitely (fast-path reads skip
+    /// `release_reader`).
+    fn settle_idle_torrents(&mut self) {
+        let idle: Vec<String> = self
+            .handles
+            .keys()
+            .filter(|ih| self.scheduler.is_idle(ih.as_str()))
+            .cloned()
+            .collect();
+        for info_hash in idle {
+            self.maybe_restore_upload_mode(&info_hash);
+        }
+    }
+
+    /// Drain all queued piece-completion events forwarded by the alert
+    /// consumer thread and register each finished piece.  This is the
+    /// convergence path for background/prefetch downloads: they never go
+    /// through a read's piece-wait loop, so without it `piece_ready` would
+    /// never fire and the retained prefetch window could not clean up.
+    fn drain_piece_finished(&mut self) {
+        while let Ok((info_hash, piece_index)) = self.piece_finished_rx.try_recv() {
+            self.handle_piece_finished(&info_hash, piece_index);
+        }
+    }
+
+    /// Register a piece reported complete by the `piece_finished` alert and
+    /// clear it from the scheduler's wanted set.  The piece is complete on
+    /// disk (libtorrent has written and hash-checked it), so its on-disk size
+    /// is the authoritative registered size.
+    fn handle_piece_finished(&mut self, info_hash: &str, piece_index: i32) {
+        if let Err(e) = self.store.register_finished_piece(info_hash, piece_index) {
+            tracing::warn!(
+                "handle_piece_finished: failed to register {}:piece:{}: {:?}",
+                info_hash,
+                piece_index,
+                e
+            );
+        }
+        if let Some(handle) = self.handles.get(info_hash) {
+            self.scheduler.piece_ready(handle, info_hash, piece_index);
         }
     }
 

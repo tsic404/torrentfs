@@ -145,3 +145,98 @@ fn test_read_registers_prefetched_pieces() {
     *stop.lock().unwrap() = true;
     let _ = seeder.join();
 }
+
+#[test]
+fn test_background_prefetch_registers_via_piece_finished_alert() {
+    let _guard = acquire_session_lock();
+    let tracker = MiniTracker::start();
+    let announce_url = tracker.announce_url();
+
+    const PIECE_LEN: usize = 262144;
+    const NUM_PIECES: usize = 4;
+    let (torrent_data, content) = build_torrent(&announce_url, PIECE_LEN, NUM_PIECES);
+
+    // Seeder holding the complete file.
+    let seed_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(seed_dir.path().join("multi.bin"), &content).unwrap();
+    let stop = Arc::new(std::sync::Mutex::new(false));
+    let stop_clone = Arc::clone(&stop);
+    let td_clone = torrent_data.clone();
+    let seeder = thread::spawn(move || {
+        let config = local_test_config();
+        let mut session = Session::new(&config).unwrap();
+        let info = TorrentInfo::from_bytes(td_clone).unwrap();
+        let handle = session.add_torrent(&info, seed_dir.path()).unwrap();
+        loop {
+            if *stop_clone.lock().unwrap() {
+                break;
+            }
+            if let Ok(s) = handle.status() {
+                let _ = matches!(s.state, TorrentState::Seeding | TorrentState::Finished);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        if tracker.announce_count() >= 1 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "seeder never announced"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    thread::sleep(Duration::from_secs(3));
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:16895".to_string());
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    let info = Arc::new(TorrentInfo::from_bytes(torrent_data).unwrap());
+
+    // Read only piece 0. Pieces 1..=3 are then prefetched by the read-ahead
+    // window and complete in the background — never through a read's
+    // piece-wait loop. Their registration therefore proves the piece_finished
+    // alert reached the engine (the alert_mask must include piece_progress).
+    let data = engine
+        .read_file_range(info.clone(), 0, 0, PIECE_LEN as u32)
+        .expect("first-piece read timed out");
+    assert_eq!(data.len(), PIECE_LEN);
+    assert_eq!(&data[..], &content[..PIECE_LEN]);
+
+    let info_hash = hex::encode(info.info_hash().unwrap());
+    let cm = engine.cache_manager();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let guard = cm.lock().unwrap();
+        let all_verified = (1..NUM_PIECES).all(|p| {
+            let key = format!("{}:piece:{}", info_hash, p);
+            guard.has_piece(&key) && guard.is_piece_verified(&key)
+        });
+        drop(guard);
+        if all_verified {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for background-prefetch piece registration"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    // Sanity: every piece is now verified — piece 0 via the read path,
+    // pieces 1..=3 via the piece_finished alert.
+    let guard = cm.lock().unwrap();
+    for p in 0..NUM_PIECES {
+        let key = format!("{}:piece:{}", info_hash, p);
+        assert!(guard.has_piece(&key), "piece {} not registered", p);
+        assert!(guard.is_piece_verified(&key), "piece {} not verified", p);
+    }
+    drop(guard);
+
+    *stop.lock().unwrap() = true;
+    let _ = seeder.join();
+}

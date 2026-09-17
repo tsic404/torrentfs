@@ -9,7 +9,7 @@
 
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -52,6 +52,7 @@ pub(crate) enum AlertType {
     SessionStats,
     TorrentFinished,
     TorrentRemoved,
+    PieceFinished,
     Other(i32),
 }
 
@@ -77,6 +78,9 @@ impl From<i32> for AlertType {
             }
             x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_REMOVED as i32 => {
                 AlertType::TorrentRemoved
+            }
+            x if x == libtorrent_sys::lt_alert_type_t_LT_ALERT_PIECE_FINISHED as i32 => {
+                AlertType::PieceFinished
             }
             other => AlertType::Other(other),
         }
@@ -166,6 +170,7 @@ impl AlertConsumer {
         session: libtorrent_sys::lt_session_t,
         stats: SharedSessionStats,
         metrics: Arc<Metrics>,
+        piece_finished_tx: mpsc::Sender<(String, i32)>,
     ) -> Self {
         let notify = Arc::new(NotifyState {
             flag: AtomicBool::new(false),
@@ -202,7 +207,7 @@ impl AlertConsumer {
                         break;
                     }
 
-                    if drain_alerts(session, &stats, &metrics) {
+                    if drain_alerts(session, &stats, &metrics, &piece_finished_tx) {
                         // Drained some alerts; loop again to drain any that
                         // arrived while we were dispatching before blocking.
                         continue;
@@ -273,6 +278,7 @@ fn drain_alerts(
     session: libtorrent_sys::lt_session_t,
     stats: &SharedSessionStats,
     metrics: &Metrics,
+    piece_finished_tx: &mpsc::Sender<(String, i32)>,
 ) -> bool {
     let list = unsafe { libtorrent_sys::lt_session_pop_alerts(session) };
     if list.is_null() {
@@ -286,7 +292,7 @@ fn drain_alerts(
         for i in 0..count {
             let alert = unsafe { &*alerts.add(i as usize) };
             let alert_type = AlertType::from(alert.type_);
-            dispatch(alert_type, alert, stats, metrics);
+            dispatch(alert_type, alert, stats, metrics, piece_finished_tx);
         }
     }
 
@@ -299,6 +305,7 @@ pub(crate) fn dispatch(
     alert: &libtorrent_sys::lt_alert_data_t,
     stats: &SharedSessionStats,
     _metrics: &Metrics,
+    piece_finished_tx: &mpsc::Sender<(String, i32)>,
 ) {
     match alert_type {
         AlertType::ReadPiece => {
@@ -347,6 +354,18 @@ pub(crate) fn dispatch(
         AlertType::TorrentRemoved => {
             let info_hash = cstr(&alert.info_hash);
             tracing::info!("alert: torrent_removed (info_hash={})", info_hash);
+        }
+        AlertType::PieceFinished => {
+            let info_hash = cstr(&alert.info_hash);
+            tracing::trace!(
+                "alert: piece_finished (info_hash={}, piece={})",
+                info_hash,
+                alert.piece_index
+            );
+            // Forward the completion to the engine thread, which registers
+            // the piece (making the cache aware of a background/prefetch
+            // download) and clears it from the scheduler's wanted set.
+            let _ = piece_finished_tx.send((info_hash.to_string(), alert.piece_index));
         }
         AlertType::Other(category) => {
             let msg = cstr_ptr(alert.message);
@@ -444,6 +463,10 @@ mod tests {
             AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_TORRENT_REMOVED as i32),
             AlertType::TorrentRemoved
         ));
+        assert!(matches!(
+            AlertType::from(libtorrent_sys::lt_alert_type_t_LT_ALERT_PIECE_FINISHED as i32),
+            AlertType::PieceFinished
+        ));
     }
 
     #[test]
@@ -466,6 +489,7 @@ mod tests {
         // `post_session_stats` request is the alert's producer.
         let shared = SharedSessionStats::new();
         let metrics = Metrics::new();
+        let (piece_finished_tx, _piece_finished_rx) = mpsc::channel::<(String, i32)>();
         let alert = libtorrent_sys::lt_alert_data_t {
             type_: libtorrent_sys::lt_alert_type_t_LT_ALERT_SESSION_STATS as i32,
             info_hash: [0; 41],
@@ -483,7 +507,13 @@ mod tests {
             message: std::ptr::null(),
             category: 0,
         };
-        dispatch(AlertType::from(alert.type_), &alert, &shared, &metrics);
+        dispatch(
+            AlertType::from(alert.type_),
+            &alert,
+            &shared,
+            &metrics,
+            &piece_finished_tx,
+        );
 
         let ss = shared.snapshot();
         assert_eq!(ss.total_downloaded, 439_871_233);
@@ -492,5 +522,49 @@ mod tests {
         assert_eq!(ss.upload_rate, 1024);
         assert_eq!(ss.dht_nodes, 300);
         assert_eq!(ss.peers_connected, 7);
+    }
+
+    #[test]
+    fn piece_finished_alert_forwards_event() {
+        // A `piece_finished_alert` must be forwarded to the engine so a
+        // background (prefetch) download gets registered and cleared from the
+        // scheduler — the convergence signal Radian's review flagged as
+        // previously unreachable.
+        let shared = SharedSessionStats::new();
+        let metrics = Metrics::new();
+        let (piece_finished_tx, piece_finished_rx) = mpsc::channel::<(String, i32)>();
+        let mut info_hash = [0 as std::os::raw::c_char; 41];
+        let hex = "cafe0123456789abcdef0123456789abcdef01";
+        for (i, b) in hex.bytes().enumerate() {
+            info_hash[i] = b as std::os::raw::c_char;
+        }
+        let alert = libtorrent_sys::lt_alert_data_t {
+            type_: libtorrent_sys::lt_alert_type_t_LT_ALERT_PIECE_FINISHED as i32,
+            info_hash,
+            piece_index: 7,
+            error_code: 0,
+            piece_data: std::ptr::null_mut(),
+            piece_data_size: 0,
+            download_rate: 0,
+            upload_rate: 0,
+            total_downloaded: 0,
+            total_uploaded: 0,
+            dht_nodes: 0,
+            peers_connected: 0,
+            half_open_connections: 0,
+            message: std::ptr::null(),
+            category: 0,
+        };
+        dispatch(
+            AlertType::from(alert.type_),
+            &alert,
+            &shared,
+            &metrics,
+            &piece_finished_tx,
+        );
+
+        let (got_hash, got_piece) = piece_finished_rx.try_recv().expect("event forwarded");
+        assert_eq!(got_hash, hex);
+        assert_eq!(got_piece, 7);
     }
 }
