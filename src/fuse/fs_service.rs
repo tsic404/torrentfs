@@ -762,7 +762,7 @@ impl FsService {
         }
 
         if !name.ends_with(".torrent") {
-            return Err(FsError::PermissionDenied);
+            return Err(FsError::InvalidArgument);
         }
 
         if self.inode_mgr.find_child_by_name(parent, name).is_some() {
@@ -801,7 +801,7 @@ impl FsService {
         }
 
         if !name.ends_with(".torrent") {
-            return Err(FsError::PermissionDenied);
+            return Err(FsError::InvalidArgument);
         }
 
         if self.inode_mgr.find_child_by_name(parent, name).is_some() {
@@ -1343,7 +1343,7 @@ impl FsService {
         }
 
         if !name.ends_with(".torrent") {
-            return Err(FsError::PermissionDenied);
+            return Err(FsError::InvalidArgument);
         }
 
         let ino = match self.inode_mgr.find_child_by_name(parent, name) {
@@ -1552,15 +1552,15 @@ impl FsService {
             // name does not already resolve (the preceding guards return
             // ENOENT/EEXIST otherwise), `metadata/` only accepts `.torrent`
             // files — also enforced in `create` — so dropping the suffix on
-            // either side is rejected with `PermissionDenied` → EACCES, not
+            // either side is rejected with `InvalidArgument` → EINVAL, not
             // `NotFound`/ENOENT: the destination parent exists, only the
             // target name is invalid. A missing destination *parent* fails
             // the kernel VFS intermediate LOOKUP with ENOENT regardless of
             // trailing slash; a missing *final* name reaches FUSE without a
-            // slash (this EACCES path) and yields ENOTDIR only under a
+            // slash (this EINVAL path) and yields ENOTDIR only under a
             // trailing slash.
             if !name.ends_with(".torrent") || !newname.ends_with(".torrent") {
-                return Err(FsError::PermissionDenied);
+                return Err(FsError::InvalidArgument);
             }
 
             let (file_data, old_name, was_unlinked) = match self.inode_mgr.inodes.get(&source_ino) {
@@ -2994,6 +2994,44 @@ mod tests {
         let data_dir_ino = DATA_DIR_INO_BASE + 5;
         let err = svc.mkdir(data_dir_ino, "foo").unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    /// Writing a file without the `.torrent` suffix into `metadata/` is an
+    /// invalid name, not a permission failure: the user must name the file
+    /// `.torrent`, so `create`/`mknod`/`unlink` reject it with
+    /// `InvalidArgument` → EINVAL, not `PermissionDenied` → EACCES.
+    #[test]
+    fn metadata_suffix_rejection_returns_einval_not_eacces() {
+        let mut svc = bare_service();
+
+        let err = svc.create(METADATA_INO, "no-suffix").unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+
+        let err = svc.mknod(METADATA_INO, "no-suffix").unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+
+        let err = svc.unlink(METADATA_INO, "no-suffix").unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+    }
+
+    /// Dropping the `.torrent` suffix on a rename is the same invalid-name
+    /// rejection as `create` — `InvalidArgument` → EINVAL, not EACCES.
+    #[test]
+    fn metadata_rename_suffix_drop_returns_einval_not_eacces() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "keep.torrent").expect("create");
+
+        let err = svc
+            .rename(METADATA_INO, "keep.torrent", METADATA_INO, "dropped")
+            .unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+
+        // The inode is untouched and still resolvable under its old name.
+        assert!(
+            svc.inode_mgr
+                .find_child_by_name(METADATA_INO, "keep.torrent")
+                == Some(created.attr.ino)
+        );
     }
 
     /// `rmdir`/`unlink` on the read-only `data/` namespace must return `EROFS`
