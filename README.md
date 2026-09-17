@@ -84,11 +84,11 @@ listen_interfaces = "0.0.0.0:6881"
 cache_size = 67108864
 ```
 
-The on-disk piece cache size (`[cache] cache_size`, or the `--cache-size <bytes>` CLI flag, which overrides the file) defaults to 1 GiB. Set it below the torrent's total size to force LRU eviction and re-download on repeated reads.
+The on-disk piece cache size (`[cache] cache_size`, in bytes) defaults to 1 GiB. Set it below the torrent's total size to force LRU eviction and re-download on repeated reads.
 
 Note: `[rate_limits] download_rate_limit` / `upload_rate_limit` (bytes per second, `0` = unlimited) do not apply to peers on the local network — libtorrent leaves loopback/local peers unthrottled by default. Use a peer address outside the local network (routable public address) to exercise rate limits.
 
-CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--cache-size <bytes>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
+CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
 
 ### Logging
 

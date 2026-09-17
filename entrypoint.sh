@@ -140,7 +140,7 @@ parse_args() {
                 validate_config "${arg#--config=}"
                 torrentfs_args+=("$arg")
                 ;;
-            --config|--db|--cache|--log-file|--log-level|--cache-size)
+            --config|--db|--cache|--log-file|--log-level)
                 torrentfs_args+=("$arg")
                 expect_value="$arg"
                 ;;
@@ -155,6 +155,13 @@ parse_args() {
             --log-file=*)
                 log_file_arg="${arg#--log-file=}"
                 torrentfs_args+=("$arg")
+                ;;
+            --cache-size|--cache-size=*)
+                # Removed CLI flag: reject explicitly so its value isn't
+                # misparsed as the mountpoint (which would mkdir at the wrong
+                # path and mount there, masking torrentfs's own clap error).
+                echo "[entrypoint] ERROR: --cache-size is not a CLI option; set [cache] cache_size in the TOML config file instead" >&2
+                exit 2
                 ;;
             -*)
                 # Any other option is forwarded verbatim. Flags that bypass
