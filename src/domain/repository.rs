@@ -75,8 +75,7 @@ pub trait TorrentRepository {
 
     fn rename_torrent(
         &mut self,
-        torrent_id: i64,
-        new_name: &str,
+        source_id: i64,
         new_filename: &str,
         new_source_path: &str,
     ) -> Result<(), DbError>;

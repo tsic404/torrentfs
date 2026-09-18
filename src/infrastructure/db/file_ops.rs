@@ -4,8 +4,15 @@ use super::database::Database;
 use super::types::{DbError, FileEntry, TorrentDirectory, TorrentFile};
 
 impl Database {
+    /// Insert a torrent's file tree.  `source_id` is a source-location id;
+    /// files/directories are stored under its shared content id so identical
+    /// torrents share one file list.
     #[allow(dead_code)]
-    pub fn insert_files(&mut self, torrent_id: i64, files: &[FileEntry]) -> Result<(), DbError> {
+    pub fn insert_files(&mut self, source_id: i64, files: &[FileEntry]) -> Result<(), DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(());
+        };
+
         let tx = self.conn.transaction()?;
 
         let mut dir_cache: std::collections::HashMap<String, i64> =
@@ -26,7 +33,7 @@ impl Database {
                 if is_file {
                     tx.execute(
                         "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
-                        params![torrent_id, current_parent_id, part, &file_entry.path, file_entry.size],
+                        params![content_id, current_parent_id, part, &file_entry.path, file_entry.size],
                     )?;
                 } else {
                     if let Some(&cached_id) = dir_cache.get(&current_path) {
@@ -37,7 +44,7 @@ impl Database {
                     let existing_id: Option<i64> = tx
                         .query_row(
                             "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
-                            params![torrent_id, current_parent_id, part],
+                            params![content_id, current_parent_id, part],
                             |row| row.get(0),
                         )
                         .optional()?
@@ -51,7 +58,7 @@ impl Database {
 
                     tx.execute(
                         "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?, ?, ?)",
-                        params![torrent_id, current_parent_id, part],
+                        params![content_id, current_parent_id, part],
                     )?;
                     let dir_id = tx.last_insert_rowid();
 
@@ -78,14 +85,18 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_files_by_torrent_id(&self, torrent_id: i64) -> Result<Vec<TorrentFile>, DbError> {
+    pub fn get_files_by_torrent_id(&self, source_id: i64) -> Result<Vec<TorrentFile>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(Vec::new());
+        };
+
         let mut stmt = self.conn.prepare(
             "SELECT id, torrent_id, directory_id, name, path, size, first_piece, last_piece, piece_start, piece_end
              FROM torrent_files WHERE torrent_id = ? ORDER BY id",
         )?;
 
         let files = stmt
-            .query_map(params![torrent_id], |row| {
+            .query_map(params![content_id], |row| {
                 Ok(TorrentFile {
                     id: row.get(0)?,
                     torrent_id: row.get(1)?,
@@ -143,14 +154,18 @@ impl Database {
         Ok(files)
     }
 
-    pub fn get_root_files(&self, torrent_id: i64) -> Result<Vec<TorrentFile>, DbError> {
+    pub fn get_root_files(&self, source_id: i64) -> Result<Vec<TorrentFile>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(Vec::new());
+        };
+
         let mut stmt = self.conn.prepare(
             "SELECT id, torrent_id, directory_id, name, path, size, first_piece, last_piece, piece_start, piece_end
              FROM torrent_files WHERE torrent_id = ? AND directory_id IS NULL",
         )?;
 
         let files = stmt
-            .query_map(params![torrent_id], |row| {
+            .query_map(params![content_id], |row| {
                 Ok(TorrentFile {
                     id: row.get(0)?,
                     torrent_id: row.get(1)?,
@@ -171,14 +186,18 @@ impl Database {
 
     pub fn get_torrent_directory(
         &self,
-        torrent_id: i64,
+        source_id: i64,
         parent_id: Option<i64>,
         name: &str,
     ) -> Result<Option<TorrentDirectory>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(None);
+        };
+
         let result = self.conn
             .query_row(
                 "SELECT id, torrent_id, parent_id, name FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
-                params![torrent_id, parent_id, name],
+                params![content_id, parent_id, name],
                 |row| {
                     Ok(TorrentDirectory {
                         id: row.get(0)?,
@@ -219,8 +238,12 @@ impl Database {
     pub fn get_torrent_directories_by_parent(
         &self,
         parent_id: Option<i64>,
-        torrent_id: i64,
+        source_id: i64,
     ) -> Result<Vec<TorrentDirectory>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(Vec::new());
+        };
+
         let mut stmt = if parent_id.is_none() {
             self.conn.prepare(
                 "SELECT id, torrent_id, parent_id, name FROM torrent_directories WHERE torrent_id = ? AND parent_id IS NULL",
@@ -232,7 +255,7 @@ impl Database {
         };
 
         let dirs = if parent_id.is_none() {
-            stmt.query_map(params![torrent_id], |row| {
+            stmt.query_map(params![content_id], |row| {
                 Ok(TorrentDirectory {
                     id: row.get(0)?,
                     torrent_id: row.get(1)?,
@@ -242,7 +265,7 @@ impl Database {
             })?
             .collect::<Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(params![torrent_id, parent_id], |row| {
+            stmt.query_map(params![content_id, parent_id], |row| {
                 Ok(TorrentDirectory {
                     id: row.get(0)?,
                     torrent_id: row.get(1)?,
@@ -291,9 +314,13 @@ impl Database {
     #[allow(dead_code)]
     pub fn get_file_by_path(
         &self,
-        torrent_id: i64,
+        source_id: i64,
         path: &str,
     ) -> Result<Option<TorrentFile>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(None);
+        };
+
         let parts: Vec<&str> = path.split('/').collect();
         if parts.is_empty() {
             return Ok(None);
@@ -307,7 +334,7 @@ impl Database {
                 .query_row(
                     "SELECT id, torrent_id, directory_id, name, path, size, first_piece, last_piece, piece_start, piece_end
                      FROM torrent_files WHERE torrent_id = ? AND directory_id IS NULL AND name = ?",
-                    params![torrent_id, file_name],
+                    params![content_id, file_name],
                     |row| {
                         Ok(TorrentFile {
                             id: row.get(0)?,
@@ -328,7 +355,7 @@ impl Database {
             return Ok(result);
         }
 
-        let dir_id = self.resolve_directory_path(torrent_id, &dir_path_parts)?;
+        let dir_id = self.resolve_directory_path(content_id, &dir_path_parts)?;
 
         match dir_id {
             Some(did) => {
@@ -336,7 +363,7 @@ impl Database {
                     .query_row(
                         "SELECT id, torrent_id, directory_id, name, path, size, first_piece, last_piece, piece_start, piece_end
                          FROM torrent_files WHERE torrent_id = ? AND directory_id = ? AND name = ?",
-                        params![torrent_id, did, file_name],
+                        params![content_id, did, file_name],
                         |row| {
                             Ok(TorrentFile {
                                 id: row.get(0)?,
@@ -362,7 +389,7 @@ impl Database {
     #[allow(dead_code)]
     fn resolve_directory_path(
         &self,
-        torrent_id: i64,
+        content_id: i64,
         parts: &[&str],
     ) -> Result<Option<i64>, DbError> {
         let mut current_parent: Option<i64> = None;
@@ -371,7 +398,7 @@ impl Database {
             let existing_id: Option<i64> = self.conn
                 .query_row(
                     "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
-                    params![torrent_id, current_parent, part],
+                    params![content_id, current_parent, part],
                     |row| row.get(0),
                 )
                 .optional()?
