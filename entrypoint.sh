@@ -289,7 +289,6 @@ ensure_fuse_device() {
     fi
 
     if is_root; then
-        echo "[entrypoint] /dev/fuse missing — attempting to create device node" >&2
         if mknod /dev/fuse c 10 229 2>/dev/null; then
             # A non-root daemon (privilege drop in rootful containers) needs
             # read-write /dev/fuse. Only chmod the node we just created (0600
@@ -299,7 +298,7 @@ ensure_fuse_device() {
             echo "[entrypoint] /dev/fuse created successfully" >&2
             return 0
         fi
-        echo "[entrypoint] mknod /dev/fuse failed" >&2
+        echo "[entrypoint] /dev/fuse missing — mknod failed, no usable device" >&2
     fi
 
     return 1
