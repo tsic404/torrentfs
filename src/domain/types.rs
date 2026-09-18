@@ -94,6 +94,20 @@ pub enum InsertTorrentResult {
     Duplicate(i64),
 }
 
+/// Outcome of atomically moving a torrent over an existing destination.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoveOverwriteResult {
+    /// The source row was absent — nothing was changed (a pending add may have
+    /// failed to persist). The destination must be preserved.
+    SourceAbsent,
+    /// The source row was re-pointed at the destination. `removed_target` is
+    /// `Some((id, info_hash))` when a destination row was deleted in the same
+    /// transaction; `None` when the destination had no persisted row.
+    Moved {
+        removed_target: Option<(i64, String)>,
+    },
+}
+
 pub struct FileEntry {
     pub path: String,
     pub size: i64,

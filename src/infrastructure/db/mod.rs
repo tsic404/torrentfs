@@ -28,7 +28,8 @@ use crate::domain::repository::{FileRepository, TorrentRepository};
 
 pub use database::Database;
 pub use types::{
-    DbError, FileEntry, InsertTorrentResult, Torrent, TorrentDirectory, TorrentFile, TorrentStatus,
+    DbError, FileEntry, InsertTorrentResult, MoveOverwriteResult, Torrent, TorrentDirectory,
+    TorrentFile, TorrentStatus,
 };
 
 // ---- Repository trait implementations for Database ----

@@ -24,7 +24,7 @@ use sha1_smol::Sha1;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
-use crate::db::Database;
+use crate::db::{Database, MoveOverwriteResult};
 use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
@@ -1137,11 +1137,27 @@ impl FsService {
             }
         };
 
-        // empty metadata directories must persist (and be restored
-        // on restart), so no directory rows are pruned here. Only the removed
-        // torrent's data/ mirror entries are evicted; source-path directory
-        // rows and their cached SourcePathDir entries stay valid — the
-        // directories still exist, now empty.
+        self.cleanup_removed_torrent_data_state(torrent_id, &info_hash, source_path, filename)?;
+
+        Ok(Some((torrent_id, info_hash)))
+    }
+
+    /// Evict every in-memory/`data/`-side trace of a torrent whose DB row has
+    /// been removed: cached data inodes, the kernel dentry, the
+    /// processing-lock key, and L1 range-cache entries. Pure cache cleanup —
+    /// it takes the already-known `(torrent_id, info_hash, source_path,
+    /// filename)` so callers that removed the row through a non-`remove_torrent`
+    /// path (rename-overwrite) can reuse it. Empty metadata directories must
+    /// persist (and be restored on restart), so no directory rows are pruned
+    /// here — source-path directory rows and their cached `SourcePathDir`
+    /// entries stay valid (the directories still exist, now empty).
+    fn cleanup_removed_torrent_data_state(
+        &mut self,
+        torrent_id: i64,
+        info_hash: &str,
+        source_path: &str,
+        filename: &str,
+    ) -> FsResult<()> {
         self.inode_mgr
             .data_inodes
             .retain(|_, data_inode| match data_inode {
@@ -1170,7 +1186,7 @@ impl FsService {
         {
             let mut processing = self.processing_torrents.lock().map_err(|e| {
                 error!(
-                    "Mutex poisoned in remove_torrent_and_data_state() processing_torrents: {}",
+                    "Mutex poisoned in cleanup_removed_torrent_data_state() processing_torrents: {}",
                     e
                 );
                 FsError::LockPoisoned
@@ -1181,7 +1197,7 @@ impl FsService {
         {
             let mut cache = self.torrent_data_cache.lock().map_err(|e| {
                 error!(
-                    "Mutex poisoned in remove_torrent_and_data_state() torrent_data_cache: {}",
+                    "Mutex poisoned in cleanup_removed_torrent_data_state() torrent_data_cache: {}",
                     e
                 );
                 FsError::LockPoisoned
@@ -1192,7 +1208,7 @@ impl FsService {
             cache.retain(|k, _| !k.starts_with(&prefix));
         }
 
-        Ok(Some((torrent_id, info_hash)))
+        Ok(())
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &str) -> FsResult<Attr> {
@@ -1476,12 +1492,32 @@ impl FsService {
             }
         };
 
-        if let Some(target_ino) = self.inode_mgr.find_child_by_name(newparent, newname) {
-            if target_ino == source_ino {
-                return Ok(());
-            }
-            return Err(FsError::AlreadyExists);
-        }
+        // POSIX `rename` overwrite semantics: a regular file may be renamed
+        // over an existing regular file — the destination is removed and the
+        // source takes its name. Every other destination collision is still
+        // rejected: a directory cannot silently replace (or be replaced by) a
+        // file, and directory-over-directory keeps its existing EEXIST.
+        let overwrite_target =
+            if let Some(target_ino) = self.inode_mgr.find_child_by_name(newparent, newname) {
+                if target_ino == source_ino {
+                    return Ok(());
+                }
+                let source_is_file = matches!(
+                    self.inode_mgr.inodes.get(&source_ino),
+                    Some(InodeData::File { .. })
+                );
+                let target_is_file = matches!(
+                    self.inode_mgr.inodes.get(&target_ino),
+                    Some(InodeData::File { .. })
+                );
+                if source_is_file && target_is_file {
+                    Some(target_ino)
+                } else {
+                    return Err(FsError::AlreadyExists);
+                }
+            } else {
+                None
+            };
 
         let is_directory = matches!(
             self.inode_mgr.inodes.get(&source_ino),
@@ -1619,7 +1655,96 @@ impl FsService {
                     return Err(e);
                 }
 
-                ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
+                if let Some(target_ino) = overwrite_target {
+                    // Overwrite: the destination and source rows must change
+                    // atomically, so a source-side failure can never leave the
+                    // destination already destroyed. Wait for the
+                    // destination's in-flight add to settle first — a
+                    // still-pending add would otherwise land a row at
+                    // `(new_source_path, newname)` after our move and clobber
+                    // the source. On timeout roll the source inode back; the
+                    // destination is untouched.
+                    let target_dedup_key = (new_source_path.clone(), newname.to_string());
+                    if let Err(e) =
+                        self.wait_for_pending_add(&target_dedup_key, pending_timeout, "rename")
+                    {
+                        self.inode_mgr.inodes.insert(
+                            source_ino,
+                            InodeData::File {
+                                parent,
+                                name: old_name.clone(),
+                                data: file_data.clone(),
+                                unlinked: was_unlinked,
+                            },
+                        );
+                        return Err(e);
+                    }
+
+                    let result = match ts.rename_torrent_overwriting(
+                        &old_name,
+                        &old_source_path,
+                        newname,
+                        &new_source_path,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            self.inode_mgr.inodes.insert(
+                                source_ino,
+                                InodeData::File {
+                                    parent,
+                                    name: old_name.clone(),
+                                    data: file_data.clone(),
+                                    unlinked: was_unlinked,
+                                },
+                            );
+                            return Err(e);
+                        }
+                    };
+
+                    match result {
+                        MoveOverwriteResult::SourceAbsent => {
+                            // The source's pending add failed to persist — no
+                            // row to move. Roll the in-memory move back and
+                            // FAIL the rename: both names stay in place, so the
+                            // kernel's dentry view and the directory state
+                            // agree. Surfacing an error (rather than the
+                            // non-overwrite path's silent inode-only move) is
+                            // deliberate — the destination must not be
+                            // destroyed for a source that cannot replace it.
+                            self.inode_mgr.inodes.insert(
+                                source_ino,
+                                InodeData::File {
+                                    parent,
+                                    name: old_name.clone(),
+                                    data: file_data.clone(),
+                                    unlinked: was_unlinked,
+                                },
+                            );
+                            return Err(FsError::Internal(format!(
+                                "cannot rename '{}': torrent has no persisted row",
+                                old_name
+                            )));
+                        }
+                        MoveOverwriteResult::Moved { removed_target } => {
+                            // DB committed — the in-memory + cache mutations
+                            // are now safe.
+                            if let Ok(mut guard) = self.persist_errors.lock() {
+                                guard.remove(&(new_source_path.clone(), newname.to_string()));
+                            }
+                            self.inode_mgr.unlink_file(target_ino);
+                            if let Some((target_id, target_info_hash)) = removed_target {
+                                self.cleanup_removed_torrent_data_state(
+                                    target_id,
+                                    &target_info_hash,
+                                    &new_source_path,
+                                    newname,
+                                )?;
+                            }
+                        }
+                    }
+                } else {
+                    ts.rename_torrent(&old_name, &old_source_path, newname, &new_source_path)?;
+                }
 
                 // a cross-directory move leaves the old source-path
                 // directory empty, but empty directories must persist (and be
@@ -1682,6 +1807,11 @@ impl FsService {
                     old_name, newname, old_source_path, new_source_path
                 );
             } else {
+                // No database: an overwrite still retires the destination
+                // inode so the source takes its name.
+                if let Some(target_ino) = overwrite_target {
+                    self.inode_mgr.unlink_file(target_ino);
+                }
                 info!("Renamed file '{}' to '{}' (no database)", old_name, newname);
             }
             Ok(())
@@ -3701,6 +3831,348 @@ mod tests {
             .expect_err("rename into a missing destination parent must fail");
 
         assert_eq!(err, FsError::NotFound);
+    }
+
+    /// `mv metadata/cat-b/x.torrent metadata/cat-a/x.torrent` when
+    /// `cat-a/x.torrent` already exists must overwrite the destination per
+    /// POSIX `rename` semantics — the source torrent replaces the target
+    /// (target row + inode removed, source row re-pointed at the new
+    /// location) — instead of returning `AlreadyExists`/EEXIST.
+    #[test]
+    fn rename_over_existing_torrent_overwrites_target() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        // Two distinct torrents at the same filename in each directory.
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "target", "x.torrent", 16, "hash-target", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+            match db.insert_torrent("cat-b", "source", "x.torrent", 16, "hash-source", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        let target_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            target_ino,
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+        let source_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            source_ino,
+            InodeData::File {
+                parent: cat_b_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        svc.rename(cat_b_ino, "x.torrent", cat_a_ino, "x.torrent")
+            .expect("same-name move must overwrite the destination, not return EEXIST");
+
+        // The source inode now lives at (cat-a, "x.torrent").
+        match svc.inode_mgr.inodes.get(&source_ino) {
+            Some(InodeData::File { parent, name, .. }) => {
+                assert_eq!(*parent, cat_a_ino, "source inode must move into cat-a");
+                assert_eq!(name, "x.torrent");
+            }
+            other => panic!(
+                "source inode must survive the rename, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+        // The target inode is retired (no open handles in this test).
+        assert!(
+            !svc.inode_mgr.inodes.contains_key(&target_ino),
+            "target inode must be removed by the overwrite"
+        );
+
+        // DB: exactly one row at (cat-a, "x.torrent") carrying the source's
+        // content; the target row is gone and cat-b no longer holds one.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let moved = db_guard
+            .get_torrent_by_filename_and_source_path("x.torrent", "cat-a")
+            .unwrap()
+            .expect("source row must land at cat-a/x.torrent");
+        assert_eq!(
+            moved.info_hash, "hash-source",
+            "cat-a must carry the source torrent, not the target"
+        );
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("x.torrent", "cat-b")
+                .unwrap()
+                .is_none(),
+            "the source location cat-b/x.torrent must be vacated"
+        );
+        assert_eq!(
+            db_guard.get_all_torrents().unwrap().len(),
+            1,
+            "target row must be removed, leaving only the source"
+        );
+    }
+
+    /// The overwrite path must be atomic: when the source's pending add does
+    /// not settle in time (simulated with a pre-seeded `processing_torrents`
+    /// key and a short injected deadline), the rename fails and BOTH names
+    /// survive — the source inode/row stay at `cat-b`, the target inode/row
+    /// stay at `cat-a`. A non-atomic implementation (destroy the target first)
+    /// would leave the target name vacant and its data lost.
+    #[test]
+    fn rename_overwrite_failure_keeps_both_names() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "target", "x.torrent", 16, "hash-target", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+            match db.insert_torrent("cat-b", "source", "x.torrent", 16, "hash-source", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        let target_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            target_ino,
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+        let source_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            source_ino,
+            InodeData::File {
+                parent: cat_b_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        // The source's add stays pending forever — no background thread will
+        // clear it, so the source-side wait times out under the short deadline.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(("cat-b".to_string(), "x.torrent".to_string()), ());
+
+        let started = std::time::Instant::now();
+        let result = svc.rename_with_pending_timeout(
+            cat_b_ino,
+            "x.torrent",
+            cat_a_ino,
+            "x.torrent",
+            Duration::from_millis(100),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path must honor the injected deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            result.is_err(),
+            "rename over a stuck pending source add must fail, not destroy the target"
+        );
+
+        // The source inode is rolled back to (cat-b, "x.torrent").
+        match svc.inode_mgr.inodes.get(&source_ino) {
+            Some(InodeData::File { parent, name, .. }) => {
+                assert_eq!(*parent, cat_b_ino, "source inode must stay in cat-b");
+                assert_eq!(name, "x.torrent");
+            }
+            other => panic!(
+                "source inode must survive the failed rename, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+        // The target inode is untouched (still at cat-a, not unlinked).
+        match svc.inode_mgr.inodes.get(&target_ino) {
+            Some(InodeData::File {
+                parent,
+                name,
+                unlinked,
+                ..
+            }) => {
+                assert_eq!(*parent, cat_a_ino, "target inode must stay in cat-a");
+                assert_eq!(name, "x.torrent");
+                assert!(!*unlinked, "target inode must not be unlinked");
+            }
+            other => panic!(
+                "target inode must survive the failed rename, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+
+        // DB: both rows remain at their original locations.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("x.torrent", "cat-a")
+                .unwrap()
+                .is_some(),
+            "target row must survive the failed rename at cat-a"
+        );
+        let source_row = db_guard
+            .get_torrent_by_filename_and_source_path("x.torrent", "cat-b")
+            .unwrap()
+            .expect("source row must survive the failed rename at cat-b");
+        assert_eq!(source_row.info_hash, "hash-source");
+        assert_eq!(
+            db_guard.get_all_torrents().unwrap().len(),
+            2,
+            "failed overwrite must not delete either row"
+        );
+    }
+
+    /// When the source torrent's DB row is absent (a prior persist failed),
+    /// the overwrite must FAIL — never silently report success. The source and
+    /// destination both stay in place (inode + row), so the kernel's dentry
+    /// view and the FUSE directory state stay consistent.
+    #[test]
+    fn rename_overwrite_source_absent_returns_error() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        // The destination has a persisted row; the source only has an inode
+        // (its add never landed — e.g. a failed persist).
+        {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("cat-a", "target", "x.torrent", 16, "hash-target", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(_)) => {}
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        }
+        let target_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            target_ino,
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+        let source_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            source_ino,
+            InodeData::File {
+                parent: cat_b_ino,
+                name: "x.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        let err = svc
+            .rename(cat_b_ino, "x.torrent", cat_a_ino, "x.torrent")
+            .expect_err("rename over an unpersisted source must fail");
+
+        assert!(
+            matches!(err, FsError::Internal(_)),
+            "expected Internal error for a missing source row, got {:?}",
+            err
+        );
+
+        // Both names stay in place: source inode back at cat-b, target inode
+        // still at cat-a (not unlinked).
+        match svc.inode_mgr.inodes.get(&source_ino) {
+            Some(InodeData::File { parent, name, .. }) => {
+                assert_eq!(*parent, cat_b_ino, "source inode must stay in cat-b");
+                assert_eq!(name, "x.torrent");
+            }
+            other => panic!(
+                "source inode must survive the failed rename, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+        match svc.inode_mgr.inodes.get(&target_ino) {
+            Some(InodeData::File {
+                parent,
+                name,
+                unlinked,
+                ..
+            }) => {
+                assert_eq!(*parent, cat_a_ino, "target inode must stay in cat-a");
+                assert_eq!(name, "x.torrent");
+                assert!(!*unlinked, "target inode must not be unlinked");
+            }
+            other => panic!(
+                "target inode must survive the failed rename, got {:?}",
+                other.map(|d| match d {
+                    InodeData::File { name, .. } => name.clone(),
+                    _ => "<non-file>".to_string(),
+                })
+            ),
+        }
+
+        // The destination row survives; no source row exists (it never did).
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("x.torrent", "cat-a")
+                .unwrap()
+                .is_some(),
+            "target row must survive the failed rename at cat-a"
+        );
+        assert_eq!(
+            db_guard.get_all_torrents().unwrap().len(),
+            1,
+            "failed overwrite must not delete the destination row"
+        );
     }
 
     #[test]

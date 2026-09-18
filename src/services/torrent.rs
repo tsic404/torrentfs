@@ -7,7 +7,7 @@
 use crate::seeding::SeedingManager;
 use std::sync::{Arc, Mutex};
 
-use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
+use crate::db::{Database, FileEntry, InsertTorrentResult, MoveOverwriteResult, TorrentFile};
 use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::cache::remove_dir_all_tolerating_writers;
 use crate::metadata::TorrentInfo;
@@ -451,6 +451,74 @@ impl TorrentService {
                 Err(FsError::from(e))
             }
         }
+    }
+
+    /// Atomically move a torrent over an existing destination. Deletes the
+    /// destination row and re-points the source row at the destination in one
+    /// DB lock (a single transaction), so a failure on the source side never
+    /// leaves the destination already destroyed — satisfying POSIX's "a failed
+    /// rename keeps both names". The removed destination's engine handle and
+    /// piece cache are released best-effort after the commit, mirroring
+    /// `remove_torrent`'s ordering.
+    pub fn rename_torrent_overwriting(
+        &self,
+        old_name: &str,
+        old_source_path: &str,
+        new_name: &str,
+        new_source_path: &str,
+    ) -> FsResult<MoveOverwriteResult> {
+        let (result, purge_info_hash) = {
+            let mut db_guard = self.db.lock().map_err(|_| {
+                error!("Database lock poisoned");
+                FsError::LockPoisoned
+            })?;
+
+            match db_guard.move_torrent_replacing(
+                old_name,
+                old_source_path,
+                new_name,
+                new_source_path,
+            ) {
+                Ok(MoveOverwriteResult::Moved { removed_target }) => {
+                    let purge_info_hash = removed_target
+                        .as_ref()
+                        .and_then(|(_, info_hash)| {
+                            match db_guard.get_torrents_by_infohash(info_hash.as_str()) {
+                                Ok(remaining) if !remaining.is_empty() => None,
+                                Ok(_) => Some(info_hash.to_string()),
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to check remaining torrents for info_hash={}: {:?}; skipping purge",
+                                        info_hash, e
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                    (
+                        MoveOverwriteResult::Moved { removed_target },
+                        purge_info_hash,
+                    )
+                }
+                Ok(MoveOverwriteResult::SourceAbsent) => (MoveOverwriteResult::SourceAbsent, None),
+                Err(e) => {
+                    error!(
+                        "Failed to move torrent over destination {}: {:?}",
+                        new_name, e
+                    );
+                    return Err(FsError::from(e));
+                }
+            }
+        };
+
+        if let Some(info_hash) = purge_info_hash {
+            // Release the libtorrent handle BEFORE purging piece files (same
+            // ordering as `remove_torrent`).
+            self.release_engine_and_seeding(&info_hash);
+            self.purge_pieces_cache(&info_hash);
+        }
+
+        Ok(result)
     }
 
     /// Ensure metadata directories exist in the database for a given source_path.
