@@ -107,6 +107,16 @@ Note: `[rate_limits] download_rate_limit` / `upload_rate_limit` (bytes per secon
 
 CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
 
+In a container, set the `TORRENTFS_CONFIG` environment variable to a config file path mounted into the image — the entrypoint validates it and injects it as `--config`, so TOML-only options such as `[cache] cache_size` are configurable without a CLI flag. An explicit `--config` CLI option takes precedence over the environment variable; after `--` (end of options) `--config` is a positional argument, not the option, so it does not suppress `TORRENTFS_CONFIG`.
+
+```bash
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  -v /host/torrentfs-small-cache.toml:/etc/torrentfs/config.toml:ro \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  -e TORRENTFS_CONFIG=/etc/torrentfs/config.toml \
+  ghcr.io/tsic404/torrentfs:main /mnt
+```
+
 ### Logging
 
 torrentfs logs to stdout at `info` level by default. Verbosity follows
