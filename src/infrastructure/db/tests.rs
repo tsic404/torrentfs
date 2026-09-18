@@ -52,6 +52,190 @@ fn test_same_info_hash_different_source_path() {
     assert_eq!(torrent2.id, 2);
 }
 
+/// Identical `.torrent` bytes copied to two source paths share one content row
+/// (and one file list) but keep two distinct source entries.
+#[test]
+fn test_identical_bytes_share_content_across_source_paths() {
+    let mut db = Database::open_in_memory().unwrap();
+    let files = vec![FileEntry {
+        path: "a.txt".to_string(),
+        size: 10,
+    }];
+    let data: &[u8] = b"same-torrent-bytes";
+
+    let first = db
+        .insert_torrent_with_files_and_data(
+            "big",
+            "t",
+            "selfseed.torrent",
+            10,
+            "hash1",
+            1,
+            &files,
+            data,
+        )
+        .unwrap();
+    let second = db
+        .insert_torrent_with_files_and_data(
+            "small",
+            "t",
+            "selfseed.torrent",
+            10,
+            "hash1",
+            1,
+            &files,
+            data,
+        )
+        .unwrap();
+
+    assert!(first.content_created);
+    assert!(!first.source_reused);
+    assert!(
+        !second.content_created,
+        "identical bytes must reuse content"
+    );
+    assert!(!second.source_reused, "second path is a fresh source entry");
+    assert_eq!(first.content_id, second.content_id, "shared content row");
+    assert_ne!(first.source_id, second.source_id, "distinct source entries");
+
+    // Each source path has its own data/ display entry.
+    assert_eq!(db.get_torrents_by_source_path("big").unwrap().len(), 1);
+    assert_eq!(db.get_torrents_by_source_path("small").unwrap().len(), 1);
+
+    // One content row, two source rows.
+    let content_count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM torrents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content_count, 1);
+    let source_count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM torrent_sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(source_count, 2);
+
+    // The shared file list is reachable from either source entry.
+    assert_eq!(
+        db.get_files_by_torrent_id(first.source_id).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        db.get_files_by_torrent_id(second.source_id).unwrap().len(),
+        1
+    );
+}
+
+/// Different `.torrent` bytes (even with the same info_hash) must store one
+/// content row each.
+#[test]
+fn test_different_bytes_create_distinct_content() {
+    let mut db = Database::open_in_memory().unwrap();
+    let files = vec![FileEntry {
+        path: "a.txt".to_string(),
+        size: 10,
+    }];
+
+    let first = db
+        .insert_torrent_with_files_and_data(
+            "big",
+            "t",
+            "selfseed.torrent",
+            10,
+            "hash1",
+            1,
+            &files,
+            b"bytes-A",
+        )
+        .unwrap();
+    let second = db
+        .insert_torrent_with_files_and_data(
+            "small",
+            "t",
+            "selfseed.torrent",
+            10,
+            "hash1",
+            1,
+            &files,
+            b"bytes-B",
+        )
+        .unwrap();
+
+    assert!(first.content_created);
+    assert!(
+        second.content_created,
+        "different bytes must create new content"
+    );
+    assert_ne!(first.content_id, second.content_id);
+
+    let content_count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM torrents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(content_count, 2);
+    let source_count: i64 = db
+        .conn
+        .query_row("SELECT COUNT(*) FROM torrent_sources", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(source_count, 2);
+}
+
+/// Overwriting one source with a new info_hash must NOT release the old
+/// info_hash's handle/pieces while another content still shares that
+/// info_hash (same info_dict, different bytes).
+#[test]
+fn test_overwrite_keeps_shared_info_hash_state() {
+    let mut db = Database::open_in_memory().unwrap();
+    let files = vec![FileEntry {
+        path: "a.txt".to_string(),
+        size: 10,
+    }];
+
+    // Two distinct contents sharing info_hash H1 (e.g. only trackers differ).
+    db.insert_torrent_with_files_and_data("big", "t", "s.torrent", 10, "H1", 1, &files, b"A")
+        .unwrap();
+    db.insert_torrent_with_files_and_data("small", "t", "s.torrent", 10, "H1", 1, &files, b"B")
+        .unwrap();
+
+    // Overwrite big/ with a different info_hash H2.
+    let outcome = db
+        .insert_torrent_with_files_and_data("big", "t", "s.torrent", 10, "H2", 1, &files, b"C")
+        .unwrap();
+
+    // H1 is still referenced by small/'s content, so it must not be released.
+    assert_eq!(outcome.stale_info_hash, None);
+
+    let big = db
+        .get_torrent_by_filename_and_source_path("s.torrent", "big")
+        .unwrap()
+        .unwrap();
+    assert_eq!(big.info_hash, "H2");
+    let small = db
+        .get_torrent_by_filename_and_source_path("s.torrent", "small")
+        .unwrap()
+        .unwrap();
+    assert_eq!(small.info_hash, "H1");
+}
+
+/// Overwriting the last source of an info_hash must report that info_hash as
+/// stale (so the caller can release its handle and piece cache).
+#[test]
+fn test_overwrite_releases_orphaned_info_hash() {
+    let mut db = Database::open_in_memory().unwrap();
+    let files = vec![FileEntry {
+        path: "a.txt".to_string(),
+        size: 10,
+    }];
+
+    db.insert_torrent_with_files_and_data("big", "t", "s.torrent", 10, "H1", 1, &files, b"A")
+        .unwrap();
+
+    let outcome = db
+        .insert_torrent_with_files_and_data("big", "t", "s.torrent", 10, "H2", 1, &files, b"B")
+        .unwrap();
+
+    assert_eq!(outcome.stale_info_hash.as_deref(), Some("H1"));
+}
+
 #[test]
 fn test_duplicate_source_path_and_filename() {
     let mut db = Database::open_in_memory().unwrap();
@@ -774,10 +958,7 @@ fn test_insert_torrent_with_files_and_data_is_atomic() {
             b"raw-torrent-bytes",
         )
         .unwrap();
-    let id = match result {
-        InsertTorrentResult::Inserted(id) => id,
-        _ => panic!("Expected Inserted"),
-    };
+    let id = result.source_id;
     let torrent = db.get_torrent_by_id(id).unwrap().unwrap();
     assert_eq!(
         torrent.torrent_data.as_deref(),
@@ -935,13 +1116,14 @@ fn test_rename_torrent() {
     assert_eq!(torrent.name, "Old Name");
     assert_eq!(torrent.filename, "Old Name.torrent");
 
-    // Rename the torrent
-    db.rename_torrent(torrent_id, "New Name", "New Name.torrent", "path1")
+    // Rename the torrent (filename only; the info-dict name is content-scoped
+    // and therefore immutable).
+    db.rename_torrent(torrent_id, "New Name.torrent", "path1")
         .unwrap();
 
     // Verify the rename
     let torrent = db.get_torrent_by_id(torrent_id).unwrap().unwrap();
-    assert_eq!(torrent.name, "New Name");
+    assert_eq!(torrent.name, "Old Name");
     assert_eq!(torrent.filename, "New Name.torrent");
 
     // Old filename lookup should return None
@@ -978,12 +1160,12 @@ fn test_rename_torrent_cross_directory() {
     assert_eq!(torrent.source_path, "path1");
 
     // Rename and move to "path2" (cross-directory rename)
-    db.rename_torrent(torrent_id, "Renamed", "Renamed.torrent", "path2")
+    db.rename_torrent(torrent_id, "Renamed.torrent", "path2")
         .unwrap();
 
     // Verify the rename and source_path update
     let torrent = db.get_torrent_by_id(torrent_id).unwrap().unwrap();
-    assert_eq!(torrent.name, "Renamed");
+    assert_eq!(torrent.name, "MyTorrent");
     assert_eq!(torrent.filename, "Renamed.torrent");
     assert_eq!(torrent.source_path, "path2");
 
@@ -1302,39 +1484,46 @@ fn test_migrate_v5_cleans_orphaned_child_rows() {
         .unwrap();
     }
 
-    // Re-open: v5 migration must delete the orphan's child rows.
+    // Re-open: v5 dedup + v6 split must delete the orphan's child rows and
+    // leave exactly one source entry carrying the survivor's content.
     {
         let db = Database::open(&db_path).unwrap();
 
-        // Survivor's child rows intact
-        let files = db.get_files_by_torrent_id(survivor_id).unwrap();
+        let torrents = db.get_torrents_by_source_path("a").unwrap();
+        assert_eq!(torrents.len(), 1, "dedup should keep one source entry");
+        assert_eq!(
+            torrents[0].info_hash, "hash2",
+            "keeps the later row (MAX id)"
+        );
+        let source_id = torrents[0].id;
+
+        // Survivor's child rows intact.
+        let files = db.get_files_by_torrent_id(source_id).unwrap();
         assert_eq!(files.len(), 1, "survivor files preserved");
         assert_eq!(files[0].name, "f_new");
 
         let dirs = db
-            .get_torrent_directories_by_parent(None, survivor_id)
+            .get_torrent_directories_by_parent(None, source_id)
             .unwrap();
         assert_eq!(dirs.len(), 1, "survivor directories preserved");
+        assert_eq!(dirs[0].name, "dir_new");
 
-        // Orphan's child rows gone (no dangling torrent_id references)
-        let orphan_files = db.get_files_by_torrent_id(orphan_id).unwrap();
-        assert_eq!(orphan_files.len(), 0, "orphan files cleaned up");
+        // Orphan's file ("f_old") is gone.
+        assert!(
+            !files.iter().any(|f| f.name == "f_old"),
+            "orphan files cleaned up"
+        );
 
-        let orphan_dirs = db
-            .get_torrent_directories_by_parent(None, orphan_id)
-            .unwrap();
-        assert_eq!(orphan_dirs.len(), 0, "orphan directories cleaned up");
-
-        // directory_closure: no rows referencing the orphan's directory id
+        // directory_closure: no rows referencing the orphan's directory id.
         let conn = &db.conn;
         let dangling: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM directory_closure WHERE ancestor_id IN (
-                    SELECT id FROM torrent_directories WHERE torrent_id = ?1
+                    SELECT id FROM torrent_directories WHERE name = 'dir_old'
                 ) OR descendant_id IN (
-                    SELECT id FROM torrent_directories WHERE torrent_id = ?1
+                    SELECT id FROM torrent_directories WHERE name = 'dir_old'
                 )",
-                rusqlite::params![orphan_id],
+                [],
                 |row| row.get(0),
             )
             .unwrap();

@@ -16,6 +16,14 @@ pub(super) fn escape_like_pattern(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// SHA-1 hex of a `.torrent` file's raw bytes, used as the indexed dedup key
+/// on `torrents.content_hash`.  The index narrows the lookup to a hash
+/// match; callers still compare `torrent_data` bytes exactly so a (theoretical)
+/// SHA-1 collision can never merge two distinct files.
+pub(super) fn content_hash_of(data: &[u8]) -> String {
+    hex::encode(sha1_smol::Sha1::from(data).digest().bytes())
+}
+
 mod database;
 mod file_ops;
 mod metadata_ops;
@@ -28,8 +36,8 @@ use crate::domain::repository::{FileRepository, TorrentRepository};
 
 pub use database::Database;
 pub use types::{
-    DbError, FileEntry, InsertTorrentResult, MoveOverwriteResult, Torrent, TorrentDirectory,
-    TorrentFile, TorrentStatus,
+    DbError, FileEntry, InsertTorrentOutcome, InsertTorrentResult, MoveOverwriteResult, Torrent,
+    TorrentDirectory, TorrentFile, TorrentStatus,
 };
 
 // ---- Repository trait implementations for Database ----
@@ -148,12 +156,11 @@ impl TorrentRepository for Database {
 
     fn rename_torrent(
         &mut self,
-        torrent_id: i64,
-        new_name: &str,
+        source_id: i64,
         new_filename: &str,
         new_source_path: &str,
     ) -> Result<(), DbError> {
-        self.rename_torrent(torrent_id, new_name, new_filename, new_source_path)
+        self.rename_torrent(source_id, new_filename, new_source_path)
     }
 }
 

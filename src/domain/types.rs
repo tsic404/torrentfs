@@ -51,7 +51,14 @@ impl From<String> for TorrentStatus {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Torrent {
+    /// Source-location id (`torrent_sources.id`).  One per `(source_path,
+    /// filename)` display entry; the FUSE `data/` mirror and its inodes are
+    /// keyed by this id, so two source paths sharing one torrent file get
+    /// distinct ids.
     pub id: i64,
+    /// Content id (`torrents.id`).  One per unique torrent file bytes; files,
+    /// directories, raw bytes, and download state are keyed by this id.
+    pub torrent_id: i64,
     pub source_path: String,
     pub name: String,
     pub filename: String,
@@ -106,6 +113,28 @@ pub enum MoveOverwriteResult {
     Moved {
         removed_target: Option<(i64, String)>,
     },
+}
+
+/// Outcome of persisting a `.torrent` with its raw bytes.  Richer than
+/// [`InsertTorrentResult`] because the data-bearing insert path deduplicates
+/// content and may repoint an overwritten source location at a different
+/// (or newly-created) content row.
+#[derive(Debug, Clone)]
+pub struct InsertTorrentOutcome {
+    /// Source-location id (`torrent_sources.id`).
+    pub source_id: i64,
+    /// Content id (`torrents.id`).
+    pub content_id: i64,
+    /// `true` when a new content row was created; `false` when an existing
+    /// row with identical bytes was reused.
+    pub content_created: bool,
+    /// `true` when this was an overwrite of an existing `(source_path,
+    /// filename)` source rather than a fresh insert.
+    pub source_reused: bool,
+    /// `Some(old_info_hash)` when an overwrite orphaned a different content
+    /// whose info-hash is no longer referenced; the download handle and piece
+    /// cache for that hash must be released by the caller.
+    pub stale_info_hash: Option<String>,
 }
 
 pub struct FileEntry {

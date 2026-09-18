@@ -60,6 +60,16 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 
 Copy a `.torrent` into the `metadata/` directory (any subdirectory works); each `.torrent` generates a matching tree under `data/`.
 
+The `data/` mirror preserves the `metadata/` directory layout: a `.torrent` at `metadata/<source_path>/<name>.torrent` shows up at `data/<source_path>/<name>.torrent`. `source_path` is the path relative to `metadata/` (empty for the root).
+
+Duplicate `.torrent` files are mapped by content, not by `info_hash` alone:
+
+- Every `(source_path, filename)` gets its own `data/` entry — the same `info_hash` dropped under `metadata/big/` and `metadata/small/` shows in both `data/big/` and `data/small/`.
+- When the `.torrent` files are byte-for-byte identical, the database stores one shared content row (metadata, file list, raw bytes) plus one source row per directory; both directories still list the shared content.
+- When the `.torrent` files differ (for example, the same `info_hash` with different tracker URLs), each stores its own content row, and each directory shows its own entry.
+
+Identical files share one `info_hash` and therefore one download state: the shared content row keeps the download progress (`resume_data`) and `created_at` of the first-inserted copy — the folded copies' resume data is the same logical value, never an independent download.
+
 ### Browsing and reading
 
 ```bash

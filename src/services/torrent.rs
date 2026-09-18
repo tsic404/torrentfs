@@ -7,7 +7,7 @@
 use crate::seeding::SeedingManager;
 use std::sync::{Arc, Mutex};
 
-use crate::db::{Database, FileEntry, InsertTorrentResult, MoveOverwriteResult, TorrentFile};
+use crate::db::{Database, FileEntry, MoveOverwriteResult, TorrentFile};
 use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::cache::remove_dir_all_tolerating_writers;
 use crate::metadata::TorrentInfo;
@@ -93,7 +93,7 @@ impl TorrentService {
                 })
                 .collect();
 
-            let result = db_guard
+            let outcome = db_guard
                 .insert_torrent_with_files_and_data(
                     source_path,
                     &metadata.name,
@@ -109,77 +109,45 @@ impl TorrentService {
                     FsError::from(e)
                 })?;
 
-            let (is_new, stale_info_hash) = match result {
-                InsertTorrentResult::Inserted(_) => {
-                    info!(
-                        "Persisted torrent '{}' ({} files, {} bytes) from {}",
-                        metadata.name,
-                        metadata.num_files,
-                        metadata.total_size,
-                        if source_path.is_empty() {
-                            "root"
-                        } else {
-                            source_path
-                        }
-                    );
-                    (true, None)
-                }
-                InsertTorrentResult::Duplicate(existing_id) => {
-                    // A `cp` over an existing metadata torrent releases a NEW
-                    // info-hash under the SAME `(source_path, filename)` key. The
-                    // Duplicate branch used to keep the stale row untouched, so a
-                    // rename right after the overwrite found no row at the new name
-                    // and no-op'd — on restart the OLD torrent resurfaced. Re-point
-                    // the existing row at the new torrent (name/info_hash/size/file
-                    // list/bytes); same-content re-copy stays a cheap no-op by
-                    // skipping the rebuild when the info-hash matches.
-                    let old_info_hash = db_guard
-                        .get_torrent_by_id(existing_id)
-                        .map_err(|e| {
-                            error!("Failed to load overwritten torrent {}: {:?}", filename, e);
-                            FsError::from(e)
-                        })?
-                        .map(|t| t.info_hash)
-                        .unwrap_or_default();
+            // `is_new` mirrors the pre-split `Inserted` vs `Duplicate`
+            // distinction: a fresh source entry creates the lightweight handle;
+            // an overwrite (repointed source) merges trackers.  Content reuse
+            // (identical bytes at a second source path) is still a fresh source
+            // entry, so the handle is ensured idempotently.
+            let is_new = !outcome.source_reused;
 
-                    let replaced = old_info_hash != info_hash_hex;
-
-                    if replaced {
-                        db_guard
-                            .replace_torrent_content(
-                                existing_id,
-                                &metadata.name,
-                                &info_hash_hex,
-                                metadata.total_size as i64,
-                                metadata.num_files as i64,
-                                &files,
-                                data,
-                            )
-                            .map_err(|e| {
-                                error!(
-                                    "Failed to replace overwritten torrent {}: {:?}",
-                                    filename, e
-                                );
-                                FsError::from(e)
-                            })?;
-
-                        info!(
-                            "Torrent '{}' at ({}, {}) was overwritten with different \
-                             content; existing row updated in place",
-                            metadata.name, source_path, filename
-                        );
+            if is_new {
+                info!(
+                    "Persisted torrent '{}' ({} files, {} bytes) from {}{}",
+                    metadata.name,
+                    metadata.num_files,
+                    metadata.total_size,
+                    if source_path.is_empty() {
+                        "root"
                     } else {
-                        info!(
-                            "Torrent '{}' at ({}, {}) re-copied with identical content; \
-                             keeping existing row",
-                            metadata.name, source_path, filename
-                        );
+                        source_path
+                    },
+                    if outcome.content_created {
+                        ""
+                    } else {
+                        " (reused existing content)"
                     }
-                    (false, replaced.then_some(old_info_hash))
-                }
-            };
-            // db_guard dropped here (end of block scope)
-            (is_new, stale_info_hash)
+                );
+            } else {
+                info!(
+                    "Torrent '{}' at ({}, {}) was overwritten; source repointed to {} content",
+                    metadata.name,
+                    source_path,
+                    filename,
+                    if outcome.content_created {
+                        "new"
+                    } else {
+                        "existing"
+                    }
+                );
+            }
+
+            (is_new, outcome.stale_info_hash)
         };
 
         Ok(PersistedTorrent {
@@ -438,7 +406,7 @@ impl TorrentService {
         match db_guard.get_torrent_by_filename_and_source_path(old_name, old_source_path) {
             Ok(Some(torrent)) => {
                 db_guard
-                    .rename_torrent(torrent.id, &torrent.name, new_name, new_source_path)
+                    .rename_torrent(torrent.id, new_name, new_source_path)
                     .map_err(|e| {
                         error!("Failed to rename torrent in database: {:?}", e);
                         FsError::from(e)

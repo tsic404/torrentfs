@@ -95,15 +95,15 @@ impl Database {
             params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
         )?;
 
-        // 3. Update torrents whose source_path matches exactly
+        // 3. Update source entries whose source_path matches exactly
         tx.execute(
-            "UPDATE torrents SET source_path = ? WHERE source_path = ?",
+            "UPDATE torrent_sources SET source_path = ? WHERE source_path = ?",
             params![new_path, old_path],
         )?;
 
-        // 4. Update torrents whose source_path starts with old_path/
+        // 4. Update source entries whose source_path starts with old_path/
         tx.execute(
-            "UPDATE torrents SET source_path = ? || substr(source_path, ?) WHERE source_path LIKE ? ESCAPE '\\'",
+            "UPDATE torrent_sources SET source_path = ? || substr(source_path, ?) WHERE source_path LIKE ? ESCAPE '\\'",
             params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
         )?;
 

@@ -37,13 +37,8 @@ fn test_rename_updates_database() {
 
     // Rename the torrent file to "ubuntu-25.10.torrent"
     // The internal name should stay the same, only filename changes
-    db.rename_torrent(
-        torrent_id,
-        "ubuntu-25.10-desktop-amd64.iso", // Keep original internal name
-        "ubuntu-25.10.torrent",           // New filename
-        "",
-    )
-    .expect("Failed to rename torrent");
+    db.rename_torrent(torrent_id, "ubuntu-25.10.torrent", "")
+        .expect("Failed to rename torrent");
 
     // Verify the rename - internal name preserved, filename updated
     let torrent = db
@@ -100,13 +95,8 @@ fn test_rename_with_source_path() {
     assert_eq!(torrent.filename, "ubuntu-25.10.torrent");
 
     // Rename the torrent - internal name preserved, filename and source_path updated
-    db.rename_torrent(
-        torrent_id,
-        "ubuntu-25.10",         // Keep original internal name
-        "ubuntu-26.04.torrent", // New filename
-        "os/linux",
-    )
-    .expect("Failed to rename torrent");
+    db.rename_torrent(torrent_id, "ubuntu-26.04.torrent", "os/linux")
+        .expect("Failed to rename torrent");
 
     // Verify the rename - internal name preserved
     let torrent = db
@@ -148,7 +138,7 @@ fn test_rename_persists() {
         };
 
         // Rename - internal name preserved
-        db.rename_torrent(torrent_id, "old-name", "new-name.torrent", "")
+        db.rename_torrent(torrent_id, "new-name.torrent", "")
             .expect("Failed to rename torrent");
     }
 
@@ -207,13 +197,8 @@ fn test_hash_filename_preserved() {
         assert_eq!(torrent.filename, "3a4816f6.torrent"); // Hash filename
 
         // Rename to another hash filename
-        db.rename_torrent(
-            torrent_id,
-            "How.NOT.to.Summon.a.Demon.Lord.S02", // Keep internal name
-            "newhash123.torrent",                 // New hash filename
-            "",
-        )
-        .expect("Failed to rename torrent");
+        db.rename_torrent(torrent_id, "newhash123.torrent", "")
+            .expect("Failed to rename torrent");
 
         // Verify internal name is preserved
         let torrent = db

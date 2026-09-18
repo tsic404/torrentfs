@@ -2,10 +2,126 @@ use rusqlite::{params, OptionalExtension};
 
 use super::database::Database;
 use super::types::{
-    DbError, FileEntry, InsertTorrentResult, MoveOverwriteResult, Torrent, TorrentStatus,
+    DbError, FileEntry, InsertTorrentOutcome, InsertTorrentResult, MoveOverwriteResult, Torrent,
+    TorrentStatus,
 };
 
+/// Shared SELECT for a source-location view of a torrent: one row per
+/// `(source_path, filename)` entry joined against its shared content row.
+const TORRENT_SELECT: &str = "SELECT s.id, s.torrent_id, s.source_path, t.name, s.filename, \
+     t.total_size, t.info_hash, t.file_count, t.status, t.torrent_data, t.resume_data, \
+     t.created_at FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id";
+
+fn torrent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Torrent> {
+    Ok(Torrent {
+        id: row.get(0)?,
+        torrent_id: row.get(1)?,
+        source_path: row.get(2)?,
+        name: row.get(3)?,
+        filename: row.get(4)?,
+        total_size: row.get(5)?,
+        info_hash: row.get(6)?,
+        file_count: row.get(7)?,
+        status: row.get::<_, String>(8)?.into(),
+        torrent_data: row.get(9)?,
+        resume_data: row.get(10)?,
+        created_at: row.get(11)?,
+    })
+}
+
+/// Insert a torrent's file/directory tree under a content id inside `tx`.
+/// Content-scoped: two source paths sharing one content row also share this
+/// file list, so it must be built once per content.
+fn insert_files_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    content_id: i64,
+    files: &[FileEntry],
+) -> Result<(), DbError> {
+    let mut dir_cache: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    for file_entry in files {
+        let path_parts: Vec<&str> = file_entry.path.split('/').collect();
+        if path_parts.is_empty() {
+            continue;
+        }
+
+        let mut current_parent_id: Option<i64> = None;
+
+        for (i, part) in path_parts.iter().enumerate() {
+            let is_file = i == path_parts.len() - 1;
+            let current_path = path_parts[..=i].join("/");
+
+            if is_file {
+                tx.execute(
+                    "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
+                    params![content_id, current_parent_id, part, &file_entry.path, file_entry.size],
+                )?;
+            } else {
+                if let Some(&cached_id) = dir_cache.get(&current_path) {
+                    current_parent_id = Some(cached_id);
+                    continue;
+                }
+
+                let existing_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
+                        params![content_id, current_parent_id, part],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+
+                if let Some(id) = existing_id {
+                    dir_cache.insert(current_path.clone(), id);
+                    current_parent_id = Some(id);
+                    continue;
+                }
+
+                tx.execute(
+                    "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?, ?, ?)",
+                    params![content_id, current_parent_id, part],
+                )?;
+                let dir_id = tx.last_insert_rowid();
+
+                tx.execute(
+                    "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
+                    params![dir_id, dir_id],
+                )?;
+
+                if let Some(parent_id) = current_parent_id {
+                    tx.execute(
+                        "INSERT INTO directory_closure (ancestor_id, descendant_id, depth)
+                         SELECT ancestor_id, ?, depth + 1 FROM directory_closure WHERE descendant_id = ?",
+                        params![dir_id, parent_id],
+                    )?;
+                }
+
+                dir_cache.insert(current_path.clone(), dir_id);
+                current_parent_id = Some(dir_id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl Database {
+    /// Resolve a source-location id (`torrent_sources.id`) to its shared
+    /// content id (`torrents.id`).
+    pub(crate) fn resolve_content_id(&self, source_id: i64) -> Result<Option<i64>, DbError> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT torrent_id FROM torrent_sources WHERE id = ?",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(result)
+    }
+
     #[allow(dead_code)]
     pub fn insert_torrent(
         &mut self,
@@ -16,10 +132,11 @@ impl Database {
         info_hash: &str,
         file_count: i64,
     ) -> Result<InsertTorrentResult, DbError> {
-        let existing: Option<i64> = self
-            .conn
+        let tx = self.conn.transaction()?;
+
+        let existing: Option<i64> = tx
             .query_row(
-                "SELECT id FROM torrents WHERE source_path = ? AND filename = ?",
+                "SELECT id FROM torrent_sources WHERE source_path = ? AND filename = ?",
                 params![source_path, filename],
                 |row| row.get(0),
             )
@@ -30,12 +147,36 @@ impl Database {
             return Ok(InsertTorrentResult::Duplicate(id));
         }
 
-        self.conn.execute(
-            "INSERT INTO torrents (source_path, name, filename, total_size, info_hash, file_count, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-            params![source_path, name, filename, total_size, info_hash, file_count],
-        )?;
+        // No raw bytes: dedupe content by the metadata identity that would be
+        // identical for an identical `.torrent` file.  Keeps `insert_torrent`
+        // (a public trait API) consistent with the byte-dedup data path.
+        let content_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM torrents WHERE info_hash = ? AND total_size = ? AND file_count = ?",
+                params![info_hash, total_size, file_count],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
 
-        let id = self.conn.last_insert_rowid();
+        let content_id = match content_id {
+            Some(cid) => cid,
+            None => {
+                tx.execute(
+                    "INSERT INTO torrents (info_hash, name, total_size, file_count, status) VALUES (?, ?, ?, ?, 'pending')",
+                    params![info_hash, name, total_size, file_count],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+
+        tx.execute(
+            "INSERT INTO torrent_sources (torrent_id, source_path, filename) VALUES (?, ?, ?)",
+            params![content_id, source_path, filename],
+        )?;
+        let source_id = tx.last_insert_rowid();
+
+        tx.commit()?;
 
         if !source_path.is_empty() {
             if let Err(e) = self.ensure_metadata_directories(source_path) {
@@ -47,22 +188,29 @@ impl Database {
             }
         }
 
-        Ok(InsertTorrentResult::Inserted(id))
+        Ok(InsertTorrentResult::Inserted(source_id))
     }
 
-    pub fn set_torrent_data(&mut self, torrent_id: i64, data: &[u8]) -> Result<(), DbError> {
+    pub fn set_torrent_data(&mut self, source_id: i64, data: &[u8]) -> Result<(), DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(());
+        };
+        let content_hash = super::content_hash_of(data);
         self.conn.execute(
-            "UPDATE torrents SET torrent_data = ? WHERE id = ?",
-            params![data, torrent_id],
+            "UPDATE torrents SET torrent_data = ?, content_hash = ? WHERE id = ?",
+            params![data, content_hash, content_id],
         )?;
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub fn set_resume_data(&mut self, torrent_id: i64, data: &[u8]) -> Result<(), DbError> {
+    pub fn set_resume_data(&mut self, source_id: i64, data: &[u8]) -> Result<(), DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(());
+        };
         self.conn.execute(
             "UPDATE torrents SET resume_data = ? WHERE id = ?",
-            params![data, torrent_id],
+            params![data, content_id],
         )?;
         Ok(())
     }
@@ -70,18 +218,20 @@ impl Database {
     #[allow(dead_code)]
     pub fn set_torrent_status(
         &mut self,
-        torrent_id: i64,
+        source_id: i64,
         status: &TorrentStatus,
     ) -> Result<(), DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(());
+        };
         self.conn.execute(
             "UPDATE torrents SET status = ? WHERE id = ?",
-            params![status.as_str(), torrent_id],
+            params![status.as_str(), content_id],
         )?;
         Ok(())
     }
 
     /// Insert torrent and its files atomically in a single transaction.
-    /// This prevents orphaned torrent records without file entries.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_torrent_with_files(
         &mut self,
@@ -93,7 +243,7 @@ impl Database {
         file_count: i64,
         files: &[FileEntry],
     ) -> Result<InsertTorrentResult, DbError> {
-        self.insert_torrent_with_files_inner(
+        let outcome = self.insert_torrent_with_files_inner(
             source_path,
             name,
             filename,
@@ -102,15 +252,20 @@ impl Database {
             file_count,
             files,
             None,
-        )
+        )?;
+        Ok(if outcome.source_reused {
+            InsertTorrentResult::Duplicate(outcome.source_id)
+        } else {
+            InsertTorrentResult::Inserted(outcome.source_id)
+        })
     }
 
     /// Insert a torrent, its files, AND its raw `.torrent` bytes in one
-    /// transaction.  Writing `torrent_data` here — instead of a
-    /// separate `set_torrent_data` follow-up outside the insert transaction —
-    /// makes the row complete on commit: a disk-full between the two used to
-    /// leave a row with `torrent_data = NULL` that a same-content re-copy
-    /// could never repair (the Duplicate branch keeps the existing row).
+    /// transaction, deduplicating content by exact bytes.  When an identical
+    /// torrent already exists at a different source path, only a new source
+    /// row is created (the content row and its file list are shared); when the
+    /// same `(source_path, filename)` is overwritten, the source is repointed
+    /// at the (possibly new) content and the orphaned old content is deleted.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_torrent_with_files_and_data(
         &mut self,
@@ -122,7 +277,7 @@ impl Database {
         file_count: i64,
         files: &[FileEntry],
         data: &[u8],
-    ) -> Result<InsertTorrentResult, DbError> {
+    ) -> Result<InsertTorrentOutcome, DbError> {
         self.insert_torrent_with_files_inner(
             source_path,
             name,
@@ -135,6 +290,7 @@ impl Database {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_torrent_with_files_inner(
         &mut self,
         source_path: &str,
@@ -145,100 +301,121 @@ impl Database {
         file_count: i64,
         files: &[FileEntry],
         data: Option<&[u8]>,
-    ) -> Result<InsertTorrentResult, DbError> {
+    ) -> Result<InsertTorrentOutcome, DbError> {
         let tx = self.conn.transaction()?;
 
-        // Check for existing torrent with same source_path and filename
-        let existing: Option<i64> = tx
+        let existing_source: Option<i64> = tx
             .query_row(
-                "SELECT id FROM torrents WHERE source_path = ? AND filename = ?",
+                "SELECT id FROM torrent_sources WHERE source_path = ? AND filename = ?",
                 params![source_path, filename],
                 |row| row.get(0),
             )
             .optional()?
             .flatten();
 
-        if let Some(id) = existing {
-            return Ok(InsertTorrentResult::Duplicate(id));
-        }
+        // Content dedup is by exact bytes; info_hash alone is insufficient
+        // (two files may share an info_hash while differing in trackers).
+        // `content_hash` narrows via an index; `torrent_data = ?` verifies the
+        // exact bytes so a theoretical SHA-1 collision cannot merge files.
+        let content_hash = data.map(super::content_hash_of);
+        let existing_content: Option<i64> = match data {
+            Some(bytes) => tx
+                .query_row(
+                    "SELECT id FROM torrents WHERE content_hash = ?1 AND torrent_data = ?2",
+                    params![content_hash, bytes],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+            None => tx
+                .query_row(
+                    "SELECT id FROM torrents WHERE info_hash = ? AND total_size = ? AND file_count = ?",
+                    params![info_hash, total_size, file_count],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten(),
+        };
 
-        // Insert torrent record (torrent_data written atomically when provided)
-        tx.execute(
-            "INSERT INTO torrents (source_path, name, filename, total_size, info_hash, file_count, status, torrent_data) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-            params![source_path, name, filename, total_size, info_hash, file_count, data.map(|d| d.to_vec())],
-        )?;
-        let torrent_id = tx.last_insert_rowid();
-
-        // Insert files in the same transaction
-        let mut dir_cache: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-
-        for file_entry in files {
-            let path_parts: Vec<&str> = file_entry.path.split('/').collect();
-            if path_parts.is_empty() {
-                continue;
+        let (content_id, content_created) = match existing_content {
+            Some(cid) => (cid, false),
+            None => {
+                tx.execute(
+                    "INSERT INTO torrents (info_hash, name, total_size, file_count, status, torrent_data, content_hash) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                    params![
+                        info_hash,
+                        name,
+                        total_size,
+                        file_count,
+                        data.map(|d| d.to_vec()),
+                        content_hash.unwrap_or_default(),
+                    ],
+                )?;
+                let cid = tx.last_insert_rowid();
+                insert_files_in_tx(&tx, cid, files)?;
+                (cid, true)
             }
+        };
 
-            let mut current_parent_id: Option<i64> = None;
+        let (source_id, source_reused, stale_info_hash) = match existing_source {
+            Some(sid) => {
+                let old: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT s.torrent_id, t.info_hash FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id WHERE s.id = ?",
+                        params![sid],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
 
-            for (i, part) in path_parts.iter().enumerate() {
-                let is_file = i == path_parts.len() - 1;
-                let current_path = path_parts[..=i].join("/");
+                tx.execute(
+                    "UPDATE torrent_sources SET torrent_id = ? WHERE id = ?",
+                    params![content_id, sid],
+                )?;
 
-                if is_file {
-                    tx.execute(
-                        "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
-                        params![torrent_id, current_parent_id, part, &file_entry.path, file_entry.size],
-                    )?;
-                } else {
-                    if let Some(&cached_id) = dir_cache.get(&current_path) {
-                        current_parent_id = Some(cached_id);
-                        continue;
-                    }
-
-                    let existing_id: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
-                            params![torrent_id, current_parent_id, part],
+                // The overwritten content may now be unreferenced: delete it
+                // (and, via FK cascade, its files/directories) so a long-lived
+                // daemon does not accumulate orphaned content rows.
+                let mut stale = None;
+                if let Some((old_content_id, old_info_hash)) = old {
+                    if old_content_id != content_id {
+                        let refs: i64 = tx.query_row(
+                            "SELECT COUNT(*) FROM torrent_sources WHERE torrent_id = ?",
+                            params![old_content_id],
                             |row| row.get(0),
-                        )
-                        .optional()?
-                        .flatten();
-
-                    if let Some(id) = existing_id {
-                        dir_cache.insert(current_path.clone(), id);
-                        current_parent_id = Some(id);
-                        continue;
-                    }
-
-                    tx.execute(
-                        "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?, ?, ?)",
-                        params![torrent_id, current_parent_id, part],
-                    )?;
-                    let dir_id = tx.last_insert_rowid();
-
-                    tx.execute(
-                        "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
-                        params![dir_id, dir_id],
-                    )?;
-
-                    if let Some(parent_id) = current_parent_id {
-                        tx.execute(
-                            "INSERT INTO directory_closure (ancestor_id, descendant_id, depth)
-                             SELECT ancestor_id, ?, depth + 1 FROM directory_closure WHERE descendant_id = ?",
-                            params![dir_id, parent_id],
                         )?;
+                        if refs == 0 {
+                            tx.execute(
+                                "DELETE FROM torrents WHERE id = ?",
+                                params![old_content_id],
+                            )?;
+                            // Release the old info_hash's handle/pieces only
+                            // when NO source (across all contents) still
+                            // references it — another content may share the
+                            // same info_hash with different bytes.
+                            let remaining: i64 = tx.query_row(
+                                "SELECT COUNT(*) FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id WHERE t.info_hash = ?",
+                                params![old_info_hash],
+                                |row| row.get(0),
+                            )?;
+                            if remaining == 0 {
+                                stale = Some(old_info_hash);
+                            }
+                        }
                     }
-
-                    dir_cache.insert(current_path.clone(), dir_id);
-                    current_parent_id = Some(dir_id);
                 }
+                (sid, true, stale)
             }
-        }
+            None => {
+                tx.execute(
+                    "INSERT INTO torrent_sources (torrent_id, source_path, filename) VALUES (?, ?, ?)",
+                    params![content_id, source_path, filename],
+                )?;
+                (tx.last_insert_rowid(), false, None)
+            }
+        };
 
         tx.commit()?;
 
-        // Ensure metadata directories exist for the source_path
         if !source_path.is_empty() {
             if let Err(e) = self.ensure_metadata_directories(source_path) {
                 tracing::warn!(
@@ -249,112 +426,63 @@ impl Database {
             }
         }
 
-        Ok(InsertTorrentResult::Inserted(torrent_id))
+        Ok(InsertTorrentOutcome {
+            source_id,
+            content_id,
+            content_created,
+            source_reused,
+            stale_info_hash,
+        })
     }
 
-    /// Replace the content of an existing torrent row in place. Used when a
-    /// `.torrent` is overwritten under the same `(source_path, filename)`: the
-    /// row keeps its id/location but its name, info_hash, size, file list, and
-    /// raw bytes point at the new torrent. Atomic — row + files update in one
-    /// transaction so a crash can't leave a torrent without matching files.
-    #[allow(clippy::too_many_arguments)]
-    pub fn replace_torrent_content(
-        &mut self,
-        torrent_id: i64,
-        name: &str,
-        info_hash: &str,
-        total_size: i64,
-        file_count: i64,
-        files: &[FileEntry],
-        data: &[u8],
-    ) -> Result<(), DbError> {
+    pub fn get_torrent_by_source_path(
+        &self,
+        source_path: &str,
+    ) -> Result<Option<Torrent>, DbError> {
+        let sql = format!("{TORRENT_SELECT} WHERE s.source_path = ? ORDER BY s.id LIMIT 1");
+        let result = self
+            .conn
+            .query_row(&sql, params![source_path], torrent_from_row)
+            .optional()?;
+        Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_torrent_by_info_hash(&self, info_hash: &str) -> Result<Option<Torrent>, DbError> {
+        let sql = format!("{TORRENT_SELECT} WHERE t.info_hash = ? ORDER BY s.id LIMIT 1");
+        let result = self
+            .conn
+            .query_row(&sql, params![info_hash], torrent_from_row)
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn delete_torrent(&mut self, source_id: i64) -> Result<(), DbError> {
         let tx = self.conn.transaction()?;
 
+        let content_id: Option<i64> = tx
+            .query_row(
+                "SELECT torrent_id FROM torrent_sources WHERE id = ?",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
         tx.execute(
-            "UPDATE torrents SET name = ?, info_hash = ?, total_size = ?, file_count = ?, \
-             torrent_data = ?, status = 'pending', resume_data = NULL WHERE id = ?",
-            params![name, info_hash, total_size, file_count, data, torrent_id],
+            "DELETE FROM torrent_sources WHERE id = ?",
+            params![source_id],
         )?;
 
-        // Rebuild the file/directory tree from scratch for this torrent.
-        tx.execute(
-            "DELETE FROM directory_closure WHERE descendant_id IN \
-             (SELECT id FROM torrent_directories WHERE torrent_id = ?1) \
-             OR ancestor_id IN (SELECT id FROM torrent_directories WHERE torrent_id = ?1)",
-            params![torrent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM torrent_directories WHERE torrent_id = ?",
-            params![torrent_id],
-        )?;
-        tx.execute(
-            "DELETE FROM torrent_files WHERE torrent_id = ?",
-            params![torrent_id],
-        )?;
-
-        let mut dir_cache: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-
-        for file_entry in files {
-            let path_parts: Vec<&str> = file_entry.path.split('/').collect();
-            if path_parts.is_empty() {
-                continue;
-            }
-
-            let mut current_parent_id: Option<i64> = None;
-
-            for (i, part) in path_parts.iter().enumerate() {
-                let is_file = i == path_parts.len() - 1;
-                let current_path = path_parts[..=i].join("/");
-
-                if is_file {
-                    tx.execute(
-                        "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
-                        params![torrent_id, current_parent_id, part, &file_entry.path, file_entry.size],
-                    )?;
-                } else {
-                    if let Some(&cached_id) = dir_cache.get(&current_path) {
-                        current_parent_id = Some(cached_id);
-                        continue;
-                    }
-
-                    let existing_id: Option<i64> = tx
-                        .query_row(
-                            "SELECT id FROM torrent_directories WHERE torrent_id = ? AND parent_id IS ? AND name = ?",
-                            params![torrent_id, current_parent_id, part],
-                            |row| row.get(0),
-                        )
-                        .optional()?
-                        .flatten();
-
-                    if let Some(id) = existing_id {
-                        dir_cache.insert(current_path.clone(), id);
-                        current_parent_id = Some(id);
-                        continue;
-                    }
-
-                    tx.execute(
-                        "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?, ?, ?)",
-                        params![torrent_id, current_parent_id, part],
-                    )?;
-                    let dir_id = tx.last_insert_rowid();
-
-                    tx.execute(
-                        "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
-                        params![dir_id, dir_id],
-                    )?;
-
-                    if let Some(parent_id) = current_parent_id {
-                        tx.execute(
-                            "INSERT INTO directory_closure (ancestor_id, descendant_id, depth)
-                             SELECT ancestor_id, ?, depth + 1 FROM directory_closure WHERE descendant_id = ?",
-                            params![dir_id, parent_id],
-                        )?;
-                    }
-
-                    dir_cache.insert(current_path.clone(), dir_id);
-                    current_parent_id = Some(dir_id);
-                }
+        if let Some(content_id) = content_id {
+            let refs: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM torrent_sources WHERE torrent_id = ?",
+                params![content_id],
+                |row| row.get(0),
+            )?;
+            if refs == 0 {
+                // Cascade deletes files/directories/closure.
+                tx.execute("DELETE FROM torrents WHERE id = ?", params![content_id])?;
             }
         }
 
@@ -362,205 +490,68 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_torrent_by_source_path(
-        &self,
-        source_path: &str,
-    ) -> Result<Option<Torrent>, DbError> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-                 FROM torrents WHERE source_path = ?",
-                params![source_path],
-                |row| {
-                    Ok(Torrent {
-                        id: row.get(0)?,
-                        source_path: row.get(1)?,
-                        name: row.get(2)?,
-                        filename: row.get(3)?,
-                        total_size: row.get(4)?,
-                        info_hash: row.get(5)?,
-                        file_count: row.get(6)?,
-                        status: row.get::<_, String>(7)?.into(),
-                        torrent_data: row.get(8)?,
-                        resume_data: row.get(9)?,
-                        created_at: row.get(10)?,
-                    })
-                },
-            )
-            .optional()?;
-
-        Ok(result)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_torrent_by_info_hash(&self, info_hash: &str) -> Result<Option<Torrent>, DbError> {
-        let result = self
-            .conn
-            .query_row(
-                "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-                 FROM torrents WHERE info_hash = ?",
-                params![info_hash],
-                |row| {
-                    Ok(Torrent {
-                        id: row.get(0)?,
-                        source_path: row.get(1)?,
-                        name: row.get(2)?,
-                        filename: row.get(3)?,
-                        total_size: row.get(4)?,
-                        info_hash: row.get(5)?,
-                        file_count: row.get(6)?,
-                        status: row.get::<_, String>(7)?.into(),
-                        torrent_data: row.get(8)?,
-                        resume_data: row.get(9)?,
-                        created_at: row.get(10)?,
-                    })
-                },
-            )
-            .optional()?;
-
-        Ok(result)
-    }
-
-    pub fn delete_torrent(&mut self, torrent_id: i64) -> Result<(), DbError> {
-        self.conn
-            .execute("DELETE FROM torrents WHERE id = ?", params![torrent_id])?;
-        Ok(())
-    }
-
     pub fn get_all_torrents(&self) -> Result<Vec<Torrent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-             FROM torrents ORDER BY id",
-        )?;
-
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{TORRENT_SELECT} ORDER BY s.id"))?;
         let torrents = stmt
-            .query_map([], |row| {
-                Ok(Torrent {
-                    id: row.get(0)?,
-                    source_path: row.get(1)?,
-                    name: row.get(2)?,
-                    filename: row.get(3)?,
-                    total_size: row.get(4)?,
-                    info_hash: row.get(5)?,
-                    file_count: row.get(6)?,
-                    status: row.get::<_, String>(7)?.into(),
-                    torrent_data: row.get(8)?,
-                    resume_data: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })?
+            .query_map([], torrent_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-
         Ok(torrents)
     }
 
     #[allow(dead_code)]
     pub fn get_torrents_by_status(&self, status: &TorrentStatus) -> Result<Vec<Torrent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-             FROM torrents WHERE status = ? ORDER BY id",
-        )?;
-
+        let sql = format!("{TORRENT_SELECT} WHERE t.status = ? ORDER BY s.id");
+        let mut stmt = self.conn.prepare(&sql)?;
         let torrents = stmt
-            .query_map(params![status.as_str()], |row| {
-                Ok(Torrent {
-                    id: row.get(0)?,
-                    source_path: row.get(1)?,
-                    name: row.get(2)?,
-                    filename: row.get(3)?,
-                    total_size: row.get(4)?,
-                    info_hash: row.get(5)?,
-                    file_count: row.get(6)?,
-                    status: row.get::<_, String>(7)?.into(),
-                    torrent_data: row.get(8)?,
-                    resume_data: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })?
+            .query_map(params![status.as_str()], torrent_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-
         Ok(torrents)
     }
 
     pub fn get_torrents_by_source_path(&self, source_path: &str) -> Result<Vec<Torrent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-             FROM torrents WHERE source_path = ? ORDER BY id",
-        )?;
-
+        let sql = format!("{TORRENT_SELECT} WHERE s.source_path = ? ORDER BY s.id");
+        let mut stmt = self.conn.prepare(&sql)?;
         let torrents = stmt
-            .query_map(params![source_path], |row| {
-                Ok(Torrent {
-                    id: row.get(0)?,
-                    source_path: row.get(1)?,
-                    name: row.get(2)?,
-                    filename: row.get(3)?,
-                    total_size: row.get(4)?,
-                    info_hash: row.get(5)?,
-                    file_count: row.get(6)?,
-                    status: row.get::<_, String>(7)?.into(),
-                    torrent_data: row.get(8)?,
-                    resume_data: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })?
+            .query_map(params![source_path], torrent_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-
         Ok(torrents)
     }
 
-    /// Get all torrents whose source_path matches exactly or is a child of the given prefix.
-    /// For example, with prefix "os", this returns torrents with source_path "os",
-    /// "os/linux", "os/bsd", etc.
+    /// Get all torrents whose source_path matches exactly or is a child of the
+    /// given prefix.
     pub fn get_torrents_by_source_path_prefix(
         &self,
         source_path: &str,
     ) -> Result<Vec<Torrent>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-             FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ESCAPE '\\' ORDER BY id",
-        )?;
-        // Escape LIKE metacharacters (%, _) and the escape character itself so that
-        // source_path is matched literally rather than treated as a glob pattern.
         let escaped_path = super::escape_like_pattern(source_path);
         let pattern = if source_path.is_empty() {
             "%".to_string()
         } else {
             format!("{}/%", escaped_path)
         };
+        let sql = format!(
+            "{TORRENT_SELECT} WHERE s.source_path = ?1 OR s.source_path LIKE ?2 ESCAPE '\\' ORDER BY s.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let torrents = stmt
-            .query_map(params![source_path, pattern], |row| {
-                Ok(Torrent {
-                    id: row.get(0)?,
-                    source_path: row.get(1)?,
-                    name: row.get(2)?,
-                    filename: row.get(3)?,
-                    total_size: row.get(4)?,
-                    info_hash: row.get(5)?,
-                    file_count: row.get(6)?,
-                    status: row.get::<_, String>(7)?.into(),
-                    torrent_data: row.get(8)?,
-                    resume_data: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
-            })?
+            .query_map(params![source_path, pattern], torrent_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-
         Ok(torrents)
     }
 
-    /// Get counts of torrents grouped by status.
-    /// Returns (pending, downloading, seeding, error, total).
+    /// Get counts of torrents grouped by status.  Counts source entries (one
+    /// per `(source_path, filename)`), grouped by the shared content's status.
     pub fn get_torrent_counts_by_status(&self) -> Result<(i64, i64, i64, i64, i64), DbError> {
         let mut pending: i64 = 0;
         let mut downloading: i64 = 0;
         let mut seeding: i64 = 0;
         let mut error: i64 = 0;
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT status, COUNT(*) as cnt FROM torrents GROUP BY status")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT t.status, COUNT(*) AS cnt FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id GROUP BY t.status",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -578,13 +569,15 @@ impl Database {
         Ok((pending, downloading, seeding, error, total))
     }
 
-    /// Get all torrents that share a given info_hash.
+    /// Get all source entries that share a given info_hash (across all
+    /// contents — two files with the same info_hash but different bytes both
+    /// appear here).
     pub fn get_torrents_by_infohash(
         &self,
         info_hash: &str,
     ) -> Result<Vec<(i64, String, String, String)>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, filename, source_path FROM torrents WHERE info_hash = ? ORDER BY id",
+            "SELECT s.id, t.name, s.filename, s.source_path FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id WHERE t.info_hash = ? ORDER BY s.id",
         )?;
         let rows = stmt.query_map(params![info_hash], |row| {
             Ok((
@@ -594,12 +587,7 @@ impl Database {
                 row.get::<_, String>(3)?,
             ))
         })?;
-        let mut result = Vec::new();
-        for row in rows {
-            let (id, name, filename, source_path) = row?;
-            result.push((id, name, filename, source_path));
-        }
-        Ok(result)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     #[allow(dead_code)]
@@ -611,7 +599,7 @@ impl Database {
         let result = self
             .conn
             .query_row(
-                "SELECT id FROM torrents WHERE name = ? AND source_path = ?",
+                "SELECT s.id FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id WHERE t.name = ? AND s.source_path = ?",
                 params![name, source_path],
                 |row| row.get(0),
             )
@@ -621,48 +609,28 @@ impl Database {
         Ok(result)
     }
 
-    pub fn get_torrent_by_id(&self, id: i64) -> Result<Option<Torrent>, DbError> {
+    pub fn get_torrent_by_id(&self, source_id: i64) -> Result<Option<Torrent>, DbError> {
+        let sql = format!("{TORRENT_SELECT} WHERE s.id = ?");
         let result = self
             .conn
-            .query_row(
-                "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-                 FROM torrents WHERE id = ?",
-                params![id],
-                |row| {
-                    Ok(Torrent {
-                        id: row.get(0)?,
-                        source_path: row.get(1)?,
-                        name: row.get(2)?,
-                        filename: row.get(3)?,
-                        total_size: row.get(4)?,
-                        info_hash: row.get(5)?,
-                        file_count: row.get(6)?,
-                        status: row.get::<_, String>(7)?.into(),
-                        torrent_data: row.get(8)?,
-                        resume_data: row.get(9)?,
-                        created_at: row.get(10)?,
-                    })
-                },
-            )
+            .query_row(&sql, params![source_id], torrent_from_row)
             .optional()?;
-
         Ok(result)
     }
 
-    /// Rename a torrent by updating its name, filename, and source_path fields.
+    /// Rename a source entry by updating its filename and source_path.  The
+    /// content name is shared across source entries and therefore untouched.
     pub fn rename_torrent(
         &mut self,
-        torrent_id: i64,
-        new_name: &str,
+        source_id: i64,
         new_filename: &str,
         new_source_path: &str,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE torrents SET name = ?, filename = ?, source_path = ? WHERE id = ?",
-            params![new_name, new_filename, new_source_path, torrent_id],
+            "UPDATE torrent_sources SET filename = ?, source_path = ? WHERE id = ?",
+            params![new_filename, new_source_path, source_id],
         )?;
 
-        // Ensure metadata directories exist for the new source_path
         if !new_source_path.is_empty() {
             if let Err(e) = self.ensure_metadata_directories(new_source_path) {
                 tracing::warn!(
@@ -696,7 +664,7 @@ impl Database {
 
         let source_id: Option<i64> = tx
             .query_row(
-                "SELECT id FROM torrents WHERE filename = ? AND source_path = ?",
+                "SELECT id FROM torrent_sources WHERE filename = ? AND source_path = ?",
                 params![source_filename, source_path],
                 |row| row.get(0),
             )
@@ -707,23 +675,47 @@ impl Database {
             return Ok(MoveOverwriteResult::SourceAbsent);
         };
 
+        // Delete the destination source entry (and its orphaned content) in
+        // the same transaction as the re-point, mirroring `delete_torrent`.
         let removed_target: Option<(i64, String)> = tx
             .query_row(
-                "SELECT id, info_hash FROM torrents WHERE filename = ? AND source_path = ?",
+                "SELECT s.id, t.info_hash FROM torrent_sources s JOIN torrents t ON t.id = s.torrent_id WHERE s.filename = ? AND s.source_path = ?",
                 params![dest_filename, dest_path],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
-            .map(|(dest_id, info_hash)| {
-                tx.execute("DELETE FROM torrents WHERE id = ?", params![dest_id])?;
-                Ok::<_, DbError>((dest_id, info_hash))
+            .map(|(dest_source_id, info_hash)| {
+                let content_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT torrent_id FROM torrent_sources WHERE id = ?",
+                        params![dest_source_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+
+                tx.execute("DELETE FROM torrent_sources WHERE id = ?", params![dest_source_id])?;
+
+                if let Some(content_id) = content_id {
+                    let refs: i64 = tx.query_row(
+                        "SELECT COUNT(*) FROM torrent_sources WHERE torrent_id = ?",
+                        params![content_id],
+                        |row| row.get(0),
+                    )?;
+                    if refs == 0 {
+                        // Cascade deletes files/directories/closure.
+                        tx.execute("DELETE FROM torrents WHERE id = ?", params![content_id])?;
+                    }
+                }
+
+                Ok::<_, DbError>((dest_source_id, info_hash))
             })
             .transpose()?;
 
-        // Preserve the source's `name` (bencode name); only its `filename`
+        // Preserve the source's content (bencode name); only its `filename`
         // and `source_path` change — matching `rename_torrent`'s contract.
         tx.execute(
-            "UPDATE torrents SET filename = ?, source_path = ? WHERE id = ?",
+            "UPDATE torrent_sources SET filename = ?, source_path = ? WHERE id = ?",
             params![dest_filename, dest_path, source_id],
         )?;
 
@@ -750,30 +742,13 @@ impl Database {
         filename: &str,
         source_path: &str,
     ) -> Result<Option<Torrent>, DbError> {
+        let sql = format!(
+            "{TORRENT_SELECT} WHERE s.filename = ? AND s.source_path = ? ORDER BY s.id LIMIT 1"
+        );
         let result = self
             .conn
-            .query_row(
-                "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-                 FROM torrents WHERE filename = ? AND source_path = ?",
-                params![filename, source_path],
-                |row| {
-                    Ok(Torrent {
-                        id: row.get(0)?,
-                        source_path: row.get(1)?,
-                        name: row.get(2)?,
-                        filename: row.get(3)?,
-                        total_size: row.get(4)?,
-                        info_hash: row.get(5)?,
-                        file_count: row.get(6)?,
-                        status: row.get::<_, String>(7)?.into(),
-                        torrent_data: row.get(8)?,
-                        resume_data: row.get(9)?,
-                        created_at: row.get(10)?,
-                    })
-                },
-            )
+            .query_row(&sql, params![filename, source_path], torrent_from_row)
             .optional()?;
-
         Ok(result)
     }
 }
