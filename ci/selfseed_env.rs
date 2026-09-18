@@ -56,8 +56,17 @@ struct Peer {
     seen: std::time::Instant,
 }
 
+/// Announce interval (seconds) advertised by the tracker as both `interval`
+/// and `min interval`, and used by the seeder's keep-alive loop and
+/// `min_announce_interval` setting.  Must stay below [`PEER_EXPIRY`] so a live
+/// seeder re-announces before the tracker reaps its entry.  Advertising
+/// `min interval` matters: libtorrent defaults a missing `min interval` to
+/// 30s, which would clamp the 5s interval up to 30s and race the 30s expiry.
+const ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Drop peers that have not re-announced within this window.  The tracker
-/// advertises `interval=5`, so a live client announces well inside 30s.
+/// advertises [`ANNOUNCE_INTERVAL`], so a live client announces well inside
+/// 30s.
 const PEER_EXPIRY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Bound on the wait for the first announce bytes.  A client that connects
@@ -211,7 +220,12 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
         if let Some(entry) = peers.get_mut(&info_hash) {
             entry.retain(|p| !(p.ip == ip && p.port == peer_port));
         }
-        let body = b"d8:intervali5e5:peers0:e".to_vec();
+        let body = format!(
+            "d8:intervali{}e12:min intervali{}e5:peers0:e",
+            ANNOUNCE_INTERVAL.as_secs(),
+            ANNOUNCE_INTERVAL.as_secs()
+        )
+        .into_bytes();
         let response = format!(
             "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
             body.len()
@@ -248,8 +262,13 @@ fn handle_announce(state: Arc<TrackerState>, mut stream: std::net::TcpStream) {
             .unwrap_or_default()
     };
 
-    // d8:intervali5e5:peers<len>:<compact_peer_list>e
-    let mut body = b"d8:intervali5e5:peers".to_vec();
+    // d8:intervali<interval>e12:min intervali<interval>e5:peers<len>:<compact_peer_list>e
+    let mut body = format!(
+        "d8:intervali{}e12:min intervali{}e5:peers",
+        ANNOUNCE_INTERVAL.as_secs(),
+        ANNOUNCE_INTERVAL.as_secs()
+    )
+    .into_bytes();
     body.extend_from_slice(format!("{}:", compact.len()).as_bytes());
     body.extend_from_slice(&compact);
     body.extend_from_slice(b"e");
@@ -516,7 +535,7 @@ fn main() {
     config.connections.peer_connect_timeout = Some(5);
     config.tracker.announce_to_all_trackers = Some(true);
     config.tracker.announce_to_all_tiers = Some(true);
-    config.tracker.min_announce_interval = Some(5);
+    config.tracker.min_announce_interval = Some(ANNOUNCE_INTERVAL.as_secs() as i64);
 
     let mut session = Session::new(&config).expect("failed to create libtorrent session");
     let handle = session
@@ -554,13 +573,17 @@ fn main() {
 
     println!("[seeder] ready — Ctrl-C to stop");
     loop {
-        // Re-announce each hour so the swarm entry never expires for
-        // long-running QA sessions.  Poll SHUTDOWN on a short sleep instead
-        // of sleeping the full hour: a supervisor that escalates SIGTERM to
-        // SIGKILL (podman/docker's 10s default grace period) would otherwise
-        // kill the process mid-sleep with no error line, surfacing as an
-        // intermittent silent exit after "ready".
-        for _ in 0..(3600 * 1000 / 500) {
+        // Re-announce at the tracker's advertised interval so the swarm entry
+        // never expires: the tracker reaps peers that have not re-announced
+        // within PEER_EXPIRY (30s), and libtorrent's own periodic announce is
+        // not guaranteed to keep a seeding torrent's entry alive across a long
+        // QA session.  Poll SHUTDOWN on a short sleep instead of sleeping the
+        // full interval: a supervisor that escalates SIGTERM to SIGKILL
+        // (podman/docker's 10s default grace period) would otherwise kill the
+        // process mid-sleep with no error line, surfacing as an intermittent
+        // silent exit after "ready".
+        // ceil-division keeps SHUTDOWN polling non-empty for sub-500ms intervals.
+        for _ in 0..(ANNOUNCE_INTERVAL.as_millis().div_ceil(500)) {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 eprintln!("[seeder] shutdown signal received — stopping");
                 return;
@@ -849,6 +872,46 @@ mod tests {
             start.elapsed() >= Duration::from_secs(4),
             "400 must follow the read timeout, got it after {:?}",
             start.elapsed()
+        );
+    }
+
+    /// a successful announce response must advertise `min interval` equal to
+    /// [`ANNOUNCE_INTERVAL`].  libtorrent defaults a missing `min interval` to
+    /// 30s, which clamps the 5s `interval` up to 30s and races [`PEER_EXPIRY`]
+    /// (the seeder entry expires before the next announce, surfacing as an
+    /// empty `peers` list).  Asserting the field guards that regression.
+    #[test]
+    fn announce_response_advertises_min_interval() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(TrackerState {
+            peers: parking_lot_stub(),
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::thread::spawn(move || handle_announce(state, server));
+
+        // Bare ASCII hex info_hash (decode_info_hash's alternate form) keeps
+        // the request human-readable; a real announce also carries peer_id
+        // and port, which this tracker ignores beyond `port`.
+        let request = concat!(
+            "GET /announce?info_hash=0102030405060708090a0b0c0d0e0f1011121314",
+            "&peer_id=0123456789abcdefghij&port=6881&left=0&event=started ",
+            "HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let expected = format!("12:min intervali{}e", ANNOUNCE_INTERVAL.as_secs());
+        assert!(
+            response.contains(&expected),
+            "announce response must advertise {expected}, got: {response}"
         );
     }
 
