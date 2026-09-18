@@ -84,5 +84,11 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # Deployment): the image cannot override podman/docker's default 10s
 # SIGTERM→SIGKILL grace period, and a forced kill leaves a stale ENOTCONN
 # mount that blocks the next `podman start`.
+#
+# The QA-verified rootful run used `--network host` (see README "Docker
+# (rootful, host-visible mount)"): in that environment the default bridge
+# network failed while creating the container's veth pair (`failed to add the
+# host (veth…) pair interfaces: operation not supported`), before any process
+# started.
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/mnt"]

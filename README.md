@@ -46,10 +46,17 @@ cat /mnt/torrentfs/data/<name>/README
 
 ### Docker (rootful, host-visible mount)
 
+In QA's environment the rootful run required `--network host`: with the
+default bridge network, container creation failed at the veth setup stage
+(`failed to add the host (veth…) pair interfaces: operation not supported`),
+before any process started. `--network host` (the QA-verified command below)
+avoids that, at the cost of network isolation.
+
 ```bash
 sudo mkdir -p /host/torrentfs
 sudo mount --bind /host/torrentfs /host/torrentfs && sudo mount --make-shared /host/torrentfs
-docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+docker run --rm --network host --device /dev/fuse --cap-add SYS_ADMIN \
+  --stop-timeout 30 \
   --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
   ghcr.io/tsic404/torrentfs:main
 ```
@@ -122,7 +129,8 @@ privilege drop. `--log-file` must be an absolute path — a relative path resolv
 against the container WORKDIR (`/`), which the daemon user cannot write:
 
 ```bash
-docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+docker run --rm --network host --device /dev/fuse --cap-add SYS_ADMIN \
+  --stop-timeout 30 \
   -v /host/logs:/logs \
   --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
   ghcr.io/tsic404/torrentfs:main /mnt --log-file /logs/torrentfs.log --log-level debug
