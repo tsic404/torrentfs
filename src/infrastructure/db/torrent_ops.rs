@@ -1,7 +1,9 @@
 use rusqlite::{params, OptionalExtension};
 
 use super::database::Database;
-use super::types::{DbError, FileEntry, InsertTorrentResult, Torrent, TorrentStatus};
+use super::types::{
+    DbError, FileEntry, InsertTorrentResult, MoveOverwriteResult, Torrent, TorrentStatus,
+};
 
 impl Database {
     #[allow(dead_code)]
@@ -672,6 +674,74 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// Atomically move a torrent over an existing destination in a single
+    /// transaction: look up the source row, delete the destination row (if
+    /// any), then re-point the source at the destination. The
+    /// `UNIQUE(source_path, filename)` constraint makes this indivisible —
+    /// re-pointing first collides with the destination, while deleting first
+    /// loses the destination if the re-point later fails. Returns
+    /// `SourceAbsent` when the source row is missing (a failed pending add
+    /// leaves no row); otherwise `Moved`, carrying the removed destination's
+    /// `(id, info_hash)` (`None` when the destination had no persisted row).
+    pub fn move_torrent_replacing(
+        &mut self,
+        source_filename: &str,
+        source_path: &str,
+        dest_filename: &str,
+        dest_path: &str,
+    ) -> Result<MoveOverwriteResult, DbError> {
+        let tx = self.conn.transaction()?;
+
+        let source_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM torrents WHERE filename = ? AND source_path = ?",
+                params![source_filename, source_path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let Some(source_id) = source_id else {
+            return Ok(MoveOverwriteResult::SourceAbsent);
+        };
+
+        let removed_target: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT id, info_hash FROM torrents WHERE filename = ? AND source_path = ?",
+                params![dest_filename, dest_path],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .map(|(dest_id, info_hash)| {
+                tx.execute("DELETE FROM torrents WHERE id = ?", params![dest_id])?;
+                Ok::<_, DbError>((dest_id, info_hash))
+            })
+            .transpose()?;
+
+        // Preserve the source's `name` (bencode name); only its `filename`
+        // and `source_path` change — matching `rename_torrent`'s contract.
+        tx.execute(
+            "UPDATE torrents SET filename = ?, source_path = ? WHERE id = ?",
+            params![dest_filename, dest_path, source_id],
+        )?;
+
+        tx.commit()?;
+
+        // Ensure metadata directories exist for the destination path, outside
+        // the transaction (best-effort, mirroring `rename_torrent`).
+        if !dest_path.is_empty() {
+            if let Err(e) = self.ensure_metadata_directories(dest_path) {
+                tracing::warn!(
+                    "Failed to create metadata directories for {}: {}",
+                    dest_path,
+                    e
+                );
+            }
+        }
+
+        Ok(MoveOverwriteResult::Moved { removed_target })
     }
 
     /// Get a torrent by its filename and source_path.
