@@ -224,6 +224,50 @@ run_test "parse_args --log-level=debug /mnt keeps mountpoint" \
 run_test "parse_args --cache-size 4194304 /mnt rejects with exit 2" \
     'rc=0; ( parse_args --cache-size 4194304 /mnt ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
 
+run_test "parse_args --config /foo.toml /mnt captures config_arg" \
+    'parse_args --config /foo.toml /mnt; [ "$config_arg" = /foo.toml ]'
+
+run_test "parse_args --config=/foo.toml /mnt captures config_arg inline" \
+    'parse_args --config=/foo.toml /mnt; [ "$config_arg" = /foo.toml ]'
+
+run_test "parse_args -- /mnt leaves config_arg empty" \
+    'parse_args -- /mnt; [ -z "$config_arg" ]'
+
+# --- apply_config_env (TORRENTFS_CONFIG) ---
+# apply_config_env injects TORRENTFS_CONFIG as a leading --config argument when
+# no --config CLI argument was given. An explicit CLI --config wins over the env
+# variable; an unset env variable is a no-op.
+
+run_test "apply_config_env injects --config from TORRENTFS_CONFIG" \
+    'export TORRENTFS_CONFIG=/env.toml; parse_args /mnt; apply_config_env; [ "$config_arg" = /env.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /env.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
+
+run_test "apply_config_env defers to CLI --config over TORRENTFS_CONFIG" \
+    'export TORRENTFS_CONFIG=/env.toml; parse_args --config /cli.toml /mnt; apply_config_env; [ "$config_arg" = /cli.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
+
+run_test "apply_config_env defers to CLI --config= over TORRENTFS_CONFIG" \
+    'export TORRENTFS_CONFIG=/env.toml; parse_args --config=/cli.toml /mnt; apply_config_env; [ "$config_arg" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 1 ]'
+
+run_test "apply_config_env no-ops when TORRENTFS_CONFIG is unset" \
+    'unset TORRENTFS_CONFIG; parse_args /mnt; apply_config_env; [ -z "$config_arg" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
+
+# --- should_apply_config_env ---
+# TORRENTFS_CONFIG is applied only when the command consumes the parsed args —
+# the mount path or --config-check. Diagnostic commands that forward the raw
+# "$@" (--help/--version) skip it, so a bad TORRENTFS_CONFIG path cannot block
+# their output.
+
+run_test "should_apply_config_env true for a mount command" \
+    'parse_args /mnt; should_apply_config_env /mnt'
+
+run_test "should_apply_config_env false for --help" \
+    'parse_args --help; if should_apply_config_env --help; then exit 1; else exit 0; fi'
+
+run_test "should_apply_config_env false for --version" \
+    'parse_args --version; if should_apply_config_env --version; then exit 1; else exit 0; fi'
+
+run_test "should_apply_config_env true for --config-check" \
+    'parse_args --config-check; should_apply_config_env --config-check'
+
 # --- validate_mountpoint (mountpoint guard) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
 # before the FUSE device check. The nested subshell captures the exit code so

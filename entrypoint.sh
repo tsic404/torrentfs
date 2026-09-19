@@ -98,6 +98,8 @@ torrentfs_args=()
 cache_arg=""
 db_arg=""
 log_file_arg=""
+# --config value, so TORRENTFS_CONFIG (env) defers to an explicit CLI --config.
+config_arg=""
 
 parse_args() {
     local arg expect_value="" options_ended=0
@@ -106,6 +108,7 @@ parse_args() {
     cache_arg=""
     db_arg=""
     log_file_arg=""
+    config_arg=""
 
     for arg in "$@"; do
         if [ "$options_ended" -eq 1 ]; then
@@ -121,7 +124,7 @@ parse_args() {
         if [ -n "$expect_value" ]; then
             # Value of the preceding --config/--db/--cache/--log-file option.
             case "$expect_value" in
-                --config) validate_config "$arg" ;;
+                --config) validate_config "$arg"; config_arg="$arg" ;;
                 --db) db_arg="$arg" ;;
                 --cache) cache_arg="$arg" ;;
                 --log-file) log_file_arg="$arg" ;;
@@ -137,7 +140,8 @@ parse_args() {
                 options_ended=1
                 ;;
             --config=*)
-                validate_config "${arg#--config=}"
+                config_arg="${arg#--config=}"
+                validate_config "$config_arg"
                 torrentfs_args+=("$arg")
                 ;;
             --config|--db|--cache|--log-file|--log-level)
@@ -180,7 +184,29 @@ parse_args() {
     done
 }
 
+# Apply TORRENTFS_CONFIG (env) as `--config` when no --config CLI argument was
+# given. The value is validated like a CLI --config so a bad path fails fast at
+# startup. An explicit CLI --config wins over the environment variable.
+apply_config_env() {
+    if [ -n "${TORRENTFS_CONFIG:-}" ] && [ -z "$config_arg" ]; then
+        validate_config "$TORRENTFS_CONFIG"
+        torrentfs_args=(--config "$TORRENTFS_CONFIG" "${torrentfs_args[@]}")
+        config_arg="$TORRENTFS_CONFIG"
+    fi
+}
+
+# Whether TORRENTFS_CONFIG applies to this invocation: only when the command
+# consumes the parsed args — the mount path, or --config-check. --help/-h/
+# --version/-V/help forward the raw "$@" (dropping any injected --config), so
+# skip env-config validation for them instead of blocking their output.
+should_apply_config_env() {
+    needs_fuse "$@" || has_config_check "${torrentfs_args[@]}"
+}
+
 parse_args "$@"
+if should_apply_config_env "$@"; then
+    apply_config_env
+fi
 
 # Reject a missing or unusable mountpoint with an actionable diagnostic (exit 2,
 # matching clap's usage-error code) before the FUSE device check runs, so the
