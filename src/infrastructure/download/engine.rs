@@ -509,14 +509,29 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     tracing::info!("Download engine started");
+    // `publish_snapshot` rebuilds the per-torrent piece grid — O(num_pieces)
+    // cache lookups plus a `post_torrent_updates` FFI round-trip — so running
+    // it after *every* command made byte-granular reads (`dd bs=1 count=4096`)
+    // pathological on large torrents.  Non-read commands (handle add/remove,
+    // tracker merge) mutate observable state, so they still publish
+    // immediately.  `ReadFileRange` is the high-frequency command: a cached
+    // read mutates nothing, so publishing per read is pure waste — instead
+    // refresh on a wall-clock threshold.  The threshold must not gate on the
+    // timeout branch: `recv_timeout` returns immediately while commands are
+    // queued, so an idle-only publish would freeze `.stats` (per-torrent
+    // status / num_peers) for the whole duration of a sustained read burst
+    // (`dd bs=1 count=N`).
+    let mut last_publish = Instant::now();
     loop {
-        // Block on commands; wake every `SNAPSHOT_INTERVAL` to refresh the
-        // non-blocking `.stats` snapshot (design §4.2: no alert polling here).
         match rx.recv_timeout(SNAPSHOT_INTERVAL) {
             Ok(cmd) => {
+                let is_read = matches!(cmd, Command::ReadFileRange { .. });
                 let stop = state.handle_command(cmd);
                 state.drain_piece_finished();
-                state.publish_snapshot();
+                if !is_read || last_publish.elapsed() >= SNAPSHOT_INTERVAL {
+                    state.publish_snapshot();
+                    last_publish = Instant::now();
+                }
                 // do NOT flush cache metadata per command.  Every
                 // cached read marks the piece metadata dirty
                 // (`record_access`), so a per-command flush fsync'd
@@ -534,6 +549,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 state.settle_idle_torrents();
                 state.publish_snapshot();
                 state.flush_cache_metadata();
+                last_publish = Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
