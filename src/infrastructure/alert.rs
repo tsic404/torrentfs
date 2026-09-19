@@ -300,6 +300,22 @@ fn drain_alerts(
     true
 }
 
+/// Render the `torrent_finished` alert message. `finished_complete` comes
+/// from the C wrapper's have-pieces bitfield check: 1 when every piece is
+/// downloaded (a full completion), 0 when selective piece priorities left
+/// filtered pieces missing (a premature/partial finish).
+fn torrent_finished_message(info_hash: &str, finished_complete: i32) -> String {
+    let reason = if finished_complete != 0 {
+        "complete — all pieces downloaded"
+    } else {
+        "incomplete — selective download, filtered pieces remain"
+    };
+    format!(
+        "alert: torrent_finished (info_hash={}, {})",
+        info_hash, reason
+    )
+}
+
 pub(crate) fn dispatch(
     alert_type: AlertType,
     alert: &libtorrent_sys::lt_alert_data_t,
@@ -338,17 +354,9 @@ pub(crate) fn dispatch(
         }
         AlertType::TorrentFinished => {
             let info_hash = cstr(&alert.info_hash);
-            // With selective piece priorities (priority 0 for
-            // non-read-range pieces), libtorrent fires torrent_finished
-            // prematurely when all non-filtered pieces in the current read
-            // range have passed hash check. This is expected behavior —
-            // close_redundant_connections is disabled to prevent seed peer
-            // disconnection, and the next read's priority changes trigger
-            // resume_download() to return to downloading state.
             tracing::debug!(
-                "alert: torrent_finished (info_hash={}, \
-                 likely premature — selective download with filtered pieces)",
-                info_hash
+                "{}",
+                torrent_finished_message(info_hash, alert.finished_complete)
             );
         }
         AlertType::TorrentRemoved => {
@@ -506,6 +514,7 @@ mod tests {
             half_open_connections: 2,
             message: std::ptr::null(),
             category: 0,
+            finished_complete: 0,
         };
         dispatch(
             AlertType::from(alert.type_),
@@ -554,6 +563,7 @@ mod tests {
             half_open_connections: 0,
             message: std::ptr::null(),
             category: 0,
+            finished_complete: 0,
         };
         dispatch(
             AlertType::from(alert.type_),
@@ -566,5 +576,21 @@ mod tests {
         let (got_hash, got_piece) = piece_finished_rx.try_recv().expect("event forwarded");
         assert_eq!(got_hash, hex);
         assert_eq!(got_piece, 7);
+    }
+
+    #[test]
+    fn torrent_finished_message_distinguishes_complete_from_incomplete() {
+        // `finished_complete` is the C wrapper's have-pieces verdict: 1 =
+        // full completion, 0 = selective download with filtered pieces still
+        // missing. The log must not mislabel a normal full download as
+        // premature.
+        assert_eq!(
+            torrent_finished_message("cafe", 1),
+            "alert: torrent_finished (info_hash=cafe, complete — all pieces downloaded)"
+        );
+        assert_eq!(
+            torrent_finished_message("cafe", 0),
+            "alert: torrent_finished (info_hash=cafe, incomplete — selective download, filtered pieces remain)"
+        );
     }
 }

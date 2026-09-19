@@ -62,6 +62,7 @@ typedef struct {
     // other alert info
     const char* message;
     int category;                // libtorrent alert_category bits (for tracing)
+    int finished_complete;       // torrent_finished_alert: 1 = all pieces downloaded, 0 = selective/partial
 } lt_alert_data_t;
 
 typedef struct {

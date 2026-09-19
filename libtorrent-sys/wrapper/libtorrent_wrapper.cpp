@@ -1330,6 +1330,24 @@ static void alert_fill_info_hash_from_handle(const lt::torrent_handle& h, char* 
     std::memcpy(out, hex.c_str(), hex.size() + 1);
 }
 
+// ── Helper: distinguish a full completion from a selective-download one ──
+// torrent_finished fires when every *wanted* piece (priority > 0) is
+// downloaded. With selective piece priorities, filtered pieces (priority 0)
+// may still be missing — a partial completion, not the whole torrent. Check
+// the have-pieces bitfield: all pieces set means the full torrent downloaded.
+static int alert_torrent_finished_is_complete(const lt::torrent_handle& h) {
+    if (!h.is_valid()) return 0;
+    auto ti = h.torrent_file();
+    if (!ti) return 1; // no metadata yet; nothing filtered to judge
+    int num_pieces = static_cast<int>(ti->num_pieces());
+    auto st = h.status();
+    if (static_cast<int>(st.pieces.size()) < num_pieces) return 0;
+    for (int i = 0; i < num_pieces; ++i) {
+        if (!st.pieces[lt::piece_index_t(i)]) return 0;
+    }
+    return 1;
+}
+
 void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* user_data), void* user_data) {
     if (!session) return;
     auto wrapper = static_cast<lt_session_wrapper*>(session);
@@ -1418,6 +1436,7 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
             else if (auto* tf = lt::alert_cast<lt::torrent_finished_alert>(alert)) {
                 out.type = LT_ALERT_TORRENT_FINISHED;
                 alert_fill_info_hash_from_handle(tf->handle, out.info_hash);
+                out.finished_complete = alert_torrent_finished_is_complete(tf->handle);
             }
             // ── piece_finished_alert ──
             else if (auto* pf = lt::alert_cast<lt::piece_finished_alert>(alert)) {
