@@ -27,7 +27,7 @@ pub struct TorrentStatus {
 }
 
 /// libtorrent torrent state enum.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentState {
     QueuedForChecking,
     CheckingFiles,

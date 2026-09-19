@@ -63,6 +63,9 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --no-fail-fast
 
+      - name: Run seeder example tests
+        run: cargo test --locked --example torrentfs-selfseed-env --example torrentfs-mffs-seeder
+
   entrypoint-test:
     name: Entrypoint Shell Tests
     runs-on: ubuntu-24.04

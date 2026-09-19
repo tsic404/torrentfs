@@ -31,3 +31,7 @@ parking_lot = "0.12"
 [[example]]
 name = "torrentfs-selfseed-env"
 path = "ci/selfseed_env.rs"
+
+[[example]]
+name = "torrentfs-mffs-seeder"
+path = "ci/mffs_seeder.rs"
