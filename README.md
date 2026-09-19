@@ -54,6 +54,24 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
   ghcr.io/tsic404/torrentfs:main
 ```
 
+`/mnt` is the FUSE mountpoint, not a persistence location: the entrypoint
+mounts the filesystem over it, so its tree exists only while the FUSE mount is
+alive and a volume mounted at `/mnt` is shadowed by it. torrentfs persists its
+state — the SQLite metadata DB and the on-disk piece cache — under the XDG data
+directory (`$XDG_DATA_HOME/torrentfs`, defaulting to
+`/home/torrentfs/.local/share/torrentfs` for the image's UID-1000 daemon user),
+or under `--db` / `--cache` when those overrides are given. To survive
+`docker stop` / restart, mount a persistent volume over that state directory:
+
+```bash
+sudo mkdir -p /host/torrentfs /host/torrentfs-state
+sudo mount --bind /host/torrentfs /host/torrentfs && sudo mount --make-shared /host/torrentfs
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  -v /host/torrentfs-state:/home/torrentfs/.local/share/torrentfs \
+  ghcr.io/tsic404/torrentfs:main
+```
+
 ## Usage
 
 ### Adding a torrent
