@@ -3933,6 +3933,81 @@ mod tests {
         );
     }
 
+    /// A same-name `mv` (POSIX `renameat` overwrite) over an existing torrent
+    /// must replace the destination's full byte stream with the source's — the
+    /// destination row carries the source `.torrent` bytes, never the old
+    /// bytes and never an empty stream. This pins the QA regression contract
+    /// (`renameat(AT_FDCWD)` replacing an existing torrent's full byte stream).
+    #[test]
+    fn rename_over_existing_torrent_replaces_full_byte_stream() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "cat-a").expect("mkdir cat-a");
+        svc.mkdir(METADATA_INO, "cat-b").expect("mkdir cat-b");
+        let cat_a_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-a")
+            .expect("cat-a inode");
+        let cat_b_ino = svc
+            .inode_mgr
+            .find_child_by_name(METADATA_INO, "cat-b")
+            .expect("cat-b inode");
+
+        // Distinct byte streams: the bencode `name` field differs, so each
+        // parses to a distinct info-dict and a distinct content row.
+        let source_bytes = minimal_torrent_named("source");
+        let dest_bytes = minimal_torrent_named("dest");
+
+        {
+            let ts = svc.torrent_service.clone().expect("torrent service");
+            ts.add_torrent(&source_bytes, "cat-b", "x.torrent")
+                .expect("add source torrent");
+            ts.add_torrent(&dest_bytes, "cat-a", "x.torrent")
+                .expect("add destination torrent");
+        }
+
+        let target_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            target_ino,
+            InodeData::File {
+                parent: cat_a_ino,
+                name: "x.torrent".to_string(),
+                data: dest_bytes.clone(),
+                unlinked: false,
+            },
+        );
+        let source_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            source_ino,
+            InodeData::File {
+                parent: cat_b_ino,
+                name: "x.torrent".to_string(),
+                data: source_bytes.clone(),
+                unlinked: false,
+            },
+        );
+
+        svc.rename(cat_b_ino, "x.torrent", cat_a_ino, "x.torrent")
+            .expect("same-name move must overwrite the destination");
+
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let moved = db_guard
+            .get_torrent_by_filename_and_source_path("x.torrent", "cat-a")
+            .unwrap()
+            .expect("source row must land at cat-a/x.torrent");
+        assert_eq!(
+            moved.torrent_data.as_deref(),
+            Some(source_bytes.as_slice()),
+            "cat-a/x.torrent must carry the source's full byte stream"
+        );
+        assert!(
+            db_guard
+                .get_torrent_by_filename_and_source_path("x.torrent", "cat-b")
+                .unwrap()
+                .is_none(),
+            "the source location cat-b/x.torrent must be vacated"
+        );
+    }
+
     /// The overwrite path must be atomic: when the source's pending add does
     /// not settle in time (simulated with a pre-seeded `processing_torrents`
     /// key and a short injected deadline), the rename fails and BOTH names
