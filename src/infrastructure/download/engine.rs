@@ -442,22 +442,49 @@ pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
 /// engine thread, so it adds to the read budget.
 pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
 
+/// Upper bound (seconds) on the piece-wait window for a read with no connected
+/// seeder (`num_seeds == 0`).  A no-seeder read can never be served by the
+/// swarm, so waiting the full `read_timeout_secs` (60s default) blocks the
+/// engine thread and serializes every other read/write on the mount behind it.
+/// The no-seeder read instead fails fast with `NoPeers` after this short
+/// window — unless a seeder connects mid-wait, which upgrades the window back
+/// to the full `read_timeout_secs`.
+pub(crate) const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
+
 /// Worst-case seconds a single `read_file_range` call may block on the engine
 /// thread before returning its own result: state-transition wait
 /// (`read_timeout_secs`) + recheck wait (≤ [`RECHECK_WAIT_CAP_SECS`]) +
-/// peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) + the piece-wait window
-/// (`read_timeout_secs`, one shared deadline across all pieces in the
-/// requested range — see `read_file_range`).
+/// peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) + the piece-wait window.
+/// The piece-wait worst case is a seeder connecting at the very end of the
+/// short no-seeder window (≤ [`NO_SEEDER_READ_TIMEOUT_SECS`]) and then getting
+/// a full `read_timeout_secs` window from its connect time (the window resets
+/// on seeder connect — see `read_file_range`).
 ///
 /// This is the budget the FUSE deferred-read deadline must cover.  Pure so it
 /// is unit-testable without a running engine.
 pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
     let recheck_wait = std::cmp::min(read_timeout_secs, RECHECK_WAIT_CAP_SECS);
     let peer_wait = std::cmp::min(read_timeout_secs, PEER_WAIT_CAP_SECS);
+    let no_seeder_wait = std::cmp::min(read_timeout_secs, NO_SEEDER_READ_TIMEOUT_SECS);
     read_timeout_secs
         .saturating_add(recheck_wait)
         .saturating_add(peer_wait)
+        .saturating_add(no_seeder_wait)
         .saturating_add(read_timeout_secs)
+}
+
+/// Piece-wait window (seconds) for a single read: the full `read_timeout_secs`
+/// when a seeder is connected (a slow-but-present seeder may still finish), or
+/// the short [`NO_SEEDER_READ_TIMEOUT_SECS`] cap when no seeder is connected
+/// (the read can never be served, so it fails fast instead of blocking the
+/// engine thread and serializing every other read/write on the mount).  Pure so
+/// it is unit-testable without a running engine.
+fn piece_wait_window_secs(has_seeder: bool, read_timeout_secs: u64) -> u64 {
+    if has_seeder {
+        read_timeout_secs
+    } else {
+        std::cmp::min(read_timeout_secs, NO_SEEDER_READ_TIMEOUT_SECS)
+    }
 }
 
 /// Format the stderr hint emitted when a read times out with zero connected
@@ -1093,14 +1120,19 @@ impl EngineState {
         }
 
         // ── Wait for each missing piece ────────────────────────────────
-        // the deadline is shared across ALL pieces in the range —
-        // `read_timeout_secs` bounds the whole read, not each piece.  This
-        // keeps `read_wait_budget_secs()` in lockstep with the engine's true
-        // worst-case wait (state wait + peer-discovery wait + one piece-wait
-        // window), so the FUSE deferred-read deadline never expires a ticket
-        // while the engine is still legitimately waiting.
-        let piece_wait_timeout = Duration::from_secs(self.read_timeout_secs);
-        let piece_wait_start = Instant::now();
+        // the deadline is shared across ALL pieces in the range — the window
+        // bounds the whole read, not each piece.  A read with a connected
+        // seeder uses the full `read_timeout_secs` (a slow-but-present seeder
+        // may still finish), keeping `read_wait_budget_secs()` in lockstep
+        // with the engine's worst-case wait.  A read with no connected seeder
+        // (`num_seeds == 0`) can never be served, so it uses the short
+        // [`NO_SEEDER_READ_TIMEOUT_SECS`] window and fails fast with `NoPeers`
+        // instead of blocking the engine thread for the full timeout — which
+        // would serialize every other read/write on the mount behind it.  A
+        // seeder that connects mid-wait upgrades the window back to the full
+        // timeout, so a late-connecting cold-torrent seeder is still served.
+        let mut piece_wait_start = Instant::now();
+        let mut has_seeder = status.num_seeds > 0;
         for piece_idx in start_piece..=end_piece {
             loop {
                 if self.stopping.load(Ordering::Relaxed) {
@@ -1156,6 +1188,22 @@ impl EngineState {
                     }
                     break;
                 }
+
+                // A late-connecting seeder upgrades the wait window from the
+                // short no-seeder timeout to the full read timeout.  The window
+                // restarts from the connect time, so a seeder that arrives at
+                // the end of the short window still gets a full
+                // `read_timeout_secs` rather than its leftover sliver.
+                if !has_seeder {
+                    if let Some(s) = self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
+                        if s.num_seeds > 0 {
+                            has_seeder = true;
+                            piece_wait_start = Instant::now();
+                        }
+                    }
+                }
+                let piece_wait_timeout =
+                    Duration::from_secs(piece_wait_window_secs(has_seeder, self.read_timeout_secs));
 
                 if piece_wait_start.elapsed() >= piece_wait_timeout {
                     // The piece-wait window expired, but libtorrent's custom
@@ -1760,7 +1808,10 @@ impl EngineState {
 
 #[cfg(test)]
 mod tests {
-    use super::{no_seeder_stderr_hint, partial_read_bounds, read_wait_budget_secs};
+    use super::{
+        no_seeder_stderr_hint, partial_read_bounds, piece_wait_window_secs, read_wait_budget_secs,
+        NO_SEEDER_READ_TIMEOUT_SECS,
+    };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
 
     /// the no-seeder stderr hint must use the exact message the
@@ -1780,28 +1831,59 @@ mod tests {
         );
     }
 
-    /// the read budget must cover all four synchronous phases —
+    /// the read budget must cover all five synchronous phases —
     /// state-transition wait + recheck wait (capped) + peer-discovery wait
-    /// (capped) + piece wait — so the FUSE deferred-read deadline never
-    /// expires a ticket while the engine is still legitimately waiting.
+    /// (capped) + no-seeder wait (capped) + piece wait (full window, reset on
+    /// seeder connect) — so the FUSE deferred-read deadline never expires a
+    /// ticket while the engine is still legitimately waiting.
     #[test]
     fn budget_covers_all_slow_path_phases() {
         // Default read_timeout_secs = 60 (DEFAULT_READ_TIMEOUT_SECS):
-        //   60 (state) + 10 (recheck cap) + 9 (peer cap) + 60 (piece) = 139s.
-        assert_eq!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS), 139);
-        // Short timeout still caps recheck + peer waits at the timeout itself.
-        assert_eq!(read_wait_budget_secs(4), 4 + 4 + 4 + 4);
-        // Timeout below both caps.
-        assert_eq!(read_wait_budget_secs(2), 2 + 2 + 2 + 2);
+        //   60 (state) + 10 (recheck cap) + 9 (peer cap) + 15 (no-seeder cap)
+        //   + 60 (piece) = 154s.
+        assert_eq!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS), 154);
+        // Short timeout still caps every phase at the timeout itself.
+        assert_eq!(read_wait_budget_secs(4), 4 + 4 + 4 + 4 + 4);
+        // Timeout below every cap.
+        assert_eq!(read_wait_budget_secs(2), 2 + 2 + 2 + 2 + 2);
     }
 
     #[test]
     fn budget_exceeds_legacy_deadline_for_default_timeout() {
         // The old FUSE deadline was `read_timeout_secs + 5` — shorter than
         // the engine's worst-case budget and even its peer-wait+piece-wait
-        // path. At the default timeout the budget (139s) still exceeds the
+        // path. At the default timeout the budget (154s) still exceeds the
         // legacy deadline (65s), so a slow seeder is never expired early.
         assert!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS) > DEFAULT_READ_TIMEOUT_SECS + 5);
+    }
+
+    /// a no-seeder read must never wait the full read timeout — it caps at
+    /// [`NO_SEEDER_READ_TIMEOUT_SECS`], so the engine thread is not blocked for
+    /// the whole `read_timeout_secs` and concurrent healthy reads on the same
+    /// mount are not serialized behind a dead torrent.
+    #[test]
+    fn no_seeder_piece_wait_caps_at_short_timeout() {
+        assert_eq!(
+            piece_wait_window_secs(false, DEFAULT_READ_TIMEOUT_SECS),
+            NO_SEEDER_READ_TIMEOUT_SECS
+        );
+        assert_eq!(
+            piece_wait_window_secs(false, 120),
+            NO_SEEDER_READ_TIMEOUT_SECS
+        );
+        // A read_timeout below the cap still bounds the window at itself.
+        assert_eq!(piece_wait_window_secs(false, 3), 3);
+    }
+
+    /// a read with a connected seeder uses the full window so a
+    /// slow-but-present seeder is not failed fast.
+    #[test]
+    fn seeder_piece_wait_uses_full_timeout() {
+        assert_eq!(
+            piece_wait_window_secs(true, DEFAULT_READ_TIMEOUT_SECS),
+            DEFAULT_READ_TIMEOUT_SECS
+        );
+        assert_eq!(piece_wait_window_secs(true, 3), 3);
     }
 
     /// With the first piece missing, the partial read is empty —

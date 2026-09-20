@@ -314,3 +314,76 @@ fn test_transient_peer_fast_exit() {
 
     println!("\n=== Transient peer fast-exit test passed! ===");
 }
+
+/// A read on a torrent with no seeder must fail fast with `NoPeers` instead
+/// of blocking the engine thread for the full `read_timeout_secs` — the
+/// regression where a no-seeder `cat` serialized every other read/write on the
+/// mount for ~60s.  With a large read timeout (60s) the no-seeder read must
+/// still return well before that window (peer-wait ≤9s + no-seeder piece-wait
+/// ≤15s ≈ 24s), proving the short no-seeder cap takes effect.
+///
+/// Ignored by default: it needs a local tracker and spends ~25s of real
+/// wall-clock waiting for the cap to elapse.  Run with
+/// `cargo test --test peer_download_test test_no_seeder_read_fails_fast -- --ignored`.
+#[test]
+#[ignore = "requires local tracker; ~25s wall-clock"]
+fn test_no_seeder_read_fails_fast() {
+    use common::{create_test_torrent_with_tracker, MiniTracker};
+
+    // ── Start a tracker with no seeder behind it ───────────────────────
+    let tracker = MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    println!("Tracker started at {}", announce_url);
+
+    let (torrent_data, _file_content) = create_test_torrent_with_tracker(&announce_url);
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+    let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
+    println!("Info hash: {}", info_hash);
+
+    // Large read timeout: without the no-seeder cap this read would block the
+    // engine for peer-wait(9s) + piece-wait(60s) ≈ 69s before returning NoPeers.
+    let mut config = local_test_config();
+    config.timeouts.read_timeout_secs = Some(60);
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let read_start = std::time::Instant::now();
+    let result = engine.read_file_range(info, 0, 0, 50);
+    let elapsed = read_start.elapsed();
+
+    match &result {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {
+            println!("Got NoPeers after {:.2}s", elapsed.as_secs_f64());
+        }
+        Err(e) => {
+            println!(
+                "Got other error after {:.2}s: {:?}",
+                elapsed.as_secs_f64(),
+                e
+            );
+        }
+        Ok(data) => {
+            println!(
+                "Read succeeded after {:.2}s ({} bytes)",
+                elapsed.as_secs_f64(),
+                data.len()
+            );
+        }
+    }
+    // Pin the error type, not just the latency: a wrong error or an unexpected
+    // `Ok` must fail the test, not slip through a passing latency check.
+    assert!(
+        matches!(&result, Err(torrentfs::TorrentError::NoPeers(_))),
+        "expected Err(NoPeers) for a no-seeder read, got {:?}",
+        result
+    );
+    assert!(
+        elapsed < Duration::from_secs(40),
+        "no-seeder read took {:.2}s; expected fast NoPeers well under read_timeout (60s)",
+        elapsed.as_secs_f64()
+    );
+}
