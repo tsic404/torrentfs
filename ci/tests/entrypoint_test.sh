@@ -407,6 +407,30 @@ break" || rc=$?
 rm -rf "$d"
 [ "$rc" -eq 0 ]'
 
+# --- mountpoint_has_fuse dead-mount fallback ---
+# A dead (ENOTCONN) FUSE mount cannot be canonicalized: readlink -f fails even
+# though the mount still appears in mountinfo. The exit-side detach depends on
+# this probe seeing a stale mount it must detach, so when readlink fails the
+# raw target (trailing slash stripped) is matched against mountinfo field 5.
+# `readlink` is stubbed to fail; the fixture carries the raw absolute path.
+
+run_test "mountpoint_has_fuse detects a dead mount when readlink -f fails" \
+    'readlink() { return 1; }
+mnt="/tmp/dead-mnt"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+if mountpoint_has_fuse "$mnt"; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_has_fuse strips a trailing slash in the dead-mount fallback" \
+    'readlink() { return 1; }
+mnt="/tmp/dead-mnt"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+if mountpoint_has_fuse "$mnt/"; then exit 0; else exit 1; fi'
+
+run_test "mountpoint_has_fuse returns false when dead-mount raw target is absent" \
+    'readlink() { return 1; }
+setup_mountinfo "36 35 98:0 /mnt-inner /other rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+if mountpoint_has_fuse /tmp/absent; then exit 1; else exit 0; fi'
+
 # --- start_torrentfs exit-101 integration ---
 # start_torrentfs must refuse (exit 101) when a FUSE mount already exists at
 # the mountpoint. recover_stale_mountpoint and flock are stubbed so the test
@@ -531,6 +555,18 @@ rc=0
 rm -rf "$mnt"
 test "$rc" -eq 1'
 
+run_test "start_torrentfs_rootless exits 103 when stale detach fails after clean exit" \
+    'mnt="$(mktemp -d)"
+is_bind_mount() { return 1; }
+run_daemon() { exit 0; }
+wait_for_fuse_mount() { return 0; }
+force_unmount_fuse() { return 1; }
+umount() { return 0; }
+rc=0
+( start_torrentfs_rootless "$mnt" ) 2>/dev/null || rc=$?
+rm -rf "$mnt"
+test "$rc" -eq 103'
+
 # --- mountpoint_enotconn ---
 # setup_stat defines a fake `stat` function (a shell builtin here, so a PATH
 # stub would never be consulted) with the given exit code and stderr text.
@@ -543,6 +579,67 @@ run_test "mountpoint_enotconn false when stat succeeds" \
 
 run_test "mountpoint_enotconn false on ENOENT" \
     'setup_stat 1 "stat: cannot stat '\''/mnt'\'': No such file or directory"; if mountpoint_enotconn /mnt; then exit 1; else exit 0; fi'
+
+# --- force_unmount_fuse ---
+# The exit-side stale-mount detach: after the daemon exits, if a FUSE mount is
+# still present at the target, detach it via fusermount3 → fusermount → umount -l.
+# `setup_mountinfo` points mountpoint_has_fuse at a fixture; the detach commands
+# are shell-function stubs so no real fusermount/umount runs on the test host.
+
+run_test "force_unmount_fuse no-ops when nothing is mounted" \
+    'mnt="$(mktemp -d)"
+setup_mountinfo ""
+called=""
+fusermount3() { called="fusermount3"; }
+fusermount() { called="fusermount"; }
+umount() { called="umount"; }
+force_unmount_fuse "$mnt" 2>/dev/null
+rm -rf "$mnt"
+[ -z "$called" ]'
+
+run_test "force_unmount_fuse detaches via fusermount3 when a FUSE mount lingers" \
+    'mnt="$(mktemp -d)"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+fusermount3_called=""
+fusermount3() { fusermount3_called="$*"; return 0; }
+fusermount() { return 99; }
+umount() { return 99; }
+force_unmount_fuse "$mnt" 2>/dev/null
+rm -rf "$mnt"
+[ "$fusermount3_called" = "-u -q -z -- $mnt" ]'
+
+run_test "force_unmount_fuse falls back to fusermount when fusermount3 fails" \
+    'mnt="$(mktemp -d)"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+fusermount3() { return 1; }
+fusermount_called=""
+fusermount() { fusermount_called="$*"; return 0; }
+umount() { return 99; }
+force_unmount_fuse "$mnt" 2>/dev/null
+rm -rf "$mnt"
+[ "$fusermount_called" = "-u -q -z -- $mnt" ]'
+
+run_test "force_unmount_fuse falls back to umount -l when both helpers fail" \
+    'mnt="$(mktemp -d)"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+fusermount3() { return 1; }
+fusermount() { return 1; }
+umount_called=""
+umount() { umount_called="$*"; return 0; }
+force_unmount_fuse "$mnt" 2>/dev/null
+rm -rf "$mnt"
+[ "$umount_called" = "-l $mnt" ]'
+
+run_test "force_unmount_fuse returns non-zero when every detach attempt fails" \
+    'mnt="$(mktemp -d)"
+setup_mountinfo "36 35 98:0 /mnt-inner $mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw"
+fusermount3() { return 1; }
+fusermount() { return 1; }
+umount() { return 1; }
+rc=0
+force_unmount_fuse "$mnt" 2>/dev/null || rc=$?
+rm -rf "$mnt"
+[ "$rc" -ne 0 ]'
 
 # --- fuse_device_exists (just verify it doesn't crash) ---
 

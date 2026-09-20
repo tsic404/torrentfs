@@ -72,6 +72,50 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
   ghcr.io/tsic404/torrentfs:main
 ```
 
+### Shutdown, restart, and stale mounts
+
+`docker stop` / `podman stop` send SIGTERM first: torrentfs drains the download
+engine, unmounts its FUSE filesystem, and the entrypoint releases the rshared
+bind mount, so a graceful stop also unmounts the host-visible mountpoint —
+`findmnt` shows no leftover entry and `docker start` restores it cleanly.
+
+A forced kill skips that path. `docker kill -s KILL` (or an OOM kill) terminates
+the daemon with no chance to unmount, and the FUSE mount it propagated to the
+host via rshared bind propagation survives the container as a stale mount that
+reports `ENOTCONN` ("Transport endpoint is not connected"). The next
+`docker start` then fails before the entrypoint can run — the engine cannot
+re-establish a bind mount whose source path is a dead FUSE mount:
+
+```text
+invalid mount config for type "bind": stat /host/torrentfs: transport endpoint is not connected
+```
+
+Recover on the host, then restart:
+
+```bash
+sudo umount -l /host/torrentfs        # or: sudo fusermount -uz /host/torrentfs
+docker start torrentfs
+```
+
+Two defenses live inside the image:
+
+- **Exit-side detach.** On shutdown the entrypoint detaches any FUSE mount the
+  daemon failed to unmount itself (`fusermount3 -u` / `fusermount -u`, then
+  `umount -l`), so a daemon that exits without a clean unmount does not leave a
+  stale host mount behind. If the detach itself fails after a clean daemon exit
+  (status 0), the entrypoint exits `103` so the cleanup failure is not mistaken
+  for a clean shutdown.
+- **Startup probe.** For container-only mounts (rootless podman / non-root
+  `--user`, where the stale mount lives inside the container and the engine can
+  still start it), the entrypoint probes the mountpoint for `ENOTCONN` at
+  startup, lazy-unmounts a stale mount, and retries automatically.
+
+Neither can clear a host-side stale mount left by a `SIGKILL`: the entrypoint
+never runs because the engine refuses the restart first, so the host-side
+`umount -l` above is required. Give torrentfs enough time to stop to avoid the
+situation — `docker run --stop-timeout 30`, `podman run --stop-timeout 30`, or
+`stop_grace_period: 30s` in compose.
+
 ## Usage
 
 ### Adding a torrent

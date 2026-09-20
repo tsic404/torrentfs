@@ -20,6 +20,9 @@
 #      flock on the mountpoint directory (same inode across containers) held
 #      for the container lifetime, then refuses to start if $mountpoint
 #      already carries a foreign FUSE mount.
+#   7. Exit-side stale-mount detach: on shutdown, if a FUSE mount is still
+#      present (a killed daemon skipped its own unmount), detach it so rshared
+#      propagation does not leave a stale ENOTCONN mount on the host.
 
 set -euo pipefail
 
@@ -609,10 +612,18 @@ wait_for_fuse_mount() {
 # exercise this production function directly against a fixture.
 mountpoint_has_fuse() {
     local target="$1" mountinfo="${TORRENTFS_MOUNTINFO_PATH:-/proc/self/mountinfo}"
+    local canonical
     # Canonicalize to the kernel's representation. The mountpoint exists by the
-    # time we probe (mkdir -p ran first); if it can't be resolved, report "no
-    # FUSE mount" rather than risk a false ready.
-    target="$(readlink -f "$target" 2>/dev/null)" || return 1
+    # time we probe (mkdir -p ran first); when readlink -f fails the path is a
+    # dead (ENOTCONN) FUSE mount, which still appears in mountinfo — fall back
+    # to the raw target (trailing slash stripped, which the kernel also drops)
+    # so a dead mount is detected instead of silently reported as absent.
+    if canonical="$(readlink -f "$target" 2>/dev/null)"; then
+        target="$canonical"
+    else
+        target="${target%/}"
+        [ -n "$target" ] || target="/"
+    fi
     # Field 5 is the mount point. The filesystem type is the first field after
     # the "-" separator: the optional-fields column (field 7) holds 0..N
     # entries (`shared:X master:Y` on rshared propagation trees), so fstype is
@@ -641,6 +652,42 @@ mountpoint_has_fuse() {
         }
         END { exit !found }
     ' "$mountinfo" 2>/dev/null
+}
+
+# Fallback for a daemon that exited without detaching its own FUSE mount.
+#
+# torrentfs's primary unmount runs on SIGTERM, but an OOM kill or a targeted
+# kill of the daemon can skip it and — via rshared bind propagation — leave a
+# stale ENOTCONN mount on the host that blocks the next start. The startup
+# probe (`recover_stale_mountpoint`) reclaims such a mount on the *next* run;
+# this function is the *exit*-side safety net: it detaches a FUSE mount that is
+# still present when the entrypoint shuts down. Idempotent — no-op when nothing
+# is mounted. Returns 0 when the path ends up clean, non-zero when every detach
+# attempt failed.
+force_unmount_fuse() {
+    local target="$1" bin
+
+    if ! mountpoint_has_fuse "$target"; then
+        return 0
+    fi
+
+    echo "[entrypoint] WARNING: FUSE mount still present at $target after daemon exit — detaching" >&2
+    for bin in fusermount3 fusermount; do
+        if "$bin" -u -q -z -- "$target" 2>/dev/null; then
+            echo "[entrypoint] detached stale FUSE mount at $target ($bin -u)" >&2
+            return 0
+        fi
+    done
+
+    # A rootful entrypoint can still lazy-detach a mount the setuid helper
+    # refused; a rootless one usually cannot, but the attempt is harmless.
+    if umount -l "$target" 2>/dev/null; then
+        echo "[entrypoint] detached stale FUSE mount at $target (umount -l)" >&2
+        return 0
+    fi
+
+    echo "[entrypoint] ERROR: could not detach stale FUSE mount at $target" >&2
+    return 1
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -828,6 +875,7 @@ start_torrentfs_rootless() {
             wait "$torrentfs_pid" 2>/dev/null || true
         fi
         umount "${mountpoint:-}" 2>/dev/null || true
+        force_unmount_fuse "${mountpoint:-}" || true
     }
     trap cleanup EXIT INT TERM
 
@@ -844,6 +892,15 @@ start_torrentfs_rootless() {
 
     local rc=0
     wait "$torrentfs_pid" || rc=$?
+    # The daemon has stopped; detach any FUSE mount it left behind. If it exited
+    # cleanly (0) but the mount cannot be detached, surface that as a distinct
+    # status (103) so a false-clean shutdown does not leave the next
+    # `docker start` blocked by a stale ENOTCONN mount. The EXIT trap re-runs
+    # this idempotently as the safety net for the signal/error paths.
+    if [ "$rc" -eq 0 ] && ! force_unmount_fuse "$mountpoint"; then
+        echo "[entrypoint] ERROR: stale FUSE mount could not be detached after clean shutdown (container-only mount — no host-side residue; the stale mount dies with this container)" >&2
+        rc=103
+    fi
     exit "$rc"
 }
 
@@ -868,6 +925,10 @@ start_torrentfs_rootful() {
             kill "$torrentfs_pid" 2>/dev/null || true
             wait "$torrentfs_pid" 2>/dev/null || true
         fi
+        # Detach the FUSE mount first (the daemon unmounts $internal_mnt itself,
+        # but a killed daemon may have skipped it), then release the bind mount
+        # that publishes it at $mountpoint.
+        force_unmount_fuse "${internal_mnt:-}" || true
         umount "${mountpoint:-}" 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
@@ -888,6 +949,15 @@ start_torrentfs_rootful() {
 
     local rc=0
     wait "$torrentfs_pid" || rc=$?
+    # The daemon has stopped; detach any FUSE mount it left behind. If it exited
+    # cleanly (0) but the mount cannot be detached, surface that as a distinct
+    # status (103) so a false-clean shutdown does not leave the next
+    # `docker start` blocked by a stale ENOTCONN mount. The EXIT trap re-runs
+    # this idempotently as the safety net for the signal/error paths.
+    if [ "$rc" -eq 0 ] && ! force_unmount_fuse "$internal_mnt"; then
+        echo "[entrypoint] ERROR: stale FUSE mount could not be detached after clean shutdown — check the host with 'findmnt $mountpoint'; if a fuse entry remains, run 'umount -l $mountpoint' (no entry means the bind release already cleaned it)" >&2
+        rc=103
+    fi
     exit "$rc"
 }
 
