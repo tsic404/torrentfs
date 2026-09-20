@@ -10,7 +10,7 @@
 //! through [`super::piece_store::PieceStore`] (read-only) when a gradient is
 //! applied.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::TorrentResult;
 use crate::infrastructure::config::PiecePriorityToml;
@@ -42,9 +42,6 @@ pub struct PiecePriorityConfig {
     pub window_edge_priority: i32,
     /// Priority for pieces beyond the access window (default 0 = not wanted).
     pub rest_priority: i32,
-    /// Priority for pieces before the current read offset but still within
-    /// the access window (default 1).  Pieces further back are 0.
-    pub backward_priority: i32,
 }
 
 impl Default for PiecePriorityConfig {
@@ -55,7 +52,6 @@ impl Default for PiecePriorityConfig {
             step_priorities: [6, 5, 4, 3],
             window_edge_priority: 1,
             rest_priority: 0,
-            backward_priority: 1,
         }
     }
 }
@@ -64,6 +60,12 @@ impl PiecePriorityConfig {
     /// Build the runtime config from optional TOML overrides, falling back to
     /// [`Self::default`] for any field the user did not specify.
     pub fn from_toml(toml: &PiecePriorityToml) -> Self {
+        if toml.backward_priority.is_some() {
+            tracing::warn!(
+                "[piece_priority] backward_priority is deprecated and ignored; \
+                 backward prefetch is no longer supported"
+            );
+        }
         let d = Self::default();
         Self {
             access_window_mb: toml.access_window_mb.unwrap_or(d.access_window_mb),
@@ -73,7 +75,6 @@ impl PiecePriorityConfig {
                 .window_edge_priority
                 .unwrap_or(d.window_edge_priority),
             rest_priority: toml.rest_priority.unwrap_or(d.rest_priority),
-            backward_priority: toml.backward_priority.unwrap_or(d.backward_priority),
         }
     }
 }
@@ -123,10 +124,21 @@ pub struct PieceScheduler {
     /// kept after the final reader releases so the read-ahead window keeps
     /// downloading and stays visible in `.stats` as `[N]` markers.
     prefetch: HashMap<String, Vec<i32>>,
+    /// Info hashes whose libtorrent piece priorities were reset out-of-band
+    /// (e.g. by a `force_recheck`) and no longer match `elevated`.  The next
+    /// `recompute` fully rewrites every priority once, then clears the flag;
+    /// ordinary recomputes write only changed pieces (O(changed), not
+    /// O(num_pieces)).
+    dirty: HashSet<String>,
+    /// Cache capacity (bytes).  Caps the read-ahead window so prefetch never
+    /// outruns the cache: a window larger than the cache would make the
+    /// prefetch download evict the pieces the current read is still serving,
+    /// leaving stale `have_piece` bits that re-trigger `force_recheck`.
+    cache_capacity_bytes: u64,
 }
 
 impl PieceScheduler {
-    pub fn new(config: PiecePriorityConfig) -> Self {
+    pub fn new(config: PiecePriorityConfig, cache_capacity_bytes: u64) -> Self {
         Self {
             elevated: HashMap::new(),
             piece_lengths: HashMap::new(),
@@ -134,6 +146,8 @@ impl PieceScheduler {
             readers: HashMap::new(),
             next_read_id: 0,
             prefetch: HashMap::new(),
+            dirty: HashSet::new(),
+            cache_capacity_bytes,
         }
     }
 
@@ -154,6 +168,7 @@ impl PieceScheduler {
         );
         self.piece_lengths.insert(info_hash.to_string(), piece_length);
         self.prefetch.remove(info_hash);
+        self.dirty.remove(info_hash);
         Ok(())
     }
 
@@ -273,6 +288,17 @@ impl PieceScheduler {
         self.recompute(handle, info_hash, store);
         Ok(())
     }
+
+    /// Mark a torrent's libtorrent piece priorities as out-of-band with the
+    /// in-memory cache (a `force_recheck` reset them).  The next `recompute`
+    /// fully rewrites every priority once, then clears the flag; ordinary
+    /// recomputes write only changed pieces.
+    pub fn mark_priorities_dirty(&mut self, info_hash: &str) {
+        if self.elevated.contains_key(info_hash) {
+            self.dirty.insert(info_hash.to_string());
+        }
+    }
+
     // ── Status queries ────────────────────────────────────────────────
 
     /// The current priority vector for an info_hash.
@@ -334,6 +360,7 @@ impl PieceScheduler {
         self.piece_lengths.remove(info_hash);
         self.readers.remove(info_hash);
         self.prefetch.remove(info_hash);
+        self.dirty.remove(info_hash);
     }
 
     // ── Internals ─────────────────────────────────────────────────────
@@ -343,7 +370,7 @@ impl PieceScheduler {
     /// gradient once the last reader releases), then apply it to the handle
     /// (skipping already-cached pieces).  Infallible: it only mutates
     /// in-memory state and issues best-effort piece-priority FFI calls.
-    fn recompute(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
+    pub fn recompute(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
         let num_pieces = self
             .elevated
             .get(info_hash)
@@ -353,6 +380,11 @@ impl PieceScheduler {
         if num_pieces <= 0 {
             return;
         }
+
+        // A recheck reset libtorrent's piece priorities out-of-band, leaving
+        // the in-memory cache stale.  Rewrite every piece once when that
+        // happened; the ordinary path below writes only changed pieces.
+        let full_rewrite = self.dirty.remove(info_hash);
 
         let priorities = self
             .elevated
@@ -369,24 +401,29 @@ impl PieceScheduler {
             Some(t) => t,
             None => {
                 // Nothing wanted (no readers, no prefetch): idle baseline.
-                for (p, prio) in priorities.iter_mut().enumerate() {
-                    if *prio != DEFAULT_PRIORITY {
-                        *prio = DEFAULT_PRIORITY;
-                        handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
-                    }
+                // Bulk-reset every piece to `dont_download`.
+                for prio in priorities.iter_mut() {
+                    *prio = DEFAULT_PRIORITY;
                 }
+                handle.set_all_piece_priorities(DEFAULT_PRIORITY);
                 return;
             }
         };
 
         for (p, &prio) in target.iter().enumerate() {
             let piece_key = PieceStore::piece_key(info_hash, p as i32);
-            let cached = store.has_piece(info_hash, p as i32) || store.has_piece_on_disk(&piece_key);
+            let cached =
+                store.has_piece(info_hash, p as i32) || store.has_piece_on_disk(&piece_key);
             let new_prio = if cached { 0 } else { prio };
-            if priorities[p] != new_prio {
-                priorities[p] = new_prio;
-                handle.set_piece_priority(p as i32, new_prio);
+            // Skip unchanged pieces on the ordinary path (O(changed)); the
+            // in-memory cache is authoritative except after a recheck, whose
+            // out-of-band priority reset is covered by the one-shot full
+            // rewrite above.
+            if !full_rewrite && priorities[p] == new_prio {
+                continue;
             }
+            priorities[p] = new_prio;
+            handle.set_piece_priority(p as i32, new_prio);
         }
     }
 
@@ -435,8 +472,11 @@ impl PieceScheduler {
 
         // Access window in pieces, shared by the forward and backward regions.
         // `piece_length > 0` is guaranteed by the early return above.
-        let window_bytes = self.config.access_window_mb as u64 * 1024 * 1024;
-        let window_pieces = window_bytes.div_ceil(piece_length) as i32;
+        let window_pieces = effective_window_pieces(
+            self.config.access_window_mb,
+            self.cache_capacity_bytes,
+            piece_length,
+        );
 
         let mut gradient = vec![0i32; num_pieces as usize];
         let p_start = std::cmp::max(0, p_file_start);
@@ -497,13 +537,32 @@ fn clear_ready_piece(pref: &mut [i32], piece_index: i32) -> bool {
     pref.iter().all(|&p| p == 0)
 }
 
+/// Effective read-ahead window in pieces, capped so prefetch never outruns the
+/// cache: it reserves one piece for the piece being served (cache minus one
+/// piece), so prefetch can't evict that piece before its sub-reads complete.
+/// A one-piece cache yields a zero window (no prefetch; the current piece stays
+/// wanted).  Pure for unit testing.
+fn effective_window_pieces(
+    access_window_mb: u32,
+    cache_capacity_bytes: u64,
+    piece_length: u64,
+) -> i32 {
+    let window_bytes = access_window_mb as u64 * 1024 * 1024;
+    let prefetch_bytes = cache_capacity_bytes.saturating_sub(piece_length);
+    let window_bytes = std::cmp::min(window_bytes, prefetch_bytes);
+    // Floor division, not ceil: a fractional-multiple cache (e.g. 1.5 pieces)
+    // must round the headroom DOWN, or the ceiling over-reserves and prefetch
+    // evicts the piece being served.
+    (window_bytes / piece_length) as i32
+}
+
 /// Piece priority decision for a single piece — pure and unit-testable.
 ///
 /// `p_cur_start..=p_cur_end` is the current read range; `window_pieces` is the
-/// access window size in pieces.  Backward pieces within the window get
-/// `backward_priority`, forward pieces descend through `step_priorities` to
-/// `window_edge_priority` at the window edge, and everything beyond the window
-/// gets `rest_priority` (0 = not wanted).
+/// access window size in pieces.  Backward pieces are never prefetched; forward
+/// pieces descend through `step_priorities` to `window_edge_priority` at the
+/// window edge, and everything beyond the window gets `rest_priority`
+/// (0 = not wanted).
 fn decide_priority(
     config: &PiecePriorityConfig,
     p: i32,
@@ -512,24 +571,28 @@ fn decide_priority(
     window_pieces: i32,
 ) -> i32 {
     if p < p_cur_start {
-        // Backward region: only pieces within the window behind the read range
-        // stay "wanted"; anything further back is not.
-        if p >= p_cur_start.saturating_sub(window_pieces) {
-            config.backward_priority
-        } else {
-            0
-        }
+        // No backward prefetch.  Forward prefetch + the piece being served
+        // already fill a small cache; prefetching pieces behind the read on top
+        // of that evicts the served piece (stale bit → recheck → slow
+        // re-download).
+        0
     } else if p <= p_cur_end {
         config.current_priority
     } else {
+        // The window bounds the whole forward region, including `step_priorities`:
+        // without this a window smaller than `step_priorities.len()` would still
+        // elevate those pieces and the prefetch reach would have a 4-piece floor
+        // (`max(4, window_pieces)`), outrunning a sub-4-piece cache.
         let dist = p - p_cur_end; // 1-based distance past the current read end.
-        let idx = (dist - 1) as usize;
-        if idx < config.step_priorities.len() {
-            config.step_priorities[idx]
-        } else if p <= p_cur_end.saturating_add(window_pieces) {
-            config.window_edge_priority
-        } else {
+        if dist > window_pieces {
             config.rest_priority
+        } else {
+            let idx = (dist - 1) as usize;
+            if idx < config.step_priorities.len() {
+                config.step_priorities[idx]
+            } else {
+                config.window_edge_priority
+            }
         }
     }
 }
@@ -543,6 +606,32 @@ mod tests {
         assert_eq!(DEFAULT_PRIORITY, 0);
     }
 
+    /// The window must reserve one piece for the piece being served, and a
+    /// one-piece cache yields a zero window (no prefetch) rather than a floor
+    /// of one — otherwise prefetch would evict the in-service piece.
+    #[test]
+    fn effective_window_reserves_one_piece() {
+        const PIECE: u64 = 256 * 1024;
+        // QA scenario: 1 MiB cache = 4 pieces → 3-piece window.
+        assert_eq!(effective_window_pieces(4096, 4 * PIECE, PIECE), 3);
+        // One-piece cache → zero window: no prefetch, current piece stays wanted.
+        assert_eq!(effective_window_pieces(4096, PIECE, PIECE), 0);
+        // Two-piece cache → one piece of headroom.
+        assert_eq!(effective_window_pieces(4096, 2 * PIECE, PIECE), 1);
+        // Fractional-multiple caches round the headroom DOWN: 1.5 pieces leaves
+        // no whole piece of headroom, 2.5 leaves exactly one.
+        assert_eq!(effective_window_pieces(4096, 3 * PIECE / 2, PIECE), 0);
+        assert_eq!(effective_window_pieces(4096, 5 * PIECE / 2, PIECE), 1);
+        // Default 1 GiB cache (4096 pieces) → 4095; the access window is the
+        // larger bound here.
+        assert_eq!(
+            effective_window_pieces(4096, 1024 * 1024 * 1024, PIECE),
+            4095
+        );
+        // A narrow access window still wins when it is smaller than the cache.
+        assert_eq!(effective_window_pieces(1, 1024 * 1024 * 1024, PIECE), 4);
+    }
+
     #[test]
     fn default_config_matches_design() {
         let c = PiecePriorityConfig::default();
@@ -551,7 +640,6 @@ mod tests {
         assert_eq!(c.step_priorities, [6, 5, 4, 3]);
         assert_eq!(c.window_edge_priority, 1);
         assert_eq!(c.rest_priority, 0);
-        assert_eq!(c.backward_priority, 1);
     }
 
     #[test]
@@ -575,17 +663,46 @@ mod tests {
         assert_eq!(decide_priority(&c, 19, cur_start, cur_end, window_pieces), 0);
     }
 
+    /// A window smaller than `step_priorities.len()` must also bound the step
+    /// priorities — otherwise the forward reach has a 4-piece floor
+    /// (`max(4, window_pieces)`) and a sub-4-piece cache still prefetches past
+    /// its capacity.
     #[test]
-    fn backward_priority_is_gated_by_window() {
+    fn forward_step_priorities_are_bounded_by_window() {
+        let c = PiecePriorityConfig::default();
+        let (cur_start, cur_end) = (10, 10);
+        let window_pieces = 2;
+
+        // Distances 1..=2 stay on the step ladder.
+        assert_eq!(
+            decide_priority(&c, 11, cur_start, cur_end, window_pieces),
+            6
+        );
+        assert_eq!(
+            decide_priority(&c, 12, cur_start, cur_end, window_pieces),
+            5
+        );
+        // Distance 3 is inside step_priorities but beyond the window: not wanted.
+        assert_eq!(
+            decide_priority(&c, 13, cur_start, cur_end, window_pieces),
+            0
+        );
+        assert_eq!(
+            decide_priority(&c, 14, cur_start, cur_end, window_pieces),
+            0
+        );
+    }
+
+    #[test]
+    fn backward_pieces_are_never_prefetched() {
         let c = PiecePriorityConfig::default();
         let (cur_start, cur_end) = (10, 10);
         let window_pieces = 8;
 
-        // Within the window behind the read range: wanted (1).
-        assert_eq!(decide_priority(&c, 9, cur_start, cur_end, window_pieces), 1);
-        assert_eq!(decide_priority(&c, 2, cur_start, cur_end, window_pieces), 1);
-        // Further back than the window: not wanted (0).
-        assert_eq!(decide_priority(&c, 1, cur_start, cur_end, window_pieces), 0);
+        // Backward pieces are never prefetched, regardless of the window:
+        // forward prefetch + the served piece already fill a small cache, and
+        // prefetching behind the read would evict the served piece.
+        assert_eq!(decide_priority(&c, 9, cur_start, cur_end, window_pieces), 0);
         assert_eq!(decide_priority(&c, 0, cur_start, cur_end, window_pieces), 0);
     }
 
@@ -595,7 +712,6 @@ mod tests {
         let d = PiecePriorityConfig::from_toml(&PiecePriorityToml::default());
         assert_eq!(d.access_window_mb, 4096);
         assert_eq!(d.rest_priority, 0);
-        assert_eq!(d.backward_priority, 1);
 
         // Partial override: only the specified fields change.
         let partial = PiecePriorityToml {
@@ -611,7 +727,8 @@ mod tests {
         assert_eq!(p.current_priority, 7);
         assert_eq!(p.step_priorities, [6, 5, 4, 3]);
 
-        // Full override.
+        // Full override.  `backward_priority` is accepted but ignored
+        // (deprecated); setting it must not affect the result.
         let full = PiecePriorityToml {
             access_window_mb: Some(512),
             current_priority: Some(8),
@@ -626,7 +743,6 @@ mod tests {
         assert_eq!(f.step_priorities, [7, 6, 5, 4]);
         assert_eq!(f.window_edge_priority, 2);
         assert_eq!(f.rest_priority, 1);
-        assert_eq!(f.backward_priority, 2);
     }
 
     #[test]
@@ -685,7 +801,7 @@ mod tests {
 
     #[test]
     fn is_idle_requires_no_readers_and_no_wanted_pieces() {
-        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
         s.init_torrent("hash", 4, 256).unwrap();
 
         // Fresh torrent: no readers, no wanted pieces.
@@ -725,7 +841,7 @@ mod tests {
         use crate::infrastructure::cache::CacheManager;
         use std::sync::{Arc, Mutex};
 
-        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
         s.init_torrent("hash", 4, 256).unwrap();
 
         // Reader 0 wants pieces 0..1, reader 1 wants pieces 2..3.
@@ -778,7 +894,7 @@ mod tests {
         use crate::infrastructure::cache::CacheManager;
         use std::sync::{Arc, Mutex};
 
-        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
         s.init_torrent("hash", 4, 256).unwrap();
         s.readers.insert(
             "hash".to_string(),

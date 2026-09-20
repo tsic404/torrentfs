@@ -465,6 +465,8 @@ backward_priority = 1
         let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.piece_priority.access_window_mb, Some(2048));
         assert_eq!(config.piece_priority.rest_priority, Some(0));
+        // `backward_priority` is accepted (deprecated, ignored at runtime) so
+        // existing config files keep parsing.
         assert_eq!(config.piece_priority.backward_priority, Some(1));
         // Unspecified fields remain None (so they fall back to defaults).
         assert_eq!(config.piece_priority.current_priority, None);

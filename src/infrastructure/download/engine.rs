@@ -160,7 +160,10 @@ impl DownloadEngine {
             .unwrap_or(1024 * 1024 * 1024);
         let cache_manager = Arc::new(Mutex::new(CacheManager::new(cache_dir, cache_size)?));
         let store = PieceStore::new(cache_manager.clone());
-        let scheduler = PieceScheduler::new(PiecePriorityConfig::from_toml(&config.piece_priority));
+        let scheduler = PieceScheduler::new(
+            PiecePriorityConfig::from_toml(&config.piece_priority),
+            cache_size,
+        );
 
         let read_timeout_secs = config.timeouts.resolved_read_timeout_secs();
 
@@ -1264,26 +1267,36 @@ impl EngineState {
                 read.start_piece,
                 read.end_piece
             );
-            let recheck_started = self
-                .handles
-                .get(&read.info_hash)
-                .map(|h| h.force_recheck())
-                .unwrap_or(false);
-            if !recheck_started {
-                tracing::warn!(
-                    "force_recheck failed for info_hash={}; stale bits may persist",
-                    read.info_hash
-                );
+            if !self.start_recheck(read) {
                 return self.begin_waiting(read);
             }
-            read.phase = ReadPhase::Recheck;
-            read.phase_start = Instant::now();
-            read.phase_deadline = read.phase_start
-                + Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
-            read.saw_checking = false;
             return None;
         }
         self.begin_waiting(read)
+    }
+
+    /// Start a `force_recheck` to clear stale `have_piece` bits (set but the
+    /// piece file is missing or truncated) and park the read in the recheck
+    /// phase.  Returns false when the recheck could not be started.
+    fn start_recheck(&mut self, read: &mut PendingRead) -> bool {
+        let recheck_started = self
+            .handles
+            .get(&read.info_hash)
+            .map(|h| h.force_recheck())
+            .unwrap_or(false);
+        if !recheck_started {
+            tracing::warn!(
+                "force_recheck failed for info_hash={}; stale bits may persist",
+                read.info_hash
+            );
+            return false;
+        }
+        read.phase = ReadPhase::Recheck;
+        read.phase_start = Instant::now();
+        read.phase_deadline = read.phase_start
+            + Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
+        read.saw_checking = false;
+        true
     }
 
     /// Serve a read from local pieces when possible; otherwise apply the reader
@@ -1483,7 +1496,7 @@ impl EngineState {
                     .saturating_duration_since(read.phase_start),
                 read.info_hash
             );
-            return self.begin_waiting(read);
+            return self.finish_recheck(read);
         }
         let status = self.handles.get(&read.info_hash).map(|h| h.status());
         match status {
@@ -1494,7 +1507,20 @@ impl EngineState {
                 } else if read.saw_checking {
                     // We observed the checking state and it has now ended — the
                     // recheck is truly complete.
-                    self.begin_waiting(read)
+                    self.finish_recheck(read)
+                } else if !self.has_stale_pieces(
+                    &read.info_hash,
+                    read.start_piece,
+                    read.end_piece,
+                    read.piece_length,
+                    read.num_pieces,
+                    read.total_size,
+                ) {
+                    // The recheck cleared the stale bits even though the poll
+                    // never saw a settling state (a small torrent rechecks
+                    // faster than the poll).  This is the condition the recheck
+                    // actually exists for, so it avoids the fixed 2s fallback.
+                    self.finish_recheck(read)
                 } else if read.phase_start.elapsed() > Duration::from_secs(2) {
                     // No checking state observed after 2s — the recheck may
                     // have completed instantly (unlikely) or failed to start.
@@ -1505,14 +1531,35 @@ impl EngineState {
                          info_hash={} after 2s, proceeding",
                         read.info_hash
                     );
-                    self.begin_waiting(read)
+                    self.finish_recheck(read)
                 } else {
                     None
                 }
             }
             // `status()` failed — proceed, as the inline wait did.
-            _ => self.begin_waiting(read),
+            _ => self.finish_recheck(read),
         }
+    }
+
+    /// Transition a read out of the recheck phase: mark the torrent's piece
+    /// priorities dirty (the recheck reset libtorrent's priorities out-of-band,
+    /// so the next `recompute` must rewrite them once) and fall through to the
+    /// normal download path.
+    fn finish_recheck(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        self.scheduler.mark_priorities_dirty(&read.info_hash);
+        if read.reader_id.is_some() {
+            // The read registered its reader before the recheck (a stale piece
+            // surfaced mid-wait).  Recompute — the dirty flag forces a full
+            // rewrite, re-elevating the cleared pieces — and re-enter the
+            // piece wait without double-adding a reader.
+            if let Some(handle) = self.handles.get(&read.info_hash) {
+                self.scheduler
+                    .recompute(handle, &read.info_hash, &self.store);
+            }
+            self.enter_piece_wait(read);
+            return None;
+        }
+        self.begin_waiting(read)
     }
 
     /// Poll a read probing an empty-looking swarm for a peer or seeder.
@@ -1610,11 +1657,12 @@ impl EngineState {
                 .get(&read.info_hash)
                 .map(|h| h.have_piece(piece_idx))
                 .unwrap_or(false);
-            // `have_piece` can be stale (resume state marks the piece complete,
-            // but the file was purged or truncated); in that case do not treat
-            // it as ready — fall through to the download path so libtorrent
-            // re-requests the piece.
-            let have_valid = if have {
+            // `have_piece` can be stale: the bit says complete but the file
+            // was purged or truncated.  Such a piece cannot be re-downloaded
+            // until a recheck clears the bit (libtorrent skips pieces it
+            // already has), so detect it here and recheck instead of stalling
+            // the piece-wait window.
+            let stale = if have {
                 let piece_key = PieceStore::piece_key(&read.info_hash, piece_idx);
                 let expected = PieceStore::expected_piece_size(
                     piece_idx,
@@ -1622,10 +1670,11 @@ impl EngineState {
                     read.num_pieces,
                     read.total_size,
                 );
-                !self.store.has_stale_piece(&piece_key, expected)
+                self.store.has_stale_piece(&piece_key, expected)
             } else {
                 false
             };
+            let have_valid = have && !stale;
             let cached = {
                 let piece_key = PieceStore::piece_key(&read.info_hash, piece_idx);
                 let cache = self.store.cache_manager();
@@ -1645,17 +1694,25 @@ impl EngineState {
             };
             self.metrics.record_poll(have_valid || cached);
             if have_valid || cached {
-                if have_valid {
-                    self.register_piece(
-                        &read.info_hash,
-                        piece_idx,
-                        read.piece_length,
-                        read.num_pieces,
-                        read.total_size,
-                    );
-                }
+                // Defer registration to `read_from_disk`: eager `register_piece`
+                // credits the cache size and can LRU-evict this just-downloaded
+                // piece before `read_from_disk` reads it, re-triggering the
+                // stale-bit recheck.
                 read.current_piece += 1;
                 continue;
+            }
+            if stale {
+                // The bit is set but the file is gone.  A recheck clears the
+                // bit so libtorrent re-requests the piece; detected here (not
+                // only in `after_settling`) because a whole-file read evicts
+                // earlier pieces as later ones download, turning them stale
+                // mid-wait — without this the wait runs out its 60s window.
+                read.had_truncated_piece = true;
+                if self.start_recheck(read) {
+                    return None;
+                }
+                // Recheck failed to start: fall through to the normal wait
+                // (the window will time out rather than loop).
             }
 
             // A late-connecting seeder upgrades the wait window from the short
@@ -1974,15 +2031,6 @@ impl EngineState {
                 }
                 continue;
             }
-            // the piece is being served from the local disk. If it is
-            // not yet registered in the cache metadata (e.g. it was downloaded
-            // eagerly by the access-window prefetch rather than through this
-            // read's piece-wait loop), register it now so `pieces_on_disk` and
-            // restart scans treat it as a complete, verified piece instead of
-            // forcing a re-download that can time out with EIO.
-            if !self.store.has_piece(info_hash, piece_idx) {
-                self.register_piece(info_hash, piece_idx, piece_length, num_pieces, total_size);
-            }
             if let Some((local_start, local_end)) = Self::piece_chunk_bounds(
                 &piece_data,
                 piece_idx,
@@ -2003,6 +2051,17 @@ impl EngineState {
                 "Short read: expected {} bytes, got {} bytes",
                 size, bytes_read
             )));
+        }
+        // Register every piece AFTER the whole range has been read.  A
+        // per-piece register during the loop evicts the oldest cache entry on
+        // each `add_piece`; on a warm read whose tail pieces are already
+        // cached but whose head must be re-downloaded, the head's registrations
+        // would evict the still-unread tail pieces and re-trigger the recheck
+        // spin.  Deferring means all bytes are captured before any eviction.
+        for piece_idx in start_piece..=end_piece {
+            if !self.store.has_piece(info_hash, piece_idx) {
+                self.register_piece(info_hash, piece_idx, piece_length, num_pieces, total_size);
+            }
         }
         Ok(result)
     }
