@@ -693,8 +693,8 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
     // it keeps the no-seeder piece-wait window instead of the zero-second
     // `NO_SEEDER_FAST_FAIL_SECS`.  Boundary: the fast-fail path returns
     // NoPeers right after the ~9s peer-wait cap (`PEER_WAIT_CAP_SECS`), and
-    // the 500ms poll granularity plus the final status refresh put that in
-    // ~9.0-9.6s; the leecher path adds the 12s piece-wait window
+    // the 200ms poll granularity plus the final status refresh put that in
+    // ~9.0-9.2s; the leecher path adds the 12s piece-wait window
     // (`min(read_timeout_secs, 15s)`), so it returns at ≥ ~12.5s.  `>= 10s`
     // sits in the gap — below the correct path's lower bound, above the
     // fast-fail path's upper bound.
@@ -1018,7 +1018,7 @@ fn test_shutdown_aborts_blocked_read() {
     let elapsed = start.elapsed();
 
     // With the fix, shutdown completes in well under a second (the peer-wait
-    // loop polls `stopping` every 500ms).  Assert well below the 30s read
+    // loop polls `stopping` every 200ms).  Assert well below the 30s read
     // timeout to catch regressions; 15s (not 5s) leaves headroom for CPU
     // starvation when the full workspace test suite runs in parallel and
     // multiple libtorrent sessions contend for cores on a 2-core CI runner.
