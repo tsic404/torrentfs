@@ -415,6 +415,20 @@ impl TorrentHandle {
         }
     }
 
+    /// Set every piece's priority in a single bulk call.
+    ///
+    /// Used to align libtorrent's default priority (4 = "want") with the
+    /// scheduler's all-zero baseline when a torrent is added, so the first
+    /// read only downloads the pieces `reader_added` elevates.  Bulk — one FFI
+    /// round-trip — rather than a per-piece loop: the engine thread is the
+    /// single command loop, and N per-piece round-trips would stall every
+    /// other torrent's command while a large torrent is added.
+    pub fn set_all_piece_priorities(&self, priority: i32) -> bool {
+        unsafe {
+            libtorrent_sys::lt_torrent_handle_set_all_piece_priorities(self.inner, priority) == 0
+        }
+    }
+
     /// Set one or more `torrent_flags_t` bits on the underlying handle.
     ///
     /// Used to return a download handle to idle upload_mode after a read.

@@ -558,8 +558,16 @@ impl TestHarness {
         let seeder_ready_clone = Arc::clone(&seeder_ready);
 
         let seeder_thread = thread::spawn(move || {
-            // Use local test config (DHT disabled) for clean tracker-only path
-            let config = local_test_config();
+            // Use local test config (DHT disabled) for clean tracker-only path.
+            let mut config = local_test_config();
+            // Bind the seeder to an ephemeral port so concurrent test binaries
+            // (and any other torrentfs process on the host) never collide on
+            // libtorrent's default `0.0.0.0:6881`.  A contested 6881 leaves the
+            // seeder announcing a port it does not actually own, which surfaces
+            // as a downloader `NoPeers` timeout.  libtorrent announces its real
+            // bound port, so the downloader still discovers the seeder through
+            // the tracker.
+            config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
             let mut session = match torrentfs::download::Session::new(&config) {
                 Ok(s) => s,
                 Err(e) => {
