@@ -319,14 +319,15 @@ fn test_transient_peer_fast_exit() {
 /// of blocking the engine thread for the full `read_timeout_secs` — the
 /// regression where a no-seeder `cat` serialized every other read/write on the
 /// mount for ~60s.  With a large read timeout (60s) the no-seeder read must
-/// still return well before that window (peer-wait ≤9s + no-seeder piece-wait
-/// ≤15s ≈ 24s), proving the short no-seeder cap takes effect.
+/// still return well before that window (peer-wait ≤9s, then an immediate
+/// fast-fail `NoPeers` once peer discovery elapsed ≈ 9s), proving the short
+/// no-seeder cap takes effect.
 ///
-/// Ignored by default: it needs a local tracker and spends ~25s of real
-/// wall-clock waiting for the cap to elapse.  Run with
+/// Ignored by default: it needs a local tracker and spends ~10s of real
+/// wall-clock waiting for the peer-wait cap to elapse.  Run with
 /// `cargo test --test peer_download_test test_no_seeder_read_fails_fast -- --ignored`.
 #[test]
-#[ignore = "requires local tracker; ~25s wall-clock"]
+#[ignore = "requires local tracker; ~10s wall-clock"]
 fn test_no_seeder_read_fails_fast() {
     use common::{create_test_torrent_with_tracker, MiniTracker};
 
