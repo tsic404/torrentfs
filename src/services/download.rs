@@ -101,9 +101,8 @@ impl DownloadService {
         self.engine.snapshot_stats()
     }
 
-    /// Worst-case seconds a single blocking read may occupy the engine thread
-    /// before returning.  The FUSE deferred-read deadline derives from this
-    /// budget.
+    /// Worst-case seconds a single blocking read may block its caller before
+    /// returning.  The FUSE deferred-read deadline derives from this budget.
     pub fn read_wait_budget_secs(&self) -> u64 {
         self.engine.read_wait_budget_secs()
     }

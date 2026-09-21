@@ -89,10 +89,18 @@ pub struct PieceStatus {
     pub hit_count: u64,
 }
 
+/// Unique id of an active reader.  [`PieceScheduler::reader_added`] returns it
+/// and [`PieceScheduler::reader_released`] requires it, so a release removes
+/// exactly the reader that finished — several readers on one torrent can be
+/// active at once now that a read can be parked off the engine thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadId(u64);
+
 /// An active reader: its precomputed priority gradient.  Reference-counted by
 /// [`PieceScheduler::readers`].
 #[derive(Debug, Clone)]
 struct ReadRange {
+    id: ReadId,
     gradient: Vec<i32>,
 }
 /// Manages piece priority lifecycle across all active torrents.
@@ -103,11 +111,14 @@ pub struct PieceScheduler {
     piece_lengths: HashMap<String, i64>,
     /// Priority configuration.
     config: PiecePriorityConfig,
-    /// Active readers per info_hash (reference counting).  The engine thread
-    /// is single-threaded and `read_file_range` blocks it, so at most one
-    /// reader per torrent is ever active; the LIFO `pop` in `reader_released`
-    /// therefore always removes the reader that just finished.
+    /// Active readers per info_hash (reference counting), each tagged with a
+    /// unique [`ReadId`].  A read parked off the engine thread keeps its reader
+    /// registered while it waits, so one torrent can hold several active
+    /// readers; `reader_released` therefore removes by id, never by position.
     readers: HashMap<String, Vec<ReadRange>>,
+    /// Next [`ReadId`] to hand out.  Monotonic, so an id is never reused and a
+    /// stale release cannot match a newer reader.
+    next_read_id: u64,
     /// Per-info_hash retained prefetch gradient: the last reader's gradient,
     /// kept after the final reader releases so the read-ahead window keeps
     /// downloading and stays visible in `.stats` as `[N]` markers.
@@ -121,6 +132,7 @@ impl PieceScheduler {
             piece_lengths: HashMap::new(),
             config,
             readers: HashMap::new(),
+            next_read_id: 0,
             prefetch: HashMap::new(),
         }
     }
@@ -147,8 +159,11 @@ impl PieceScheduler {
 
     // ── Priority events ───────────────────────────────────────────────
 
-    /// `ReaderAdded` event: a reader started.  Records the read range and
-    /// recomputes the priority gradient (union over all active readers).
+    /// `ReaderAdded` event: a reader started.  Records the read range under a
+    /// fresh [`ReadId`] and recomputes the priority gradient (union over all
+    /// active readers).  The caller must pass that id back to
+    /// [`Self::reader_released`]; an unreadable range registers no gradient but
+    /// still gets an id, whose release is a no-op.
     pub fn reader_added(
         &mut self,
         handle: &TorrentHandle,
@@ -157,31 +172,42 @@ impl PieceScheduler {
         offset: u64,
         size: u32,
         store: &PieceStore,
-    ) -> TorrentResult<()> {
+    ) -> TorrentResult<ReadId> {
         let info_hash = hex::encode(info.info_hash()?);
+        let id = ReadId(self.next_read_id);
+        self.next_read_id += 1;
         let gradient = match self.gradient_for(handle, info, file_index, offset, size) {
             Some(g) => g,
-            None => return Ok(()),
+            None => return Ok(id),
         };
         self.readers
             .entry(info_hash.clone())
             .or_default()
-            .push(ReadRange { gradient });
+            .push(ReadRange { id, gradient });
         self.recompute(handle, &info_hash, store);
-        Ok(())
+        Ok(id)
     }
 
-    /// `ReaderReleased` event: a reader finished.  Decrements the reference
-    /// count and recomputes.  When the last reader releases, its gradient is
-    /// retained as the prefetch window so the read-ahead download continues.
+    /// `ReaderReleased` event: the reader identified by `id` finished.  Removes
+    /// exactly that reader and recomputes.  When the last reader releases, its
+    /// gradient is retained as the prefetch window so the read-ahead download
+    /// continues.
     ///
-    /// Infallible: the engine is single-threaded (at most one reader per
-    /// torrent), so the LIFO `pop` removes the reader that just finished, and
-    /// `recompute` only mutates in-memory state and best-effort FFI priorities.
-    pub fn reader_released(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
+    /// Infallible: `recompute` only mutates in-memory state and best-effort FFI
+    /// priorities.
+    pub fn reader_released(
+        &mut self,
+        handle: &TorrentHandle,
+        info_hash: &str,
+        id: ReadId,
+        store: &PieceStore,
+    ) {
         let (empty, last_gradient) = if let Some(ranges) = self.readers.get_mut(info_hash) {
-            let popped = ranges.pop();
-            (ranges.is_empty(), popped.map(|r| r.gradient))
+            let released = ranges
+                .iter()
+                .position(|r| r.id == id)
+                .map(|pos| ranges.remove(pos).gradient);
+            (ranges.is_empty(), released)
         } else {
             (true, None)
         };
@@ -607,9 +633,11 @@ mod tests {
     fn resolve_target_unions_active_readers_over_prefetch() {
         let readers = vec![
             ReadRange {
+                id: ReadId(0),
                 gradient: vec![7, 0, 6, 5],
             },
             ReadRange {
+                id: ReadId(1),
                 gradient: vec![0, 3, 0, 0],
             },
         ];
@@ -672,6 +700,7 @@ mod tests {
         s.readers.insert(
             "hash".to_string(),
             vec![ReadRange {
+                id: ReadId(0),
                 gradient: vec![7, 0, 0, 0],
             }],
         );
@@ -683,5 +712,95 @@ mod tests {
 
         // An unknown torrent is trivially idle.
         assert!(s.is_idle("other"));
+    }
+
+    /// Two readers can be active on one torrent at once: a read parked off the
+    /// engine thread keeps its reader registered while it waits on the swarm.
+    /// Releasing one must remove exactly that reader — the old LIFO `pop`
+    /// removed the last-added one instead, so a finished read's gradient
+    /// lingered while the still-waiting read's was dropped, corrupting the
+    /// union gradient, the retained prefetch window and `is_idle`.
+    #[test]
+    fn concurrent_readers_release_by_id_not_lifo() {
+        use crate::infrastructure::cache::CacheManager;
+        use std::sync::{Arc, Mutex};
+
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        s.init_torrent("hash", 4, 256).unwrap();
+
+        // Reader 0 wants pieces 0..1, reader 1 wants pieces 2..3.
+        s.readers.insert(
+            "hash".to_string(),
+            vec![
+                ReadRange {
+                    id: ReadId(0),
+                    gradient: vec![7, 6, 0, 0],
+                },
+                ReadRange {
+                    id: ReadId(1),
+                    gradient: vec![0, 0, 6, 5],
+                },
+            ],
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PieceStore::new(Arc::new(Mutex::new(
+            CacheManager::new(dir.path(), 1024 * 1024).unwrap(),
+        )));
+        // Piece-priority FFI calls are no-ops on a null handle; the assertions
+        // cover the scheduler's own bookkeeping, which is where the bug was.
+        let handle = TorrentHandle {
+            inner: std::ptr::null_mut(),
+            info_hash: "hash".to_string(),
+            session: std::ptr::null_mut(),
+        };
+
+        // The first reader finishes while the second is still waiting.
+        s.reader_released(&handle, "hash", ReadId(0), &store);
+        assert_eq!(
+            s.readers.get("hash").map(|r| r.len()),
+            Some(1),
+            "releasing reader 0 must leave reader 1 active"
+        );
+        // The union still wants reader 1's pieces, not the released reader's.
+        assert_eq!(s.elevated_pieces("hash"), vec![2, 3]);
+
+        // The last reader's own gradient becomes the retained prefetch window.
+        s.reader_released(&handle, "hash", ReadId(1), &store);
+        assert_eq!(s.readers.get("hash").map(|r| r.len()), Some(0));
+        assert_eq!(s.prefetch.get("hash").cloned(), Some(vec![0, 0, 6, 5]));
+    }
+
+    /// A release carrying an id that was never registered (or was already
+    /// released) is a no-op: it must not remove an unrelated live reader.
+    #[test]
+    fn release_of_unknown_id_leaves_other_readers_alone() {
+        use crate::infrastructure::cache::CacheManager;
+        use std::sync::{Arc, Mutex};
+
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default());
+        s.init_torrent("hash", 4, 256).unwrap();
+        s.readers.insert(
+            "hash".to_string(),
+            vec![ReadRange {
+                id: ReadId(7),
+                gradient: vec![0, 0, 6, 5],
+            }],
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PieceStore::new(Arc::new(Mutex::new(
+            CacheManager::new(dir.path(), 1024 * 1024).unwrap(),
+        )));
+        let handle = TorrentHandle {
+            inner: std::ptr::null_mut(),
+            info_hash: "hash".to_string(),
+            session: std::ptr::null_mut(),
+        };
+
+        s.reader_released(&handle, "hash", ReadId(3), &store);
+        assert_eq!(s.readers.get("hash").map(|r| r.len()), Some(1));
+        assert_eq!(s.elevated_pieces("hash"), vec![2, 3]);
+        assert!(s.prefetch.get("hash").is_none());
     }
 }
