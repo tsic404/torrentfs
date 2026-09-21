@@ -964,9 +964,18 @@ impl EngineState {
         // A piece can be purged from cache while libtorrent's bitmask still
         // marks it complete; the fast path would then find the file missing,
         // silently skip it, and return a short read → EIO. If any piece has
-        // `have_piece == true` but no on-disk file, `force_recheck` clears the
-        // stale bit (via the custom storage) and we wait for the recheck.
-        if self.has_stale_pieces(&info_hash, start_piece, end_piece) {
+        // `have_piece == true` but the on-disk file is missing or shorter
+        // than the expected piece size (purge or truncation), `force_recheck`
+        // clears the stale bit (via the custom storage) and we wait for the
+        // recheck.
+        if self.has_stale_pieces(
+            &info_hash,
+            start_piece,
+            end_piece,
+            piece_length,
+            num_pieces,
+            total_size,
+        ) {
             tracing::info!(
                 "read_file_range: stale libtorrent piece state detected for \
                  info_hash={}, forcing recheck to clear bits for pieces {}-{}",
@@ -1151,10 +1160,10 @@ impl EngineState {
         }
 
         // ── Set piece deadlines ────────────────────────────────────────
-        // `have_piece` can be stale (true but file purged).
+        // `have_piece` can be stale (true but file purged or truncated).
         // Only skip the deadline for pieces that are truly available —
-        // `have_piece` true AND the file exists on disk.  Stale pieces
-        // still need a deadline so libtorrent re-requests them.
+        // `have_piece` true AND the file on disk reaches the expected size.
+        // Stale pieces still need a deadline so libtorrent re-requests them.
         {
             let handle = self
                 .handles
@@ -1162,8 +1171,14 @@ impl EngineState {
                 .ok_or_else(|| Self::missing())?;
             for piece_idx in start_piece..=end_piece {
                 let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
-                let truly_available =
-                    handle.have_piece(piece_idx) && !self.store.has_stale_piece(&piece_key);
+                let expected = PieceStore::expected_piece_size(
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size,
+                );
+                let truly_available = handle.have_piece(piece_idx)
+                    && !self.store.has_stale_piece(&piece_key, expected);
                 if !truly_available {
                     handle.set_piece_deadline(piece_idx, 0);
                 }
@@ -1202,13 +1217,19 @@ impl EngineState {
                     .map(|h| h.have_piece(piece_idx))
                     .unwrap_or(false);
                 // `have_piece` can be stale (resume state marks the
-                // piece as complete, but the file was purged from cache).
+                // piece as complete, but the file was purged or truncated).
                 // In that case, do not treat it as ready — instead, fall
                 // through to the download path so libtorrent re-requests
                 // the piece.
                 let have_valid = if have {
                     let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
-                    !self.store.has_stale_piece(&piece_key)
+                    let expected = PieceStore::expected_piece_size(
+                        piece_idx,
+                        piece_length,
+                        num_pieces,
+                        total_size,
+                    );
+                    !self.store.has_stale_piece(&piece_key, expected)
                 } else {
                     false
                 };
@@ -1405,11 +1426,18 @@ impl EngineState {
                 })
                 .unwrap_or(false);
             // use the unified stale detection — `have_piece` true
-            // but the on-disk file is gone means the bit is stale; the
-            // piece is NOT available locally and must be re-downloaded.
+            // but the on-disk file is gone or truncated means the bit is
+            // stale; the piece is NOT available locally and must be
+            // re-downloaded.
             let have = handle.have_piece(piece_idx);
             let have_valid = if have {
-                !self.store.has_stale_piece(&piece_key)
+                let expected = PieceStore::expected_piece_size(
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size,
+                );
+                !self.store.has_stale_piece(&piece_key, expected)
             } else {
                 false
             };
@@ -1421,10 +1449,19 @@ impl EngineState {
     }
 
     /// detect whether any piece in the range has a stale
-    /// libtorrent bitmask — `have_piece == true` but the on-disk piece file
-    /// is gone (purged by cache verification or manual `delete_piece`).
+    /// libtorrent bitmask — `have_piece == true` but the on-disk piece is
+    /// missing or shorter than its expected size (purged by cache
+    /// verification / manual `delete_piece`, or truncated externally).
     /// Returns `true` if at least one such piece exists.
-    fn has_stale_pieces(&self, info_hash: &str, start_piece: i32, end_piece: i32) -> bool {
+    fn has_stale_pieces(
+        &self,
+        info_hash: &str,
+        start_piece: i32,
+        end_piece: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) -> bool {
         let handle = match self.handles.get(info_hash) {
             Some(h) => h,
             None => return false,
@@ -1432,7 +1469,13 @@ impl EngineState {
         for piece_idx in start_piece..=end_piece {
             if handle.have_piece(piece_idx) {
                 let piece_key = PieceStore::piece_key(info_hash, piece_idx);
-                if self.store.has_stale_piece(&piece_key) {
+                let expected = PieceStore::expected_piece_size(
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size,
+                );
+                if self.store.has_stale_piece(&piece_key, expected) {
                     return true;
                 }
             }
@@ -1570,16 +1613,8 @@ impl EngineState {
             // (the write-during-read race). The shared read lock should
             // prevent this in normal operation, but this check is a safety
             // net for edge cases (e.g. cache eviction + re-download).
-            let expected_piece_size = if piece_idx == num_pieces - 1 {
-                let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
-                if remainder > 0 {
-                    remainder
-                } else {
-                    piece_length
-                }
-            } else {
-                piece_length
-            };
+            let expected_piece_size =
+                PieceStore::expected_piece_size(piece_idx, piece_length, num_pieces, total_size);
             if (piece_data.len() as u64) < expected_piece_size {
                 let piece_start = (piece_idx as u64) * piece_length;
                 let piece_end_theoretical = piece_start + piece_length;
@@ -1635,16 +1670,8 @@ impl EngineState {
         num_pieces: i32,
         total_size: u64,
     ) {
-        let expected = if piece_idx == num_pieces - 1 {
-            let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
-            if remainder > 0 {
-                remainder
-            } else {
-                piece_length
-            }
-        } else {
-            piece_length
-        };
+        let expected =
+            PieceStore::expected_piece_size(piece_idx, piece_length, num_pieces, total_size);
         if let Err(e) = self.store.register_piece(info_hash, piece_idx, expected) {
             tracing::warn!(
                 "register_piece: failed for {}:piece:{}: {:?}",

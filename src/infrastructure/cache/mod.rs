@@ -863,6 +863,17 @@ impl CacheManager {
         self.piece_path(piece_key).exists()
     }
 
+    /// Check if a piece file exists on disk with a real length reaching
+    /// `expected`.  `Path::exists` alone would pass a truncated file, so
+    /// completeness/staleness decisions must compare the actual length — a
+    /// truncated piece is as unusable as a missing one.
+    pub fn piece_on_disk_at_least(&self, piece_key: &str, expected: u64) -> bool {
+        match fs::metadata(self.piece_path(piece_key)) {
+            Ok(m) => m.len() >= expected,
+            Err(_) => false,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn current_size(&self) -> u64 {
         self.current_size
