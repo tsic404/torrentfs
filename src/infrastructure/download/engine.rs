@@ -1077,6 +1077,9 @@ impl EngineState {
         // [`NO_SEEDER_READ_TIMEOUT_SECS`] more on a seeder the probe already
         // proved cannot arrive.
         let mut is_peer_wait_exhausted = false;
+        // Track the actual peer-discovery wait (≤ PEER_WAIT_CAP_SECS) so the
+        // NoPeers message reports it even when the piece-wait fast-fails at 0s.
+        let mut peer_wait_elapsed = Duration::from_secs(0);
         {
             let handle = self
                 .handles
@@ -1156,6 +1159,7 @@ impl EngineState {
                         handle.force_reannounce();
                     }
                 }
+                peer_wait_elapsed = peer_wait_start.elapsed();
             }
         }
 
@@ -1354,10 +1358,12 @@ impl EngineState {
                             no_seeder_stderr_hint(num_peers, num_seeds)
                         );
                         return Err(TorrentError::NoPeers(format!(
-                            "No seeder connected for info_hash {} after {:.0}s. \
-                             The torrent has no available seeder — check \
-                             tracker health or try again later.",
+                            "No seeder connected for info_hash {} after {:.0}s \
+                             peer discovery + {:.0}s piece wait. The torrent \
+                             has no available seeder — check tracker health or \
+                             try again later.",
                             info_hash,
+                            peer_wait_elapsed.as_secs(),
                             piece_wait_timeout.as_secs(),
                         )));
                     }
