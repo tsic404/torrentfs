@@ -8,6 +8,7 @@
 mod common;
 
 use common::{local_test_config, TestHarness};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -530,6 +531,181 @@ fn test_no_peers_read_probes_then_fails_fast() {
     );
 }
 
+/// RAII guard that stops and joins a background leecher thread on drop.
+///
+/// Drop runs on both normal exit and panic unwind, so a failed assertion in
+/// the test body (announce timeout, reader join) still tears the leecher's
+/// libtorrent session down instead of leaking it — and its listen port /
+/// thread-pool slots — into the next test.
+struct LeecherGuard {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for LeecherGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// With a live leecher in the swarm (`num_peers > 0`, `num_seeds == 0`), a
+/// read must NOT fast-fail once peer discovery elapses.  The empty-swarm
+/// fast-fail (`is_peer_wait_exhausted`) may only be set when BOTH peer and
+/// seed counts are zero; a leecher is still a potential source (or a future
+/// seeder), so it keeps the regular no-seeder piece-wait window.
+///
+/// Deterministic: a download-mode leecher session (empty save dir → `left` is
+/// the full file size) announces to the tracker before the read, so the
+/// downloader connects to it and observes `num_peers > 0, num_seeds == 0`.
+#[test]
+fn test_leecher_only_swarm_read_does_not_fast_fail() {
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
+    // Unique info_hash (distinct name) so no other test's (or a leaked)
+    // seeder for the shared fixture torrent can serve the read.
+    let tracker = common::MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    let torrent_data = distinct_torrent_with_tracker("leecher-only.iso", &announce_url);
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"),
+    );
+    let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
+    let raw_info_hash = info.info_hash().expect("Failed to get info hash");
+
+    // ── Leecher: has the torrent, but no file data (`left` = total size) ──
+    // A download-mode session with an empty save dir announces as a leecher
+    // and stays alive so the downloader keeps a connected leecher peer.
+    let leecher_stop = Arc::new(AtomicBool::new(false));
+    let leecher_stop_clone = Arc::clone(&leecher_stop);
+    let leecher_torrent = torrent_data.clone();
+    let leecher_thread = thread::spawn(move || {
+        let mut cfg = common::local_test_config();
+        // Distinct listen port so the tracker records the leecher as a peer
+        // separate from the downloader (16881).
+        cfg.connections.listen_interfaces = Some("0.0.0.0:16882".to_string());
+        let mut session = torrentfs::download::Session::new(&cfg).expect("leecher session");
+        let li = torrentfs::TorrentInfo::from_bytes(leecher_torrent).expect("leecher parse");
+        let save_dir = tempfile::TempDir::new().expect("leecher save dir");
+        // No file written → zero pieces, so the leecher announces with
+        // `left = total_size` and the downloader counts it as a peer, not a seed.
+        let _handle = session
+            .add_torrent(&li, save_dir.path())
+            .expect("leecher add");
+        while !leecher_stop_clone.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    // The guard owns the stop flag and join handle; on any panic unwind below
+    // (announce assert, reader join) it still stops and joins the leecher so
+    // its session never leaks into a later test.
+    let _leecher_guard = LeecherGuard {
+        stop: leecher_stop,
+        thread: Some(leecher_thread),
+    };
+
+    // Wait for the leecher to register with the tracker before the read, so
+    // the downloader's first announce already returns it.
+    let announce_start = std::time::Instant::now();
+    loop {
+        if tracker.peer_count(&raw_info_hash) > 0 {
+            break;
+        }
+        assert!(
+            announce_start.elapsed() < Duration::from_secs(30),
+            "leecher never announced (announce_count={})",
+            tracker.announce_count()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── Downloader: distinct listen port, DHT/LSD disabled ──────────────
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = common::local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // The leecher-only swarm has no seeder, so the piece-wait window is
+    // min(read_timeout_secs, 15s); the 12s cap keeps the test bounded while
+    // still exceeding the 9s peer-wait cap (`PEER_WAIT_CAP_SECS`).
+    config.timeouts.read_timeout_secs = Some(12);
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+
+    // Start the read in the background so the live swarm state can be polled.
+    let engine_reader = Arc::clone(&engine);
+    let info_reader = Arc::clone(&info);
+    let reader = thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let result = engine_reader.read_file_range(info_reader, 0, 0, 50);
+        (result, start.elapsed())
+    });
+
+    // Poll the snapshot until the read itself completes — the read's own
+    // completion bounds the poll, so a slow-CI leecher connect cannot outlive
+    // the poller (no hard deadline that expires early and false-fails while
+    // the read is still legitimately waiting).  This is the positive proof the
+    // read exercised the leecher-only branch, not the empty-swarm fast-fail:
+    // if the leecher never connects, this fails and the timing assertion below
+    // would otherwise be ambiguous (both paths return NoPeers).
+    let mut saw_leecher = false;
+    while !reader.is_finished() {
+        if let Some(status) = engine.try_torrent_status(&info_hash) {
+            if status.num_peers > 0 && status.num_seeds == 0 {
+                saw_leecher = true;
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let (result, elapsed) = reader.join().expect("reader thread panicked");
+
+    assert!(
+        saw_leecher,
+        "downloader never observed a connected leecher (num_peers > 0, num_seeds == 0)"
+    );
+
+    match &result {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {
+            println!(
+                "NoPeers after {:.2}s (leecher-only swarm)",
+                elapsed.as_secs_f64()
+            );
+        }
+        Err(e) => panic!(
+            "Expected NoPeers, got {:?} after {:.2}s",
+            e,
+            elapsed.as_secs_f64()
+        ),
+        Ok(data) => panic!(
+            "Unexpectedly read {} bytes from a leecher-only swarm (no seed)",
+            data.len()
+        ),
+    }
+
+    // Contract: a leecher (`num_peers > 0`) is a potential source (or future
+    // seeder), so the read must NOT fast-fail once peer discovery elapses —
+    // it keeps the no-seeder piece-wait window instead of the zero-second
+    // `NO_SEEDER_FAST_FAIL_SECS`.  Boundary: the fast-fail path returns
+    // NoPeers right after the ~9s peer-wait cap (`PEER_WAIT_CAP_SECS`), and
+    // the 500ms poll granularity plus the final status refresh put that in
+    // ~9.0-9.6s; the leecher path adds the 12s piece-wait window
+    // (`min(read_timeout_secs, 15s)`), so it returns at ≥ ~12.5s.  `>= 10s`
+    // sits in the gap — below the correct path's lower bound, above the
+    // fast-fail path's upper bound.
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "read returned NoPeers after {:.2}s — a leecher-only swarm fast-failed \
+         instead of keeping the no-seeder piece-wait window",
+        elapsed.as_secs_f64()
+    );
+}
+
 /// if a peer appears mid-read (while the engine is
 /// still inside peer-wait/piece-wait), the read must return the correct
 /// data instead of erroring out.
@@ -716,8 +892,18 @@ fn test_peer_appearing_mid_read_returns_data() {
 /// all zero.  Parsing and handle creation only need valid structure (not
 /// correct hashes); distinct `name`s yield distinct info hashes.
 fn distinct_torrent(name: &str) -> Vec<u8> {
+    distinct_torrent_with_tracker(name, "http://127.0.0.1:19999/announce")
+}
+
+/// [`distinct_torrent`] pointing at a caller-supplied announce URL, so a test
+/// can join its own `MiniTracker` swarm while keeping a distinct info_hash.
+fn distinct_torrent_with_tracker(name: &str, announce_url: &str) -> Vec<u8> {
     let mut t = Vec::new();
-    t.extend_from_slice(b"d8:announce31:http://127.0.0.1:19999/announce4:infod");
+    t.extend_from_slice(b"d8:announce");
+    t.extend_from_slice(announce_url.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(announce_url.as_bytes());
+    t.extend_from_slice(b"4:infod");
     t.extend_from_slice(b"6:lengthi16384e");
     t.extend_from_slice(format!("4:name{}:{}", name.len(), name).as_bytes());
     t.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
