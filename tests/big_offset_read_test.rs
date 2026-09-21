@@ -122,6 +122,13 @@ fn test_read_near_1g_boundary_returns_correct_content() {
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
     let mut config = local_test_config();
     config.connections.listen_interfaces = Some("0.0.0.0:16884".to_string());
+    // Restrict the piece-priority access window.  The default (4096 MiB = 4 GiB)
+    // is larger than this 1 GiB fixture, so every read would mark the *entire*
+    // file as wanted and trigger a full-file prefetch (hundreds of MiB) — slow
+    // and fragile under concurrent CI.  Each read here needs exactly one 256 KiB
+    // piece, so a 1 MiB window (4 pieces) keeps the download to a handful of
+    // pieces while still exercising the slow (download) + fast (cached) paths.
+    config.piece_priority.access_window_mb = Some(1);
     let engine =
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config).expect("engine");
 
@@ -145,4 +152,27 @@ fn test_read_near_1g_boundary_returns_correct_content() {
         let cached = read_once(&engine, &info, offset, size, timeout);
         assert_content(&cached, offset, size);
     }
+
+    // Regression guard for the selective-download fix in `ensure_handle`:
+    // with `access_window_mb = 1` only the pieces around the four read offsets
+    // may land in the cache.  If `ensure_handle` ever stops zeroing
+    // libtorrent's default piece priorities, the first read re-requests every
+    // piece and this count balloons toward the whole torrent (~4097 pieces) —
+    // a regression the content assertions above cannot catch (they still pass,
+    // just slower).  The four reads touch pieces 3814 and 4095-4096; a 1 MiB
+    // window elevates at most ~15 pieces, so 64 is a comfortable ceiling.
+    // `get_pieces_status` is a synchronous engine round-trip, not the
+    // non-blocking `try_pieces_status`: the latter `try_lock`s the snapshot the
+    // engine thread briefly holds on its 1s tick, so `.expect()`ing it would
+    // open a fresh flake window in a test whose whole point is not flaking.
+    let info_hash = hex::encode(info.info_hash().expect("info hash"));
+    let pieces = engine
+        .get_pieces_status(&info_hash, info.num_pieces() as i32)
+        .expect("engine must report piece status");
+    let cached = pieces.iter().filter(|p| p.is_cached).count();
+    assert!(
+        cached < 64,
+        "selective download regressed: {cached} pieces cached — expected only \
+         the pieces near the read offsets, not the whole torrent"
+    );
 }

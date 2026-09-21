@@ -937,6 +937,24 @@ impl EngineState {
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
+        // Zero every piece priority in libtorrent.  A freshly added torrent
+        // defaults all pieces to libtorrent's `default_priority` (4 = "want"),
+        // so the moment the first read clears `upload_mode` the torrent would
+        // request *every* piece — a full-file download for a large torrent the
+        // instant any byte is read.  `init_torrent` above only records an
+        // all-zero baseline in the scheduler; mirror it here so libtorrent
+        // requests only the pieces `reader_added` actually elevates (the
+        // selective, on-demand download the scheduler is designed to drive).
+        // One bulk FFI call, not a per-piece loop: this runs on the single
+        // engine command thread, so N round-trips would stall every other
+        // torrent's command while a large torrent is added.
+        if !handle.set_all_piece_priorities(0) {
+            tracing::warn!(
+                "ensure_handle {}: failed to zero piece priorities; the first \
+                 read may re-request the whole file",
+                info_hash
+            );
+        }
         // Record the private flag so that tracker merging can
         // check it without re-parsing the torrent_info on every duplicate
         // add. The flag is immutable for the lifetime of the info_hash.

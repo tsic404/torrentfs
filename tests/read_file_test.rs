@@ -833,7 +833,11 @@ fn test_peer_appearing_mid_read_returns_data() {
                 &file_content,
             )
             .expect("write seed file");
-            let cfg = common::local_test_config();
+            let mut cfg = common::local_test_config();
+            // Ephemeral listen port: concurrent test binaries (and other
+            // torrentfs processes) must not collide on libtorrent's default
+            // `0.0.0.0:6881`, or the downloader sees `NoPeers`.
+            cfg.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
             let mut session = torrentfs::download::Session::new(&cfg).expect("seeder session");
             let si = torrentfs::TorrentInfo::from_bytes(seed_torrent_data).expect("seeder parse");
             let h = session.add_torrent(&si, seed_dir.path()).expect("add");
