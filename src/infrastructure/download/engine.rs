@@ -442,14 +442,22 @@ pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
 /// engine thread, so it adds to the read budget.
 pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
 
-/// Upper bound (seconds) on the piece-wait window for a read with no connected
-/// seeder (`num_seeds == 0`).  A no-seeder read can never be served by the
-/// swarm, so waiting the full `read_timeout_secs` (60s default) blocks the
-/// engine thread and serializes every other read/write on the mount behind it.
-/// The no-seeder read instead fails fast with `NoPeers` after this short
-/// window — unless a seeder connects mid-wait, which upgrades the window back
-/// to the full `read_timeout_secs`.
+/// Upper bound (seconds) on the piece-wait window for a no-seeder read
+/// (`num_seeds == 0`) that has not yet exhausted peer discovery.  A no-seeder
+/// read can never be served by the swarm, so it fails fast with `NoPeers`
+/// after this short window (not the full `read_timeout_secs`, which would
+/// serialize every other read/write on the mount behind it) — unless a seeder
+/// connects mid-wait and upgrades the window back to the full timeout.
 pub(crate) const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
+
+/// Piece-wait window (seconds) for a read whose peer-discovery wait already
+/// elapsed without a seeder.  Zero: the swarm probe (`force_reannounce` + up to
+/// [`PEER_WAIT_CAP_SECS`]) already gave a seeder time to appear; finding none
+/// means the read is sourceless, so the piece-wait loop fails on its first
+/// iteration rather than re-blocking the engine thread.  A whole-file `cat`
+/// fans out into one 128 KiB chunk read per command, each previously paying its
+/// own 15s window and serializing healthy reads behind a dead torrent.
+pub(crate) const NO_SEEDER_FAST_FAIL_SECS: u64 = 0;
 
 /// Worst-case seconds a single `read_file_range` call may block on the engine
 /// thread before returning its own result: state-transition wait
@@ -474,17 +482,35 @@ pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
 }
 
 /// Piece-wait window (seconds) for a single read: the full `read_timeout_secs`
-/// when a seeder is connected (a slow-but-present seeder may still finish), or
-/// the short [`NO_SEEDER_READ_TIMEOUT_SECS`] cap when no seeder is connected
-/// (the read can never be served, so it fails fast instead of blocking the
-/// engine thread and serializing every other read/write on the mount).  Pure so
-/// it is unit-testable without a running engine.
-fn piece_wait_window_secs(has_seeder: bool, read_timeout_secs: u64) -> u64 {
+/// when a seeder is connected (a slow-but-present seeder may still finish); the
+/// short [`NO_SEEDER_READ_TIMEOUT_SECS`] cap when no seeder is connected and
+/// peer discovery has not elapsed (leechers may still serve, or a seeder may
+/// still connect); or zero ([`NO_SEEDER_FAST_FAIL_SECS`]) once peer discovery
+/// elapsed with no seeder — the read is sourceless and fails fast instead of
+/// blocking the engine thread and serializing every other read/write on the
+/// mount.  Pure so it is unit-testable without a running engine.
+fn piece_wait_window_secs(
+    has_seeder: bool,
+    is_peer_wait_exhausted: bool,
+    read_timeout_secs: u64,
+) -> u64 {
     if has_seeder {
         read_timeout_secs
+    } else if is_peer_wait_exhausted {
+        NO_SEEDER_FAST_FAIL_SECS
     } else {
         std::cmp::min(read_timeout_secs, NO_SEEDER_READ_TIMEOUT_SECS)
     }
+}
+
+/// Whether a swarm-status snapshot is completely empty — no peers and no
+/// seeds.  The no-seeder fast-fail (`is_peer_wait_exhausted`) may only be set for
+/// an empty swarm: a leecher (`num_peers > 0`) is still a potential source (or
+/// a future seeder), so it keeps the regular no-seeder piece-wait window
+/// rather than failing in zero seconds.  Pure so the exact condition is
+/// unit-testable without a running engine.
+fn swarm_is_empty(num_peers: i32, num_seeds: i32) -> bool {
+    num_peers == 0 && num_seeds == 0
 }
 
 /// Format the stderr hint emitted when a read times out with zero connected
@@ -1035,6 +1061,13 @@ impl EngineState {
         // With zero connected peers/seeds, kick the swarm immediately: after a
         // delete + re-add the fresh handle's first announce can land outside
         // the tracker's min-interval, timing out an otherwise-healthy read.
+        //
+        // Set when the peer-wait loop below runs its full window without a
+        // peer or seeder connecting.  A sourceless read then fails fast in the
+        // piece-wait loop ([`NO_SEEDER_FAST_FAIL_SECS`]) instead of spending
+        // [`NO_SEEDER_READ_TIMEOUT_SECS`] more on a seeder the probe already
+        // proved cannot arrive.
+        let mut is_peer_wait_exhausted = false;
         {
             let handle = self
                 .handles
@@ -1059,6 +1092,24 @@ impl EngineState {
                         ));
                     }
                     if peer_wait_start.elapsed() >= peer_wait_timeout {
+                        // Final status refresh before declaring the swarm
+                        // empty: a peer or seeder that connected during the
+                        // last poll window must not be treated as absent.  A
+                        // late leecher (`num_peers > 0, num_seeds == 0`) still
+                        // gets the regular no-seeder piece-wait window instead
+                        // of a zero-second `NoPeers`.
+                        match handle.status() {
+                            Ok(s) => {
+                                status = s;
+                                self.publish_snapshot();
+                                is_peer_wait_exhausted =
+                                    swarm_is_empty(status.num_peers, status.num_seeds);
+                            }
+                            Err(e) => {
+                                self.release_reader(&info_hash);
+                                return Err(e);
+                            }
+                        }
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
@@ -1128,7 +1179,10 @@ impl EngineState {
         // (`num_seeds == 0`) can never be served, so it uses the short
         // [`NO_SEEDER_READ_TIMEOUT_SECS`] window and fails fast with `NoPeers`
         // instead of blocking the engine thread for the full timeout — which
-        // would serialize every other read/write on the mount behind it.  A
+        // would serialize every other read/write on the mount behind it.  Once
+        // peer discovery elapsed with no seeder, that window collapses to zero
+        // ([`NO_SEEDER_FAST_FAIL_SECS`]): the probe proved the read is
+        // sourceless, so any further wait only re-blocks the engine thread.  A
         // seeder that connects mid-wait upgrades the window back to the full
         // timeout, so a late-connecting cold-torrent seeder is still served.
         let mut piece_wait_start = Instant::now();
@@ -1202,8 +1256,11 @@ impl EngineState {
                         }
                     }
                 }
-                let piece_wait_timeout =
-                    Duration::from_secs(piece_wait_window_secs(has_seeder, self.read_timeout_secs));
+                let piece_wait_timeout = Duration::from_secs(piece_wait_window_secs(
+                    has_seeder,
+                    is_peer_wait_exhausted,
+                    self.read_timeout_secs,
+                ));
 
                 if piece_wait_start.elapsed() >= piece_wait_timeout {
                     // The piece-wait window expired, but libtorrent's custom
@@ -1810,7 +1867,7 @@ impl EngineState {
 mod tests {
     use super::{
         no_seeder_stderr_hint, partial_read_bounds, piece_wait_window_secs, read_wait_budget_secs,
-        NO_SEEDER_READ_TIMEOUT_SECS,
+        swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
 
@@ -1864,15 +1921,43 @@ mod tests {
     #[test]
     fn no_seeder_piece_wait_caps_at_short_timeout() {
         assert_eq!(
-            piece_wait_window_secs(false, DEFAULT_READ_TIMEOUT_SECS),
+            piece_wait_window_secs(false, false, DEFAULT_READ_TIMEOUT_SECS),
             NO_SEEDER_READ_TIMEOUT_SECS
         );
         assert_eq!(
-            piece_wait_window_secs(false, 120),
+            piece_wait_window_secs(false, false, 120),
             NO_SEEDER_READ_TIMEOUT_SECS
         );
         // A read_timeout below the cap still bounds the window at itself.
-        assert_eq!(piece_wait_window_secs(false, 3), 3);
+        assert_eq!(piece_wait_window_secs(false, false, 3), 3);
+    }
+
+    /// a sourceless read (peer discovery already elapsed with no seeder) must
+    /// not spend the no-seeder window again — it fails fast so the engine
+    /// thread is freed for healthy reads instead of re-blocking per chunk.
+    #[test]
+    fn peer_wait_exhausted_no_seeder_fails_fast() {
+        assert_eq!(
+            piece_wait_window_secs(false, true, DEFAULT_READ_TIMEOUT_SECS),
+            NO_SEEDER_FAST_FAIL_SECS
+        );
+        // A seeder connected mid-wait still gets the full timeout, even when
+        // peer discovery had previously elapsed.
+        assert_eq!(
+            piece_wait_window_secs(true, true, DEFAULT_READ_TIMEOUT_SECS),
+            DEFAULT_READ_TIMEOUT_SECS
+        );
+    }
+
+    /// the no-seeder fast-fail may only trigger for a truly empty swarm — a
+    /// leecher (`num_peers > 0, num_seeds == 0`) is not empty, so it keeps the
+    /// regular no-seeder piece-wait window instead of failing in zero seconds.
+    #[test]
+    fn swarm_is_empty_requires_no_peers_and_no_seeds() {
+        assert!(swarm_is_empty(0, 0));
+        assert!(!swarm_is_empty(1, 0));
+        assert!(!swarm_is_empty(0, 1));
+        assert!(!swarm_is_empty(3, 2));
     }
 
     /// a read with a connected seeder uses the full window so a
@@ -1880,10 +1965,10 @@ mod tests {
     #[test]
     fn seeder_piece_wait_uses_full_timeout() {
         assert_eq!(
-            piece_wait_window_secs(true, DEFAULT_READ_TIMEOUT_SECS),
+            piece_wait_window_secs(true, false, DEFAULT_READ_TIMEOUT_SECS),
             DEFAULT_READ_TIMEOUT_SECS
         );
-        assert_eq!(piece_wait_window_secs(true, 3), 3);
+        assert_eq!(piece_wait_window_secs(true, false, 3), 3);
     }
 
     /// With the first piece missing, the partial read is empty —

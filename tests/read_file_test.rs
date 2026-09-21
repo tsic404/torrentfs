@@ -458,15 +458,17 @@ fn test_read_file_range_no_peers_error() {
     }
 }
 
-/// with no peers at all, a read must NOT return early
-/// (the old ≤9s fast-fail) — it must block for the full
-/// `read_timeout_secs` and only then return `NoPeers`.
+/// With no peers at all, a read must probe the swarm for the full peer-wait
+/// window before giving up, then fail fast with `NoPeers` — not spend the
+/// extra no-seeder piece-wait window on a seeder that can never appear, which
+/// would serialize healthy reads on the single engine thread behind a dead
+/// torrent's whole-file `cat`.
 ///
 /// Deterministic: unique info_hash with no reachable tracker (the announce
 /// URL is a dead endpoint) and DHT/LSD disabled, so no peer can ever appear;
 /// the all-zero piece hashes additionally make a hash-valid piece impossible.
 #[test]
-fn test_no_peers_read_blocks_full_timeout_then_errors() {
+fn test_no_peers_read_probes_then_fails_fast() {
     // Serialize libtorrent session creation to avoid resource contention
     // when multiple tests run in parallel within the same binary.
     let _session_guard = common::acquire_session_lock();
@@ -480,8 +482,10 @@ fn test_no_peers_read_blocks_full_timeout_then_errors() {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
-    // Short but non-trivial timeout so the elapsed-time assertion below
-    // can distinguish "waited the full timeout" from any fast-fail path.
+    // Short timeout: the read must block for the peer-wait probe
+    // (min(read_timeout_secs, 9s) = 4s) and then fail fast with `NoPeers`,
+    // so the elapsed-time assertions below can tell the probe apart from the
+    // extra no-seeder piece-wait window.
     config.timeouts.read_timeout_secs = Some(4);
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
@@ -509,14 +513,19 @@ fn test_no_peers_read_blocks_full_timeout_then_errors() {
         ),
     }
 
-    // Contract: the read must have blocked for the full read_timeout_secs
-    // (peer-wait ≤9s + piece-wait 4s), NOT returned after the old ~≤9s
-    // fast-fail.  Allow generous slack for CI scheduling jitter while
-    // still failing on any early-return path (< read_timeout_secs).
+    // Contract: the read probes the swarm for the full peer-wait window
+    // (min(read_timeout_secs, 9s) = 4s) and then fails fast with `NoPeers` —
+    // neither returning before the probe completes, nor spending the extra
+    // no-seeder piece-wait window (~4s here) on a seeder that can never appear.
     assert!(
-        elapsed >= Duration::from_millis(3900),
-        "Read returned NoPeers too early ({:.2}s): the old fast-fail path \
-         must not trigger; expected blocking for the full read_timeout_secs",
+        elapsed >= Duration::from_millis(3500),
+        "Read returned NoPeers before the peer-wait probe completed ({:.2}s)",
+        elapsed.as_secs_f64()
+    );
+    assert!(
+        elapsed < Duration::from_millis(7500),
+        "Read returned NoPeers too late ({:.2}s): the no-seeder piece-wait \
+         window must not block the engine thread",
         elapsed.as_secs_f64()
     );
 }
