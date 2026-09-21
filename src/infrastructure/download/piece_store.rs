@@ -53,13 +53,45 @@ impl PieceStore {
             .unwrap_or(false)
     }
 
-    /// whether a piece is stale — libtorrent's `have_piece` says
-    /// true but the on-disk piece file has been purged (deleted by cache
-    /// verification or manual `delete_piece`).  This is the unified stale
-    /// detection primitive used by the engine's `has_stale_pieces`,
-    /// `all_pieces_local`, and the piece-wait loop.
-    pub fn has_stale_piece(&self, piece_key: &str) -> bool {
-        !self.has_piece_on_disk(piece_key)
+    /// Whether the piece file exists on disk with a real length reaching
+    /// `expected` — a truncated file passes `Path::exists` but is not usable.
+    pub fn has_piece_on_disk_at_least(&self, piece_key: &str, expected: u64) -> bool {
+        self.cache
+            .lock()
+            .map(|c| c.piece_on_disk_at_least(piece_key, expected))
+            .unwrap_or(false)
+    }
+
+    /// whether a piece is stale — libtorrent's `have_piece` says true
+    /// but the on-disk piece is missing or shorter than `expected` (external
+    /// purge or truncation), so it must be re-downloaded.  This is the unified
+    /// stale-detection primitive used by the engine's `has_stale_pieces`,
+    /// `all_pieces_local`, and the piece-wait loop.  `Path::exists` alone
+    /// would pass a truncated file, leaving the same EIO, so the real length
+    /// is compared instead.
+    pub fn has_stale_piece(&self, piece_key: &str, expected: u64) -> bool {
+        !self.has_piece_on_disk_at_least(piece_key, expected)
+    }
+
+    /// Expected on-disk size of piece `piece_idx`: the full `piece_length`,
+    /// except the final piece, which is shorter when `total_size` is not a
+    /// multiple of `piece_length`.
+    pub fn expected_piece_size(
+        piece_idx: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) -> u64 {
+        if piece_idx == num_pieces - 1 {
+            let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
+            if remainder > 0 {
+                remainder
+            } else {
+                piece_length
+            }
+        } else {
+            piece_length
+        }
     }
 
     /// Read a whole piece from the on-disk cache, recording an access. Takes
@@ -228,11 +260,12 @@ impl PieceStore {
         }
     }
 
-    /// whether a piece is genuinely complete in cache.  Both
-    /// conditions must hold:
-    /// 1. the piece was registered via `register_piece` (a successful
-    ///    libtorrent download), not merely discovered by a startup scan;
-    /// 2. the registered size meets the expected piece length.
+    /// whether a piece is genuinely complete in cache.  The two cheap
+    /// in-memory checks (verified flag, registered size) gate the single
+    /// filesystem stat: only when both pass do we stat the piece file and
+    /// require its actual on-disk length to reach the expected size.  That
+    /// one `metadata` call catches both a missing file (external `rm -rf`)
+    /// and a truncated file — either would otherwise surface EIO downstream.
     pub fn is_piece_complete_in_cache(
         cache: &CacheManager,
         piece_key: &str,
@@ -244,21 +277,18 @@ impl PieceStore {
         if !cache.is_piece_verified(piece_key) {
             return false;
         }
-        if let Some(size) = cache.piece_metadata_size(piece_key) {
-            let expected = if piece_idx == num_pieces - 1 {
-                let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
-                if remainder > 0 {
-                    remainder
-                } else {
-                    piece_length
-                }
-            } else {
-                piece_length
-            };
-            size >= expected
-        } else {
-            false
+        let expected = Self::expected_piece_size(piece_idx, piece_length, num_pieces, total_size);
+        if !cache
+            .piece_metadata_size(piece_key)
+            .is_some_and(|size| size >= expected)
+        {
+            return false;
         }
+        // Last, and only on a metadata hit: `Path::exists` would pass a
+        // truncated file (which then EIOs in `read_piece_range`'s
+        // `read_exact`); `fs::metadata` reports the real length, so a missing
+        // or truncated file both fall through to the slow download path.
+        cache.piece_on_disk_at_least(piece_key, expected)
     }
 
     /// Non-blocking pre-check used by the FUSE read path: are all pieces
@@ -432,10 +462,11 @@ mod tests {
         let info_hash = "ghi789";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let expected = 16_384u64;
 
         // No file on disk yet → stale (no piece to serve).
         assert!(
-            store.has_stale_piece(&piece_key),
+            store.has_stale_piece(&piece_key, expected),
             "piece not on disk → stale detection returns true"
         );
 
@@ -448,7 +479,7 @@ mod tests {
         std::fs::write(&path, vec![0xCCu8; 16_384])?;
         store.register_piece(info_hash, piece_idx, 16_384)?;
         assert!(
-            !store.has_stale_piece(&piece_key),
+            !store.has_stale_piece(&piece_key, expected),
             "piece on disk → not stale"
         );
 
@@ -459,8 +490,45 @@ mod tests {
             c.delete_piece(&piece_key)?;
         }
         assert!(
-            store.has_stale_piece(&piece_key),
+            store.has_stale_piece(&piece_key, expected),
             "piece purged → stale detection returns true"
+        );
+
+        Ok(())
+    }
+
+    /// A *truncated* piece (file present but shorter than `expected`) must
+    /// also read as stale: `Path::exists` would pass it, so the stale check
+    /// compares the real length — a truncated piece is as unusable as a
+    /// missing one and must be re-downloaded.
+    #[test]
+    fn has_stale_piece_true_after_truncate() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "truncate_stale";
+        let piece_idx = 0;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let expected = 16_384u64;
+
+        // Write a full piece, then truncate it externally.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, vec![0xCCu8; 16_384])?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+        assert!(
+            !store.has_stale_piece(&piece_key, expected),
+            "full piece on disk → not stale"
+        );
+
+        std::fs::write(&path, vec![0xCCu8; 4096])?;
+        assert!(
+            store.has_stale_piece(&piece_key, expected),
+            "truncated piece (4096 < expected 16384) → stale"
         );
 
         Ok(())
@@ -562,6 +630,123 @@ mod tests {
                 c.piece_metadata_size(&PieceStore::piece_key(info_hash, partial_idx)),
                 Some(8192),
                 "incomplete piece size must refresh on re-scan"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// `is_piece_complete_in_cache` must return `false` after an *external*
+    /// file deletion (e.g. `rm -rf` on the cache directory): the on-disk file
+    /// is gone but the in-memory verified flag + size metadata survive.  The
+    /// metadata alone must not count as complete, or the engine's fast path
+    /// (`all_pieces_local`) and the FUSE pre-check (`pieces_on_disk`) treat
+    /// the deleted piece as local and `read_from_disk` surfaces EIO.
+    #[test]
+    fn is_piece_complete_in_cache_false_after_external_delete() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "extdel";
+        let piece_idx = 0;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let piece_length = 16_384u64;
+        let num_pieces = 1i32;
+        let total_size = 16_384u64;
+
+        // Write the piece file and register it as verified/complete.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, vec![0xAAu8; 16_384])?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+
+        {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            assert!(
+                PieceStore::is_piece_complete_in_cache(
+                    &c,
+                    &piece_key,
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size
+                ),
+                "piece on disk + verified + correct size → complete"
+            );
+        }
+
+        // Delete the file externally — the same effect as `rm -rf` on the
+        // cache directory: the file vanishes, the metadata stays.
+        std::fs::remove_file(&path)?;
+
+        {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            assert!(
+                !PieceStore::is_piece_complete_in_cache(
+                    &c,
+                    &piece_key,
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size
+                ),
+                "piece file deleted externally but metadata intact → NOT complete"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A *truncated* piece file (shorter than `expected`, but still present
+    /// on disk) must also read as NOT complete: `Path::exists` would report
+    /// it as present, so the completeness check must use `fs::metadata` and
+    /// compare the real on-disk length against the expected size.
+    #[test]
+    fn is_piece_complete_in_cache_false_after_external_truncate() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "exttrunc";
+        let piece_idx = 0;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let piece_length = 16_384u64;
+        let num_pieces = 1i32;
+        let total_size = 16_384u64;
+
+        // Write the piece file and register it as verified/complete.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, vec![0xAAu8; 16_384])?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+
+        // Truncate the file externally (e.g. a partial write / torn file):
+        // the file still exists, but its on-disk length no longer reaches
+        // the expected piece size.
+        std::fs::write(&path, vec![0xAAu8; 4096])?;
+
+        {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            assert!(
+                !PieceStore::is_piece_complete_in_cache(
+                    &c,
+                    &piece_key,
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size
+                ),
+                "truncated piece file (shorter than expected) → NOT complete"
             );
         }
 

@@ -240,3 +240,119 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     *stop.lock().unwrap() = true;
     let _ = seeder.join();
 }
+
+/// Regression: an *externally truncated* piece file (still present, but
+/// shorter than its expected size) must be re-downloaded, not surfaced as
+/// EIO.  The old stale check used `Path::exists`, so a truncated file counted
+/// as present: `force_recheck` never fired, the piece-wait loop saw
+/// `have_piece` and broke immediately, and `read_from_disk` returned
+/// `PieceNotReady`.  The stale check now compares the real on-disk length, so
+/// the truncated piece is treated as stale and re-fetched from the seeder.
+#[test]
+fn test_truncated_piece_reheals_via_recheck_and_redownload() {
+    let _guard = acquire_session_lock();
+    let tracker = MiniTracker::start();
+    let announce_url = tracker.announce_url();
+
+    const PIECE_LEN: usize = 262144;
+    const NUM_PIECES: usize = 2;
+    let (torrent_data, content) = build_torrent(&announce_url, PIECE_LEN, NUM_PIECES);
+
+    // Seeder holding the complete file.
+    let seed_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(seed_dir.path().join("multi.bin"), &content).unwrap();
+    let stop = Arc::new(std::sync::Mutex::new(false));
+    let stop_clone = Arc::clone(&stop);
+    let td_clone = torrent_data.clone();
+    let seeder = thread::spawn(move || {
+        let config = local_test_config();
+        let mut session = Session::new(&config).unwrap();
+        let info = TorrentInfo::from_bytes(td_clone).unwrap();
+        let handle = session.add_torrent(&info, seed_dir.path()).unwrap();
+        loop {
+            if *stop_clone.lock().unwrap() {
+                break;
+            }
+            if let Ok(s) = handle.status() {
+                let _ = matches!(s.state, TorrentState::Seeding | TorrentState::Finished);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    let start = std::time::Instant::now();
+    loop {
+        if tracker.announce_count() >= 1 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "seeder never announced"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    thread::sleep(Duration::from_secs(3));
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:16897".to_string());
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    let info = Arc::new(TorrentInfo::from_bytes(torrent_data).unwrap());
+
+    // Warm the cache: read the whole file so every piece is on disk + verified.
+    let total = (PIECE_LEN * NUM_PIECES) as u64;
+    let mut offset = 0u64;
+    while offset < total {
+        let n = std::cmp::min(131072u64, total - offset) as u32;
+        let start = std::time::Instant::now();
+        let mut data = None;
+        while start.elapsed() < Duration::from_secs(120) {
+            match engine.read_file_range(info.clone(), 0, offset, n) {
+                Ok(d) => {
+                    data = Some(d);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_secs(1)),
+            }
+        }
+        assert_eq!(data.expect("warm-up read timed out").len() as u64, n as u64);
+        offset += n as u64;
+    }
+
+    // Truncate piece 0 externally — the file stays present, but shorter than
+    // its expected size, which `Path::exists` alone cannot detect.
+    let info_hash = hex::encode(info.info_hash().unwrap());
+    let piece_key = format!("{}:piece:0", info_hash);
+    let piece_path = {
+        let cm = engine.cache_manager();
+        let guard = cm.lock().unwrap();
+        guard.piece_path(&piece_key)
+    };
+    assert!(
+        std::fs::metadata(&piece_path).unwrap().len() >= PIECE_LEN as u64,
+        "piece 0 should be fully cached before truncation"
+    );
+    std::fs::write(&piece_path, &content[..4096]).unwrap();
+
+    // Reading the truncated piece's range must re-download it, not EIO.
+    let start = std::time::Instant::now();
+    let mut data = None;
+    while start.elapsed() < Duration::from_secs(120) {
+        match engine.read_file_range(info.clone(), 0, 0, PIECE_LEN as u32) {
+            Ok(d) => {
+                data = Some(d);
+                break;
+            }
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
+    }
+    let data = data.expect("truncated piece read timed out (EIO)");
+    assert_eq!(&data[..], &content[..PIECE_LEN]);
+    assert!(
+        std::fs::metadata(&piece_path).unwrap().len() >= PIECE_LEN as u64,
+        "piece 0 must be re-downloaded to its full length"
+    );
+
+    *stop.lock().unwrap() = true;
+    let _ = seeder.join();
+}
