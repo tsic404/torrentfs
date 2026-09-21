@@ -183,6 +183,16 @@ fn user_in_fuse_group() -> bool {
     false
 }
 
+/// How many rounds of unmount attempts to make before giving up.  A single
+/// detach can fail transiently during shutdown (a FUSE request still in flight,
+/// or the mount already detached) and succeeds on the next round; a few rounds
+/// bound the transient without stalling shutdown.
+const UNMOUNT_MAX_ATTEMPTS: usize = 3;
+
+/// Delay between unmount retry rounds, giving an in-flight FUSE request time
+/// to drain before the next detach attempt.
+const UNMOUNT_RETRY_DELAY: Duration = Duration::from_millis(200);
+
 /// Explicitly unmount the FUSE filesystem before joining the session.
 ///
 /// In `AutoUnmount` mode, `BackgroundSession::join()` only tears down the
@@ -197,6 +207,11 @@ fn user_in_fuse_group() -> bool {
 /// directly via `umount2(MNT_DETACH)`, while non-root owners skip the
 /// guaranteed-`EPERM` syscall and unmount through the setuid `fusermount`
 /// helper directly — fuser itself always tries `umount2` first for everyone.
+///
+/// A single detach can fail transiently during shutdown or spuriously when the
+/// mount was already detached (so the helper reports "not mounted").  Each
+/// round re-checks `/proc/self/mountinfo` and retries a bounded number of
+/// times, treating an already-gone mountpoint as a successful unmount.
 ///
 /// Returns `true` when the mount was detached so clean shutdown can proceed,
 /// `false` when every attempt failed and the mount is still live.
@@ -213,6 +228,25 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
         }
     };
 
+    let detached = unmount_with_retry(
+        |attempt| unmount_once(mountpoint, &c_path, attempt),
+        // A mountinfo read failure ("unknown") counts as "still mounted": the
+        // detach must be attempted, never skipped on an unreadable /proc.
+        || mountpoint_has_fuse_mount(mountpoint).unwrap_or(true),
+        UNMOUNT_MAX_ATTEMPTS,
+        UNMOUNT_RETRY_DELAY,
+    );
+    if !detached {
+        warn!("all unmount attempts failed for {}", mountpoint.display());
+    }
+    detached
+}
+
+/// One round of detach attempts: root `umount2(MNT_DETACH)`, then the setuid
+/// `fusermount`/`fusermount3` helper.  Returns `true` when any detaches the
+/// mount.  `attempt` is the 0-based retry index, used to log the `umount2`
+/// fallback once rather than on every round.
+fn unmount_once(mountpoint: &Path, c_path: &std::ffi::CStr, attempt: usize) -> bool {
     // SAFETY: `geteuid()` has no preconditions.
     if should_attempt_direct_unmount(unsafe { libc::geteuid() }) {
         // Root detaches the mount directly. Non-root mounts always go through
@@ -220,17 +254,19 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
         // helper (see fuser's `fuse_mount_pure`) — so `umount2` would fail with
         // EPERM on every shutdown: skip the doomed syscall and its spurious
         // WARN, and unmount via the helper below.
-        // SAFETY: `c_path` is a valid NUL-terminated string owned by this frame.
+        // SAFETY: `c_path` is a valid NUL-terminated string owned by the caller.
         let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
         if ret == 0 {
             info!("unmounted {} (umount2 MNT_DETACH)", mountpoint.display());
             return true;
         }
-        warn!(
-            "umount2({}) failed ({}), falling back to fusermount",
-            mountpoint.display(),
-            std::io::Error::last_os_error()
-        );
+        if attempt == 0 {
+            warn!(
+                "umount2({}) failed ({}), falling back to fusermount",
+                mountpoint.display(),
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     // Unmount via the setuid fusermount helper: the correct path for non-root
@@ -260,17 +296,56 @@ fn unmount_fuse(mountpoint: &Path) -> bool {
             }
         }
     }
-    warn!("all unmount attempts failed for {}", mountpoint.display());
     false
 }
 
-/// Return `true` when `/proc/self/mountinfo` still lists a FUSE mount at
+/// Retry a bounded number of unmount rounds, treating an already-gone mount as
+/// success.  `attempt` performs one round and returns whether it detached the
+/// mount; `is_still_mounted` reports whether the kernel still lists a FUSE
+/// mount at the target.  Split out of [`unmount_fuse`] so the retry policy is
+/// unit-testable without a live mount or the real `fusermount` helper.
+fn unmount_with_retry<A, M>(
+    mut attempt: A,
+    mut is_still_mounted: M,
+    max_attempts: usize,
+    retry_delay: Duration,
+) -> bool
+where
+    A: FnMut(usize) -> bool,
+    M: FnMut() -> bool,
+{
+    for attempt_index in 0..max_attempts {
+        // The kernel (AutoUnmount) or the session thread's ENODEV path may
+        // already have detached the mount; the helper would then fail with
+        // "not mounted" even though the unmount actually succeeded.
+        if !is_still_mounted() {
+            return true;
+        }
+        if attempt(attempt_index) {
+            return true;
+        }
+        if attempt_index + 1 < max_attempts {
+            std::thread::sleep(retry_delay);
+        }
+    }
+    // The last round may have detached the mount despite a nonzero exit (a lazy
+    // detach races the mountinfo snapshot), or AutoUnmount finished the job in
+    // the retry window.  A final check avoids reporting a residual mount that
+    // is already gone.
+    !is_still_mounted()
+}
+
+/// Return whether `/proc/self/mountinfo` still lists a FUSE mount at
 /// `mountpoint`, mirroring the entrypoint's `mountpoint_has_fuse` probe.  Used
-/// by the session-loss path to decide whether a residual mount needs detaching:
-/// the session thread usually ends because the kernel already detached the
-/// mount (ENODEV), in which case nothing remains and `unmount_fuse` would only
-/// log a spurious failure.
-fn mountpoint_has_fuse_mount(mountpoint: &Path) -> bool {
+/// by the session-loss path and the shutdown detach loop to decide whether a
+/// residual mount needs detaching: the session thread usually ends because the
+/// kernel already detached the mount (ENODEV), in which case nothing remains
+/// and `unmount_fuse` would only log a spurious failure.
+///
+/// `None` means mountinfo could not be read.  Callers must treat `None` as
+/// "still mounted" (attempt the detach): collapsing it to "not mounted" would
+/// let a read failure skip the detach and silently leave a residual mount.
+fn mountpoint_has_fuse_mount(mountpoint: &Path) -> Option<bool> {
     // A dead (ENOTCONN) mount makes `canonicalize` fail; normalize to an
     // absolute path instead so a relative CLI mountpoint still matches the
     // kernel's canonicalized mountinfo entry (whose mount point is always
@@ -278,12 +353,25 @@ fn mountpoint_has_fuse_mount(mountpoint: &Path) -> bool {
     let target = std::fs::canonicalize(mountpoint)
         .or_else(|_| std::path::absolute(mountpoint))
         .unwrap_or_else(|_| mountpoint.to_path_buf());
-    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
-        return false;
-    };
+    mountinfo_path_has_fuse_mount("/proc/self/mountinfo", &target)
+}
+
+/// Read `mountinfo_path` and report whether a FUSE mount is listed at
+/// `target`.  `None` means the file could not be read.  Split out of
+/// [`mountpoint_has_fuse_mount`] so the read-failure ("unknown") branch is
+/// unit-testable without `/proc`.
+fn mountinfo_path_has_fuse_mount(mountinfo_path: &str, target: &Path) -> Option<bool> {
+    let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
+    Some(mountinfo_has_fuse_mount(&mountinfo, target))
+}
+
+/// True when `mountinfo` text lists a FUSE mount at `target`.  Split out of
+/// [`mountinfo_path_has_fuse_mount`] so the multi-line scan is unit-testable
+/// against fixtures.
+fn mountinfo_has_fuse_mount(mountinfo: &str, target: &Path) -> bool {
     mountinfo
         .lines()
-        .any(|line| mountinfo_line_is_fuse(line, &target))
+        .any(|line| mountinfo_line_is_fuse(line, target))
 }
 
 /// True when one `/proc/self/mountinfo` line records a FUSE mount at `target`.
@@ -446,7 +534,8 @@ fn wait_for_shutdown(
         // because the bind mount keeps the superblock alive.  Check mountinfo
         // and best-effort detach whatever is still there; an unmount failure
         // must not mask the session-loss exit code.
-        if mountpoint_has_fuse_mount(mountpoint) {
+        // A mountinfo read failure ("unknown") still attempts the detach.
+        if mountpoint_has_fuse_mount(mountpoint).unwrap_or(true) {
             if unmount_fuse(mountpoint) {
                 info!(
                     "detached residual mount {} after session loss",
@@ -790,6 +879,78 @@ mod tests {
     }
 
     #[test]
+    fn unmount_with_retry_treats_already_gone_as_success() {
+        // The mount already detached (e.g. AutoUnmount or the session thread's
+        // ENODEV path): no attempt runs and the unmount is reported successful.
+        let mut attempts = 0;
+        let ok = unmount_with_retry(
+            |_| {
+                attempts += 1;
+                false
+            },
+            || false,
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(ok);
+        assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn unmount_with_retry_retries_a_transient_failure() {
+        // The first round fails while the mount is still present; the second
+        // round detaches it.
+        let mut attempts = 0;
+        let ok = unmount_with_retry(
+            |_| {
+                attempts += 1;
+                attempts >= 2
+            },
+            || true,
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(ok);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn unmount_with_retry_gives_up_after_max_attempts() {
+        let mut attempts = 0;
+        let ok = unmount_with_retry(
+            |_| {
+                attempts += 1;
+                false
+            },
+            || true,
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(!ok);
+        assert_eq!(attempts, 3, "bounded attempts, no infinite loop");
+    }
+
+    #[test]
+    fn unmount_with_retry_rechecks_after_final_attempt() {
+        // Every round reports failure, but the mount is gone after the final
+        // round (a lazy detach whose exit status raced the mountinfo snapshot).
+        // The post-loop check must still report success rather than a residual
+        // mount.
+        let attempts = std::cell::Cell::new(0usize);
+        let ok = unmount_with_retry(
+            |_| {
+                attempts.set(attempts.get() + 1);
+                false
+            },
+            || attempts.get() < 3,
+            3,
+            Duration::from_millis(1),
+        );
+        assert!(ok);
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
     fn mountpoint_lock_is_exclusive_and_released_on_drop() {
         let dir = tempfile::tempdir().unwrap();
         let first = acquire_mountpoint_lock(dir.path()).unwrap();
@@ -841,6 +1002,49 @@ mod tests {
             "36 35 98:0 /mnt-inner /mnt rw shared:1 master:2 - fuse torrentfs rw",
             Path::new("/mnt")
         ));
+    }
+
+    #[test]
+    fn mountinfo_has_fuse_mount_scans_all_lines() {
+        let mountinfo = concat!(
+            "36 35 98:0 / / rw shared:1 - ext4 /dev/sda1 rw\n",
+            "37 36 0:5 / /mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw\n",
+        );
+        assert!(mountinfo_has_fuse_mount(mountinfo, Path::new("/mnt")));
+        assert!(!mountinfo_has_fuse_mount(mountinfo, Path::new("/")));
+        assert!(!mountinfo_has_fuse_mount("", Path::new("/mnt")));
+    }
+
+    #[test]
+    fn mountinfo_read_failure_is_unknown_not_unmounted() {
+        // The exact defect this guards: a read failure must yield None
+        // ("unknown"), which the detach loop collapses to "still mounted" —
+        // never Some(false) ("unmounted"), which would silently skip the detach
+        // and leave a residual mount.
+        assert_eq!(
+            mountinfo_path_has_fuse_mount("/no/such/mountinfo", Path::new("/mnt")),
+            None
+        );
+    }
+
+    #[test]
+    fn mountinfo_path_has_fuse_mount_reads_a_fixture_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mountinfo");
+        std::fs::write(
+            &path,
+            "36 35 98:0 / /mnt rw shared:1 master:2 - fuse.torrentfs torrentfs rw\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            mountinfo_path_has_fuse_mount(path, Path::new("/mnt")),
+            Some(true)
+        );
+        assert_eq!(
+            mountinfo_path_has_fuse_mount(path, Path::new("/other")),
+            Some(false)
+        );
     }
 
     #[test]
