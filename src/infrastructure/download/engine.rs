@@ -437,6 +437,13 @@ const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 /// the FUSE deferred-read deadline must exceed that sum.
 pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
 
+/// Poll interval between swarm-status checks in the peer-discovery wait.  Each
+/// poll refreshes the shared snapshot, so `.stats` Peers/Seeds reflects
+/// connecting peers/seeds with at most this interval of staleness.  Matches the
+/// piece-wait loop's 200 ms cadence so the whole slow-read path keeps `.stats`
+/// fresh on a uniform granularity.
+const PEER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Upper bound (seconds) on the `force_recheck_and_wait` synchronous wait in
 /// the stale-piece path.  It runs before peer discovery on the same
 /// engine thread, so it adds to the read budget.
@@ -1124,7 +1131,7 @@ impl EngineState {
                         }
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                    std::thread::sleep(PEER_WAIT_POLL_INTERVAL);
                     // also refresh session stats so the global
                     // `Connected:` counter (SharedSessionStats) stays
                     // fresh during the blocked read.
