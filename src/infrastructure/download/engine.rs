@@ -6,6 +6,10 @@
 //! (hence the dropped `unsafe impl Send`). Non-blocking `.stats` reads use a
 //! shared [`DownloadSnapshot`] refreshed each tick, replacing the old big-lock
 //! `try_lock`.
+//!
+//! A read that has to wait on the swarm never blocks the engine thread: it is
+//! parked on [`EngineState::pending_reads`] and advanced one step per loop
+//! iteration, so its peer/piece-wait window cannot serialize other commands.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -24,7 +28,7 @@ use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
 use tracing::{info, warn};
 
-use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
+use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus, ReadId};
 use super::piece_store::PieceStore;
 use super::session::{Session, TorrentHandle};
 use super::types::{SessionStats, TorrentState, TorrentStatus};
@@ -42,7 +46,8 @@ pub enum Command {
     /// the single-threaded FUSE dispatch loop on a busy download.
     EnsureHandleAsync { info: Arc<TorrentInfo> },
     /// Read a byte range from a file, driving the piece download if needed.
-    /// Blocks on the engine thread until the pieces are available.
+    /// Blocks the caller until the pieces are available; the engine thread
+    /// itself stays free (the read parks on the pending-read queue).
     ReadFileRange {
         info: Arc<TorrentInfo>,
         file_index: i32,
@@ -124,6 +129,11 @@ struct EngineState {
     /// Piece-completion events forwarded by the alert consumer thread,
     /// drained by the engine loop and turned into piece registration.
     piece_finished_rx: mpsc::Receiver<(String, i32)>,
+    /// Reads parked while they wait on the swarm.  The engine loop polls them
+    /// once per iteration instead of blocking the engine thread inside a read,
+    /// so one sourceless read cannot serialize every other command behind its
+    /// peer/piece-wait window.
+    pending_reads: Vec<PendingRead>,
 }
 
 impl DownloadEngine {
@@ -216,6 +226,7 @@ impl DownloadEngine {
                     stopping: thread_stopping,
                     alert_consumer: Some(alert_consumer),
                     piece_finished_rx,
+                    pending_reads: Vec::new(),
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -296,11 +307,11 @@ impl DownloadEngine {
         self.read_timeout_secs
     }
 
-    /// Worst-case seconds a single `read_file_range` call may block on the
-    /// engine thread before returning its own result.  The FUSE deferred-read
-    /// deadline must cover this budget (plus dispatch margin) so a ticket is
-    /// never expired with ENODATA while the engine is still legitimately
-    /// waiting for a slow seeder.
+    /// Worst-case seconds a single `read_file_range` call may block its caller
+    /// before returning its own result.  The FUSE deferred-read deadline must
+    /// cover this budget (plus dispatch margin) so a ticket is never expired
+    /// with ENODATA while the read is still legitimately waiting for a slow
+    /// seeder.
     pub fn read_wait_budget_secs(&self) -> u64 {
         read_wait_budget_secs(self.read_timeout_secs)
     }
@@ -369,7 +380,11 @@ impl DownloadEngine {
         rx.recv().map_err(|_| Self::disconnected())?
     }
 
-    /// Read a file range, driving piece download on the engine thread.
+    /// Read a file range, driving the piece download if needed.
+    ///
+    /// Blocks the calling thread until the range is served or the wait windows
+    /// elapse; the download itself is driven cooperatively on the engine thread,
+    /// which stays free to serve other commands while this read waits.
     pub fn read_file_range(
         &self,
         info: Arc<TorrentInfo>,
@@ -437,43 +452,37 @@ const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 /// the FUSE deferred-read deadline must exceed that sum.
 pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
 
-/// Poll interval between swarm-status checks in the peer-discovery wait.  Each
-/// poll refreshes the shared snapshot, so `.stats` Peers/Seeds reflects
-/// connecting peers/seeds with at most this interval of staleness.  Matches the
-/// piece-wait loop's 200 ms cadence so the whole slow-read path keeps `.stats`
-/// fresh on a uniform granularity.
-const PEER_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Upper bound (seconds) on the `force_recheck_and_wait` synchronous wait in
-/// the stale-piece path.  It runs before peer discovery on the same
-/// engine thread, so it adds to the read budget.
+/// Upper bound (seconds) on the `force_recheck` wait in the stale-piece path.
+/// It runs before peer discovery in the same read, so it adds to the read
+/// budget.
 pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
 
 /// Upper bound (seconds) on the piece-wait window for a no-seeder read
 /// (`num_seeds == 0`) that has not yet exhausted peer discovery.  A no-seeder
 /// read can never be served by the swarm, so it fails fast with `NoPeers`
-/// after this short window (not the full `read_timeout_secs`, which would
-/// serialize every other read/write on the mount behind it) — unless a seeder
-/// connects mid-wait and upgrades the window back to the full timeout.
+/// after this short window rather than the full `read_timeout_secs`, which
+/// would only tie up the caller and its FUSE deferred-read deadline — unless a
+/// seeder connects mid-wait and upgrades the window back to the full timeout.
 pub(crate) const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
 
 /// Piece-wait window (seconds) for a read whose peer-discovery wait already
 /// elapsed without a seeder.  Zero: the swarm probe (`force_reannounce` + up to
 /// [`PEER_WAIT_CAP_SECS`]) already gave a seeder time to appear; finding none
 /// means the read is sourceless, so the piece-wait loop fails on its first
-/// iteration rather than re-blocking the engine thread.  A whole-file `cat`
-/// fans out into one 128 KiB chunk read per command, each previously paying its
-/// own 15s window and serializing healthy reads behind a dead torrent.
+/// iteration rather than spending the no-seeder window again.  A whole-file
+/// `cat` fans out into one 128 KiB chunk read per command, each previously
+/// paying its own 15s window.
 pub(crate) const NO_SEEDER_FAST_FAIL_SECS: u64 = 0;
 
-/// Worst-case seconds a single `read_file_range` call may block on the engine
-/// thread before returning its own result: state-transition wait
-/// (`read_timeout_secs`) + recheck wait (≤ [`RECHECK_WAIT_CAP_SECS`]) +
-/// peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) + the piece-wait window.
-/// The piece-wait worst case is a seeder connecting at the very end of the
-/// short no-seeder window (≤ [`NO_SEEDER_READ_TIMEOUT_SECS`]) and then getting
-/// a full `read_timeout_secs` window from its connect time (the window resets
-/// on seeder connect — see `read_file_range`).
+/// Worst-case seconds a single `read_file_range` call may block its caller (a
+/// FUSE deferred-read worker) before returning its own result: the
+/// state-transition wait (`read_timeout_secs`), the recheck wait (≤
+/// [`RECHECK_WAIT_CAP_SECS`]), the peer-discovery wait (≤
+/// [`PEER_WAIT_CAP_SECS`]) and the piece-wait window.  The piece-wait worst
+/// case is a seeder connecting at the very end of the short no-seeder window
+/// (≤ [`NO_SEEDER_READ_TIMEOUT_SECS`]) and then getting a full
+/// `read_timeout_secs` window from its connect time (the window resets on
+/// seeder connect — see [`EngineState::poll_piece_wait`]).
 ///
 /// This is the budget the FUSE deferred-read deadline must cover.  Pure so it
 /// is unit-testable without a running engine.
@@ -494,8 +503,8 @@ pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
 /// peer discovery has not elapsed (leechers may still serve, or a seeder may
 /// still connect); or zero ([`NO_SEEDER_FAST_FAIL_SECS`]) once peer discovery
 /// elapsed with no seeder — the read is sourceless and fails fast instead of
-/// blocking the engine thread and serializing every other read/write on the
-/// mount.  Pure so it is unit-testable without a running engine.
+/// tying up the caller and its FUSE deadline budget for a seeder the probe
+/// proved cannot arrive.  Pure so it is unit-testable without a running engine.
 fn piece_wait_window_secs(
     has_seeder: bool,
     is_peer_wait_exhausted: bool,
@@ -607,6 +616,141 @@ fn partial_read_bounds(
 /// the consumer drains into the shared stats snapshot.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Poll cadence for parked reads while at least one is waiting on the swarm.
+/// Matches the old inline piece-wait poll so a parked read observes a newly
+/// available piece or a connecting seeder at the same granularity it used to
+/// while it held the engine thread.
+const PENDING_READ_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Phase of a parked read's wait machine.  Each engine-loop iteration advances
+/// every parked read by one step, so no phase ever sleeps on the engine
+/// thread.
+enum ReadPhase {
+    /// The torrent is still checking/allocating; wait for it to settle.
+    WaitState,
+    /// Stale libtorrent piece bits were detected; a recheck is in flight.
+    Recheck,
+    /// The swarm looks empty; probe for a peer or seeder to connect.
+    PeerWait,
+    /// Piece deadlines are set; wait for the pieces to arrive.
+    PieceWait,
+}
+
+/// A read that passed validation and is ready to be served or parked.
+struct PreparedRead {
+    info: Arc<TorrentInfo>,
+    file_index: i32,
+    offset: u64,
+    size: u32,
+    info_hash: String,
+    piece_length: u64,
+    num_pieces: i32,
+    total_size: u64,
+    absolute_offset: u64,
+    end_offset: u64,
+    start_piece: i32,
+    end_piece: i32,
+    status: TorrentStatus,
+}
+
+/// A read waiting on the swarm, parked on the engine's queue instead of
+/// blocking the engine thread.  The caller is still blocked on `reply`; only
+/// the engine thread is freed.
+struct PendingRead {
+    info: Arc<TorrentInfo>,
+    file_index: i32,
+    offset: u64,
+    size: u32,
+    info_hash: String,
+    piece_length: u64,
+    num_pieces: i32,
+    total_size: u64,
+    absolute_offset: u64,
+    end_offset: u64,
+    start_piece: i32,
+    end_piece: i32,
+    /// First piece not yet known to be available.
+    current_piece: i32,
+    /// Reply channel to the caller blocked in `DownloadEngine::read_file_range`.
+    reply: SyncSender<TorrentResult<Vec<u8>>>,
+    phase: ReadPhase,
+    /// When the current phase started (drives the recheck grace check).
+    phase_start: Instant,
+    /// When the current phase gives up.
+    phase_deadline: Instant,
+    /// Last observed torrent status — the peer/seed counts drive the windows.
+    status: TorrentStatus,
+    /// Peer discovery ran its full window on an empty swarm, so the piece wait
+    /// collapses to zero seconds.
+    is_peer_wait_exhausted: bool,
+    /// A seeder is connected, so the piece wait uses the full read timeout.
+    has_seeder: bool,
+    /// The peer-wait probe already re-announced once mid-window.
+    reannounced_mid_wait: bool,
+    /// Start of the piece-wait window; resets when a seeder connects.
+    piece_wait_start: Instant,
+    /// Actual peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) once the peer-wait
+    /// phase completes, so the `NoPeers` message reports it even when the
+    /// piece wait then fast-fails at zero seconds.
+    peer_wait_elapsed: Duration,
+    /// A stale (purged/truncated) cached piece was detected at read start, so
+    /// the read entered the recheck path.  Surfaces in the `NoPeers` message
+    /// to tell "truncated + no seeder" apart from a plain cold read.
+    had_truncated_piece: bool,
+    /// The recheck has been observed in a checking state (TOCTOU guard).
+    saw_checking: bool,
+    /// Id of the reader this read registered with the scheduler, once the
+    /// priority gradient has been applied.  Released by id so a concurrent read
+    /// on the same torrent never releases the wrong reader.
+    reader_id: Option<ReadId>,
+}
+
+impl PendingRead {
+    fn new(prepared: PreparedRead, reply: SyncSender<TorrentResult<Vec<u8>>>) -> Self {
+        let now = Instant::now();
+        Self {
+            info: prepared.info,
+            file_index: prepared.file_index,
+            offset: prepared.offset,
+            size: prepared.size,
+            info_hash: prepared.info_hash,
+            piece_length: prepared.piece_length,
+            num_pieces: prepared.num_pieces,
+            total_size: prepared.total_size,
+            absolute_offset: prepared.absolute_offset,
+            end_offset: prepared.end_offset,
+            start_piece: prepared.start_piece,
+            end_piece: prepared.end_piece,
+            current_piece: prepared.start_piece,
+            reply,
+            phase: ReadPhase::PieceWait,
+            phase_start: now,
+            phase_deadline: now,
+            status: prepared.status,
+            is_peer_wait_exhausted: false,
+            has_seeder: false,
+            reannounced_mid_wait: false,
+            piece_wait_start: now,
+            peer_wait_elapsed: Duration::ZERO,
+            had_truncated_piece: false,
+            saw_checking: false,
+            reader_id: None,
+        }
+    }
+}
+
+/// Whether a libtorrent state means the torrent is still verifying or
+/// allocating its storage and cannot serve a read yet.
+fn is_settling_state(state: TorrentState) -> bool {
+    matches!(
+        state,
+        TorrentState::QueuedForChecking
+            | TorrentState::CheckingFiles
+            | TorrentState::Allocating
+            | TorrentState::CheckingResumeData
+    )
+}
+
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     tracing::info!("Download engine started");
     // `publish_snapshot` rebuilds the per-torrent piece grid — O(num_pieces)
@@ -622,12 +766,29 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     // status / num_peers) for the whole duration of a sustained read burst
     // (`dd bs=1 count=N`).
     let mut last_publish = Instant::now();
+    // Cache-metadata flush / idle-torrent settle cadence.  Tracked separately
+    // from `last_publish` because the parked-read poll shortens the loop's wait
+    // to `PENDING_READ_POLL_INTERVAL`: gating housekeeping on the publish timer
+    // would then starve the flush for the whole duration of a parked read.
+    let mut last_housekeeping = Instant::now();
     loop {
-        match rx.recv_timeout(SNAPSHOT_INTERVAL) {
+        // Poll parked reads on the short cadence so a waiting read is checked
+        // at roughly the old inline piece-wait granularity; with none parked,
+        // fall back to the snapshot interval.
+        let wait = if state.pending_reads.is_empty() {
+            SNAPSHOT_INTERVAL
+        } else {
+            PENDING_READ_POLL_INTERVAL
+        };
+        match rx.recv_timeout(wait) {
             Ok(cmd) => {
                 let is_read = matches!(cmd, Command::ReadFileRange { .. });
                 let stop = state.handle_command(cmd);
                 state.drain_piece_finished();
+                state.poll_pending_reads();
+                if !state.pending_reads.is_empty() {
+                    state.refresh_session_stats();
+                }
                 if !is_read || last_publish.elapsed() >= SNAPSHOT_INTERVAL {
                     state.publish_snapshot();
                     last_publish = Instant::now();
@@ -639,21 +800,39 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 // cost that made `dd bs=1 count=4096` hang on a cached file.
                 // Flushing on the periodic tick (timeout branch) and on
                 // shutdown is the "periodic flush" intent.
+                if last_housekeeping.elapsed() >= SNAPSHOT_INTERVAL {
+                    state.settle_idle_torrents();
+                    state.flush_cache_metadata();
+                    last_housekeeping = Instant::now();
+                }
                 if stop {
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                state.refresh_session_stats();
+                let housekeeping = last_housekeeping.elapsed() >= SNAPSHOT_INTERVAL;
+                if housekeeping {
+                    state.settle_idle_torrents();
+                    state.flush_cache_metadata();
+                    last_housekeeping = Instant::now();
+                }
                 state.drain_piece_finished();
-                state.settle_idle_torrents();
-                state.publish_snapshot();
-                state.flush_cache_metadata();
-                last_publish = Instant::now();
+                state.poll_pending_reads();
+                if housekeeping || !state.pending_reads.is_empty() {
+                    state.refresh_session_stats();
+                }
+                if last_publish.elapsed() >= SNAPSHOT_INTERVAL {
+                    state.publish_snapshot();
+                    last_publish = Instant::now();
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    // Resolve every parked read before the session goes away: their callers
+    // are blocked on the reply channel and would otherwise see a bare
+    // disconnect error instead of the shutdown abort.
+    state.abort_pending_reads();
     // final flush so metadata mutations that happened since the
     // last tick are durable before the engine thread exits.
     state.flush_cache_metadata();
@@ -689,7 +868,7 @@ impl EngineState {
                 size,
                 reply,
             } => {
-                let _ = reply.send(self.read_file_range(&info, file_index, offset, size));
+                self.start_read(info, file_index, offset, size, reply);
             }
             Command::GetPiecesStatus {
                 info_hash,
@@ -904,16 +1083,64 @@ impl EngineState {
         );
     }
 
-    /// Read a file range, driving piece download if needed.  Runs entirely on
-    /// the engine thread; alerts are drained during the piece wait.
-    fn read_file_range(
+    /// Begin a read, running only the non-blocking setup here.  A range whose
+    /// pieces are already local is served inline; anything that has to wait on
+    /// the swarm is parked on [`EngineState::pending_reads`] and polled by the
+    /// engine loop, so the engine thread never blocks inside a read and one
+    /// sourceless read cannot serialize healthy commands behind its wait
+    /// window.
+    fn start_read(
         &mut self,
-        info: &TorrentInfo,
+        info: Arc<TorrentInfo>,
         file_index: i32,
         offset: u64,
         size: u32,
-    ) -> TorrentResult<Vec<u8>> {
-        self.ensure_handle(info)?;
+        reply: SyncSender<TorrentResult<Vec<u8>>>,
+    ) {
+        let prepared = match self.prepare_read(info, file_index, offset, size) {
+            Ok(Some(prepared)) => prepared,
+            // An empty range (offset past EOF, or a zero-span slice) is a
+            // legitimate empty read, not a download failure.
+            Ok(None) => {
+                let _ = reply.send(Ok(Vec::new()));
+                return;
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                return;
+            }
+        };
+
+        let mut read = PendingRead::new(prepared, reply);
+        if is_settling_state(read.status.state) {
+            // Wait for the torrent to finish checking/allocating first: both
+            // the stale-piece recheck and the local-pieces fast path need a
+            // settled bitmask.
+            read.phase = ReadPhase::WaitState;
+            read.phase_start = Instant::now();
+            self.pending_reads.push(read);
+            return;
+        }
+
+        if let Some(result) = self.after_settling(&mut read) {
+            let _ = read.reply.send(result);
+            return;
+        }
+        self.pending_reads.push(read);
+    }
+
+    /// Validate a read and collect everything the wait machine needs.  Errors
+    /// here mean the read never touched the swarm, so the caller is answered
+    /// immediately.  `Ok(None)` is an empty read, also served without touching
+    /// the swarm.
+    fn prepare_read(
+        &mut self,
+        info: Arc<TorrentInfo>,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    ) -> TorrentResult<Option<PreparedRead>> {
+        self.ensure_handle(&info)?;
         let info_hash = hex::encode(info.info_hash()?);
 
         // ── Collect handle metadata (scoped borrow) ────────────────────
@@ -958,7 +1185,7 @@ impl EngineState {
         let size = if absolute_offset < file_end {
             (std::cmp::min(size as u64, file_end - absolute_offset) as u32).max(1)
         } else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         let start_piece = (absolute_offset / piece_length) as i32;
@@ -975,261 +1202,192 @@ impl EngineState {
             )));
         }
         if start_piece > end_piece {
-            return Ok(Vec::new());
+            return Ok(None);
         }
 
-        // ── Wait for initial state transitions ─────────────────────────
-        let max_wait_secs = self.read_timeout_secs;
-        let start = Instant::now();
-        let mut status = status;
-        while matches!(
-            status.state,
-            TorrentState::QueuedForChecking
-                | TorrentState::CheckingFiles
-                | TorrentState::Allocating
-                | TorrentState::CheckingResumeData
-        ) {
-            if self.stopping.load(Ordering::Relaxed) {
-                return Err(TorrentError::Timeout(
-                    "shutdown requested, read aborted".to_string(),
-                ));
-            }
-            if start.elapsed().as_secs() > max_wait_secs {
-                return Err(TorrentError::Timeout(format!(
-                    "Torrent stuck in state {:?} for {} seconds",
-                    status.state, max_wait_secs
-                )));
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            match self.handles.get(&info_hash).map(|h| h.status()) {
-                Some(Ok(s)) => status = s,
-                _ => {}
-            }
-        }
-
-        // ── Detect stale libtorrent piece state ───────────────
-        // A piece can be purged from cache while libtorrent's bitmask still
-        // marks it complete; the fast path would then find the file missing,
-        // silently skip it, and return a short read → EIO. If any piece has
-        // `have_piece == true` but the on-disk file is missing or shorter
-        // than the expected piece size (purge or truncation), `force_recheck`
-        // clears the stale bit (via the custom storage) and we wait for the
-        // recheck. Keep the flag so a later `NoPeers` failure can say
-        // "truncated piece needs re-download" rather than a plain
-        // "no seeder" — the operator must tell the two apart.
-        let had_truncated_piece = self.has_stale_pieces(
-            &info_hash,
-            start_piece,
-            end_piece,
+        Ok(Some(PreparedRead {
+            info,
+            file_index,
+            offset,
+            size,
+            info_hash,
             piece_length,
             num_pieces,
             total_size,
+            absolute_offset,
+            end_offset,
+            start_piece,
+            end_piece,
+            status,
+        }))
+    }
+
+    /// Continue a read whose torrent has settled: recheck stale piece bits when
+    /// any exist, otherwise serve from local pieces or park it in a swarm-wait
+    /// phase.  Returns `Some(result)` when the read finishes here.
+    fn after_settling(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        // Keep the flag so a later `NoPeers` failure can say "truncated piece
+        // needs re-download" rather than a plain "no seeder" — the operator
+        // must tell the two apart.
+        let had_truncated_piece = self.has_stale_pieces(
+            &read.info_hash,
+            read.start_piece,
+            read.end_piece,
+            read.piece_length,
+            read.num_pieces,
+            read.total_size,
         );
         if had_truncated_piece {
+            read.had_truncated_piece = true;
             tracing::info!(
                 "read_file_range: stale libtorrent piece state detected for \
                  info_hash={}, forcing recheck to clear bits for pieces {}-{}",
-                info_hash,
-                start_piece,
-                end_piece
+                read.info_hash,
+                read.start_piece,
+                read.end_piece
             );
-            self.force_recheck_and_wait(&info_hash);
+            let recheck_started = self
+                .handles
+                .get(&read.info_hash)
+                .map(|h| h.force_recheck())
+                .unwrap_or(false);
+            if !recheck_started {
+                tracing::warn!(
+                    "force_recheck failed for info_hash={}; stale bits may persist",
+                    read.info_hash
+                );
+                return self.begin_waiting(read);
+            }
+            read.phase = ReadPhase::Recheck;
+            read.phase_start = Instant::now();
+            read.phase_deadline = read.phase_start
+                + Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
+            read.saw_checking = false;
+            return None;
         }
+        self.begin_waiting(read)
+    }
 
-        // ── Fast path: all pieces available locally ────────────────────
+    /// Serve a read from local pieces when possible; otherwise apply the reader
+    /// priority gradient and park it in a swarm-wait phase.  Returns
+    /// `Some(result)` when the read finished here.
+    fn begin_waiting(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
         // A fully-cached read must not run the download machinery:
         // `reader_added`/`publish_snapshot`/`release_reader` scale with torrent
-        // size and exist only to drive a download. For a cached range their
+        // size and exist only to drive a download.  For a cached range their
         // per-read FFI overhead made byte-granular reads (`dd bs=1`) slow, so
         // read straight from the piece store.
         if self.all_pieces_local(
-            &info_hash,
-            start_piece,
-            end_piece,
-            piece_length,
-            num_pieces,
-            total_size,
+            &read.info_hash,
+            read.start_piece,
+            read.end_piece,
+            read.piece_length,
+            read.num_pieces,
+            read.total_size,
         ) {
-            return self.read_from_disk(
-                &info_hash,
-                start_piece,
-                end_piece,
-                piece_length,
-                num_pieces,
-                total_size,
-                absolute_offset,
-                end_offset,
-                size,
-            );
+            return Some(self.read_from_disk(
+                &read.info_hash,
+                read.start_piece,
+                read.end_piece,
+                read.piece_length,
+                read.num_pieces,
+                read.total_size,
+                read.absolute_offset,
+                read.end_offset,
+                read.size,
+            ));
         }
 
-        // ── ReaderAdded: elevate priority for this read ────────────────
-        {
-            let handle = self
-                .handles
-                .get(&info_hash)
-                .ok_or_else(|| Self::missing())?;
-            if let Err(e) =
-                self.scheduler
-                    .reader_added(handle, info, file_index, offset, size, &self.store)
-            {
-                tracing::warn!("read_file_range: reader_added failed: {:?}", e);
+        // ReaderAdded: elevate priority for this read.  Publish immediately so
+        // `.stats` reflects the elevated priorities while the read is parked —
+        // the old inline path published here because the engine blocked until
+        // `release_reader` reset them, leaving `.stats` permanently all-`[]`.
+        // The returned id is what releases *this* reader: a concurrent read on
+        // the same torrent holds its own, so neither can release the other's.
+        let reader_id = {
+            let handle = match self.handles.get(&read.info_hash) {
+                Some(h) => h,
+                None => return Some(Err(Self::missing())),
+            };
+            match self.scheduler.reader_added(
+                handle,
+                &read.info,
+                read.file_index,
+                read.offset,
+                read.size,
+                &self.store,
+            ) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!("read_file_range: reader_added failed: {:?}", e);
+                    None
+                }
             }
-        }
-        // Publish the snapshot immediately so `.stats` reflects the elevated
-        // piece priorities while this read is in progress.  Without
-        // this, `publish_snapshot` only runs in the engine loop between
-        // commands — but this handler blocks the engine thread until the read
-        // completes, by which point `release_reader` has already reset all
-        // priorities to 0, so `.stats` always saw an all-`[]` Pieces grid.
+        };
+        read.reader_id = reader_id;
         self.publish_snapshot();
 
-        // ── Switch to download mode ────────────────────────────────────
-        // The handle was created in upload_mode (connect, never request). The
-        // reader_added call above has already applied the piece priority
-        // gradient; clearing upload_mode now lets libtorrent start requesting
-        // those pieces from the peers it is already connected to.
+        // Switch to download mode: the gradient above is already applied, so
+        // clearing upload_mode lets libtorrent start requesting those pieces
+        // from the peers it is already connected to.
         {
-            let handle = self
-                .handles
-                .get(&info_hash)
-                .ok_or_else(|| Self::missing())?;
+            let handle = match self.handles.get(&read.info_hash) {
+                Some(h) => h,
+                None => return Some(Err(Self::missing())),
+            };
             if !handle.unset_flags(UPLOAD_MODE_FLAG) {
                 tracing::warn!(
                     "read_file_range: failed to clear upload_mode for {}",
-                    info_hash
+                    read.info_hash
                 );
             }
         }
-
-        // publish the snapshot after switching to download mode so
-        // `.stats` reflects the state change immediately. Without this, the
-        // snapshot published at reader_added (line 822) is the last refresh
-        // before the engine blocks in the peer-wait / piece-wait loops —
-        // `.stats` shows stale Peers: 0 / Seeds: 0 even after peers connect.
         self.publish_snapshot();
 
-        // Settle sleep for libtorrent state transitions.
-        std::thread::sleep(Duration::from_millis(100));
-
-        // ── Slow path: peer discovery + piece-wait ─────────────────────
-        // We no longer fail fast with `NoPeers` after the peer-wait probe:
-        // falling through to the piece-wait loop lets cold torrents wait
-        // peer-wait(≤9s) + piece-wait(read_timeout_secs) for peers that appear
-        // late (cost: engine-thread reads serialize up to read_timeout each).
         // With zero connected peers/seeds, kick the swarm immediately: after a
         // delete + re-add the fresh handle's first announce can land outside
         // the tracker's min-interval, timing out an otherwise-healthy read.
-        //
-        // Set when the peer-wait loop below runs its full window without a
-        // peer or seeder connecting.  A sourceless read then fails fast in the
-        // piece-wait loop ([`NO_SEEDER_FAST_FAIL_SECS`]) instead of spending
-        // [`NO_SEEDER_READ_TIMEOUT_SECS`] more on a seeder the probe already
-        // proved cannot arrive.
-        let mut is_peer_wait_exhausted = false;
-        // Track the actual peer-discovery wait (≤ PEER_WAIT_CAP_SECS) so the
-        // NoPeers message reports it even when the piece-wait fast-fails at 0s.
-        let mut peer_wait_elapsed = Duration::from_secs(0);
-        {
-            let handle = self
-                .handles
-                .get(&info_hash)
-                .ok_or_else(|| Self::missing())?;
-            if status.num_peers == 0 && status.num_seeds == 0 {
-                if !handle.force_reannounce() {
-                    tracing::debug!(
-                        "read_file_range {}: force_reannounce rejected (non-fatal)",
-                        info_hash
-                    );
-                }
-                let peer_wait_start = Instant::now();
-                let peer_wait_timeout =
-                    Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
-                let mut reannounced_mid_wait = false;
-                loop {
-                    if self.stopping.load(Ordering::Relaxed) {
-                        self.release_reader(&info_hash);
-                        return Err(TorrentError::Timeout(
-                            "shutdown requested, read aborted".to_string(),
-                        ));
-                    }
-                    if peer_wait_start.elapsed() >= peer_wait_timeout {
-                        // Final status refresh before declaring the swarm
-                        // empty: a peer or seeder that connected during the
-                        // last poll window must not be treated as absent.  A
-                        // late leecher (`num_peers > 0, num_seeds == 0`) still
-                        // gets the regular no-seeder piece-wait window instead
-                        // of a zero-second `NoPeers`.
-                        match handle.status() {
-                            Ok(s) => {
-                                status = s;
-                                self.publish_snapshot();
-                                is_peer_wait_exhausted =
-                                    swarm_is_empty(status.num_peers, status.num_seeds);
-                            }
-                            Err(e) => {
-                                self.release_reader(&info_hash);
-                                return Err(e);
-                            }
-                        }
-                        break;
-                    }
-                    std::thread::sleep(PEER_WAIT_POLL_INTERVAL);
-                    // also refresh session stats so the global
-                    // `Connected:` counter (SharedSessionStats) stays
-                    // fresh during the blocked read.
-                    self.refresh_session_stats();
-                    match handle.status() {
-                        Ok(s) => {
-                            status = s;
-                            // refresh the shared snapshot so
-                            // `.stats` shows peers/seeds as they connect
-                            // during the peer-wait phase. Without this,
-                            // the snapshot stays stale from the upload_mode
-                            // publish above, and `.stats` shows Peers: 0
-                            // / Seeds: 0 even while peers are connected.
-                            self.publish_snapshot();
-                            if status.num_peers > 0 || status.num_seeds > 0 {
-                                break;
-                            }
-                        }
-                        // `handle.status()` failed — return
-                        // the actual error instead of masking it behind a
-                        // misleading "no seeder" message.
-                        Err(e) => {
-                            self.release_reader(&info_hash);
-                            return Err(e);
-                        }
-                    }
-                    // Half the peer-wait budget gone and still nobody
-                    // connected — force one more announce before the piece
-                    // deadline path takes over.
-                    if !reannounced_mid_wait && peer_wait_start.elapsed() >= peer_wait_timeout / 2 {
-                        reannounced_mid_wait = true;
-                        handle.force_reannounce();
-                    }
-                }
-                peer_wait_elapsed = peer_wait_start.elapsed();
+        if swarm_is_empty(read.status.num_peers, read.status.num_seeds) {
+            self.enter_peer_wait(read);
+        } else {
+            self.enter_piece_wait(read);
+        }
+        None
+    }
+
+    /// Park a read in the peer-discovery phase: the swarm looked empty, so kick
+    /// an immediate re-announce and give peers a bounded window to appear.
+    fn enter_peer_wait(&mut self, read: &mut PendingRead) {
+        if let Some(handle) = self.handles.get(&read.info_hash) {
+            if !handle.force_reannounce() {
+                tracing::debug!(
+                    "read_file_range {}: force_reannounce rejected (non-fatal)",
+                    read.info_hash
+                );
             }
         }
+        read.phase = ReadPhase::PeerWait;
+        read.phase_start = Instant::now();
+        read.phase_deadline = read.phase_start
+            + Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
+        read.reannounced_mid_wait = false;
+    }
 
-        // ── Set piece deadlines ────────────────────────────────────────
-        // `have_piece` can be stale (true but file purged or truncated).
-        // Only skip the deadline for pieces that are truly available —
-        // `have_piece` true AND the file on disk reaches the expected size.
-        // Stale pieces still need a deadline so libtorrent re-requests them.
-        {
-            let handle = self
-                .handles
-                .get(&info_hash)
-                .ok_or_else(|| Self::missing())?;
-            for piece_idx in start_piece..=end_piece {
-                let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
+    /// Park a read in the piece-wait phase: set piece deadlines for every piece
+    /// not truly available, then wait for them to arrive.
+    fn enter_piece_wait(&mut self, read: &mut PendingRead) {
+        // `have_piece` can be stale (true but file purged or truncated).  Only
+        // skip the deadline for pieces that are truly available — `have_piece`
+        // true AND the file on disk reaches the expected size.  Stale pieces
+        // still need a deadline so libtorrent re-requests them.
+        if let Some(handle) = self.handles.get(&read.info_hash) {
+            for piece_idx in read.start_piece..=read.end_piece {
+                let piece_key = PieceStore::piece_key(&read.info_hash, piece_idx);
                 let expected = PieceStore::expected_piece_size(
                     piece_idx,
-                    piece_length,
-                    num_pieces,
-                    total_size,
+                    read.piece_length,
+                    read.num_pieces,
+                    read.total_size,
                 );
                 let truly_available = handle.have_piece(piece_idx)
                     && !self.store.has_stale_piece(&piece_key, expected);
@@ -1238,214 +1396,405 @@ impl EngineState {
                 }
             }
         }
+        read.has_seeder = read.status.num_seeds > 0;
+        read.piece_wait_start = Instant::now();
+        read.phase = ReadPhase::PieceWait;
+    }
 
-        // ── Wait for each missing piece ────────────────────────────────
-        // the deadline is shared across ALL pieces in the range — the window
-        // bounds the whole read, not each piece.  A read with a connected
-        // seeder uses the full `read_timeout_secs` (a slow-but-present seeder
-        // may still finish), keeping `read_wait_budget_secs()` in lockstep
-        // with the engine's worst-case wait.  A read with no connected seeder
-        // (`num_seeds == 0`) can never be served, so it uses the short
-        // [`NO_SEEDER_READ_TIMEOUT_SECS`] window and fails fast with `NoPeers`
-        // instead of blocking the engine thread for the full timeout — which
-        // would serialize every other read/write on the mount behind it.  Once
-        // peer discovery elapsed with no seeder, that window collapses to zero
-        // ([`NO_SEEDER_FAST_FAIL_SECS`]): the probe proved the read is
-        // sourceless, so any further wait only re-blocks the engine thread.  A
-        // seeder that connects mid-wait upgrades the window back to the full
-        // timeout, so a late-connecting cold-torrent seeder is still served.
-        let mut piece_wait_start = Instant::now();
-        let mut has_seeder = status.num_seeds > 0;
-        for piece_idx in start_piece..=end_piece {
-            loop {
-                if self.stopping.load(Ordering::Relaxed) {
-                    self.release_reader(&info_hash);
-                    return Err(TorrentError::Timeout(
-                        "shutdown requested, read aborted".to_string(),
-                    ));
-                }
+    /// Poll one parked read by a single step.  Returns `Some(result)` when the
+    /// read terminates here (success, short read, or error); `None` keeps it
+    /// parked for the next iteration.
+    fn poll_read(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        if !self.handles.contains_key(&read.info_hash) {
+            return Some(Err(Self::missing()));
+        }
+        match read.phase {
+            ReadPhase::WaitState => self.poll_wait_state(read),
+            ReadPhase::Recheck => self.poll_recheck(read),
+            ReadPhase::PeerWait => self.poll_peer_wait(read),
+            ReadPhase::PieceWait => self.poll_piece_wait(read),
+        }
+    }
 
-                let have = self
-                    .handles
-                    .get(&info_hash)
-                    .map(|h| h.have_piece(piece_idx))
-                    .unwrap_or(false);
-                // `have_piece` can be stale (resume state marks the
-                // piece as complete, but the file was purged or truncated).
-                // In that case, do not treat it as ready — instead, fall
-                // through to the download path so libtorrent re-requests
-                // the piece.
-                let have_valid = if have {
-                    let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
-                    let expected = PieceStore::expected_piece_size(
-                        piece_idx,
-                        piece_length,
-                        num_pieces,
-                        total_size,
-                    );
-                    !self.store.has_stale_piece(&piece_key, expected)
+    /// Poll a read waiting for the torrent to leave a checking/allocating
+    /// state.
+    fn poll_wait_state(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Some(Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            )));
+        }
+        let max_wait_secs = self.read_timeout_secs;
+        if read.phase_start.elapsed().as_secs() > max_wait_secs {
+            return Some(Err(TorrentError::Timeout(format!(
+                "Torrent stuck in state {:?} for {} seconds",
+                read.status.state, max_wait_secs
+            ))));
+        }
+        let status = self.handles.get(&read.info_hash).map(|h| h.status());
+        match status {
+            Some(Ok(s)) => {
+                let is_settling = is_settling_state(s.state);
+                read.status = s;
+                if is_settling {
+                    None
                 } else {
-                    false
-                };
-                let cached = {
-                    let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
-                    let cache = self.store.cache_manager();
-                    cache
-                        .lock()
-                        .map(|c| {
-                            PieceStore::is_piece_complete_in_cache(
-                                &c,
-                                &piece_key,
-                                piece_idx,
-                                piece_length,
-                                num_pieces,
-                                total_size,
-                            )
-                        })
-                        .unwrap_or(false)
-                };
-                self.metrics.record_poll(have_valid || cached);
-                if have_valid || cached {
-                    if have_valid {
-                        self.register_piece(
-                            &info_hash,
-                            piece_idx,
-                            piece_length,
-                            num_pieces,
-                            total_size,
-                        );
-                    }
-                    break;
+                    self.after_settling(read)
                 }
-
-                // A late-connecting seeder upgrades the wait window from the
-                // short no-seeder timeout to the full read timeout.  The window
-                // restarts from the connect time, so a seeder that arrives at
-                // the end of the short window still gets a full
-                // `read_timeout_secs` rather than its leftover sliver.
-                if !has_seeder {
-                    if let Some(s) = self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
-                        if s.num_seeds > 0 {
-                            has_seeder = true;
-                            piece_wait_start = Instant::now();
-                        }
-                    }
-                }
-                let piece_wait_timeout = Duration::from_secs(piece_wait_window_secs(
-                    has_seeder,
-                    is_peer_wait_exhausted,
-                    self.read_timeout_secs,
-                ));
-
-                if piece_wait_start.elapsed() >= piece_wait_timeout {
-                    // The piece-wait window expired, but libtorrent's custom
-                    // storage may have already written partial piece data to
-                    // disk for the requested range. Record it as incomplete
-                    // metadata so `.stats` reflects the download progress the
-                    // failed read actually made — regardless of whether we
-                    // return a completed prefix or an error below.
-                    self.register_incomplete_on_disk_pieces(&info_hash, start_piece, end_piece);
-
-                    // Instead of empty (ENODATA) after the piece-wait window,
-                    // return the contiguous prefix of completed pieces. The loop
-                    // advances `piece_idx` in order, so every piece before it is
-                    // complete (`piece_idx` is the first missing one); returning
-                    // that prefix as a short read gives visible progress instead
-                    // of 0 bytes the client can't tell from EOF.
-                    if let Some((partial_end, partial_size)) = partial_read_bounds(
-                        start_piece,
-                        piece_idx - 1,
-                        piece_length,
-                        absolute_offset,
-                        end_offset,
-                    ) {
-                        let result = self.read_from_disk(
-                            &info_hash,
-                            start_piece,
-                            piece_idx - 1,
-                            piece_length,
-                            num_pieces,
-                            total_size,
-                            absolute_offset,
-                            partial_end,
-                            partial_size,
-                        );
-                        self.release_reader(&info_hash);
-                        return result;
-                    }
-
-                    self.release_reader(&info_hash);
-                    // On piece-wait timeout, distinguish "no seeder" from "slow
-                    // download": zero connected seeders → `NoPeers`; seeders
-                    // present but slow → `Timeout` (both map to ENODATA at FUSE).
-                    // If status is unavailable (handle gone, status() failed),
-                    // fall back to `Timeout` — don't fabricate a zero-seeder
-                    // swarm and mislead the user into checking tracker health
-                    // for a stale handle.
-                    let (progress, num_peers, num_seeds) =
-                        match self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
-                            Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
-                            None => {
-                                return Err(TorrentError::Timeout(format!(
-                                    "Timed out waiting for piece {} after {:.0}s \
-                                 (status unavailable)",
-                                    piece_idx,
-                                    piece_wait_timeout.as_secs(),
-                                )));
-                            }
-                        };
-                    if num_seeds == 0 {
-                        // A zero-seeder read has no seeder to serve it, unlike
-                        // the `Timeout` branch below. Write a one-line hint to
-                        // the daemon's own stderr (operator-facing; FUSE has no
-                        // channel into the client's stderr) via a direct,
-                        // non-panicking write: `eprintln!` panics on a broken
-                        // stderr (aborting this thread), and `tracing` writes
-                        // to stdout, not stderr.
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "{}",
-                            no_seeder_stderr_hint(num_peers, num_seeds, had_truncated_piece)
-                        );
-                        return Err(TorrentError::NoPeers(no_peers_message(
-                            &info_hash,
-                            peer_wait_elapsed.as_secs(),
-                            piece_wait_timeout.as_secs(),
-                            had_truncated_piece,
-                        )));
-                    }
-                    return Err(TorrentError::Timeout(format!(
-                        "Timed out waiting for piece {} after {:.0}s. \
-                         Torrent progress: {:.2}%",
-                        piece_idx,
-                        piece_wait_timeout.as_secs(),
-                        progress,
-                    )));
-                }
-
-                // Refresh the snapshot so `.stats` shows pieces becoming
-                // cached and priority changes during long reads.
-                self.publish_snapshot();
-                // refresh session stats for global counters.
-                self.refresh_session_stats();
-
-                std::thread::sleep(Duration::from_millis(200));
             }
+            // A failed status read keeps the last known state, as the inline
+            // wait loop did.
+            _ => None,
+        }
+    }
+
+    /// Poll a read waiting for a `force_recheck` to finish.  Falls through to
+    /// the normal slow path once the recheck completes (or its cap elapses) —
+    /// the recheck only clears stale bits; the read still has to fetch the
+    /// piece.
+    fn poll_recheck(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Some(Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            )));
+        }
+        if Instant::now() >= read.phase_deadline {
+            tracing::warn!(
+                "force_recheck did not finish within {:?} for info_hash={}",
+                read.phase_deadline
+                    .saturating_duration_since(read.phase_start),
+                read.info_hash
+            );
+            return self.begin_waiting(read);
+        }
+        let status = self.handles.get(&read.info_hash).map(|h| h.status());
+        match status {
+            Some(Ok(s)) => {
+                if is_settling_state(s.state) {
+                    read.saw_checking = true;
+                    None
+                } else if read.saw_checking {
+                    // We observed the checking state and it has now ended — the
+                    // recheck is truly complete.
+                    self.begin_waiting(read)
+                } else if read.phase_start.elapsed() > Duration::from_secs(2) {
+                    // No checking state observed after 2s — the recheck may
+                    // have completed instantly (unlikely) or failed to start.
+                    // Fall through; the safety nets in `all_pieces_local` and
+                    // the piece wait catch any remaining stale bits.
+                    tracing::warn!(
+                        "force_recheck: no checking state observed for \
+                         info_hash={} after 2s, proceeding",
+                        read.info_hash
+                    );
+                    self.begin_waiting(read)
+                } else {
+                    None
+                }
+            }
+            // `status()` failed — proceed, as the inline wait did.
+            _ => self.begin_waiting(read),
+        }
+    }
+
+    /// Poll a read probing an empty-looking swarm for a peer or seeder.
+    fn poll_peer_wait(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Some(Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            )));
         }
 
-        let result = self.read_from_disk(
-            &info_hash,
-            start_piece,
-            end_piece,
-            piece_length,
-            num_pieces,
-            total_size,
-            absolute_offset,
-            end_offset,
-            size,
-        );
-        self.release_reader(&info_hash);
-        result
+        if Instant::now() >= read.phase_deadline {
+            // Final status refresh before declaring the swarm empty: a peer or
+            // seeder that connected during the last poll window must not be
+            // treated as absent.  A late leecher (`num_peers > 0, num_seeds ==
+            // 0`) still gets the regular no-seeder piece-wait window instead of
+            // a zero-second `NoPeers`.
+            match self.handles.get(&read.info_hash).map(|h| h.status()) {
+                Some(Ok(s)) => {
+                    read.is_peer_wait_exhausted = swarm_is_empty(s.num_peers, s.num_seeds);
+                    read.status = s;
+                    self.publish_snapshot();
+                }
+                Some(Err(e)) => return Some(Err(e)),
+                None => return Some(Err(Self::missing())),
+            }
+            read.peer_wait_elapsed = Instant::now().saturating_duration_since(read.phase_start);
+            self.enter_piece_wait(read);
+            return None;
+        }
+
+        // Keep the global `Connected:` counter fresh while the read is parked.
+        self.refresh_session_stats();
+        let status = self.handles.get(&read.info_hash).map(|h| h.status());
+        match status {
+            Some(Ok(s)) => {
+                let has_swarm = s.num_peers > 0 || s.num_seeds > 0;
+                read.status = s;
+                // Refresh the shared snapshot so `.stats` shows peers/seeds as
+                // they connect during the peer-wait phase.
+                self.publish_snapshot();
+                if has_swarm {
+                    read.peer_wait_elapsed =
+                        Instant::now().saturating_duration_since(read.phase_start);
+                    self.enter_piece_wait(read);
+                    return None;
+                }
+            }
+            Some(Err(e)) => return Some(Err(e)),
+            None => return Some(Err(Self::missing())),
+        }
+
+        // Half the peer-wait budget gone and still nobody connected — force one
+        // more announce before the piece deadline path takes over.
+        let window = read
+            .phase_deadline
+            .saturating_duration_since(read.phase_start);
+        if !read.reannounced_mid_wait && read.phase_start.elapsed() >= window / 2 {
+            read.reannounced_mid_wait = true;
+            if let Some(handle) = self.handles.get(&read.info_hash) {
+                handle.force_reannounce();
+            }
+        }
+        None
+    }
+
+    /// Poll a read waiting for its pieces to arrive.
+    fn poll_piece_wait(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
+        if self.stopping.load(Ordering::Relaxed) {
+            return Some(Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            )));
+        }
+
+        // Consume every piece that has become available, then wait on the first
+        // one that has not — the old inline inner loop, minus the sleep on the
+        // engine thread.
+        loop {
+            let piece_idx = read.current_piece;
+            if piece_idx > read.end_piece {
+                return Some(self.read_from_disk(
+                    &read.info_hash,
+                    read.start_piece,
+                    read.end_piece,
+                    read.piece_length,
+                    read.num_pieces,
+                    read.total_size,
+                    read.absolute_offset,
+                    read.end_offset,
+                    read.size,
+                ));
+            }
+
+            let have = self
+                .handles
+                .get(&read.info_hash)
+                .map(|h| h.have_piece(piece_idx))
+                .unwrap_or(false);
+            // `have_piece` can be stale (resume state marks the piece complete,
+            // but the file was purged or truncated); in that case do not treat
+            // it as ready — fall through to the download path so libtorrent
+            // re-requests the piece.
+            let have_valid = if have {
+                let piece_key = PieceStore::piece_key(&read.info_hash, piece_idx);
+                let expected = PieceStore::expected_piece_size(
+                    piece_idx,
+                    read.piece_length,
+                    read.num_pieces,
+                    read.total_size,
+                );
+                !self.store.has_stale_piece(&piece_key, expected)
+            } else {
+                false
+            };
+            let cached = {
+                let piece_key = PieceStore::piece_key(&read.info_hash, piece_idx);
+                let cache = self.store.cache_manager();
+                cache
+                    .lock()
+                    .map(|c| {
+                        PieceStore::is_piece_complete_in_cache(
+                            &c,
+                            &piece_key,
+                            piece_idx,
+                            read.piece_length,
+                            read.num_pieces,
+                            read.total_size,
+                        )
+                    })
+                    .unwrap_or(false)
+            };
+            self.metrics.record_poll(have_valid || cached);
+            if have_valid || cached {
+                if have_valid {
+                    self.register_piece(
+                        &read.info_hash,
+                        piece_idx,
+                        read.piece_length,
+                        read.num_pieces,
+                        read.total_size,
+                    );
+                }
+                read.current_piece += 1;
+                continue;
+            }
+
+            // A late-connecting seeder upgrades the wait window from the short
+            // no-seeder timeout to the full read timeout.  The window restarts
+            // from the connect time, so a seeder that arrives at the end of the
+            // short window still gets a full `read_timeout_secs` rather than
+            // its leftover sliver.
+            if !read.has_seeder {
+                if let Some(s) = self
+                    .handles
+                    .get(&read.info_hash)
+                    .and_then(|h| h.status().ok())
+                {
+                    if s.num_seeds > 0 {
+                        read.has_seeder = true;
+                        read.piece_wait_start = Instant::now();
+                        read.status = s;
+                    }
+                }
+            }
+            let window = Duration::from_secs(piece_wait_window_secs(
+                read.has_seeder,
+                read.is_peer_wait_exhausted,
+                self.read_timeout_secs,
+            ));
+            if read.piece_wait_start.elapsed() >= window {
+                return Some(self.read_timed_out(read, piece_idx, window));
+            }
+            return None;
+        }
+    }
+
+    /// Resolve a read whose piece-wait window elapsed: return the contiguous
+    /// prefix of completed pieces when there is one, otherwise the
+    /// `NoPeers`/`Timeout` error that distinguishes "no seeder" from "slow".
+    fn read_timed_out(
+        &mut self,
+        read: &PendingRead,
+        piece_idx: i32,
+        window: Duration,
+    ) -> TorrentResult<Vec<u8>> {
+        // libtorrent's custom storage may have already written partial piece
+        // data to disk for the requested range.  Record it as incomplete
+        // metadata so `.stats` reflects the download progress the failed read
+        // actually made.
+        self.register_incomplete_on_disk_pieces(&read.info_hash, read.start_piece, read.end_piece);
+
+        // Instead of empty (ENODATA) after the window, return the contiguous
+        // prefix of completed pieces.  `current_piece` advances in order, so
+        // every piece before `piece_idx` is complete (it is the first missing
+        // one); returning that prefix as a short read gives visible progress
+        // instead of 0 bytes the client can't tell from EOF.
+        if let Some((partial_end, partial_size)) = partial_read_bounds(
+            read.start_piece,
+            piece_idx - 1,
+            read.piece_length,
+            read.absolute_offset,
+            read.end_offset,
+        ) {
+            return self.read_from_disk(
+                &read.info_hash,
+                read.start_piece,
+                piece_idx - 1,
+                read.piece_length,
+                read.num_pieces,
+                read.total_size,
+                read.absolute_offset,
+                partial_end,
+                partial_size,
+            );
+        }
+
+        // Distinguish "no seeder" from "slow download": zero connected seeders
+        // → `NoPeers`; seeders present but slow → `Timeout`.  If status is
+        // unavailable (handle gone, `status()` failed), fall back to `Timeout`
+        // — don't fabricate a zero-seeder swarm and mislead the user into
+        // checking tracker health for a stale handle.
+        let (progress, num_peers, num_seeds) = match self
+            .handles
+            .get(&read.info_hash)
+            .and_then(|h| h.status().ok())
+        {
+            Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
+            None => {
+                return Err(TorrentError::Timeout(format!(
+                    "Timed out waiting for piece {} after {:.0}s \
+                         (status unavailable)",
+                    piece_idx,
+                    window.as_secs(),
+                )));
+            }
+        };
+        if num_seeds == 0 {
+            // A zero-seeder read has no seeder to serve it.  Write a one-line
+            // hint to the daemon's own stderr (operator-facing; FUSE has no
+            // channel into the client's stderr) via a direct, non-panicking
+            // write: `eprintln!` panics on a broken stderr (aborting this
+            // thread), and `tracing` writes to stdout, not stderr.
+            let _ = writeln!(
+                std::io::stderr(),
+                "{}",
+                no_seeder_stderr_hint(num_peers, num_seeds, read.had_truncated_piece)
+            );
+            return Err(TorrentError::NoPeers(no_peers_message(
+                &read.info_hash,
+                read.peer_wait_elapsed.as_secs(),
+                window.as_secs(),
+                read.had_truncated_piece,
+            )));
+        }
+        Err(TorrentError::Timeout(format!(
+            "Timed out waiting for piece {} after {:.0}s. \
+             Torrent progress: {:.2}%",
+            piece_idx,
+            window.as_secs(),
+            progress,
+        )))
+    }
+
+    /// Advance every parked read by one step, resolving (and removing) the ones
+    /// that terminated.
+    fn poll_pending_reads(&mut self) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        let parked = std::mem::take(&mut self.pending_reads);
+        let mut remaining = Vec::with_capacity(parked.len());
+        for mut read in parked {
+            match self.poll_read(&mut read) {
+                Some(result) => self.finish_read(&read, result),
+                None => remaining.push(read),
+            }
+        }
+        self.pending_reads = remaining;
+    }
+
+    /// Deliver a parked read's final result and, when the reader priority
+    /// gradient was applied, release exactly that reader.
+    fn finish_read(&mut self, read: &PendingRead, result: TorrentResult<Vec<u8>>) {
+        if let Some(id) = read.reader_id {
+            self.release_reader(&read.info_hash, id);
+        }
+        let _ = read.reply.send(result);
+    }
+
+    /// Resolve every parked read with a shutdown abort.  Called as the engine
+    /// loop exits so a blocked caller sees a timeout, not a bare channel
+    /// disconnect.
+    fn abort_pending_reads(&mut self) {
+        for read in std::mem::take(&mut self.pending_reads) {
+            self.finish_read(
+                &read,
+                Err(TorrentError::Timeout(
+                    "shutdown requested, read aborted".to_string(),
+                )),
+            );
+        }
     }
 
     fn all_pieces_local(
@@ -1534,81 +1883,6 @@ impl EngineState {
             }
         }
         false
-    }
-
-    /// force libtorrent to re-verify all pieces for a torrent and
-    /// wait for the recheck to complete (or time out).  After `force_recheck`,
-    /// libtorrent transitions through `CheckingFiles` and, via the custom
-    /// storage's `async_check_files`, discovers that purged pieces are gone
-    /// — clearing their `have_piece` bits so the normal download path can
-    /// re-request them.
-    fn force_recheck_and_wait(&self, info_hash: &str) {
-        let handle = match self.handles.get(info_hash) {
-            Some(h) => h,
-            None => return,
-        };
-        if !handle.force_recheck() {
-            tracing::warn!(
-                "force_recheck failed for info_hash={}; stale bits may persist",
-                info_hash
-            );
-            return;
-        }
-        // Wait for the recheck to finish. Two subtleties: (1) TOCTOU —
-        // `force_recheck()` is async, so without a grace period the first
-        // `status()` may see the old state and conclude "done" with stale bits
-        // intact; sleep a grace period, then only return after observing the
-        // transition OUT of a checking state. (2) A 200ms poll keeps syscall
-        // overhead low while recheck latency (<1s) stays acceptable.
-        let max_wait =
-            Duration::from_secs(std::cmp::min(self.read_timeout_secs, RECHECK_WAIT_CAP_SECS));
-        let start = Instant::now();
-
-        // Grace period: let libtorrent queue the recheck before polling.
-        std::thread::sleep(Duration::from_millis(200));
-
-        let mut saw_checking = false;
-        while start.elapsed() < max_wait {
-            if self.stopping.load(Ordering::Relaxed) {
-                return;
-            }
-            match handle.status() {
-                Ok(s) => {
-                    let is_checking = matches!(
-                        s.state,
-                        TorrentState::QueuedForChecking
-                            | TorrentState::CheckingFiles
-                            | TorrentState::CheckingResumeData
-                    );
-                    if is_checking {
-                        saw_checking = true;
-                    } else if saw_checking {
-                        // We observed the checking state and it has now
-                        // ended — the recheck is truly complete.
-                        return;
-                    } else if start.elapsed() > Duration::from_secs(2) {
-                        // No checking state observed after 2s — the recheck
-                        // may have completed instantly (unlikely but
-                        // possible) or failed to start.  Fall through; the
-                        // safety nets in all_pieces_local and the piece-wait
-                        // loop will catch any remaining stale bits.
-                        tracing::warn!(
-                            "force_recheck: no checking state observed for \
-                             info_hash={} after 2s, proceeding",
-                            info_hash
-                        );
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        tracing::warn!(
-            "force_recheck did not finish within {:?} for info_hash={}",
-            max_wait,
-            info_hash
-        );
     }
 
     fn read_from_disk(
@@ -1757,10 +2031,10 @@ impl EngineState {
             .register_incomplete_pieces_in_range(info_hash, start_piece, end_piece);
     }
 
-    fn release_reader(&mut self, info_hash: &str) {
+    fn release_reader(&mut self, info_hash: &str, id: ReadId) {
         if let Some(handle) = self.handles.get(info_hash) {
             self.scheduler
-                .reader_released(handle, info_hash, &self.store);
+                .reader_released(handle, info_hash, id, &self.store);
         }
         // Restore idle upload_mode when the reader count and the wanted set
         // both reach zero. `reader_released` is infallible, so this decision
