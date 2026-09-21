@@ -519,13 +519,53 @@ fn swarm_is_empty(num_peers: i32, num_seeds: i32) -> bool {
 /// so it says "no seeder connected", not "no seeder ever connected".  The
 /// daemon writes the line to its own stderr (operator-facing; a FUSE daemon
 /// has no channel into the reading client's stderr), letting the operator
-/// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`).  Pure so the
-/// exact message is unit-testable without a running engine.
-pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
-    format!(
-        "no seeder connected (Peers:{} Seeds:{})",
-        num_peers, num_seeds
-    )
+/// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`).  `truncated`
+/// marks the stale-piece path (a cached piece was purged or truncated and
+/// needed re-download), so "truncated + no seeder" is distinguishable from a
+/// plain cold read with no seeder.  Pure so the exact message is
+/// unit-testable without a running engine.
+pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32, truncated: bool) -> String {
+    if truncated {
+        format!(
+            "no seeder connected (Peers:{} Seeds:{}, truncated piece re-download)",
+            num_peers, num_seeds
+        )
+    } else {
+        format!(
+            "no seeder connected (Peers:{} Seeds:{})",
+            num_peers, num_seeds
+        )
+    }
+}
+
+/// Format the `NoPeers` error returned when a piece-wait expires with zero
+/// connected seeders.  `truncated` distinguishes the two failure contexts the
+/// operator must tell apart: a plain cold read that simply has no seeder, vs.
+/// a read that began with a truncated/purged cached piece whose re-download
+/// (`force_recheck`) needs a seeder that is absent — the file cannot self-heal.
+/// Pure so the exact message is unit-testable without a running engine.
+pub(crate) fn no_peers_message(
+    info_hash: &str,
+    peer_wait_secs: u64,
+    piece_wait_secs: u64,
+    truncated: bool,
+) -> String {
+    if truncated {
+        format!(
+            "No seeder connected for info_hash {info_hash} after {:.0}s \
+             peer discovery + {:.0}s piece wait. A truncated piece needs \
+             re-download, but the torrent has no available seeder — the file \
+             cannot self-heal until a seeder connects.",
+            peer_wait_secs, piece_wait_secs
+        )
+    } else {
+        format!(
+            "No seeder connected for info_hash {info_hash} after {:.0}s \
+             peer discovery + {:.0}s piece wait. The torrent has no available \
+             seeder — check tracker health or try again later.",
+            peer_wait_secs, piece_wait_secs
+        )
+    }
 }
 
 /// Compute the partial-read bounds when the piece-wait window elapses. The
@@ -967,15 +1007,18 @@ impl EngineState {
         // `have_piece == true` but the on-disk file is missing or shorter
         // than the expected piece size (purge or truncation), `force_recheck`
         // clears the stale bit (via the custom storage) and we wait for the
-        // recheck.
-        if self.has_stale_pieces(
+        // recheck. Keep the flag so a later `NoPeers` failure can say
+        // "truncated piece needs re-download" rather than a plain
+        // "no seeder" — the operator must tell the two apart.
+        let had_truncated_piece = self.has_stale_pieces(
             &info_hash,
             start_piece,
             end_piece,
             piece_length,
             num_pieces,
             total_size,
-        ) {
+        );
+        if had_truncated_piece {
             tracing::info!(
                 "read_file_range: stale libtorrent piece state detected for \
                  info_hash={}, forcing recheck to clear bits for pieces {}-{}",
@@ -1355,16 +1398,13 @@ impl EngineState {
                         let _ = writeln!(
                             std::io::stderr(),
                             "{}",
-                            no_seeder_stderr_hint(num_peers, num_seeds)
+                            no_seeder_stderr_hint(num_peers, num_seeds, had_truncated_piece)
                         );
-                        return Err(TorrentError::NoPeers(format!(
-                            "No seeder connected for info_hash {} after {:.0}s \
-                             peer discovery + {:.0}s piece wait. The torrent \
-                             has no available seeder — check tracker health or \
-                             try again later.",
-                            info_hash,
+                        return Err(TorrentError::NoPeers(no_peers_message(
+                            &info_hash,
                             peer_wait_elapsed.as_secs(),
                             piece_wait_timeout.as_secs(),
+                            had_truncated_piece,
                         )));
                     }
                     return Err(TorrentError::Timeout(format!(
@@ -1899,8 +1939,9 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        no_seeder_stderr_hint, partial_read_bounds, piece_wait_window_secs, read_wait_budget_secs,
-        swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
+        no_peers_message, no_seeder_stderr_hint, partial_read_bounds, piece_wait_window_secs,
+        read_wait_budget_secs, swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS,
+        NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
 
@@ -1911,14 +1952,35 @@ mod tests {
     #[test]
     fn no_seeder_hint_reports_live_counts() {
         assert_eq!(
-            no_seeder_stderr_hint(0, 0),
+            no_seeder_stderr_hint(0, 0, false),
             "no seeder connected (Peers:0 Seeds:0)"
         );
         // Peers may be non-zero (leechers without the piece) while seeds stay 0.
         assert_eq!(
-            no_seeder_stderr_hint(3, 0),
+            no_seeder_stderr_hint(3, 0, false),
             "no seeder connected (Peers:3 Seeds:0)"
         );
+        // The truncated stale-piece path appends a marker so the operator can
+        // tell "truncated + no seeder" apart from a plain no-seeder read.
+        assert_eq!(
+            no_seeder_stderr_hint(0, 0, true),
+            "no seeder connected (Peers:0 Seeds:0, truncated piece re-download)"
+        );
+    }
+
+    /// the `NoPeers` message must distinguish a plain cold read with no seeder
+    /// from a truncated/purged piece whose re-download needs a seeder that is
+    /// absent — the two failure contexts a reader can't otherwise tell apart
+    /// from the bare `ENODATA` the FUSE layer returns.
+    #[test]
+    fn no_peers_message_distinguishes_truncated_context() {
+        let plain = no_peers_message("abc", 9, 0, false);
+        let truncated = no_peers_message("abc", 9, 0, true);
+        assert!(plain.contains("check tracker health"));
+        assert!(!plain.contains("truncated"));
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.contains("self-heal"));
+        assert_ne!(plain, truncated);
     }
 
     /// the read budget must cover all five synchronous phases —
