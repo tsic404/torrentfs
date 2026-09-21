@@ -726,6 +726,230 @@ fn distinct_torrent(name: &str) -> Vec<u8> {
     t
 }
 
+/// Build a structurally valid multi-piece single-file `.torrent` (4 × 256 KiB
+/// = 1 MiB) with all-zero piece hashes and a caller-chosen `name`.  Distinct
+/// `name`s yield distinct info hashes; zero hashes make a hash-valid piece
+/// impossible, so a no-seeder read on this torrent is deterministic even if a
+/// stray peer connects.
+fn distinct_multipiece_torrent(announce_url: &str, name: &str) -> Vec<u8> {
+    const PIECE_LEN: usize = 256 * 1024;
+    const NUM_PIECES: usize = 4;
+    let total = PIECE_LEN * NUM_PIECES;
+
+    let hashes = vec![0u8; 20 * NUM_PIECES];
+
+    let mut t = Vec::new();
+    t.push(b'd');
+    t.extend_from_slice(b"8:announce");
+    t.extend_from_slice(announce_url.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(announce_url.as_bytes());
+    t.extend_from_slice(b"4:infod");
+    t.extend_from_slice(b"6:lengthi");
+    t.extend_from_slice(total.to_string().as_bytes());
+    t.push(b'e');
+    t.extend_from_slice(format!("4:name{}:{}", name.len(), name).as_bytes());
+    t.extend_from_slice(b"12:piece lengthi");
+    t.extend_from_slice(PIECE_LEN.to_string().as_bytes());
+    t.push(b'e');
+    t.extend_from_slice(b"6:pieces");
+    t.extend_from_slice(hashes.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(&hashes);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// Integration test for the core invariant: a whole-file read (`cat`) on a
+/// no-seeder torrent must not block a healthy (seeded) read on the same
+/// engine.  Before the fix, a no-seeder whole-file read serialized healthy
+/// reads on the single engine thread behind a per-chunk no-seeder window
+/// (observed ~47s for a 4 MiB `cat`).  After the fix, a no-seeder read probes
+/// the empty swarm (≤9s peer-wait) then fails fast with `NoPeers` (0s
+/// piece-wait), so the engine is never occupied for the full read timeout.
+///
+/// Constructed as a dual-torrent scenario on one MiniTracker: a healthy
+/// single-piece torrent served by a real seeder, and a no-seeder multi-piece
+/// torrent (distinct info_hash, all-zero piece hashes, empty swarm) whose
+/// whole-file read must fail fast.  Both reads are issued concurrently; the
+/// healthy read is dispatched first so the single engine thread serves it
+/// immediately (proving it is not serialized behind the no-seeder `cat`).
+#[test]
+fn test_no_seeder_cat_does_not_block_healthy_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
+    // ── One tracker shared by both torrents ────────────────────────────
+    let tracker = common::MiniTracker::start();
+    let announce_url = tracker.announce_url();
+
+    // ── Healthy torrent: single piece, served by a real seeder ────────
+    let (healthy_torrent, healthy_content) =
+        common::create_test_torrent_with_tracker(&announce_url);
+
+    // ── No-seeder torrent: multi-piece, distinct info_hash, empty swarm ─
+    let no_seeder_torrent = distinct_multipiece_torrent(&announce_url, "no-seeder.iso");
+
+    // ── Engine with a distinct listen port (seeder binds 6881) ─────────
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:16886".to_string());
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+
+    let healthy_info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(healthy_torrent.clone())
+            .expect("Failed to parse healthy torrent"),
+    );
+    let no_seeder_info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(no_seeder_torrent.clone())
+            .expect("Failed to parse no-seeder torrent"),
+    );
+
+    // ── Seeder for the healthy torrent (joins OUR tracker's swarm) ─────
+    // Stop flag so the seeder thread is joined (and its default 6881 listen
+    // binding released) at the end of the test, instead of parking forever and
+    // leaking the binding until process exit.
+    let seeder_stop = Arc::new(AtomicBool::new(false));
+    let seeder_handle = {
+        let content = healthy_content.clone();
+        let seeder_torrent = healthy_torrent.clone();
+        let stop = Arc::clone(&seeder_stop);
+        thread::spawn(move || {
+            let seed_dir = tempfile::TempDir::new().expect("Failed to create seed dir");
+            std::fs::write(seed_dir.path().join("final_verification.txt"), &content)
+                .expect("Failed to write seed file");
+            let cfg = common::local_test_config();
+            let mut session =
+                torrentfs::download::Session::new(&cfg).expect("Seeder: failed to create session");
+            let info = torrentfs::TorrentInfo::from_bytes(seeder_torrent)
+                .expect("Seeder: failed to parse torrent");
+            let handle = session
+                .add_torrent(&info, seed_dir.path())
+                .expect("Seeder: failed to add torrent");
+            loop {
+                if let Ok(s) = handle.status() {
+                    if matches!(
+                        s.state,
+                        torrentfs::download::TorrentState::Seeding
+                            | torrentfs::download::TorrentState::Finished
+                    ) {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            // Keep the seeder session alive until the test signals stop.
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+
+    // ── Prime both handles (state transitions out of the measured path) ─
+    engine
+        .ensure_handle(healthy_info.clone())
+        .expect("ensure_handle healthy");
+    engine
+        .ensure_handle(no_seeder_info.clone())
+        .expect("ensure_handle no-seeder");
+
+    // ── Warm the healthy torrent: download + cache its single piece, and
+    // confirm the seeder connection is live (retry transient errors).
+    let healthy_len = healthy_content.len() as u32;
+    {
+        let start = std::time::Instant::now();
+        loop {
+            match engine.read_file_range(healthy_info.clone(), 0, 0, healthy_len) {
+                Ok(data) if data == healthy_content => break,
+                _ => {
+                    if start.elapsed() > Duration::from_secs(60) {
+                        panic!("Timed out warming the healthy torrent");
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    }
+
+    // ── Concurrent reads ───────────────────────────────────────────────
+    // Dispatch the healthy read first (flag + head-start) so the single
+    // engine thread serves it ahead of the no-seeder read; the no-seeder
+    // whole-file read is issued concurrently and must fail fast.
+    let healthy_started = Arc::new(AtomicBool::new(false));
+    let started_flag = Arc::clone(&healthy_started);
+    let engine_healthy = Arc::clone(&engine);
+    let info_healthy = Arc::clone(&healthy_info);
+    let healthy_reader = thread::spawn(move || {
+        started_flag.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        let result = engine_healthy.read_file_range(info_healthy, 0, 0, healthy_len);
+        (start.elapsed(), result)
+    });
+
+    while !healthy_started.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Give the healthy command a head start in the engine's command queue so
+    // it is serviced before the no-seeder read (which then runs concurrently).
+    thread::sleep(Duration::from_millis(200));
+
+    let no_seeder_len = no_seeder_info.total_size() as u32;
+    let engine_no_seeder = Arc::clone(&engine);
+    let info_no_seeder = Arc::clone(&no_seeder_info);
+    let no_seeder_reader = thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let result = engine_no_seeder.read_file_range(info_no_seeder, 0, 0, no_seeder_len);
+        (start.elapsed(), result)
+    });
+
+    let (healthy_elapsed, healthy_result) = healthy_reader.join().expect("healthy reader panicked");
+    let (no_seeder_elapsed, no_seeder_result) =
+        no_seeder_reader.join().expect("no-seeder reader panicked");
+
+    // ── Assertions ─────────────────────────────────────────────────────
+    // The healthy read is served fast (correct data, well under 2s) — it is
+    // not serialized behind the no-seeder `cat`.
+    assert_eq!(
+        healthy_result.expect("healthy read must succeed"),
+        healthy_content,
+        "healthy read returned wrong data"
+    );
+    assert!(
+        healthy_elapsed < Duration::from_secs(2),
+        "healthy read blocked for {:?} behind the no-seeder cat",
+        healthy_elapsed
+    );
+
+    // The no-seeder whole-file read fails fast with `NoPeers` (not the full
+    // read_timeout, not a wrong error type).
+    match no_seeder_result {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {}
+        other => panic!(
+            "expected Err(NoPeers) for the no-seeder whole-file read, got {:?}",
+            other
+        ),
+    }
+    assert!(
+        no_seeder_elapsed < Duration::from_secs(12),
+        "no-seeder whole-file read took {:?}; expected fast NoPeers (≤9s peer-wait)",
+        no_seeder_elapsed
+    );
+
+    // Stop and join the seeder thread so its listen binding is released
+    // before the next test runs (the previous park-forever + detach leaked
+    // the 6881 binding until process exit).
+    seeder_stop.store(true, Ordering::Relaxed);
+    seeder_handle.join().expect("seeder thread panicked");
+    engine.shutdown();
+}
+
 /// Regression test: creating a lightweight handle through the
 /// fire-and-forget `ensure_handle_async` path must not block the caller while
 /// the engine thread is busy downloading.  The FUSE release path calls this
