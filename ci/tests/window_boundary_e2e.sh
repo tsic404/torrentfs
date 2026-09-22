@@ -26,8 +26,8 @@
 # `run_self_seed_env.sh` also builds).  Usage:
 #   ./ci/tests/window_boundary_e2e.sh [torrentfs_binary] [mountpoint]
 #   env: PAYLOAD_GIB (default 5), CACHE_GIB (default 5),
-#        ACCESS_WINDOW_MB (default 4096), TRACKER_PORT (default 16969),
-#        SELFSEED_OUT (default /tmp/window_selfseed)
+#        ACCESS_WINDOW_MB (default 4096), TRACKER_PORT (default 0 = OS-assigned
+#        free port), SELFSEED_OUT (default /tmp/window_selfseed)
 # Exit: 0 = pass, 1 = fail.
 set -euo pipefail
 
@@ -40,7 +40,7 @@ CACHE_GIB="${CACHE_GIB:-5}"
 # (4096) and is written into the config below, so the value the assertions
 # check against is the value the runtime uses.
 ACCESS_WINDOW_MB="${ACCESS_WINDOW_MB:-4096}"
-TRACKER_PORT="${TRACKER_PORT:-16969}"
+TRACKER_PORT="${TRACKER_PORT:-0}"
 SELFSEED_OUT="${SELFSEED_OUT:-/tmp/window_selfseed}"
 SEEDER_LOG="$SELFSEED_OUT/seeder.log"
 TORRENTFS_LOG="$(mktemp)"
