@@ -75,6 +75,9 @@ jobs:
       - name: Run entrypoint detection tests
         run: ./ci/tests/entrypoint_test.sh
 
+      - name: Syntax-check FUSE e2e script (not run here, no /dev/fuse)
+        run: bash -n ./ci/tests/small_cache_read_e2e.sh
+
   deploy-rootful-test:
     name: Deploy Rootful Shell Tests
     runs-on: ubuntu-24.04

@@ -25,7 +25,7 @@ pub struct PiecePriorityToml {
     pub window_edge_priority: Option<i32>,
     /// Priority for pieces beyond the access window (default 0 = not wanted).
     pub rest_priority: Option<i32>,
-    /// Priority for pieces before the current read offset but still within
-    /// the access window (default 1); pieces further back are 0.
+    /// Deprecated: backward prefetch is disabled, so this field is accepted
+    /// for backward compatibility but ignored (a warning is logged when set).
     pub backward_priority: Option<i32>,
 }
