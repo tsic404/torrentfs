@@ -418,17 +418,19 @@ fn has_active_reader(pieces: &[PieceStatus]) -> bool {
 /// `PieceSize`/`PieceCount` key-value lines follow the marker so metadata can
 /// be read structurally instead of regex-parsing the header (which must stay
 /// byte-for-byte unchanged).
+///
+/// The marker run is contiguous and whitespace-terminated by construction: no
+/// separators and no trailing whitespace, so a strict
+/// `^(\[\]|\[x\]|\[X n\]|\[N\])+$` check over the run passes.
 fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
+    let markers: String = pieces.iter().map(piece_marker).collect();
     let mut out = String::new();
     out.push_str(&format!(
-        "\n-- Pieces ({} pieces, {} each) --\n  Pieces: ",
+        "\n-- Pieces ({} pieces, {} each) --\n  Pieces: {}\n",
         pieces.len(),
-        format_bytes(piece_length)
+        format_bytes(piece_length),
+        markers.trim_end()
     ));
-    for status in pieces {
-        out.push_str(&piece_marker(status));
-    }
-    out.push('\n');
     out.push_str(&format!(
         "  PieceSize: {}\n  PieceCount: {}\n",
         format_bytes(piece_length),
@@ -1185,6 +1187,48 @@ mod tests {
         // structured metadata lines appended after the marker line.
         assert!(block.contains("\n  PieceSize: 256.00 KB\n"));
         assert!(block.contains("\n  PieceCount: 2\n"));
+    }
+
+    #[test]
+    fn test_piece_block_marker_line_is_contiguous_and_whitespace_free() {
+        // All four marker forms on one contiguous line, in piece order.
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 12,
+            },
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        let block = piece_block(256 * 1024, &pieces);
+        assert_eq!(
+            block,
+            "\n-- Pieces (4 pieces, 256.00 KB each) --\n  Pieces: [x][X 12][7][]\n  PieceSize: 256.00 KB\n  PieceCount: 4\n"
+        );
+
+        // The marker run must end at a marker, never whitespace, so a strict
+        // `^(\[\]|\[x\]|\[X n\]|\[N\])+$` check over the run passes.
+        let marker_line = block
+            .lines()
+            .find(|line| line.starts_with("  Pieces: "))
+            .expect("marker line present");
+        assert_eq!(marker_line, "  Pieces: [x][X 12][7][]");
+        assert!(marker_line.ends_with(']'));
+        assert_eq!(marker_line, marker_line.trim_end());
     }
 
     #[test]
