@@ -345,6 +345,27 @@ fn status_to_english(status: &TorrentStatus) -> &'static str {
     }
 }
 
+/// Display status for a torrent, derived from the same authoritative piece
+/// snapshot that drives the progress column.  The persisted `torrents.status`
+/// column has no production writer, so reading it would render `Pending` even
+/// for a fully cached torrent; deriving from the piece snapshot keeps `Status`
+/// and `Progress` in one `.stats` consistent: fully cached → `Seeding` at
+/// `100.0%`, partially cached or actively read → `Downloading`, untouched →
+/// `Pending`.  With no snapshot (no handle yet) the persisted status is
+/// returned, matching the progress column's own fallback.
+fn display_status(persisted: &TorrentStatus, pieces: Option<&[PieceStatus]>) -> TorrentStatus {
+    let Some(pieces) = pieces else {
+        return persisted.clone();
+    };
+    if is_download_complete(pieces) {
+        TorrentStatus::Seeding
+    } else if has_cached_piece(pieces) || has_active_reader(pieces) {
+        TorrentStatus::Downloading
+    } else {
+        TorrentStatus::Pending
+    }
+}
+
 /// Render the piece marker per the `.stats` spec:
 /// `[x]` cached but never accessed (`hit_count == 0`),
 /// `[X n]` cached and accessed `n` times (`hit_count > 0`),
@@ -551,7 +572,16 @@ pub fn generate_torrent_stats(
     // Torrent title line
     output.push_str(&format!("===== torrent: {} =====\n\n", t.name));
 
-    let status_str = status_to_english(&t.status);
+    // Authoritative piece snapshot, shared by the Status and Progress columns
+    // so the two can never disagree within this file.
+    let piece_statuses = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_get_pieces_status(info_hash));
+
+    let status_str = status_to_english(&display_status(
+        &t.status,
+        piece_statuses.as_ref().map(|(_, pieces)| pieces.as_slice()),
+    ));
 
     let (
         dl_rate,
@@ -585,9 +615,6 @@ pub fn generate_torrent_stats(
     // libtorrent's status.progress is unreliable under the custom storage
     // backend (can report 1.0 before pieces are downloaded). Use the actual
     // cached piece count instead.
-    let piece_statuses = download_service
-        .as_ref()
-        .and_then(|ds| ds.try_get_pieces_status(info_hash));
     let actual_progress = piece_statuses
         .as_ref()
         .map(|(_, pieces)| piece_progress(pieces))
@@ -805,10 +832,10 @@ pub fn generate_directory_stats(
     let mut aggregate_peers: i32 = 0;
     let mut aggregate_seeds: i32 = 0;
 
-    // Per-torrent (downloaded bytes, progress) from the piece snapshot,
-    // collected while aggregating so the Summary section can render one line
-    // per torrent without a second piece query.
-    let mut per_torrent: Vec<(u64, f64)> = Vec::with_capacity(torrents.len());
+    // Per-torrent (downloaded bytes, progress, display status) from the piece
+    // snapshot, collected while aggregating so the Summary section can render
+    // one line per torrent without a second piece query.
+    let mut per_torrent: Vec<(u64, f64, TorrentStatus)> = Vec::with_capacity(torrents.len());
 
     for t in &torrents {
         let total = t.total_size.max(0) as u64;
@@ -835,7 +862,11 @@ pub fn generate_directory_stats(
             total,
         );
         total_done += downloaded;
-        per_torrent.push((downloaded, progress));
+        per_torrent.push((
+            downloaded,
+            progress,
+            display_status(&t.status, pieces.as_ref().map(|(_, ps)| ps.as_slice())),
+        ));
     }
 
     // -- Summary -- aggregate counts plus a one-line summary per torrent.
@@ -846,8 +877,8 @@ pub fn generate_directory_stats(
         format_bytes(total_size),
         format_bytes(total_done)
     ));
-    for (t, (downloaded, progress)) in torrents.iter().zip(&per_torrent) {
-        let status_str = status_to_english(&t.status);
+    for (t, (downloaded, progress, display)) in torrents.iter().zip(&per_torrent) {
+        let status_str = status_to_english(display);
         let prog_pct = if t.total_size > 0 {
             progress * 100.0
         } else {
@@ -916,7 +947,13 @@ pub fn generate_directory_stats(
 
     output.push_str("\n-- Torrents --\n");
     for (idx, t) in torrents.iter().enumerate() {
-        let status_str = status_to_english(&t.status);
+        let piece_statuses = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash));
+        let status_str = status_to_english(&display_status(
+            &t.status,
+            piece_statuses.as_ref().map(|(_, pieces)| pieces.as_slice()),
+        ));
 
         let (dl_rate, ul_rate, peers, seeds, progress, ts) = download_service
             .as_ref()
@@ -936,10 +973,9 @@ pub fn generate_directory_stats(
         // Override libtorrent progress with piece-availability-based progress
         // libtorrent's progress can report 1.0 before pieces are
         // actually downloaded under the custom storage backend.
-        let actual_progress = download_service
+        let actual_progress = piece_statuses
             .as_ref()
-            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash))
-            .map(|(_, pieces)| piece_progress(&pieces))
+            .map(|(_, pieces)| piece_progress(pieces))
             .unwrap_or(progress as f64);
         let prog_pct = if ts > 0 { actual_progress * 100.0 } else { 0.0 };
 
@@ -1990,5 +2026,70 @@ mod tests {
         assert!(has_active_reader(&pieces));
         assert!(!has_active_reader(&pieces[..1]));
         assert!(!has_active_reader(&[]));
+    }
+
+    /// A cached piece snapshot: `(priority, is_cached)` pairs.
+    fn snapshot(entries: &[(i32, bool)]) -> Vec<PieceStatus> {
+        entries
+            .iter()
+            .map(|&(priority, is_cached)| PieceStatus {
+                priority,
+                is_cached,
+                hit_count: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_display_status_tracks_progress_column() {
+        // The reported defect: a fully cached torrent rendered `Status:
+        // Pending` beside `Progress: 100.0%`. Deriving status from the same
+        // piece snapshot as progress makes the pair consistent: 100% renders
+        // `Seeding`, never `Pending`.
+        let complete = snapshot(&[(0, true), (0, true)]);
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Pending, Some(&complete))),
+            "Seeding"
+        );
+        assert_eq!(piece_progress(&complete), 1.0);
+
+        let partial = snapshot(&[(0, true), (0, false)]);
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Pending, Some(&partial))),
+            "Downloading"
+        );
+        assert!(piece_progress(&partial) > 0.0 && piece_progress(&partial) < 1.0);
+
+        let untouched = snapshot(&[(0, false), (0, false)]);
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Pending, Some(&untouched))),
+            "Pending"
+        );
+        assert_eq!(piece_progress(&untouched), 0.0);
+    }
+
+    #[test]
+    fn test_display_status_active_reader_is_downloading() {
+        // A read in flight with nothing cached yet is being fetched, not
+        // pending — even though the progress column still reads 0.0%.
+        let wanted = snapshot(&[(7, false)]);
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Pending, Some(&wanted))),
+            "Downloading"
+        );
+    }
+
+    #[test]
+    fn test_display_status_without_snapshot_keeps_persisted() {
+        // No handle yet: the progress column falls back to 0.0%, so the
+        // persisted status is returned rather than a derived one.
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Error, None)),
+            "Error"
+        );
+        assert_eq!(
+            status_to_english(&display_status(&TorrentStatus::Pending, None)),
+            "Pending"
+        );
     }
 }
