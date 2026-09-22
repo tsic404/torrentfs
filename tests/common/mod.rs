@@ -365,6 +365,17 @@ fn bencode_tracker_response(interval: i64, compact_peers: &[u8]) -> Vec<u8> {
 /// The content is 162 bytes of known data, piece length 16384 (single piece),
 /// so the entire file fits in one piece.
 pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
+    create_single_piece_torrent(announce_url, "final_verification.txt")
+}
+
+/// Same single-piece torrent as [`create_test_torrent_with_tracker`] but with a
+/// caller-chosen `name`.
+///
+/// The info hash covers the info dict, so `name` selects the swarm identity: a
+/// test that must not be discovered by another test's session (libtorrent LSD
+/// pairs two sessions serving the same info hash on one host, and the ignored
+/// engine tests share one process) passes a name unique to itself.
+pub fn create_single_piece_torrent(announce_url: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
     let mut test_content = b"Hello, this is a test file for torrentfs verification.\n".to_vec();
     while test_content.len() < 16384 {
         test_content.push(b'X');
@@ -388,7 +399,7 @@ pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>
 
     torrent.extend_from_slice(b"4:infod");
     torrent.extend_from_slice(b"6:lengthi16384e");
-    torrent.extend_from_slice(b"4:name22:final_verification.txt");
+    torrent.extend_from_slice(format!("4:name{}:{}", name.len(), name).as_bytes());
     torrent.extend_from_slice(b"12:piece lengthi16384e");
     torrent.extend_from_slice(b"6:pieces20:");
     torrent.extend_from_slice(&sha1_hash);

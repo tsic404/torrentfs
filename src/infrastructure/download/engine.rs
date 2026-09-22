@@ -139,6 +139,11 @@ struct EngineState {
     /// so one sourceless read cannot serialize every other command behind its
     /// peer/piece-wait window.
     pending_reads: Vec<PendingRead>,
+    /// Per-info_hash cold-start flight, shared by every read parked in the
+    /// peer-discovery phase.  Concurrent cold reads of one torrent therefore
+    /// run a single probe and share its outcome instead of each starting its
+    /// own window and making its own "no seeder" decision.
+    cold_flights: HashMap<String, ColdFlight>,
     /// Per-info_hash instant the swarm last became empty (no peers, no seeds).
     /// Kept across ticks so the published age measures one continuous empty
     /// window instead of the time since the last snapshot.
@@ -239,6 +244,7 @@ impl DownloadEngine {
                     alert_consumer: Some(alert_consumer),
                     piece_finished_rx,
                     pending_reads: Vec::new(),
+                    cold_flights: HashMap::new(),
                     empty_swarm_since: HashMap::new(),
                 };
                 let _ = init_tx.send(Ok(()));
@@ -687,6 +693,58 @@ enum ReadPhase {
     PieceWait,
 }
 
+/// One cold-start flight per info_hash: the shared peer-discovery window for
+/// every read of that torrent that finds the swarm empty.
+///
+/// The first such read starts the flight (a single `force_reannounce` plus one
+/// bounded window); concurrent reads of the same info_hash attach to it and
+/// observe the same outcome, so the probe and the "no seeder" decision are per
+/// torrent instead of per reader.  The flight retires when its window ends —
+/// either because a peer/seeder finally connected or because the probe
+/// exhausted on an empty swarm — so a later read starts a fresh probe and can
+/// discover a seeder that came online after the previous probe.  Concurrent
+/// dedup holds only within the window; recovery from a transiently-empty swarm
+/// is unchanged from the pre-flight behaviour.
+struct ColdFlight {
+    /// When the window started — shared by every attached read.
+    started: Instant,
+    /// When the probe gives up.
+    deadline: Instant,
+    /// The mid-window re-announce already fired for this flight.
+    reannounced: bool,
+}
+
+impl ColdFlight {
+    fn new(now: Instant, window: Duration) -> Self {
+        Self {
+            started: now,
+            deadline: now + window,
+            reannounced: false,
+        }
+    }
+
+    /// Whether the window has ended.  A reader attaching to an expired flight
+    /// would fail on its first poll with no chance to probe again, so the
+    /// caller retires it and starts a fresh one.
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    /// Whether the single mid-window re-announce is due and not yet taken.
+    /// Marks it taken, so concurrent attached reads cannot each re-announce.
+    fn take_reannounce(&mut self, now: Instant) -> bool {
+        if self.reannounced {
+            return false;
+        }
+        let window = self.deadline.saturating_duration_since(self.started);
+        if now.saturating_duration_since(self.started) < window / 2 {
+            return false;
+        }
+        self.reannounced = true;
+        true
+    }
+}
+
 /// A read that passed validation and is ready to be served or parked.
 struct PreparedRead {
     info: Arc<TorrentInfo>,
@@ -736,8 +794,6 @@ struct PendingRead {
     is_peer_wait_exhausted: bool,
     /// A seeder is connected, so the piece wait uses the full read timeout.
     has_seeder: bool,
-    /// The peer-wait probe already re-announced once mid-window.
-    reannounced_mid_wait: bool,
     /// Start of the piece-wait window; resets when a seeder connects.
     piece_wait_start: Instant,
     /// Actual peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) once the peer-wait
@@ -780,7 +836,6 @@ impl PendingRead {
             status: prepared.status,
             is_peer_wait_exhausted: false,
             has_seeder: false,
-            reannounced_mid_wait: false,
             piece_wait_start: now,
             peer_wait_elapsed: Duration::ZERO,
             had_truncated_piece: false,
@@ -1026,6 +1081,7 @@ impl EngineState {
         }
         self.scheduler.remove_torrent(info_hash);
         self.private_torrents.remove(info_hash);
+        self.cold_flights.remove(info_hash);
         Ok(())
     }
 
@@ -1434,22 +1490,50 @@ impl EngineState {
         None
     }
 
-    /// Park a read in the peer-discovery phase: the swarm looked empty, so kick
-    /// an immediate re-announce and give peers a bounded window to appear.
+    /// Park a read in the peer-discovery phase: the swarm looked empty, so
+    /// attach it to the info_hash's shared cold flight (creating the flight and
+    /// kicking one re-announce when it is the first reader of this cold
+    /// period) and give peers a bounded window to appear.
     fn enter_peer_wait(&mut self, read: &mut PendingRead) {
-        if let Some(handle) = self.handles.get(&read.info_hash) {
-            if !handle.force_reannounce() {
-                tracing::debug!(
-                    "read_file_range {}: force_reannounce rejected (non-fatal)",
-                    read.info_hash
-                );
-            }
+        let window = Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
+        // A flight whose window already elapsed is stale — attaching to it
+        // would fail this read on its first poll, and only libtorrent's own
+        // announce schedule could ever refresh the swarm.  Retire it so this
+        // read probes again (a fresh `force_reannounce` + a fresh window); the
+        // window's own expiry retires flights on the normal path, so this
+        // guards a flight left behind by any other exit.
+        if self
+            .cold_flights
+            .get(&read.info_hash)
+            .map(|flight| flight.is_expired(Instant::now()))
+            .unwrap_or(false)
+        {
+            self.cold_flights.remove(&read.info_hash);
         }
+        if !self.cold_flights.contains_key(&read.info_hash) {
+            // First cold reader of this info_hash: kick the swarm once.  A
+            // concurrent reader attaching below must not re-announce — the
+            // flight already covers discovery for the whole torrent.
+            if let Some(handle) = self.handles.get(&read.info_hash) {
+                if !handle.force_reannounce() {
+                    tracing::debug!(
+                        "read_file_range {}: force_reannounce rejected (non-fatal)",
+                        read.info_hash
+                    );
+                }
+            }
+            self.cold_flights.insert(
+                read.info_hash.clone(),
+                ColdFlight::new(Instant::now(), window),
+            );
+        }
+        let flight = self
+            .cold_flights
+            .get(&read.info_hash)
+            .expect("cold flight was just created");
         read.phase = ReadPhase::PeerWait;
-        read.phase_start = Instant::now();
-        read.phase_deadline = read.phase_start
-            + Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
-        read.reannounced_mid_wait = false;
+        read.phase_start = flight.started;
+        read.phase_deadline = flight.deadline;
     }
 
     /// Park a read in the piece-wait phase: set piece deadlines for every piece
@@ -1633,6 +1717,13 @@ impl EngineState {
                 Some(Err(e)) => return Some(Err(e)),
                 None => return Some(Err(Self::missing())),
             }
+            // The window elapsed: retire the flight so the next read of this
+            // info_hash starts a fresh one — a new `force_reannounce` and a new
+            // window.  A seeder that came online after the probe is then
+            // discoverable by a retry; retaining the expired flight instead
+            // would fail every later read instantly and leave discovery to
+            // libtorrent's own (possibly minutes-long) announce schedule.
+            self.cold_flights.remove(&read.info_hash);
             read.peer_wait_elapsed = Instant::now().saturating_duration_since(read.phase_start);
             self.enter_piece_wait(read);
             return None;
@@ -1649,6 +1740,7 @@ impl EngineState {
                 // they connect during the peer-wait phase.
                 self.publish_snapshot();
                 if has_swarm {
+                    self.cold_flights.remove(&read.info_hash);
                     read.peer_wait_elapsed =
                         Instant::now().saturating_duration_since(read.phase_start);
                     self.enter_piece_wait(read);
@@ -1660,12 +1752,15 @@ impl EngineState {
         }
 
         // Half the peer-wait budget gone and still nobody connected — force one
-        // more announce before the piece deadline path takes over.
-        let window = read
-            .phase_deadline
-            .saturating_duration_since(read.phase_start);
-        if !read.reannounced_mid_wait && read.phase_start.elapsed() >= window / 2 {
-            read.reannounced_mid_wait = true;
+        // more announce before the piece deadline path takes over.  The flight
+        // owns that re-announce, so the reads sharing it produce one, not one
+        // each.
+        let due = self
+            .cold_flights
+            .get_mut(&read.info_hash)
+            .map(|flight| flight.take_reannounce(Instant::now()))
+            .unwrap_or(false);
+        if due {
             if let Some(handle) = self.handles.get(&read.info_hash) {
                 handle.force_reannounce();
             }
@@ -2364,10 +2459,62 @@ impl EngineState {
 mod tests {
     use super::{
         advance_empty_swarm_since, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
-        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS,
-        NO_SEEDER_READ_TIMEOUT_SECS,
+        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight,
+        NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
+    use std::time::{Duration, Instant};
+
+    /// A cold flight is the shared peer-discovery window of one info_hash: its
+    /// deadline is fixed when the first reader creates it, so every reader that
+    /// attaches later observes the same expiry instead of getting a fresh
+    /// window of its own.
+    #[test]
+    fn cold_flight_deadline_is_fixed_at_creation() {
+        let start = Instant::now();
+        let flight = ColdFlight::new(start, Duration::from_secs(9));
+        assert_eq!(flight.deadline, start + Duration::from_secs(9));
+        // Attachment copies `started`/`deadline` verbatim; a later reader must
+        // not extend the window.
+        assert_eq!(flight.started, start);
+    }
+
+    /// A flight is expired exactly when its window ended.  A reader attaching
+    /// to an expired flight must start a fresh one (see `enter_peer_wait`):
+    /// otherwise it would fail on its first poll and leave swarm discovery to
+    /// libtorrent's own announce schedule.
+    #[test]
+    fn cold_flight_expires_at_its_deadline() {
+        let start = Instant::now();
+        let flight = ColdFlight::new(start, Duration::from_secs(9));
+        assert!(!flight.is_expired(start + Duration::from_secs(8)));
+        assert!(flight.is_expired(start + Duration::from_secs(9)));
+        assert!(flight.is_expired(start + Duration::from_secs(30)));
+    }
+
+    /// The mid-window re-announce belongs to the flight, not the reader: it
+    /// fires once, after half the window, however many readers are attached.
+    /// Pre-fix each parked read carried its own flag, so N concurrent cold
+    /// readers produced N re-announces on one torrent.
+    #[test]
+    fn cold_flight_reannounces_once_after_half_the_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(10);
+        let mut flight = ColdFlight::new(start, window);
+
+        assert!(
+            !flight.take_reannounce(start + Duration::from_secs(4)),
+            "re-announce must not fire before half the window elapsed"
+        );
+        assert!(
+            flight.take_reannounce(start + Duration::from_secs(5)),
+            "re-announce must fire once half the window elapsed"
+        );
+        assert!(
+            !flight.take_reannounce(start + Duration::from_secs(9)),
+            "a second attached reader must not re-announce again"
+        );
+    }
 
     /// the no-seeder stderr hint must use the exact message the
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
