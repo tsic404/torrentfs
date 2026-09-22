@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    acquire_session_lock, build_multipiece_torrent, create_test_torrent_with_tracker,
-    local_test_config, MiniTracker,
+    acquire_session_lock, build_multipiece_torrent, create_single_piece_torrent,
+    create_test_torrent_with_tracker, local_test_config, MiniTracker, TestHarness,
 };
 use torrentfs::download::DownloadEngine;
 
@@ -83,6 +83,165 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
          blocked the engine thread",
         probe_elapsed.as_secs_f64()
     );
+}
+
+/// Concurrent cold reads of one info_hash share a single discovery window
+/// (single flight), and that window retires when it ends.
+///
+/// Two end-to-end observable properties, each discriminating against a
+/// different regression:
+/// * a reader joining *inside* the window fails at the shared deadline instead
+///   of opening a window of its own (pre-flight, N concurrent readers ran N
+///   independent probes);
+/// * a reader arriving *after* the window gets a fresh flight — a new
+///   `force_reannounce` and a fresh window — instead of failing instantly
+///   against an expired one.  Retaining the expired flight would leave a seeder
+///   that came online after the probe unreachable until libtorrent's own
+///   announce schedule fired, turning intermittent ENODATA into persistent
+///   `NoPeers`.
+#[test]
+#[ignore = "requires local tracker; ~22s wall-clock"]
+fn concurrent_cold_reads_share_one_discovery_window() {
+    let _session_guard = acquire_session_lock();
+
+    let tracker = MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    // A name unique to this test: the info hash covers it, and libtorrent LSD
+    // would otherwise pair this session with another ignored test's session
+    // (same process, same torrent) and serve the piece being asserted absent.
+    let (torrent_data, _file_content) =
+        create_single_piece_torrent(&announce_url, "cold_flight_window!!");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    let mut config = local_test_config();
+    // Large read timeout: a no-seeder read parks in the peer-wait window
+    // (capped at `PEER_WAIT_CAP_SECS`) instead of failing fast.
+    config.timeouts.read_timeout_secs = Some(60);
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let engine = Arc::new(
+        DownloadEngine::new(cache_dir.path(), &config).expect("Failed to create DownloadEngine"),
+    );
+    engine.ensure_handle(info.clone()).expect("ensure_handle");
+
+    fn spawn_read(
+        engine: &Arc<DownloadEngine>,
+        info: &Arc<torrentfs::TorrentInfo>,
+    ) -> std::thread::JoinHandle<(torrentfs::TorrentResult<Vec<u8>>, Duration)> {
+        let reader_engine = Arc::clone(engine);
+        let reader_info = Arc::clone(info);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let result = reader_engine.read_file_range(reader_info, 0, 0, 4096);
+            (result, start.elapsed())
+        })
+    }
+
+    // ── Five concurrent cold reads on one torrent ─────────────────────
+    let readers: Vec<_> = (0..5).map(|_| spawn_read(&engine, &info)).collect();
+
+    // A reader joining while the shared window is still running.  It must
+    // observe the flight's deadline, so it gives up well before a window of
+    // its own would have elapsed.
+    const JOIN_DELAY: Duration = Duration::from_secs(6);
+    std::thread::sleep(JOIN_DELAY);
+    let joiner = spawn_read(&engine, &info);
+    let (joiner_result, joiner_elapsed) = joiner.join().expect("joiner thread");
+    assert!(
+        joiner_result.is_err(),
+        "a no-seeder cold read must fail with NoPeers"
+    );
+    assert!(
+        joiner_elapsed < Duration::from_secs(5),
+        "a reader joining {:.0}s into the window waited {:.1}s; it must share \
+         the info_hash's flight deadline, not open its own window",
+        JOIN_DELAY.as_secs_f64(),
+        joiner_elapsed.as_secs_f64()
+    );
+
+    for reader in readers {
+        let (result, _elapsed) = reader.join().expect("reader thread");
+        assert!(
+            result.is_err(),
+            "a no-seeder cold read must fail with NoPeers"
+        );
+    }
+
+    // ── A reader arriving after the window elapsed ────────────────────
+    // The flight retired with the window, so this read must probe again: a
+    // fresh `force_reannounce` and a fresh window.
+    let recovery_start = Instant::now();
+    let recovery = engine.read_file_range(info.clone(), 0, 0, 4096);
+    let recovery_elapsed = recovery_start.elapsed();
+    assert!(
+        recovery.is_err(),
+        "no seeder is reachable, so the read must fail"
+    );
+    assert!(
+        recovery_elapsed >= Duration::from_secs(8),
+        "a reader arriving after the window waited only {:.1}s; the expired \
+         flight must be retired so this read probes again instead of failing \
+         instantly",
+        recovery_elapsed.as_secs_f64()
+    );
+}
+
+/// The acceptance path: concurrent cold reads of one torrent must all succeed
+/// with the seeded bytes once a seeder is reachable — no ENODATA.
+///
+/// Same shape as the QA repro (cold handle, several readers on one info_hash)
+/// but against the harness's real tracker + seeder, so the success path the
+/// fix must not regress has automated coverage.
+#[test]
+#[ignore = "requires process-internal tracker + seeder; ~20s wall-clock"]
+fn concurrent_cold_reads_all_succeed_with_a_seeder() {
+    let _session_guard = acquire_session_lock();
+
+    let harness = TestHarness::with_torrent(|announce_url| {
+        create_single_piece_torrent(announce_url, "cold_success_path!!")
+    });
+
+    let mut config = local_test_config();
+    // Ephemeral listen port, matching the seeder's (see `TestHarness`): a
+    // fixed port is shared with the downloader of every other test binary
+    // (`small_cache_read_test`, `multifile_past_eof_test` both pin 16883), and
+    // cargo runs those binaries in parallel — the loser gets `AddrInUse`.  The
+    // OS guarantees a port distinct from the seeder's, so the tracker still
+    // tells the two apart by IP:port.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let engine = Arc::new(
+        DownloadEngine::new(cache_dir.path(), &config).expect("Failed to create DownloadEngine"),
+    );
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent"),
+    );
+    engine.ensure_handle(info.clone()).expect("ensure_handle");
+
+    const READ_SIZE: usize = 4096;
+    let readers: Vec<_> = (0..5)
+        .map(|_| {
+            let reader_engine = Arc::clone(&engine);
+            let reader_info = Arc::clone(&info);
+            std::thread::spawn(move || reader_engine.read_file_range(reader_info, 0, 0, 4096))
+        })
+        .collect();
+
+    for reader in readers {
+        let data = reader
+            .join()
+            .expect("reader thread")
+            .expect("a cold read with a reachable seeder must not return ENODATA");
+        assert_eq!(
+            data,
+            harness.file_content[..READ_SIZE],
+            "downloaded bytes must match the seeded content"
+        );
+    }
 }
 
 /// Two concurrent slow reads on the *same* torrent each hold their own reader
