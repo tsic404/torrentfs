@@ -77,6 +77,11 @@ impl DownloadService {
         self.engine.try_is_private(info_hash)
     }
 
+    /// Non-blocking "swarm empty for N seconds" check for `.stats`.
+    pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
+        self.engine.try_empty_swarm_secs(info_hash)
+    }
+
     /// Query the current tracker list on a torrent handle.
     /// Synchronous. Used by tests to verify PT isolation.
     #[cfg(test)]

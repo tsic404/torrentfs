@@ -95,6 +95,11 @@ pub struct DownloadSnapshot {
     /// from cross-site tracker merging to prevent passkey leakage and peer
     /// cross-pollination across PT swarms.
     pub private_torrents: HashMap<String, bool>,
+    /// Per-info_hash seconds the swarm has been *continuously* empty (no peers
+    /// and no seeds).  Absent for a swarm that currently has a peer/seed and
+    /// for an info_hash whose status could not be read — so `None` never means
+    /// "empty for zero seconds", it means "not observed empty".
+    pub empty_swarm_secs: HashMap<String, u64>,
 }
 
 /// Handle to a running download engine.  Cheap to clone (`Send + Sync`).
@@ -134,6 +139,10 @@ struct EngineState {
     /// so one sourceless read cannot serialize every other command behind its
     /// peer/piece-wait window.
     pending_reads: Vec<PendingRead>,
+    /// Per-info_hash instant the swarm last became empty (no peers, no seeds).
+    /// Kept across ticks so the published age measures one continuous empty
+    /// window instead of the time since the last snapshot.
+    empty_swarm_since: HashMap<String, Instant>,
 }
 
 impl DownloadEngine {
@@ -230,6 +239,7 @@ impl DownloadEngine {
                     alert_consumer: Some(alert_consumer),
                     piece_finished_rx,
                     pending_reads: Vec::new(),
+                    empty_swarm_since: HashMap::new(),
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -298,6 +308,20 @@ impl DownloadEngine {
             .try_lock()
             .ok()?
             .private_torrents
+            .get(info_hash)
+            .copied()
+    }
+
+    /// Non-blocking "swarm has been empty for this many seconds" check from
+    /// the last engine snapshot.  `None` when the snapshot has no entry for
+    /// the info_hash — the handle is gone, its status was unreadable, or the
+    /// swarm currently has a peer/seed.  Used by `.stats` to keep the health
+    /// alert off a transient empty sample.
+    pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .empty_swarm_secs
             .get(info_hash)
             .copied()
     }
@@ -530,6 +554,30 @@ fn piece_wait_window_secs(
 /// unit-testable without a running engine.
 fn swarm_is_empty(num_peers: i32, num_seeds: i32) -> bool {
     num_peers == 0 && num_seeds == 0
+}
+
+/// Advance the per-info_hash "swarm has been empty since" clock.
+///
+/// `samples` holds one `(info_hash, is_empty)` entry per handle whose status
+/// could be read.  A swarm that stays empty keeps its original start instant —
+/// the published age is therefore one *continuous* empty window, not the time
+/// since the last sample.  A swarm that gains a peer/seed drops its entry, so
+/// its next empty window starts a fresh clock; entries for handles that
+/// disappeared are dropped with it (the returned map only covers `samples`).
+/// Pure so the clock semantics are unit-testable without a running engine.
+fn advance_empty_swarm_since(
+    previous: &HashMap<String, Instant>,
+    samples: &[(String, bool)],
+    now: Instant,
+) -> HashMap<String, Instant> {
+    samples
+        .iter()
+        .filter(|(_, is_empty)| *is_empty)
+        .map(|(info_hash, _)| {
+            let since = previous.get(info_hash).copied().unwrap_or(now);
+            (info_hash.clone(), since)
+        })
+        .collect()
 }
 
 /// Format the stderr hint emitted when a read times out with zero connected
@@ -2222,9 +2270,10 @@ impl EngineState {
     }
 
     /// Publish the current engine state into the shared snapshot.
-    fn publish_snapshot(&self) {
+    fn publish_snapshot(&mut self) {
         let mut statuses = HashMap::new();
         let mut pieces = HashMap::new();
+        let mut swarms: Vec<(String, bool)> = Vec::new();
         // request libtorrent to refresh per-torrent statistics
         // before reading status. Without this, `status().num_peers` can
         // return 0 even when peers are connected — the internal peer list
@@ -2232,6 +2281,10 @@ impl EngineState {
         self.session.post_torrent_updates();
         for (info_hash, handle) in &self.handles {
             if let Ok(status) = handle.status() {
+                swarms.push((
+                    info_hash.clone(),
+                    swarm_is_empty(status.num_peers, status.num_seeds),
+                ));
                 statuses.insert(info_hash.clone(), status);
             }
             if let Some(num_pieces) = self.scheduler.num_pieces(info_hash) {
@@ -2241,11 +2294,24 @@ impl EngineState {
                 }
             }
         }
+        let now = Instant::now();
+        self.empty_swarm_since = advance_empty_swarm_since(&self.empty_swarm_since, &swarms, now);
+        let empty_swarm_secs = self
+            .empty_swarm_since
+            .iter()
+            .map(|(info_hash, since)| {
+                (
+                    info_hash.clone(),
+                    now.saturating_duration_since(*since).as_secs(),
+                )
+            })
+            .collect();
         if let Ok(mut snap) = self.snapshot.lock() {
             *snap = DownloadSnapshot {
                 statuses,
                 pieces,
                 private_torrents: self.private_torrents.clone(),
+                empty_swarm_secs,
             };
         }
     }
@@ -2297,8 +2363,8 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        no_peers_message, no_seeder_stderr_hint, partial_read_bounds, piece_wait_window_secs,
-        read_wait_budget_secs, swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS,
+        advance_empty_swarm_since, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
+        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, NO_SEEDER_FAST_FAIL_SECS,
         NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
@@ -2411,6 +2477,44 @@ mod tests {
         assert!(!swarm_is_empty(1, 0));
         assert!(!swarm_is_empty(0, 1));
         assert!(!swarm_is_empty(3, 2));
+    }
+
+    /// the empty-swarm clock must measure one continuous window: an empty
+    /// sample starts the clock, subsequent empty samples keep the original
+    /// start, a non-empty sample drops the entry, and a handle absent from the
+    /// next sample set is dropped entirely.
+    #[test]
+    fn empty_swarm_since_tracks_continuous_window() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        let t2 = t0 + Duration::from_secs(9);
+
+        let mut previous: HashMap<String, Instant> = HashMap::new();
+        previous = advance_empty_swarm_since(&previous, &[("a".into(), true)], t0);
+        assert_eq!(previous.get("a"), Some(&t0));
+
+        // still empty at t1 → keeps the original start, so the published age
+        // measures the continuous window (5s), not the last sample.
+        previous =
+            advance_empty_swarm_since(&previous, &[("a".into(), true), ("b".into(), true)], t1);
+        assert_eq!(previous.get("a"), Some(&t0));
+        assert_eq!(previous.get("b"), Some(&t1));
+
+        // "a" gains a peer at t2 → dropped; "b" stays empty → keeps t1.
+        previous =
+            advance_empty_swarm_since(&previous, &[("a".into(), false), ("b".into(), true)], t2);
+        assert!(!previous.contains_key("a"));
+        assert_eq!(previous.get("b"), Some(&t1));
+
+        // "b" gains a peer, then goes empty again → a fresh clock at t2, not
+        // the pre-connection start it had before.
+        previous = advance_empty_swarm_since(&previous, &[("b".into(), false)], t2);
+        assert!(!previous.contains_key("b"));
+        previous = advance_empty_swarm_since(&previous, &[("b".into(), true)], t2);
+        assert_eq!(previous.get("b"), Some(&t2));
     }
 
     /// a read with a connected seeder uses the full window so a
