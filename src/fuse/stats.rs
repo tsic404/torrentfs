@@ -44,6 +44,37 @@ pub fn format_num(n: u64) -> String {
     result
 }
 
+/// Render the cache-usage value for `.stats` with usage capped at the limit.
+///
+/// `CacheManager::current_size` can transiently exceed `max_cache_size`:
+/// `evict_lru` never evicts a piece libtorrent is still writing, so it accepts
+/// an over-budget state until the next pass. The raw ratio would print an
+/// impossible `200.0%`, reading as a broken limit. Cap the displayed usage at
+/// the limit and report the remainder as pending eviction instead.
+fn format_cache_usage(current: u64, max: u64) -> String {
+    if max == 0 {
+        return format!("{} / {} (0.0%)", format_bytes(current), format_bytes(max));
+    }
+    let used = current.min(max);
+    let pct = (used as f64 / max as f64) * 100.0;
+    if current > max {
+        format!(
+            "{} / {} ({:.1}%, {} pending eviction)",
+            format_bytes(used),
+            format_bytes(max),
+            pct,
+            format_bytes(current - max)
+        )
+    } else {
+        format!(
+            "{} / {} ({:.1}%)",
+            format_bytes(used),
+            format_bytes(max),
+            pct
+        )
+    }
+}
+
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
 const BANNER: &str = "===========================================================\n";
@@ -101,17 +132,10 @@ fn write_overview(
         } else {
             (0, 0, "(none)")
         };
-    let cache_pct = if cache_max_size > 0 {
-        (cache_total_size as f64 / cache_max_size as f64) * 100.0
-    } else {
-        0.0
-    };
     output.push_str(&format!("  Cache Dir:    {}\n", cache_dir_str));
     output.push_str(&format!(
-        "  Cache Usage:  {} / {} ({:.1}%)\n",
-        format_bytes(cache_total_size),
-        format_bytes(cache_max_size),
-        cache_pct
+        "  Cache Usage:  {}\n",
+        format_cache_usage(cache_total_size, cache_max_size)
     ));
 
     if let Some(ss) = session_stats {
@@ -796,11 +820,6 @@ pub fn generate_directory_stats(
                 (cm_guard.current_size(), cm_guard.max_cache_size());
             let global_hits = cm_guard.hit_count;
             let global_misses = cm_guard.miss_count;
-            let cache_pct = if cache_max_size > 0 {
-                (cache_total_size as f64 / cache_max_size as f64) * 100.0
-            } else {
-                0.0
-            };
             let global_total = global_hits + global_misses;
             let hit_rate = if global_total > 0 {
                 (global_hits as f64 / global_total as f64) * 100.0
@@ -808,10 +827,8 @@ pub fn generate_directory_stats(
                 0.0
             };
             output.push_str(&format!(
-                "  Cache Usage: {} / {} ({:.1}%)\n",
-                format_bytes(cache_total_size),
-                format_bytes(cache_max_size),
-                cache_pct
+                "  Cache Usage: {}\n",
+                format_cache_usage(cache_total_size, cache_max_size)
             ));
             output.push_str(&format!(
                 "  Hits: {}  Misses: {}  Hit Rate: {:.1}%\n",
@@ -1247,6 +1264,50 @@ mod tests {
         assert!(
             text.contains("Evictions: 1"),
             "stats must render the actual eviction count, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_global_stats_cache_usage_clamped_when_over_budget() {
+        // A piece libtorrent is still writing cannot be evicted, so the cache
+        // holds more than its limit until the write completes. `.stats` must
+        // cap the displayed usage at the limit instead of printing an
+        // impossible >100% ratio.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+
+        let piece_key = "aaaa1111:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key).unwrap();
+        std::fs::write(&piece_path, vec![0u8; 2 * 1024 * 1024]).unwrap();
+        cache
+            .register_incomplete_piece(piece_key, 2 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(cache.current_size(), 2 * 1024 * 1024);
+        assert_eq!(
+            cache.eviction_count, 0,
+            "an incomplete piece must not be evicted"
+        );
+
+        let cm = Arc::new(Mutex::new(cache));
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            None,
+            {
+                let cm = cm.clone();
+                move || Some(cm.clone())
+            },
+            "0.0.0.0:6881",
+            None,
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(
+            text.contains("Cache Usage:  1.00 MB / 1.00 MB (100.0%, 1.00 MB pending eviction)"),
+            "over-budget cache usage must be capped at the limit, got:\n{text}"
+        );
+        assert!(
+            !text.contains("200.0%"),
+            "stats must never render an over-limit percentage, got:\n{text}"
         );
     }
 
