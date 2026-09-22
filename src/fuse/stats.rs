@@ -8,6 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
 use crate::infrastructure::download::PieceStatus;
+use crate::infrastructure::download::PieceStore;
 use crate::infrastructure::download::SessionStats;
 use crate::infrastructure::download::NO_SEEDER_READ_TIMEOUT_SECS;
 use crate::infrastructure::metrics::MetricsSnapshot;
@@ -721,6 +722,48 @@ pub fn generate_torrent_stats(
     output.into_bytes()
 }
 
+/// Per-torrent `(downloaded bytes, progress)` for the directory Summary line.
+///
+/// Prefers the authoritative piece snapshot; when it is absent, falls back to
+/// libtorrent's `(progress, total_done)` — the same fallback the `-- Torrents --`
+/// detail list and the leaf `.stats` use, so one torrent never shows two
+/// different progress values in the same file. Cached bytes size the final
+/// piece at its real (short) length via [`PieceStore::expected_piece_size`], so
+/// a fully cached small torrent reports its exact size, never more.
+fn summary_torrent_stats(
+    pieces: Option<(u64, &[PieceStatus])>,
+    status: Option<(f64, u64)>,
+    total_size: u64,
+) -> (u64, f64) {
+    match pieces {
+        Some((piece_length, pieces)) => {
+            let num_pieces = pieces.len() as i32;
+            let downloaded = if piece_length == 0 {
+                0
+            } else {
+                pieces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.is_cached)
+                    .map(|(i, _)| {
+                        PieceStore::expected_piece_size(
+                            i as i32,
+                            piece_length,
+                            num_pieces,
+                            total_size,
+                        )
+                    })
+                    .sum()
+            };
+            (downloaded, piece_progress(pieces))
+        }
+        None => {
+            let (progress, done) = status.unwrap_or((0.0, 0));
+            (done.min(total_size), progress)
+        }
+    }
+}
+
 /// Generate aggregated stats for all torrents under a given source_path.
 pub fn generate_directory_stats(
     source_path: &str,
@@ -762,12 +805,19 @@ pub fn generate_directory_stats(
     let mut aggregate_peers: i32 = 0;
     let mut aggregate_seeds: i32 = 0;
 
+    // Per-torrent (downloaded bytes, progress) from the piece snapshot,
+    // collected while aggregating so the Summary section can render one line
+    // per torrent without a second piece query.
+    let mut per_torrent: Vec<(u64, f64)> = Vec::with_capacity(torrents.len());
+
     for t in &torrents {
-        total_size += t.total_size as u64;
-        if let Some(status) = download_service
+        let total = t.total_size.max(0) as u64;
+        total_size += total;
+
+        let status = download_service
             .as_ref()
-            .and_then(|ds| ds.try_query_torrent_status(&t.info_hash))
-        {
+            .and_then(|ds| ds.try_query_torrent_status(&t.info_hash));
+        if let Some(status) = &status {
             total_upload += status.total_upload as u64;
             total_download += status.total_download as u64;
             aggregate_dl_rate += status.download_rate;
@@ -776,26 +826,45 @@ pub fn generate_directory_stats(
             aggregate_seeds += status.num_seeds;
         }
 
-        // Override libtorrent's total_done with piece-availability-based
-        // bytes. Same root cause as progress: status.total_done
-        // stays 0 under the custom storage backend. Recompute from cached
-        // pieces.
-        if let Some((piece_length, pieces)) = download_service
+        let pieces = download_service
             .as_ref()
-            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash))
-        {
-            total_done += piece_downloaded(&pieces, piece_length);
-        }
+            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash));
+        let (downloaded, progress) = summary_torrent_stats(
+            pieces.as_ref().map(|(len, ps)| (*len, ps.as_slice())),
+            status.as_ref().map(|s| (s.progress as f64, s.total_done)),
+            total,
+        );
+        total_done += downloaded;
+        per_torrent.push((downloaded, progress));
     }
 
-    // -- Rates --
-    output.push_str("-- Rates --\n");
+    // -- Summary -- aggregate counts plus a one-line summary per torrent.
+    output.push_str("-- Summary --\n");
     output.push_str(&format!(
         "  Torrents: {}  Total Size: {}  Downloaded: {}\n",
         torrent_count,
         format_bytes(total_size),
         format_bytes(total_done)
     ));
+    for (t, (downloaded, progress)) in torrents.iter().zip(&per_torrent) {
+        let status_str = status_to_english(&t.status);
+        let prog_pct = if t.total_size > 0 {
+            progress * 100.0
+        } else {
+            0.0
+        };
+        output.push_str(&format!(
+            "  {}  {}  {:.1}%  {} / {}\n",
+            t.name,
+            status_str,
+            prog_pct,
+            format_bytes(*downloaded),
+            format_bytes(t.total_size.max(0) as u64),
+        ));
+    }
+
+    // -- Rates --
+    output.push_str("\n-- Rates --\n");
     output.push_str(&format!(
         "  DL Rate: ↓ {}/s  UL Rate: ↑ {}/s\n",
         format_bytes(aggregate_dl_rate as u64),
@@ -1577,6 +1646,111 @@ mod tests {
         let text = String::from_utf8_lossy(&stats);
         // Empty path shows "No torrents found" not section headers
         assert!(text.contains("No torrents found"));
+    }
+
+    #[test]
+    fn test_directory_stats_summary_lists_each_torrent() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.insert_torrent("os/linux", "ubuntu", "ubuntu.torrent", 1024, "hash-u", 1)
+            .unwrap();
+        db.insert_torrent("os/linux", "debian", "debian.torrent", 2048, "hash-d", 1)
+            .unwrap();
+        let db = Some(Arc::new(Mutex::new(db)));
+
+        let stats = generate_directory_stats("os/linux", &db, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+
+        // Summary header carries the aggregate counts ...
+        assert!(text.contains("-- Summary --\n"));
+        assert!(text.contains("  Torrents: 2  Total Size: 3.00 KB  Downloaded: 0 B\n"));
+        // ... and one line per torrent.
+        assert!(
+            text.contains("  ubuntu  Pending  0.0%  0 B / 1.00 KB\n"),
+            "missing ubuntu summary line: {text}"
+        );
+        assert!(
+            text.contains("  debian  Pending  0.0%  0 B / 2.00 KB\n"),
+            "missing debian summary line: {text}"
+        );
+
+        // Rates holds only rates — the aggregate counts moved to Summary.
+        let rates = text
+            .split("-- Rates --")
+            .nth(1)
+            .and_then(|rest| rest.split("\n--").next())
+            .unwrap();
+        assert!(
+            !rates.contains("Torrents:"),
+            "Rates section must not carry aggregate counts: {rates}"
+        );
+
+        // The per-torrent detail list is still present.
+        assert!(text.contains("\n-- Torrents --\n"));
+    }
+
+    #[test]
+    fn test_summary_torrent_stats_falls_back_to_status_without_pieces() {
+        // No piece snapshot: fall back to the same libtorrent status the
+        // Torrents detail list uses, so one torrent can't show two different
+        // progress values in the same file.
+        let (downloaded, progress) = summary_torrent_stats(None, Some((0.42, 500)), 1024);
+        assert_eq!(downloaded, 500);
+        assert!((progress - 0.42).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_summary_torrent_stats_sizes_short_final_piece_exactly() {
+        // 1500-byte torrent in two 1024-byte pieces, both cached: the final
+        // piece is 476 bytes, so the total is exactly 1500 — not 2×1024.
+        let pieces = [
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+        ];
+        let (downloaded, progress) =
+            summary_torrent_stats(Some((1024, pieces.as_slice())), None, 1500);
+        assert_eq!(downloaded, 1500);
+        assert!((progress - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_summary_torrent_stats_counts_last_piece_remainder() {
+        // Only the final piece is cached: 1500 - 1024 = 476 bytes, not 1024.
+        let pieces = [
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+        ];
+        let (downloaded, _) = summary_torrent_stats(Some((1024, pieces.as_slice())), None, 1500);
+        assert_eq!(downloaded, 476);
+    }
+
+    #[test]
+    fn test_summary_torrent_stats_prefers_piece_snapshot() {
+        // The authoritative piece snapshot wins over a stale status.
+        let pieces = [PieceStatus {
+            priority: 0,
+            is_cached: true,
+            hit_count: 0,
+        }];
+        let (downloaded, progress) =
+            summary_torrent_stats(Some((1024, pieces.as_slice())), Some((0.9, 9000)), 1024);
+        assert_eq!(downloaded, 1024);
+        assert!((progress - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
