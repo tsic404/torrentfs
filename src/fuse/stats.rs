@@ -9,6 +9,7 @@ use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
 use crate::infrastructure::download::PieceStatus;
 use crate::infrastructure::download::SessionStats;
+use crate::infrastructure::download::NO_SEEDER_READ_TIMEOUT_SECS;
 use crate::infrastructure::metrics::MetricsSnapshot;
 use crate::services::download::DownloadService;
 
@@ -412,20 +413,37 @@ fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
     out
 }
 
-/// Render the `.stats` health alert line. The alert fires on zero connected
-/// peers/seeds (`num_peers == 0 && num_seeds == 0`) — counts reflect live
-/// connections, not tracker reachability, so the wording describes observed
-/// state, not an unreachable tracker. `download_complete` suppresses it
-/// (zero peers is the expected end state of a finished torrent);
-/// `active_download` also suppresses it (the transient zero-peer window
-/// before the tracker announce returns is not a degradation).
+/// Consecutive seconds a torrent's swarm must stay empty (no peers, no seeds)
+/// before the `.stats` health alert fires.  Peer/seed counts are instantaneous
+/// samples that flap around zero while connections are established, so one
+/// empty sample is not a health signal: alerting on it contradicts the `Peers:`
+/// line a reader saw moments earlier or later.  Bound to the engine's
+/// no-seeder read window cap ([`NO_SEEDER_READ_TIMEOUT_SECS`]): the longest a
+/// read waits for a seeder before failing, so a shorter configured
+/// `read_timeout_secs` only makes this grace the more conservative of the two.
+const HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS: u64 = NO_SEEDER_READ_TIMEOUT_SECS;
+
+/// Render the `.stats` health alert line. The alert fires on a *sustained*
+/// empty swarm — zero connected peers/seeds (`num_peers == 0 && num_seeds == 0`)
+/// for at least [`HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS`] seconds. Counts reflect
+/// live connections, not tracker reachability, so the wording describes
+/// observed state, not an unreachable tracker. `download_complete` suppresses
+/// it (zero peers is the expected end state of a finished torrent);
+/// `active_download` also suppresses it (the transient zero-peer window before
+/// the tracker announce returns is not a degradation).
 fn health_alert(
     num_peers: i32,
     num_seeds: i32,
+    empty_swarm_secs: u64,
     download_complete: bool,
     active_download: bool,
 ) -> Option<&'static str> {
-    if num_peers == 0 && num_seeds == 0 && !download_complete && !active_download {
+    if num_peers == 0
+        && num_seeds == 0
+        && empty_swarm_secs >= HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS
+        && !download_complete
+        && !active_download
+    {
         Some("  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n")
     } else {
         None
@@ -580,6 +598,13 @@ pub fn generate_torrent_stats(
         .as_ref()
         .map(|(_, pieces)| has_cached_piece(pieces) || has_active_reader(pieces))
         .unwrap_or(false);
+    // How long the swarm has been continuously empty, from the engine's
+    // per-tick samples. An absent entry (no handle, unreadable status, or a
+    // live peer/seed) is not an observed empty swarm, so it counts as zero.
+    let empty_swarm_secs = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_empty_swarm_secs(info_hash))
+        .unwrap_or(0);
     output.push_str("-- Status --\n");
     output.push_str(&format!("  Name: {}\n", t.name));
     output.push_str(&format!(
@@ -613,7 +638,13 @@ pub fn generate_torrent_stats(
     // -- Peers --
     output.push_str("\n-- Peers --\n");
     output.push_str(&format!("  Peers: {}  Seeds: {}\n", num_peers, num_seeds));
-    let health = health_alert(num_peers, num_seeds, download_complete, active_download);
+    let health = health_alert(
+        num_peers,
+        num_seeds,
+        empty_swarm_secs,
+        download_complete,
+        active_download,
+    );
     if let Some(line) = health {
         output.push_str(line);
     }
@@ -1565,10 +1596,11 @@ mod tests {
 
     #[test]
     fn test_health_alert_zero_peers_zero_seeds() {
-        // the alert fires on zero connected peers/seeds but must
-        // not claim the tracker is unreachable — connected-peer count is not
-        // a tracker-reachability signal.
-        let line = health_alert(0, 0, false, false).expect("alert should fire at 0/0");
+        // the alert fires on a sustained empty swarm but must not claim the
+        // tracker is unreachable — connected-peer count is not a
+        // tracker-reachability signal.
+        let line = health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false)
+            .expect("alert should fire at 0/0 after the grace window");
         assert!(
             !line.contains("tracker may be unreachable"),
             "must not claim tracker unreachable: {line}"
@@ -1584,9 +1616,24 @@ mod tests {
     }
 
     #[test]
+    fn test_health_alert_transient_empty_swarm_suppresses() {
+        // a swarm empty for less than the grace window is still connecting —
+        // peer counts flap around zero while the tracker announce and
+        // connections settle, so no alert may fire on such a sample.
+        assert!(
+            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS - 1, false, false).is_none(),
+            "no alert for an empty swarm still inside the grace window"
+        );
+        assert!(
+            health_alert(0, 0, 0, false, false).is_none(),
+            "no alert for an unobserved/just-empty swarm"
+        );
+    }
+
+    #[test]
     fn test_health_alert_with_peers() {
         assert!(
-            health_alert(3, 0, false, false).is_none(),
+            health_alert(3, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
             "no alert when peers > 0"
         );
     }
@@ -1594,7 +1641,7 @@ mod tests {
     #[test]
     fn test_health_alert_with_seeds() {
         assert!(
-            health_alert(0, 2, false, false).is_none(),
+            health_alert(0, 2, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
             "no alert when seeds > 0"
         );
     }
@@ -1602,7 +1649,7 @@ mod tests {
     #[test]
     fn test_health_alert_both_present() {
         assert!(
-            health_alert(5, 1, false, false).is_none(),
+            health_alert(5, 1, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
             "no alert when peers and seeds > 0"
         );
     }
@@ -1612,7 +1659,7 @@ mod tests {
         // a fully downloaded torrent legitimately has zero peers;
         // the health alert must not fire when download is complete.
         assert!(
-            health_alert(0, 0, true, false).is_none(),
+            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, true, false).is_none(),
             "no alert when download is complete even at 0 peers / 0 seeds"
         );
     }
@@ -1623,7 +1670,7 @@ mod tests {
         // tracker announce returns, a download that is actively fetching
         // bytes must not raise a health alert.
         assert!(
-            health_alert(0, 0, false, true).is_none(),
+            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, true).is_none(),
             "no alert while a download is actively fetching bytes"
         );
     }
