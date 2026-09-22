@@ -90,6 +90,8 @@ struct Args {
     /// when the downloader runs in a container and reaches the host via a
     /// routable address).
     tracker_bind: String,
+    /// Port the tracker binds; 0 (the default) lets the OS pick a free
+    /// ephemeral one, which is then published in the announce URL.
     tracker_port: u16,
     /// Host placed into the .torrent announce URL (default "127.0.0.1").
     announce_host: String,
@@ -101,7 +103,7 @@ fn parse_args() -> Args {
     let mut args = Args {
         payload: PathBuf::from("payload.txt"),
         tracker_bind: "127.0.0.1".to_string(),
-        tracker_port: 16969,
+        tracker_port: 0,
         announce_host: "127.0.0.1".to_string(),
         torrent_out: PathBuf::from("selfseed.torrent"),
         url_out: PathBuf::from("tracker.url"),
@@ -143,11 +145,9 @@ fn main() {
     assert!(payload_len > 0, "payload must not be empty");
 
     // 2. Tracker — the announce URL must be live before we bencode.
-    start_tracker(&args.tracker_bind, args.tracker_port).expect("failed to start local tracker");
-    let announce_url = format!(
-        "http://{}:{}/announce",
-        args.announce_host, args.tracker_port
-    );
+    let tracker_port = start_tracker(&args.tracker_bind, args.tracker_port)
+        .expect("failed to start local tracker");
+    let announce_url = format!("http://{}:{}/announce", args.announce_host, tracker_port);
     std::fs::write(&args.url_out, &announce_url).expect("failed to write tracker.url");
 
     // 3. Deterministic single-file torrent over the fixed payload. Hashing

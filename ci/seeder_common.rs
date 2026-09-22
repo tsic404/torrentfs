@@ -307,14 +307,22 @@ fn register_peer(
     });
 }
 
-/// Start the loopback HTTP tracker in a background thread and return once it
-/// is bound and listening.
-pub fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
+/// Start the loopback HTTP tracker in a background thread and return the port
+/// it is listening on once it is bound.
+///
+/// Pass `0` to let the OS assign a free ephemeral port (the convention
+/// `tests/common/mod.rs::MiniTracker` uses) and publish the returned port in
+/// the announce URL.  A fixed port collides with a tracker left behind by a
+/// killed run: the stale socket stays in `LISTEN` and Linux rejects a second
+/// bind there regardless of `SO_REUSEADDR`, which only relaxes the `TIME_WAIT`
+/// case `TcpListener::bind` already covers.
+pub fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<u16> {
     let listener = TcpListener::bind((bind_addr, port))?;
+    let bound_port = listener.local_addr()?.port();
     let state = Arc::new(TrackerState {
         peers: Mutex::new(HashMap::new()),
     });
-    eprintln!("[tracker] listening on {}:{}", bind_addr, port);
+    eprintln!("[tracker] listening on {}:{}", bind_addr, bound_port);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
@@ -323,7 +331,7 @@ pub fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<()> {
             std::thread::spawn(move || handle_announce(state, stream));
         }
     });
-    Ok(())
+    Ok(bound_port)
 }
 
 // ── session + keep-alive ─────────────────────────────────────────────────────

@@ -13,6 +13,7 @@
 # payload, but pass --tracker-bind 127.0.0.1 to stay loopback-only.
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
+#        (--port defaults to 0: the OS picks a free port, published in tracker.url)
 #        → outputs under ci/selfseed/output, or DIR when --output-dir is given
 
 set -euo pipefail
@@ -64,7 +65,10 @@ PAYLOAD_GIB=""
 # bytes), so the later * 1024*1024 / * 1024*1024*1024 arithmetic cannot wrap.
 MAX_PAYLOAD_MIB=8796093022207
 MAX_PAYLOAD_GIB=8589934591
-TRACKER_PORT=16969
+# 0 = OS-assigned free ephemeral port, reported in the announce URL the seeder
+# writes.  A fixed port would collide with a tracker left behind by a killed
+# run (the stale process holds it in LISTEN, which no SO_REUSEADDR relaxes).
+TRACKER_PORT=0
 TRACKER_BIND=""
 ANNOUNCE_HOST=""
 
