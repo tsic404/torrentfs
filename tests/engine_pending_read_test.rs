@@ -157,6 +157,13 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     );
 
     let mut config = local_test_config();
+    // Tracker-only discovery: this test asserts a *sourceless* swarm, but LSD
+    // lets the session discover peers on the host (its own interfaces
+    // included), so `num_peers` goes non-zero and `begin_waiting` routes every
+    // read past the cold flight into the 15s no-seeder piece wait — which is
+    // exactly the 15s the late joiner below used to measure.  Tracker-only
+    // discovery keeps the swarm genuinely empty and the test deterministic.
+    config.local_discovery.lsd_enabled = Some(false);
     // Large read timeout: a no-seeder read parks in the peer-wait window
     // (capped at `PEER_WAIT_CAP_SECS`) instead of failing fast.
     config.timeouts.read_timeout_secs = Some(60);
@@ -170,45 +177,65 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     fn spawn_read(
         engine: &Arc<DownloadEngine>,
         info: &Arc<torrentfs::TorrentInfo>,
-    ) -> std::thread::JoinHandle<(torrentfs::TorrentResult<Vec<u8>>, Duration)> {
+    ) -> std::thread::JoinHandle<(torrentfs::TorrentResult<Vec<u8>>, Duration, Instant)> {
         let reader_engine = Arc::clone(engine);
         let reader_info = Arc::clone(info);
         std::thread::spawn(move || {
             let start = Instant::now();
             let result = reader_engine.read_file_range(reader_info, 0, 0, 4096);
-            (result, start.elapsed())
+            (result, start.elapsed(), Instant::now())
         })
     }
 
     // ── Five concurrent cold reads on one torrent ─────────────────────
+    // Each records the instant its read returned, so the joiner below can be
+    // compared against the flight's real deadline instead of against its own
+    // start: the deadline is a property of the flight, and a loaded host
+    // delays it for every attached reader alike.
     let readers: Vec<_> = (0..5).map(|_| spawn_read(&engine, &info)).collect();
 
     // A reader joining while the shared window is still running.  It must
-    // observe the flight's deadline, so it gives up well before a window of
-    // its own would have elapsed.
+    // observe the flight's deadline, so it gives up at the same instant as the
+    // readers that opened the flight — not one window of its own later.
     const JOIN_DELAY: Duration = Duration::from_secs(6);
     std::thread::sleep(JOIN_DELAY);
     let joiner = spawn_read(&engine, &info);
-    let (joiner_result, joiner_elapsed) = joiner.join().expect("joiner thread");
+    let (joiner_result, joiner_elapsed, joiner_finished) = joiner.join().expect("joiner thread");
     assert!(
         joiner_result.is_err(),
         "a no-seeder cold read must fail with NoPeers"
     );
-    assert!(
-        joiner_elapsed < Duration::from_secs(5),
-        "a reader joining {:.0}s into the window waited {:.1}s; it must share \
-         the info_hash's flight deadline, not open its own window",
-        JOIN_DELAY.as_secs_f64(),
-        joiner_elapsed.as_secs_f64()
-    );
 
+    // The readers that opened the flight all give up at its shared deadline, so
+    // their latest finish *is* that deadline on this host.
+    let mut flight_deadline: Option<Instant> = None;
     for reader in readers {
-        let (result, _elapsed) = reader.join().expect("reader thread");
+        let (result, _elapsed, finished) = reader.join().expect("reader thread");
         assert!(
             result.is_err(),
             "a no-seeder cold read must fail with NoPeers"
         );
+        flight_deadline = Some(flight_deadline.map_or(finished, |d| d.max(finished)));
     }
+    let flight_deadline = flight_deadline.expect("five readers finished");
+
+    // The joiner must share the flight's deadline, not open a window of its
+    // own.  Comparing the two *absolute* finish instants is load-insensitive:
+    // a loaded host delays the shared deadline and the joiner's poll of it
+    // together, so the gap stays ~0.  A window of the joiner's own would end one
+    // `JOIN_DELAY` (or more) after the shared deadline — the joiner entered the
+    // window `JOIN_DELAY` late, so its own window would expire that much later.
+    // A wall-clock bound on the joiner's own elapsed time cannot express this:
+    // it moves with host load, which is how the old 5s bound flaked.
+    let overshoot = joiner_finished.saturating_duration_since(flight_deadline);
+    assert!(
+        overshoot < JOIN_DELAY / 2,
+        "the joiner finished {:.1}s after the shared deadline (it waited {:.1}s \
+         from its own start); it must share the info_hash's flight deadline, not \
+         open its own window",
+        overshoot.as_secs_f64(),
+        joiner_elapsed.as_secs_f64()
+    );
 
     // ── A reader arriving after the window elapsed ────────────────────
     // The flight retired with the window, so this read must probe again: a
