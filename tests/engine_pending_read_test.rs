@@ -147,9 +147,8 @@ fn concurrent_cold_reads_share_one_discovery_window() {
 
     let tracker = MiniTracker::start();
     let announce_url = tracker.announce_url();
-    // A name unique to this test: the info hash covers it, and libtorrent LSD
-    // would otherwise pair this session with another ignored test's session
-    // (same process, same torrent) and serve the piece being asserted absent.
+    // A name unique to this test, so the info hash — and therefore the swarm —
+    // is this test's own; the tracker behind it returns no peers for it.
     let (torrent_data, _file_content) =
         create_single_piece_torrent(&announce_url, "cold_flight_window!!");
     let info = Arc::new(
@@ -160,6 +159,14 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     // Large read timeout: a no-seeder read parks in the peer-wait window
     // (capped at `PEER_WAIT_CAP_SECS`) instead of failing fast.
     config.timeouts.read_timeout_secs = Some(60);
+    // Only an empty swarm routes a read through the shared flight, and every
+    // assertion below reads "the swarm stayed empty for the whole window".  LSD
+    // pairs *any* session on the host serving this info hash — including a
+    // concurrent run of this very test in another process, which a parallel
+    // suite produces — and that peer puts the joining read on the no-seeder
+    // piece-wait window (`NO_SEEDER_READ_TIMEOUT_SECS`) instead of the flight.
+    // Disable it so the tracker's empty peer list is the only discovery path.
+    config.local_discovery.lsd_enabled = Some(false);
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let engine = Arc::new(
@@ -167,16 +174,28 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     );
     engine.ensure_handle(info.clone()).expect("ensure_handle");
 
+    /// One spawned read's result, plus the instants that tell a *shared* flight
+    /// deadline apart from a window of the reader's own.
+    struct ReadOutcome {
+        result: torrentfs::TorrentResult<Vec<u8>>,
+        finished_at: Instant,
+        elapsed: Duration,
+    }
+
     fn spawn_read(
         engine: &Arc<DownloadEngine>,
         info: &Arc<torrentfs::TorrentInfo>,
-    ) -> std::thread::JoinHandle<(torrentfs::TorrentResult<Vec<u8>>, Duration)> {
+    ) -> std::thread::JoinHandle<ReadOutcome> {
         let reader_engine = Arc::clone(engine);
         let reader_info = Arc::clone(info);
         std::thread::spawn(move || {
             let start = Instant::now();
             let result = reader_engine.read_file_range(reader_info, 0, 0, 4096);
-            (result, start.elapsed())
+            ReadOutcome {
+                result,
+                finished_at: Instant::now(),
+                elapsed: start.elapsed(),
+            }
         })
     }
 
@@ -184,31 +203,57 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     let readers: Vec<_> = (0..5).map(|_| spawn_read(&engine, &info)).collect();
 
     // A reader joining while the shared window is still running.  It must
-    // observe the flight's deadline, so it gives up well before a window of
-    // its own would have elapsed.
+    // observe the flight's deadline, so it gives up with the readers that
+    // started the flight, not a window of its own later.
     const JOIN_DELAY: Duration = Duration::from_secs(6);
     std::thread::sleep(JOIN_DELAY);
     let joiner = spawn_read(&engine, &info);
-    let (joiner_result, joiner_elapsed) = joiner.join().expect("joiner thread");
-    assert!(
-        joiner_result.is_err(),
-        "a no-seeder cold read must fail with NoPeers"
-    );
-    assert!(
-        joiner_elapsed < Duration::from_secs(5),
-        "a reader joining {:.0}s into the window waited {:.1}s; it must share \
-         the info_hash's flight deadline, not open its own window",
-        JOIN_DELAY.as_secs_f64(),
-        joiner_elapsed.as_secs_f64()
-    );
 
-    for reader in readers {
-        let (result, _elapsed) = reader.join().expect("reader thread");
+    let reader_outcomes: Vec<ReadOutcome> = readers
+        .into_iter()
+        .map(|reader| reader.join().expect("reader thread"))
+        .collect();
+    for outcome in &reader_outcomes {
         assert!(
-            result.is_err(),
+            outcome.result.is_err(),
             "a no-seeder cold read must fail with NoPeers"
         );
     }
+    let joiner = joiner.join().expect("joiner thread");
+    assert!(
+        joiner.result.is_err(),
+        "a no-seeder cold read must fail with NoPeers"
+    );
+
+    // The readers started the flight, so the instant they gave up *is* the
+    // shared deadline.  A joiner attached to that flight gives up in the same
+    // engine-loop poll; one that opened a window of its own trails them by a
+    // whole window.  Comparing the two instants states "shares the flight
+    // deadline" directly — a wall-clock bound on the joiner alone cannot, since
+    // a loaded host stretches every wait together.
+    let shared_deadline = reader_outcomes
+        .iter()
+        .map(|outcome| outcome.finished_at)
+        .max()
+        .expect("five readers ran");
+    let readers_elapsed = reader_outcomes
+        .iter()
+        .map(|outcome| outcome.elapsed)
+        .max()
+        .expect("five readers ran");
+    let trailing = joiner
+        .finished_at
+        .saturating_duration_since(shared_deadline);
+    assert!(
+        trailing < Duration::from_secs(2),
+        "a reader joining {:.0}s into the window gave up {:.1}s after the \
+         readers that started the flight (it waited {:.1}s, they {:.1}s); it \
+         must share the info_hash's flight deadline, not open its own window",
+        JOIN_DELAY.as_secs_f64(),
+        trailing.as_secs_f64(),
+        joiner.elapsed.as_secs_f64(),
+        readers_elapsed.as_secs_f64()
+    );
 
     // ── A reader arriving after the window elapsed ────────────────────
     // The flight retired with the window, so this read must probe again: a
