@@ -364,6 +364,7 @@ fn bencode_tracker_response(interval: i64, compact_peers: &[u8]) -> Vec<u8> {
 ///
 /// The content is 162 bytes of known data, piece length 16384 (single piece),
 /// so the entire file fits in one piece.
+#[allow(dead_code)] // each test target compiles `common` and uses a subset
 pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
     create_single_piece_torrent(announce_url, "final_verification.txt")
 }
