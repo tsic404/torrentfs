@@ -233,40 +233,95 @@ run_test "parse_args --config=/foo.toml /mnt captures config_arg inline" \
 run_test "parse_args -- /mnt leaves config_arg empty" \
     'parse_args -- /mnt; [ -z "$config_arg" ]'
 
-# --- apply_config_env (TORRENTFS_CONFIG) ---
-# apply_config_env injects TORRENTFS_CONFIG as a leading --config argument when
-# no --config CLI argument was given. An explicit CLI --config wins over the env
-# variable; an unset env variable is a no-op.
+# --- apply_config_override ---
+# apply_config_override resolves the config file in precedence order — CLI
+# --config (captured by parse_args) > TORRENTFS_CONFIG env > the mounted default
+# path — and injects the winner as a leading --config argument. Tests override
+# TORRENTFS_DEFAULT_CONFIG with a temp file (or unset it) so the well-known
+# container path (/etc/torrentfs.toml) is never read from the test host.
 
-run_test "apply_config_env injects --config from TORRENTFS_CONFIG" \
-    'export TORRENTFS_CONFIG=/env.toml; parse_args /mnt; apply_config_env; [ "$config_arg" = /env.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /env.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
+run_test "apply_config_override injects --config from TORRENTFS_CONFIG" \
+    'TORRENTFS_DEFAULT_CONFIG=/nonexistent/torrentfs-default.toml; export TORRENTFS_CONFIG=/env.toml; parse_args /mnt; apply_config_override; [ "$config_arg" = /env.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /env.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
 
-run_test "apply_config_env defers to CLI --config over TORRENTFS_CONFIG" \
-    'export TORRENTFS_CONFIG=/env.toml; parse_args --config /cli.toml /mnt; apply_config_env; [ "$config_arg" = /cli.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
+run_test "apply_config_override defers to CLI --config over TORRENTFS_CONFIG" \
+    'TORRENTFS_DEFAULT_CONFIG=/nonexistent/torrentfs-default.toml; export TORRENTFS_CONFIG=/env.toml; parse_args --config /cli.toml /mnt; apply_config_override; [ "$config_arg" = /cli.toml ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ]'
 
-run_test "apply_config_env defers to CLI --config= over TORRENTFS_CONFIG" \
-    'export TORRENTFS_CONFIG=/env.toml; parse_args --config=/cli.toml /mnt; apply_config_env; [ "$config_arg" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 1 ]'
+run_test "apply_config_override defers to CLI --config= over TORRENTFS_CONFIG" \
+    'TORRENTFS_DEFAULT_CONFIG=/nonexistent/torrentfs-default.toml; export TORRENTFS_CONFIG=/env.toml; parse_args --config=/cli.toml /mnt; apply_config_override; [ "$config_arg" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 1 ]'
 
-run_test "apply_config_env no-ops when TORRENTFS_CONFIG is unset" \
-    'unset TORRENTFS_CONFIG; parse_args /mnt; apply_config_env; [ -z "$config_arg" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
+run_test "apply_config_override no-ops when TORRENTFS_CONFIG is unset" \
+    'unset TORRENTFS_CONFIG; TORRENTFS_DEFAULT_CONFIG=/nonexistent/torrentfs-default.toml; parse_args /mnt; apply_config_override; [ -z "$config_arg" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
 
-# --- should_apply_config_env ---
-# TORRENTFS_CONFIG is applied only when the command consumes the parsed args —
-# the mount path or --config-check. Diagnostic commands that forward the raw
-# "$@" (--help/--version) skip it, so a bad TORRENTFS_CONFIG path cannot block
-# their output.
+run_test "apply_config_override applies the mounted default path when no env/CLI" \
+    'unset TORRENTFS_CONFIG; d="$(mktemp -d)"; touch "$d/cfg.toml"; TORRENTFS_DEFAULT_CONFIG="$d/cfg.toml"; parse_args /mnt; apply_config_override
+rc=0
+[ "$config_arg" = "$d/cfg.toml" ] && [ "${torrentfs_args[0]}" = --config ] && [ "${torrentfs_args[1]}" = "$d/cfg.toml" ] && [ "${#torrentfs_args[@]}" -eq 2 ] || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
 
-run_test "should_apply_config_env true for a mount command" \
-    'parse_args /mnt; should_apply_config_env /mnt'
+run_test "apply_config_override prefers TORRENTFS_CONFIG over the mounted default" \
+    'd="$(mktemp -d)"; touch "$d/cfg.toml"; TORRENTFS_DEFAULT_CONFIG="$d/cfg.toml"; export TORRENTFS_CONFIG=/env.toml; parse_args /mnt; apply_config_override
+rc=0
+[ "$config_arg" = /env.toml ] && [ "${torrentfs_args[1]}" = /env.toml ] || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
 
-run_test "should_apply_config_env false for --help" \
-    'parse_args --help; if should_apply_config_env --help; then exit 1; else exit 0; fi'
+run_test "apply_config_override prefers CLI --config over the mounted default" \
+    'd="$(mktemp -d)"; touch "$d/cfg.toml"; TORRENTFS_DEFAULT_CONFIG="$d/cfg.toml"; unset TORRENTFS_CONFIG; parse_args --config /cli.toml /mnt; apply_config_override
+rc=0
+[ "$config_arg" = /cli.toml ] && [ "${#torrentfs_args[@]}" -eq 2 ] || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
 
-run_test "should_apply_config_env false for --version" \
-    'parse_args --version; if should_apply_config_env --version; then exit 1; else exit 0; fi'
+run_test "apply_config_override set-but-empty TORRENTFS_CONFIG opts out of the mounted default" \
+    'd="$(mktemp -d)"; touch "$d/cfg.toml"; TORRENTFS_DEFAULT_CONFIG="$d/cfg.toml"; export TORRENTFS_CONFIG=; parse_args /mnt; apply_config_override
+rc=0
+[ -z "$config_arg" ] && [ "${#torrentfs_args[@]}" -eq 0 ] || rc=$?
+rm -rf "$d"
+[ "$rc" -eq 0 ]'
 
-run_test "should_apply_config_env true for --config-check" \
-    'parse_args --config-check; should_apply_config_env --config-check'
+run_test "apply_config_override no-ops when the default path file is absent" \
+    'unset TORRENTFS_CONFIG; TORRENTFS_DEFAULT_CONFIG=/no/such/config.toml; parse_args /mnt; apply_config_override; [ -z "$config_arg" ] && [ "${#torrentfs_args[@]}" -eq 0 ]'
+
+# --- should_apply_config_override ---
+# Config override resolution is applied only when the command consumes the
+# parsed args — the mount path or --config-check. Diagnostic commands that
+# forward the raw "$@" (--help/--version) skip it, so a bad config path cannot
+# block their output.
+
+run_test "should_apply_config_override true for a mount command" \
+    'parse_args /mnt; should_apply_config_override /mnt'
+
+run_test "should_apply_config_override false for --help" \
+    'parse_args --help; if should_apply_config_override --help; then exit 1; else exit 0; fi'
+
+run_test "should_apply_config_override false for --version" \
+    'parse_args --version; if should_apply_config_override --version; then exit 1; else exit 0; fi'
+
+run_test "should_apply_config_override true for --config-check" \
+    'parse_args --config-check; should_apply_config_override --config-check'
+
+# --- revalidate_config_as_daemon ---
+# Re-checks the effective config as the daemon user after the privilege drop,
+# so a config readable by root but not by UID 1000 fails at validation time
+# instead of "validated, then daemon exits with Failed to load config".
+# `setpriv` is a PATH binary, so a shell-function stub shadows it (no real drop
+# and no torrentfs invocation).
+
+run_test "revalidate_config_as_daemon no-ops without a config" \
+    'config_arg=""; should_drop_privileges() { return 0; }; revalidate_config_as_daemon'
+
+run_test "revalidate_config_as_daemon no-ops when not dropping privileges" \
+    'config_arg=/x.toml; should_drop_privileges() { return 1; }; revalidate_config_as_daemon'
+
+run_test "revalidate_config_as_daemon passes when the daemon can read the config" \
+    'config_arg=/x.toml; daemon_uid=1000; daemon_gid=1000; should_drop_privileges() { return 0; }; setpriv() { return 0; }; revalidate_config_as_daemon'
+
+run_test "revalidate_config_as_daemon fails fast when the daemon cannot read the config" \
+    'config_arg=/x.toml; daemon_uid=1000; daemon_gid=1000; should_drop_privileges() { return 0; }; setpriv() { return 1; }
+rc=0
+( revalidate_config_as_daemon ) 2>/dev/null || rc=$?
+[ "$rc" -ne 0 ]'
 
 # --- validate_mountpoint (mountpoint guard) ---
 # validate_mountpoint rejects a missing or `-`-prefixed mountpoint with exit 2
