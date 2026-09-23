@@ -103,6 +103,11 @@ db_arg=""
 log_file_arg=""
 # --config value, so TORRENTFS_CONFIG (env) defers to an explicit CLI --config.
 config_arg=""
+# Well-known in-container config path. A config file bind-mounted here is
+# applied as `--config` when neither an explicit CLI --config nor
+# TORRENTFS_CONFIG was given, so a pure
+# `-v /host.cfg:/etc/torrentfs.toml:ro` mount overrides config with no env var.
+TORRENTFS_DEFAULT_CONFIG=/etc/torrentfs.toml
 
 parse_args() {
     local arg expect_value="" options_ended=0
@@ -187,28 +192,46 @@ parse_args() {
     done
 }
 
-# Apply TORRENTFS_CONFIG (env) as `--config` when no --config CLI argument was
-# given. The value is validated like a CLI --config so a bad path fails fast at
-# startup. An explicit CLI --config wins over the environment variable.
-apply_config_env() {
-    if [ -n "${TORRENTFS_CONFIG:-}" ] && [ -z "$config_arg" ]; then
-        validate_config "$TORRENTFS_CONFIG"
-        torrentfs_args=(--config "$TORRENTFS_CONFIG" "${torrentfs_args[@]}")
-        config_arg="$TORRENTFS_CONFIG"
+# Resolve the config file to inject as a leading `--config`, in precedence
+# order: an explicit CLI --config (already captured into config_arg by
+# parse_args), then TORRENTFS_CONFIG (env), then the well-known container path
+# TORRENTFS_DEFAULT_CONFIG when that file exists. The first non-empty source is
+# validated like a CLI --config so a bad file fails fast at startup; once a
+# source wins, lower-precedence ones are ignored.
+#
+# A set-but-empty TORRENTFS_CONFIG is a deliberate "no config override": it is
+# a no-op and does NOT fall through to the mounted default path. The previous
+# `[ -n "${TORRENTFS_CONFIG:-}" ]` gate treated empty as unset and injected
+# nothing — that opt-out must not silently become "use the mounted file".
+apply_config_override() {
+    [ -z "$config_arg" ] || return 0
+    local source=""
+    if [ -n "${TORRENTFS_CONFIG:-}" ]; then
+        # Non-empty env: explicit override, wins over the mounted default.
+        source="$TORRENTFS_CONFIG"
+    elif [ -z "${TORRENTFS_CONFIG+x}" ] && [ -f "$TORRENTFS_DEFAULT_CONFIG" ]; then
+        # Env unset (not set-but-empty): fall back to the mounted default file.
+        source="$TORRENTFS_DEFAULT_CONFIG"
+        echo "[entrypoint] applying config from mounted file '$source'" >&2
     fi
+    [ -n "$source" ] || return 0
+    validate_config "$source"
+    torrentfs_args=(--config "$source" "${torrentfs_args[@]}")
+    config_arg="$source"
 }
 
-# Whether TORRENTFS_CONFIG applies to this invocation: only when the command
-# consumes the parsed args — the mount path, or --config-check. --help/-h/
-# --version/-V/help forward the raw "$@" (dropping any injected --config), so
-# skip env-config validation for them instead of blocking their output.
-should_apply_config_env() {
+# Whether config-override resolution (CLI --config / TORRENTFS_CONFIG / mounted
+# default path) applies to this invocation: only when the command consumes the
+# parsed args — the mount path, or --config-check. --help/-h/--version/-V/help
+# forward the raw "$@" (dropping any injected --config), so skip config
+# validation for them instead of blocking their output.
+should_apply_config_override() {
     needs_fuse "$@" || has_config_check "${torrentfs_args[@]}"
 }
 
 parse_args "$@"
-if should_apply_config_env "$@"; then
-    apply_config_env
+if should_apply_config_override "$@"; then
+    apply_config_override
 fi
 
 # Reject a missing or unusable mountpoint with an actionable diagnostic (exit 2,
@@ -296,6 +319,28 @@ run_daemon() {
     fi
     exec "$@"
 }
+
+# Re-validate the effective config file as the daemon user (post privilege
+# drop). validate_config ran as root before the drop, but in a rootful
+# container the daemon re-reads the same file as UID 1000: a 0600 root-owned
+# mounted config (bind mounts preserve host mode/owner) passes root validation
+# yet makes torrentfs exit(1) at startup — a misleading "validated, then
+# failed" sequence. Fail here, at validation time, with an actionable
+# diagnostic. A no-op when there is no config or no privilege drop (rootless
+# podman / non-root --user: the daemon runs as the validating user).
+revalidate_config_as_daemon() {
+    [ -n "${config_arg:-}" ] || return 0
+    should_drop_privileges || return 0
+    local rc=0
+    setpriv --reuid="$daemon_uid" --regid="$daemon_gid" --clear-groups \
+        torrentfs --config-check --config "$config_arg" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[entrypoint] ERROR: config file '$config_arg' is not readable by the daemon user (uid $daemon_uid)" >&2
+        echo "[entrypoint]   Mount it world-readable (chmod 644) so the daemon can read it after the privilege drop." >&2
+        exit "$rc"
+    fi
+}
+
 # Check whether $1 is a bind mount (root field != "/" in /proc/self/mountinfo).
 # Used to detect `-v <host>:<container>:shared` style bind mounts: under rootless
 # podman the ':shared' propagation is silently downgraded, so the FUSE mount can
@@ -964,6 +1009,8 @@ start_torrentfs_rootful() {
 echo "[entrypoint] /dev/fuse is available" >&2
 
 resolve_daemon_ids
+
+revalidate_config_as_daemon
 
 fix_state_dir_ownership
 

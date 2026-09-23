@@ -169,7 +169,32 @@ Note: `[rate_limits] download_rate_limit` / `upload_rate_limit` (bytes per secon
 
 CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
 
-In a container, set the `TORRENTFS_CONFIG` environment variable to a config file path mounted into the image — the entrypoint validates it and injects it as `--config`, so TOML-only options such as `[cache] cache_size` are configurable without a CLI flag. An explicit `--config` CLI option takes precedence over the environment variable; after `--` (end of options) `--config` is a positional argument, not the option, so it does not suppress `TORRENTFS_CONFIG`.
+In a container, the entrypoint resolves an external config file in precedence
+order and injects it as `--config`, so TOML-only options such as
+`[cache] cache_size` are configurable without a CLI flag:
+
+1. an explicit `--config` CLI option;
+2. the `TORRENTFS_CONFIG` environment variable;
+3. a config file bind-mounted at `/etc/torrentfs.toml` (no env var needed).
+
+The winning file is validated at startup (a bad file fails fast). It must be
+readable by the daemon user (UID 1000): a rootful container re-validates the
+config after the privilege drop, so a root-only `0600` mount fails fast with an
+actionable error — `chmod 644` it. Setting `TORRENTFS_CONFIG` to an empty value
+disables the override (no config is injected; the mounted default is not used).
+After `--` (end of options) `--config` is a positional argument, not the
+option, so it does not suppress `TORRENTFS_CONFIG` or the default mount path.
+
+Pure mount override — no env var required:
+
+```bash
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  -v /host/torrentfs-small-cache.toml:/etc/torrentfs.toml:ro \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  ghcr.io/tsic404/torrentfs:main /mnt
+```
+
+Environment-variable override — any mounted path:
 
 ```bash
 docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
