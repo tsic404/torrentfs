@@ -717,9 +717,10 @@ pub fn generate_torrent_stats(
         if let Ok(cm_guard) = cm.try_lock() {
             let cache_stats = cm_guard.get_cache_stats_by_infohash(info_hash);
             output.push_str(&format!(
-                "Cache: {} pieces  {}\n",
+                "Cache: {} pieces  {}  max={}\n",
                 cache_stats.piece_count,
-                format_bytes(cache_stats.total_size)
+                format_bytes(cache_stats.total_size),
+                cm_guard.max_cache_size()
             ));
         }
     }
@@ -1457,6 +1458,52 @@ mod tests {
         assert!(
             !text.contains("200.0%"),
             "stats must never render an over-limit percentage, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_torrent_stats_cache_line_shows_max_cache_size() {
+        // The leaf `.stats` Cache line must expose the configured limit so a
+        // small-cache regression can read `max=<cache_size>` and compare it
+        // against the actual config byte-for-byte, rather than re-deriving it
+        // from a rounded human-readable form.
+        use crate::db::InsertTorrentResult;
+
+        let mut db = Database::open_in_memory().unwrap();
+        let InsertTorrentResult::Inserted(source_id) = db
+            .insert_torrent(
+                "data",
+                "ubuntu",
+                "ubuntu.torrent",
+                1024,
+                "hash-cache-max",
+                1,
+            )
+            .unwrap()
+        else {
+            panic!("expected a fresh insert");
+        };
+        let db = Some(Arc::new(Mutex::new(db)));
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let max_bytes = 32 * 1024 * 1024;
+        let mut cache = CacheManager::new(temp_dir.path(), max_bytes).unwrap();
+        let piece_key = "hash-cache-max:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key).unwrap();
+        std::fs::write(&piece_path, vec![0u8; 4 * 1024 * 1024]).unwrap();
+        cache
+            .register_incomplete_piece(piece_key, 4 * 1024 * 1024)
+            .unwrap();
+        let cm = Arc::new(Mutex::new(cache));
+
+        let stats = generate_torrent_stats(source_id, "hash-cache-max", &db, &None, {
+            let cm = cm.clone();
+            move || Some(cm.clone())
+        });
+        let text = String::from_utf8_lossy(&stats);
+        assert!(
+            text.contains(&format!("Cache: 1 pieces  4.00 MB  max={max_bytes}\n")),
+            "leaf Cache line must carry max=<cache_size> in bytes, got:\n{text}"
         );
     }
 
