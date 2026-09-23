@@ -625,6 +625,13 @@ impl TestHarness {
                                         | torrentfs::download::TorrentState::Finished
                                 ) {
                                     eprintln!("TestHarness seeder: now seeding!");
+                                    // Announce the now-ready seeder at once:
+                                    // libtorrent's own re-announce schedule is
+                                    // far beyond any test wait, so the harness
+                                    // would otherwise stall on it.  This
+                                    // registers the complete-seed entry the
+                                    // downloader later discovers.
+                                    handle.force_reannounce();
                                     *seeder_ready_clone.lock().unwrap() = true;
                                     break;
                                 }
@@ -704,34 +711,12 @@ impl TestHarness {
             thread::sleep(Duration::from_millis(200));
         }
 
-        // After the seeder is ready, wait for it to complete at least one
-        // more announce cycle.  On slow CI hardware the tracker may still
-        // be returning stale peer lists from the CheckingFiles phase;
-        // forcing one extra announce ensures the downloader will see the
-        // seeder as a peer when it queries the tracker.
-        {
-            let start = std::time::Instant::now();
-            let announce_timeout = Duration::from_secs(15);
-            let target = tracker.announce_count() + 1;
-            loop {
-                if tracker.announce_count() >= target {
-                    eprintln!(
-                        "TestHarness: seeder re-announced ({} total announces)",
-                        tracker.announce_count()
-                    );
-                    break;
-                }
-                if start.elapsed() > announce_timeout {
-                    eprintln!(
-                        "TestHarness: timeout waiting for seeder re-announce (got {}, wanted {})",
-                        tracker.announce_count(),
-                        target
-                    );
-                    break;
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
+        // The seeder forced its announce as soon as it reached Seeding, so the
+        // tracker already has a complete-seed entry; the block below is what
+        // actually guarantees it (and covers the case where even the forced
+        // announce raced).  Waiting out libtorrent's own re-announce schedule
+        // instead cost every harness the full timeout, because that schedule
+        // is far longer than any test would wait.
 
         // Verify the seeder actually appears in the tracker's peer
         // list.  On slow CI, announce_count may have been incremented
