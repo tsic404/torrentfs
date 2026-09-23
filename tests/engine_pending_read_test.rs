@@ -19,15 +19,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    acquire_session_lock, build_multipiece_torrent, create_single_piece_torrent,
-    create_test_torrent_with_tracker, local_test_config, MiniTracker, TestHarness,
+    acquire_session_lock, build_multipiece_torrent, create_single_piece_torrent, local_test_config,
+    MiniTracker, TestHarness,
 };
 use torrentfs::download::DownloadEngine;
 
 /// While a no-seeder read is parked in its peer-wait window, a synchronous
 /// engine command must still be served promptly.  Pre-fix the engine thread sat
-/// inside the read for the whole window, so the probe took ~9s; post-fix it is
-/// served on the next engine-loop iteration.
+/// inside the read for the whole window, so the probe was answered only once
+/// the read had already finished; post-fix it is served on the next engine-loop
+/// iteration, while the read is still parked.
 #[test]
 #[ignore = "requires local tracker; ~10s wall-clock"]
 fn parked_no_seeder_read_does_not_block_engine_commands() {
@@ -38,7 +39,13 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
     // ── Tracker with no seeder behind it ──────────────────────────────
     let tracker = MiniTracker::start();
     let announce_url = tracker.announce_url();
-    let (torrent_data, _file_content) = create_test_torrent_with_tracker(&announce_url);
+    // Own swarm: the info hash covers the torrent `name`, and libtorrent LSD
+    // pairs two sessions serving one info hash on a host — a seeder for the
+    // widely-seeded `final_verification.txt` (another ignored test, in this or
+    // a sibling binary) serves this read before it can park, which silently
+    // voids the probe below.
+    let (torrent_data, _file_content) =
+        create_single_piece_torrent(&announce_url, "parked_no_seeder_read!!");
     let info = Arc::new(
         torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
     );
@@ -63,24 +70,58 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
     let reader_info = Arc::clone(&info);
     let reader = std::thread::spawn(move || reader_engine.read_file_range(reader_info, 0, 0, 50));
 
-    // Give the read time to reach the peer-wait window.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for the read to be *parked*, not merely started: `begin_waiting`
+    // publishes the reader's elevated piece priority before the read enters its
+    // peer-wait phase, so a non-zero priority is observable evidence that the
+    // engine reached the state under test.  A fixed sleep cannot tell "parked"
+    // from "still starting up" on a loaded host.
+    let parked_by = Instant::now() + Duration::from_secs(5);
+    while engine
+        .try_pieces_status(&info_hash)
+        .and_then(|(_, pieces)| pieces.first().map(|p| p.priority))
+        .unwrap_or(0)
+        == 0
+    {
+        assert!(
+            Instant::now() < parked_by,
+            "the no-seeder read never reached its peer-wait window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // ── Probe: a synchronous command must be served now ───────────────
     let probe_start = Instant::now();
     let served = engine.get_pieces_status(&info_hash, 1).is_ok();
     let probe_elapsed = probe_start.elapsed();
+    // The engine thread must answer *while the read is still parked*: pre-fix
+    // it sat inside the read for the whole peer-wait window, so the probe was
+    // answered only after the read had finished.  A wall-clock bound cannot
+    // express that — on a loaded host the engine loop's own housekeeping
+    // (snapshot publish) can delay the answer by seconds with nothing blocking
+    // it, while a blocked engine thread answers only after the read's whole
+    // ~9s window — so the condition is checked structurally.
+    let read_still_parked = !reader.is_finished();
 
-    let _ = reader.join();
+    let read_result = reader.join().expect("reader thread");
 
     assert!(
         served,
         "piece-status command failed while a read was parked"
     );
+    // The probe only proves anything if the read really was sourceless and
+    // waited: a seeder reaching this info_hash (LSD pairs sessions serving one
+    // info_hash on a host) serves the read instantly and voids the assertion
+    // below.
     assert!(
-        probe_elapsed < Duration::from_secs(2),
-        "engine served a command only after {:.2}s: a parked no-seeder read \
-         blocked the engine thread",
+        read_result.is_err(),
+        "a seeder served the no-seeder read (result {:?}), so nothing was \
+         parked and the probe proved nothing: this test must own its info_hash",
+        read_result.as_ref().map(|data| data.len())
+    );
+    assert!(
+        read_still_parked,
+        "the engine answered the probe only after {:.2}s, once the parked read \
+         had already finished: the read blocked the engine thread",
         probe_elapsed.as_secs_f64()
     );
 }
