@@ -326,17 +326,21 @@ fn test_transient_peer_fast_exit() {
 /// Ignored by default: it needs a local tracker and spends ~10s of real
 /// wall-clock waiting for the peer-wait cap to elapse.  Run with
 /// `cargo test --test peer_download_test test_no_seeder_read_fails_fast -- --ignored`.
+///
+/// Own info_hash: LSD pairs two sessions serving one info_hash on a host, so
+/// on the shared test swarm this binary's seeder test would answer the read.
 #[test]
 #[ignore = "requires local tracker; ~10s wall-clock"]
 fn test_no_seeder_read_fails_fast() {
-    use common::{create_test_torrent_with_tracker, MiniTracker};
+    use common::{create_single_piece_torrent, MiniTracker};
 
     // ── Start a tracker with no seeder behind it ───────────────────────
     let tracker = MiniTracker::start();
     let announce_url = tracker.announce_url();
     println!("Tracker started at {}", announce_url);
 
-    let (torrent_data, _file_content) = create_test_torrent_with_tracker(&announce_url);
+    let (torrent_data, _file_content) =
+        create_single_piece_torrent(&announce_url, "no_seeder_fails_fast!!");
     let info = Arc::new(
         torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
     );

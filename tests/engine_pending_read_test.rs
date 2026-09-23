@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    acquire_session_lock, build_multipiece_torrent, create_single_piece_torrent, local_test_config,
-    MiniTracker, TestHarness,
+    acquire_session_lock, build_multipiece_torrent_named, create_single_piece_torrent,
+    local_test_config, MiniTracker, TestHarness,
 };
 use torrentfs::download::DownloadEngine;
 
@@ -318,9 +318,9 @@ fn concurrent_cold_reads_all_succeed_with_a_seeder() {
 /// gradient, so the retained prefetch window belonged to the wrong read.
 ///
 /// The reads are staggered by a second so completion order is deterministic
-/// (both wait the same peer-discovery window from their own start), and the
-/// access window is narrowed to zero so each read's gradient is local and the
-/// two are distinguishable in `.stats`.
+/// (both wait out the info_hash's single peer-discovery window, so the earlier
+/// reader is released first), and the access window is narrowed to zero so each
+/// read's gradient is local and the two are distinguishable in `.stats`.
 #[test]
 #[ignore = "requires local tracker; ~13s wall-clock"]
 fn concurrent_slow_reads_release_their_own_reader() {
@@ -328,7 +328,10 @@ fn concurrent_slow_reads_release_their_own_reader() {
 
     let tracker = MiniTracker::start();
     let announce_url = tracker.announce_url();
-    let (torrent_data, _file_content) = build_multipiece_torrent(&announce_url);
+    // Own swarm: on a shared info_hash another test's seeder answers these
+    // reads via LSD, and both must fail with NoPeers.
+    let (torrent_data, _file_content) =
+        build_multipiece_torrent_named(&announce_url, "slow_reads_own_reader.bin");
     let info = Arc::new(
         torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
     );
