@@ -22,8 +22,8 @@ use super::types::FilePieceInfo;
 
 /// Idle baseline piece priority: 0 = "not wanted".  Pieces outside every
 /// active reader's access window stay at 0, so libtorrent never requests them
-/// on its own.  The torrent is held in `upload_mode` while idle, so it still
-/// connects and seeds without requesting any piece.
+/// on its own — the priority vector is the sole "what to download" authority,
+/// which is why the torrent is never returned to `upload_mode` after a read.
 const DEFAULT_PRIORITY: i32 = 0;
 
 /// Priority gradient configuration for selective piece download.
@@ -340,15 +340,6 @@ impl PieceScheduler {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Whether a torrent has converged to idle: no active reader and no
-    /// wanted piece.  The engine uses this (on reader release and on the
-    /// periodic tick) to restore `upload_mode` exactly when both the reader
-    /// count and the retained wanted set reach zero.
-    pub fn is_idle(&self, info_hash: &str) -> bool {
-        let has_readers = self.readers.get(info_hash).map_or(false, |r| !r.is_empty());
-        !has_readers && self.elevated_pieces(info_hash).is_empty()
     }
 
     /// Remove all per-torrent state for an info_hash (priority vector,
@@ -799,43 +790,12 @@ mod tests {
         assert_eq!(pref, vec![1, 1]);
     }
 
-    #[test]
-    fn is_idle_requires_no_readers_and_no_wanted_pieces() {
-        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
-        s.init_torrent("hash", 4, 256).unwrap();
-
-        // Fresh torrent: no readers, no wanted pieces.
-        assert!(s.is_idle("hash"));
-
-        // A wanted piece keeps it active.
-        s.elevated.insert("hash".to_string(), vec![0, 6, 0, 0]);
-        assert!(!s.is_idle("hash"));
-
-        // No wanted pieces but an active reader also keeps it active.
-        s.elevated.insert("hash".to_string(), vec![0, 0, 0, 0]);
-        s.readers.insert(
-            "hash".to_string(),
-            vec![ReadRange {
-                id: ReadId(0),
-                gradient: vec![7, 0, 0, 0],
-            }],
-        );
-        assert!(!s.is_idle("hash"));
-
-        // No readers, no wanted pieces → idle.
-        s.readers.remove("hash");
-        assert!(s.is_idle("hash"));
-
-        // An unknown torrent is trivially idle.
-        assert!(s.is_idle("other"));
-    }
-
     /// Two readers can be active on one torrent at once: a read parked off the
     /// engine thread keeps its reader registered while it waits on the swarm.
     /// Releasing one must remove exactly that reader — the old LIFO `pop`
     /// removed the last-added one instead, so a finished read's gradient
     /// lingered while the still-waiting read's was dropped, corrupting the
-    /// union gradient, the retained prefetch window and `is_idle`.
+    /// union gradient and the retained prefetch window.
     #[test]
     fn concurrent_readers_release_by_id_not_lifo() {
         use crate::infrastructure::cache::CacheManager;
