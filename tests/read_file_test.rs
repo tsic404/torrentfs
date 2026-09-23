@@ -8,10 +8,62 @@
 mod common;
 
 use common::{local_test_config, TestHarness};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+/// How many tests in this binary may run at once.
+///
+/// Each test drives one to three libtorrent sessions.  Letting all fourteen run
+/// at once makes libtorrent 2.1 segfault inside `add_torrent` and starves the
+/// engine threads enough to stretch a read's wait windows; capping the wave
+/// bounds how many sessions are live while the module stays far below
+/// libtest's 60s slow-test warning.  Four is what a 4-core CI runner already
+/// gets from libtest's own default thread count.
+const MAX_CONCURRENT_TESTS: usize = 4;
+
+/// Tests currently holding a wave slot.
+static ACTIVE_TESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Claim a wave slot, blocking until one frees.
+///
+/// Hold the returned guard for the whole test — it is the test's *sessions*,
+/// not merely their creation, that must stay bounded.
+fn wave_slot() -> WaveSlot {
+    loop {
+        let active = ACTIVE_TESTS.load(Ordering::SeqCst);
+        if active < MAX_CONCURRENT_TESTS
+            && ACTIVE_TESTS
+                .compare_exchange(active, active + 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return WaveSlot;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Releases its wave slot on drop.
+struct WaveSlot;
+
+impl Drop for WaveSlot {
+    fn drop(&mut self) {
+        ACTIVE_TESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The single-piece fixture torrent, under a `name` unique to one test.
+///
+/// Every test in this binary runs in parallel and `local_test_config()` leaves
+/// LSD enabled: libtorrent pairs two same-host sessions that serve the same
+/// info hash, so a shared fixture name would let one test's downloader read
+/// from another test's seeder — and lose that connection mid-read when that
+/// test tears its session down.  A per-test `name` gives each test its own
+/// swarm identity, so LSD can only ever pair its own peers.
+fn unique_torrent(name: &'static str) -> impl FnOnce(&str) -> (Vec<u8>, Vec<u8>) {
+    move |announce_url| common::create_single_piece_torrent(announce_url, name)
+}
 
 /// Test that DownloadEngine::read_file_range can download and return
 /// correct file data when a local seeder is available via tracker.
@@ -20,12 +72,10 @@ use std::time::Duration;
 /// validating that the lazy-loading flow works end-to-end.
 #[test]
 fn test_read_file_range_with_local_seeder() {
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     // ── Setup: start tracker + seeder ──────────────────────────────────
-    let harness = TestHarness::new();
+    let harness =
+        TestHarness::with_torrent(unique_torrent("read-file-range-with-local-seeder.txt"));
 
     let info_hash = hex::encode(harness.info.info_hash().expect("Failed to get info hash"));
     println!("TestHarness ready. Info hash: {}", info_hash);
@@ -38,12 +88,10 @@ fn test_read_file_range_with_local_seeder() {
     // ── Create DownloadEngine pointing at the tracker ──────────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // force the downloader onto a distinct listen port so the
-    // MiniTracker can distinguish it from the seeder (which defaults to
-    // 6881 via Session::new with NULL listen_interfaces).  When both
-    // sessions collide on the same port the tracker deduplicates by
-    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port: a fixed one would collide between tests
+    // now that they run in parallel, while the MiniTracker must still see
+    // the downloader as a peer distinct from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -107,19 +155,16 @@ fn test_read_file_range_with_local_seeder() {
 /// stuck in a "Finished" state with no peer connections.
 #[test]
 fn test_read_file_range_after_idle_handle() {
-    // Serialize libtorrent session creation to avoid resource contention.
-    let _session_guard = common::acquire_session_lock();
-
-    let harness = TestHarness::new();
+    let _slot = wave_slot();
+    let harness =
+        TestHarness::with_torrent(unique_torrent("read-file-range-after-idle-handle.txt"));
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // force the downloader onto a distinct listen port so the
-    // MiniTracker can distinguish it from the seeder (which defaults to
-    // 6881 via Session::new with NULL listen_interfaces).  When both
-    // sessions collide on the same port the tracker deduplicates by
-    // IP:port and returns 0 peers, causing a 30s timeout.
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port: a fixed one would collide between tests
+    // now that they run in parallel, while the MiniTracker must still see
+    // the downloader as a peer distinct from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -175,16 +220,14 @@ fn test_read_file_range_after_idle_handle() {
 /// it only polls the engine's published snapshot.
 #[test]
 fn test_idle_handle_connects_to_seeder_without_read() {
-    // Serialize libtorrent session creation to avoid resource contention.
-    let _session_guard = common::acquire_session_lock();
-
-    let harness = TestHarness::new();
+    let _slot = wave_slot();
+    let harness = TestHarness::with_torrent(unique_torrent("idle-handle-connects.txt"));
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // distinct downloader listen port so the MiniTracker can tell
-    // it apart from the seeder (which binds 6881).
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port so the MiniTracker sees it as a peer
+    // distinct from the seeder (which binds its own ephemeral port).
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -247,20 +290,18 @@ fn test_idle_handle_connects_to_seeder_without_read() {
 ///
 /// `announce_count` alone cannot distinguish the downloader's announce from
 /// the seeder's periodic re-announce, so `peer_count >= 2` is the definitive
-/// signal: the downloader listens on a distinct port (16881) and registers a
-/// second peer entry on top of the seeder's (6881).
+/// signal: the downloader listens on its own ephemeral port and registers a
+/// second peer entry on top of the seeder's.
 #[test]
 fn test_ensure_handle_triggers_announce_without_read() {
-    // Serialize libtorrent session creation to avoid resource contention.
-    let _session_guard = common::acquire_session_lock();
-
-    let harness = TestHarness::new();
+    let _slot = wave_slot();
+    let harness = TestHarness::with_torrent(unique_torrent("ensure-handle-announce.txt"));
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // distinct downloader listen port so the tracker records the downloader
-    // as a second peer, separate from the seeder (which binds 6881).
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port so the tracker records the downloader as a
+    // second peer, separate from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -333,20 +374,15 @@ fn test_ensure_handle_triggers_announce_without_read() {
 /// combinations, validating boundary handling.
 #[test]
 fn test_read_file_range_boundaries() {
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
-
-    let harness = TestHarness::new();
+    let _slot = wave_slot();
+    let harness = TestHarness::with_torrent(unique_torrent("read-file-range-boundaries.txt"));
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // force the downloader onto a distinct listen port so the
-    // MiniTracker can distinguish it from the seeder (which defaults to
-    // 6881 via Session::new with NULL listen_interfaces).  When both
-    // sessions collide on the same port the tracker deduplicates by
-    // IP:port and returns 0 peers, causing a 30s timeout.
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port: a fixed one would collide between tests
+    // now that they run in parallel, while the MiniTracker must still see
+    // the downloader as a peer distinct from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
@@ -416,20 +452,24 @@ fn test_read_file_range_boundaries() {
 /// peers/seeds are available AND no cached pieces exist.
 #[test]
 fn test_read_file_range_no_peers_error() {
+    let _slot = wave_slot();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
     // Use config with DHT disabled so we don't accidentally find peers
     let mut config = torrentfs::TorrentfsConfig::default_config();
     config.dht.enabled = Some(false);
     config.local_discovery.lsd_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     config.timeouts.read_timeout_secs = Some(2); // Short timeout for test
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
 
     // Create a test torrent with a fake tracker URL (no real tracker running)
-    let (torrent_data, _file_content) =
-        common::create_test_torrent_with_tracker("http://127.0.0.1:19999/announce");
+    let (torrent_data, _file_content) = common::create_single_piece_torrent(
+        "http://127.0.0.1:19999/announce",
+        "read-file-range-no-peers.txt",
+    );
 
     let info = Arc::new(
         torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
@@ -470,14 +510,11 @@ fn test_read_file_range_no_peers_error() {
 /// the all-zero piece hashes additionally make a hash-valid piece impossible.
 #[test]
 fn test_no_peers_read_probes_then_fails_fast() {
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     // Use a unique info_hash (distinct name) so no other test's seeder or
-    // leaked seeder thread for the shared `create_test_torrent_with_tracker`
-    // torrent can be discovered and serve piece 0 during full-suite parallel
-    // load. The all-zero piece hashes also make a hash-valid piece impossible.
+    // leaked seeder thread can be discovered and serve piece 0 during
+    // parallel load. The all-zero piece hashes also make a hash-valid piece
+    // impossible.
     let torrent_data = distinct_torrent("no-peers-read.iso");
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
@@ -562,10 +599,7 @@ impl Drop for LeecherGuard {
 /// downloader connects to it and observes `num_peers > 0, num_seeds == 0`.
 #[test]
 fn test_leecher_only_swarm_read_does_not_fast_fail() {
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     // Unique info_hash (distinct name) so no other test's (or a leaked)
     // seeder for the shared fixture torrent can serve the read.
     let tracker = common::MiniTracker::start();
@@ -585,9 +619,9 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
     let leecher_torrent = torrent_data.clone();
     let leecher_thread = thread::spawn(move || {
         let mut cfg = common::local_test_config();
-        // Distinct listen port so the tracker records the leecher as a peer
-        // separate from the downloader (16881).
-        cfg.connections.listen_interfaces = Some("0.0.0.0:16882".to_string());
+        // Ephemeral listen port so the tracker records the leecher as a peer
+        // separate from the downloader.
+        cfg.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
         let mut session = torrentfs::download::Session::new(&cfg).expect("leecher session");
         let li = torrentfs::TorrentInfo::from_bytes(leecher_torrent).expect("leecher parse");
         let save_dir = tempfile::TempDir::new().expect("leecher save dir");
@@ -623,11 +657,11 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
         thread::sleep(Duration::from_millis(200));
     }
 
-    // ── Downloader: distinct listen port, DHT/LSD disabled ──────────────
+    // ── Downloader: ephemeral listen port, DHT/LSD disabled ─────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     // The leecher-only swarm has no seeder, so the piece-wait window is
     // min(read_timeout_secs, 15s); the 12s cap keeps the test bounded while
     // still exceeding the 9s peer-wait cap (`PEER_WAIT_CAP_SECS`).
@@ -716,9 +750,12 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
 fn test_peer_appearing_mid_read_returns_data() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
+    let _slot = wave_slot();
+
+    // Unique info hash: the tests in this binary run in parallel with LSD
+    // enabled, so a name shared with another test's seeder would let this
+    // downloader pair with that seeder and lose the read mid-flight.
+    const FIXTURE_NAME: &str = "peer-appearing-mid-read.txt";
 
     // Tracker + torrent, but NO seeder yet — the downloader's first
     // announces see an empty swarm.
@@ -726,7 +763,7 @@ fn test_peer_appearing_mid_read_returns_data() {
     let tracker = common::MiniTracker::start();
     let announce_url = tracker.announce_url();
     let (torrent_data, file_content_shared) =
-        common::create_test_torrent_with_tracker(&announce_url);
+        common::create_single_piece_torrent(&announce_url, FIXTURE_NAME);
 
     let info_hash = {
         let info = torrentfs::TorrentInfo::from_bytes(torrent_data.clone())
@@ -737,12 +774,10 @@ fn test_peer_appearing_mid_read_returns_data() {
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = common::local_test_config();
     config.local_discovery.lsd_enabled = Some(false);
-    // force the downloader onto a distinct listen port so the
-    // MiniTracker can distinguish it from the seeder (which defaults to
-    // 6881 via Session::new with NULL listen_interfaces).  When both
-    // sessions collide on the same port the tracker deduplicates by
-    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port: a fixed one would collide between tests
+    // now that they run in parallel, while the MiniTracker must still see
+    // the downloader as a peer distinct from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     // The seeder is introduced 6s after the read starts; its session startup +
     // announce + peer connect must finish before the piece-wait window. On slow
     // CI 30s occasionally elapsed first (NoPeers, failing the gate), so bump to
@@ -808,7 +843,7 @@ fn test_peer_appearing_mid_read_returns_data() {
     let seed_torrent_data = {
         // Build a fresh torrent pointing at the same announce URL so the
         // info_hash matches what the downloader announced with.
-        let (t, _) = common::create_test_torrent_with_tracker(&announce_url);
+        let (t, _) = common::create_single_piece_torrent(&announce_url, FIXTURE_NAME);
         t
     };
     debug_assert_eq!(
@@ -828,11 +863,8 @@ fn test_peer_appearing_mid_read_returns_data() {
         let file_content = file_content_shared.clone();
         thread::spawn(move || {
             let seed_dir = tempfile::TempDir::new().expect("seed dir");
-            std::fs::write(
-                seed_dir.path().join("final_verification.txt"),
-                &file_content,
-            )
-            .expect("write seed file");
+            std::fs::write(seed_dir.path().join(FIXTURE_NAME), &file_content)
+                .expect("write seed file");
             let mut cfg = common::local_test_config();
             // Ephemeral listen port: concurrent test binaries (and other
             // torrentfs processes) must not collide on libtorrent's default
@@ -955,7 +987,7 @@ fn distinct_multipiece_torrent(announce_url: &str, name: &str) -> Vec<u8> {
 /// engine.  Before the fix, a no-seeder whole-file read serialized healthy
 /// reads on the single engine thread behind a per-chunk no-seeder window
 /// (observed ~47s for a 4 MiB `cat`).  After the fix, a no-seeder read probes
-/// the empty swarm (≤9s peer-wait) then fails fast with `NoPeers` (0s
+/// the empty swarm (a short peer-wait) then fails fast with `NoPeers` (0s
 /// piece-wait), so the engine is never occupied for the full read timeout.
 ///
 /// Constructed as a dual-torrent scenario on one MiniTracker: a healthy
@@ -968,9 +1000,12 @@ fn distinct_multipiece_torrent(announce_url: &str, name: &str) -> Vec<u8> {
 fn test_no_seeder_cat_does_not_block_healthy_read() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Serialize libtorrent session creation to avoid resource contention
-    // when multiple tests run in parallel within the same binary.
-    let _session_guard = common::acquire_session_lock();
+    let _slot = wave_slot();
+
+    // Unique info hash: the tests in this binary run in parallel with LSD
+    // enabled, so a name shared with another test's seeder would let this
+    // downloader pair with that seeder and lose the read mid-flight.
+    const FIXTURE_NAME: &str = "no-seeder-cat-healthy.txt";
 
     // ── One tracker shared by both torrents ────────────────────────────
     let tracker = common::MiniTracker::start();
@@ -978,15 +1013,22 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
 
     // ── Healthy torrent: single piece, served by a real seeder ────────
     let (healthy_torrent, healthy_content) =
-        common::create_test_torrent_with_tracker(&announce_url);
+        common::create_single_piece_torrent(&announce_url, FIXTURE_NAME);
 
     // ── No-seeder torrent: multi-piece, distinct info_hash, empty swarm ─
     let no_seeder_torrent = distinct_multipiece_torrent(&announce_url, "no-seeder.iso");
 
-    // ── Engine with a distinct listen port (seeder binds 6881) ─────────
+    // ── Engine with an ephemeral listen port ───────────────────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    config.connections.listen_interfaces = Some("0.0.0.0:16886".to_string());
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+    // Keep every window this test measures short and deterministic: both the
+    // peer-discovery wait (`min(read_timeout_secs, 9s)`) and the no-seeder
+    // piece-wait (`min(read_timeout_secs, 15s)`) are capped by the read
+    // timeout, so a 6s timeout makes the read return at ~6s whichever branch it
+    // takes.  The default 30s lets the two branches differ by 9s, which the
+    // wave-shared engine thread can stretch past the assertion below.
+    config.timeouts.read_timeout_secs = Some(6);
 
     let engine = Arc::new(
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
@@ -1003,8 +1045,8 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
     );
 
     // ── Seeder for the healthy torrent (joins OUR tracker's swarm) ─────
-    // Stop flag so the seeder thread is joined (and its default 6881 listen
-    // binding released) at the end of the test, instead of parking forever and
+    // Stop flag so the seeder thread is joined (and its listen binding
+    // released) at the end of the test, instead of parking forever and
     // leaking the binding until process exit.
     let seeder_stop = Arc::new(AtomicBool::new(false));
     let seeder_handle = {
@@ -1013,9 +1055,12 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
         let stop = Arc::clone(&seeder_stop);
         thread::spawn(move || {
             let seed_dir = tempfile::TempDir::new().expect("Failed to create seed dir");
-            std::fs::write(seed_dir.path().join("final_verification.txt"), &content)
+            std::fs::write(seed_dir.path().join(FIXTURE_NAME), &content)
                 .expect("Failed to write seed file");
-            let cfg = common::local_test_config();
+            let mut cfg = common::local_test_config();
+            // Ephemeral listen port so this seeder never collides with a
+            // concurrent test's session on libtorrent's default 6881.
+            cfg.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
             let mut session =
                 torrentfs::download::Session::new(&cfg).expect("Seeder: failed to create session");
             let info = torrentfs::TorrentInfo::from_bytes(seeder_torrent)
@@ -1118,7 +1163,11 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
     );
 
     // The no-seeder whole-file read fails fast with `NoPeers` (not the full
-    // read_timeout, not a wrong error type).
+    // read_timeout, not a wrong error type).  With the 6s read timeout above
+    // the read returns at ~6s whichever branch it takes, so 15s is a wide
+    // margin over the legitimate path while still catching the pre-fix
+    // behaviour this test exists for (the no-seeder `cat` holding the engine
+    // for the full read timeout, ~47s for the 4 MiB case).
     match no_seeder_result {
         Err(torrentfs::TorrentError::NoPeers(_)) => {}
         other => panic!(
@@ -1127,14 +1176,14 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
         ),
     }
     assert!(
-        no_seeder_elapsed < Duration::from_secs(12),
-        "no-seeder whole-file read took {:?}; expected fast NoPeers (≤9s peer-wait)",
+        no_seeder_elapsed < Duration::from_secs(15),
+        "no-seeder whole-file read took {:?}; expected fast NoPeers",
         no_seeder_elapsed
     );
 
     // Stop and join the seeder thread so its listen binding is released
     // before the next test runs (the previous park-forever + detach leaked
-    // the 6881 binding until process exit).
+    // the binding until process exit).
     seeder_stop.store(true, Ordering::Relaxed);
     seeder_handle.join().expect("seeder thread panicked");
     engine.shutdown();
@@ -1148,12 +1197,12 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
 /// surface as a write timeout (EIO).
 #[test]
 fn test_ensure_handle_async_does_not_block_on_busy_engine() {
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
     config.dht.enabled = Some(false);
     config.local_discovery.lsd_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     // Short timeout so the "no peers" read blocks only a few seconds.
     config.timeouts.read_timeout_secs = Some(3);
 
@@ -1207,12 +1256,12 @@ fn test_ensure_handle_async_does_not_block_on_busy_engine() {
 /// returns in well under a second, without it the join hangs ~30s.
 #[test]
 fn test_shutdown_aborts_blocked_read() {
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
     config.dht.enabled = Some(false);
     config.local_discovery.lsd_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     // Long timeout: the read would block this long without the shutdown fix.
     config.timeouts.read_timeout_secs = Some(30);
 
@@ -1270,18 +1319,15 @@ fn test_shutdown_aborts_blocked_read() {
 /// identical seed data (before the fix, reader 1 saw partial data).
 #[test]
 fn test_concurrent_reads_during_download_are_consistent() {
-    let _session_guard = common::acquire_session_lock();
-
+    let _slot = wave_slot();
     // ── Setup: start tracker + seeder ──────────────────────────────────
-    let harness = TestHarness::new();
+    let harness = TestHarness::with_torrent(unique_torrent("concurrent-reads.txt"));
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    // force the downloader onto a distinct listen port so the
-    // MiniTracker can distinguish it from the seeder (which defaults to
-    // 6881 via Session::new with NULL listen_interfaces).  When both
-    // sessions collide on the same port the tracker deduplicates by
-    // IP:port and returns 0 peers, causing a NoPeers timeout (flaky).
-    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+    // Ephemeral downloader port: a fixed one would collide between tests
+    // now that they run in parallel, while the MiniTracker must still see
+    // the downloader as a peer distinct from the seeder.
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = Arc::new(
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
@@ -1360,12 +1406,13 @@ fn test_concurrent_reads_during_download_are_consistent() {
 /// (pre-fix machinery exceeds it by orders of magnitude).
 #[test]
 fn test_cached_byte_granular_reads() {
-    let _session_guard = common::acquire_session_lock();
-
-    let harness = TestHarness::with_torrent(common::build_multipiece_torrent);
+    let _slot = wave_slot();
+    let harness = TestHarness::with_torrent(|url| {
+        common::build_multipiece_torrent_named(url, "cached-byte-granular-reads.bin")
+    });
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let mut config = local_test_config();
-    config.connections.listen_interfaces = Some("0.0.0.0:16882".to_string());
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadEngine");
