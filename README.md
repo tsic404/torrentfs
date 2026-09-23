@@ -139,6 +139,25 @@ ls /mnt/torrentfs/data/
 cat /mnt/torrentfs/data/<torrent-name>/path/to/file   # data/ is read-only (EROFS for writes)
 ```
 
+A read at or past a file's end returns 0 bytes (standard EOF), never an error
+errno — the `read` handler short-circuits `offset >= file_size` to an empty
+reply before any piece is fetched from cache or the swarm. `dd` can still print
+a warning on such a read:
+
+```bash
+dd if=/mnt/torrentfs/data/<name>/file bs=1 skip=999999999 count=1
+# dd: /mnt/...: cannot skip to specified offset
+# 0+0 records in
+# 0+0 records out
+# exit status 0
+```
+
+This is coreutils `dd`'s own "skip past EOF" notice, not a torrentfs error: it
+is emitted whenever the `skip=` distance exceeds the file size, on any regular
+file (ext4, tmpfs, …) and not only on FUSE. Nothing is read, the exit status
+stays 0, and no errno from the filesystem is involved. Pass `status=none` to
+silence it (`dd … status=none`).
+
 ### Configuration
 
 ```bash
