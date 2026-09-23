@@ -429,17 +429,16 @@ impl TorrentHandle {
         }
     }
 
-    /// Set one or more `torrent_flags_t` bits on the underlying handle.
-    ///
-    /// Used to return a download handle to idle upload_mode after a read.
-    pub fn set_flags(&self, flags: u64) -> bool {
-        unsafe { libtorrent_sys::lt_torrent_handle_set_flags(self.inner, flags) == 0 }
-    }
-
     /// Clear one or more `torrent_flags_t` bits on the underlying handle.
     ///
     /// Used to switch a lightweight upload_mode handle into download mode by
     /// clearing `torrent_flags::upload_mode` (numeric value `1 << 1`).
+    ///
+    /// There is deliberately no `set_flags` counterpart: the only caller it
+    /// ever had was the idle `upload_mode` re-arm, and re-arming that flag on
+    /// a torrent libtorrent has already released the piece picker for aborts
+    /// the process (see `UPLOAD_MODE_FLAG` in `download::engine`).  The FFI
+    /// binding `lt_torrent_handle_set_flags` is kept in the wrapper.
     pub fn unset_flags(&self, flags: u64) -> bool {
         unsafe { libtorrent_sys::lt_torrent_handle_unset_flags(self.inner, flags) == 0 }
     }

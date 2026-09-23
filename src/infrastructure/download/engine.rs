@@ -477,6 +477,15 @@ impl Drop for DownloadEngine {
 // ── Engine loop ────────────────────────────────────────────────────────────
 
 /// libtorrent `torrent_flags::upload_mode` numeric value (`1 << 1`).
+///
+/// Set once at add time (`add_torrent_upload_mode`) and cleared once by the
+/// first read that needs the swarm — never re-armed.  libtorrent 2.1.1's
+/// `torrent::set_upload_mode(true)` reaches `peer_connection::cancel_all_requests()`
+/// for every connected peer, and that dereferences the piece picker
+/// unconditionally; a torrent that finished every piece is a complete seed
+/// whose picker libtorrent has already released, so re-arming it there aborts
+/// the process.  The idle "request nothing" state is carried by the
+/// piece-priority vector instead (see [`PieceScheduler::recompute`]).
 const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 
 /// Upper bound (seconds) on the peer-discovery wait in the slow read path.
@@ -872,9 +881,9 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     // status / num_peers) for the whole duration of a sustained read burst
     // (`dd bs=1 count=N`).
     let mut last_publish = Instant::now();
-    // Cache-metadata flush / idle-torrent settle cadence.  Tracked separately
-    // from `last_publish` because the parked-read poll shortens the loop's wait
-    // to `PENDING_READ_POLL_INTERVAL`: gating housekeeping on the publish timer
+    // Cache-metadata flush cadence.  Tracked separately from `last_publish`
+    // because the parked-read poll shortens the loop's wait to
+    // `PENDING_READ_POLL_INTERVAL`: gating housekeeping on the publish timer
     // would then starve the flush for the whole duration of a parked read.
     let mut last_housekeeping = Instant::now();
     loop {
@@ -907,7 +916,6 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 // Flushing on the periodic tick (timeout branch) and on
                 // shutdown is the "periodic flush" intent.
                 if last_housekeeping.elapsed() >= SNAPSHOT_INTERVAL {
-                    state.settle_idle_torrents();
                     state.flush_cache_metadata();
                     last_housekeeping = Instant::now();
                 }
@@ -918,7 +926,6 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Err(RecvTimeoutError::Timeout) => {
                 let housekeeping = last_housekeeping.elapsed() >= SNAPSHOT_INTERVAL;
                 if housekeeping {
-                    state.settle_idle_torrents();
                     state.flush_cache_metadata();
                     last_housekeeping = Instant::now();
                 }
@@ -1464,7 +1471,8 @@ impl EngineState {
 
         // Switch to download mode: the gradient above is already applied, so
         // clearing upload_mode lets libtorrent start requesting those pieces
-        // from the peers it is already connected to.
+        // from the peers it is already connected to.  This is the only clear —
+        // the flag is never re-armed, see `UPLOAD_MODE_FLAG`.
         {
             let handle = match self.handles.get(&read.info_hash) {
                 Some(h) => h,
@@ -2255,45 +2263,6 @@ impl EngineState {
         if let Some(handle) = self.handles.get(info_hash) {
             self.scheduler
                 .reader_released(handle, info_hash, id, &self.store);
-        }
-        // Restore idle upload_mode when the reader count and the wanted set
-        // both reach zero. `reader_released` is infallible, so this decision
-        // does not depend on a recompute result.
-        self.maybe_restore_upload_mode(info_hash);
-    }
-
-    /// Restore idle `upload_mode` once a torrent has converged (no reader, no
-    /// wanted piece).  Called both on reader release and on the periodic
-    /// engine tick so convergence is also caught when the last wanted piece
-    /// becomes ready outside a reader release (e.g. a later cached read).
-    fn maybe_restore_upload_mode(&mut self, info_hash: &str) {
-        if !self.scheduler.is_idle(info_hash) {
-            return;
-        }
-        if let Some(handle) = self.handles.get(info_hash) {
-            if !handle.set_flags(UPLOAD_MODE_FLAG) {
-                tracing::warn!(
-                    "maybe_restore_upload_mode: failed to re-enable upload_mode for {}",
-                    info_hash
-                );
-            }
-        }
-    }
-
-    /// On each engine tick, restore `upload_mode` for any torrent that has
-    /// converged to idle since its last read.  Without this, a read-ahead
-    /// window completed entirely through later cached reads would leave the
-    /// handle in download mode indefinitely (fast-path reads skip
-    /// `release_reader`).
-    fn settle_idle_torrents(&mut self) {
-        let idle: Vec<String> = self
-            .handles
-            .keys()
-            .filter(|ih| self.scheduler.is_idle(ih.as_str()))
-            .cloned()
-            .collect();
-        for info_hash in idle {
-            self.maybe_restore_upload_mode(&info_hash);
         }
     }
 

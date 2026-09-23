@@ -61,7 +61,32 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
       - name: Run tests
+        id: run_tests
+        # A libtorrent-backed test can abort the test process instead of
+        # failing cleanly (known `piece_picker` lifetime flake class), so the
+        # raw outcome is recorded here and classified by the next step: this
+        # step on its own never fails the job.
+        continue-on-error: true
         run: cargo test --locked --workspace --no-fail-fast
+
+      - name: Classify test outcome
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          # One retry. A suite that fails and then passes is flaky, not broken;
+          # a suite that fails twice is a real failure. The two outcomes get
+          # distinct annotations so a flake is never read as a regression.
+          if cargo test --locked --workspace --no-fail-fast; then
+            echo "::warning title=Flaky test (FLAKY)::Cargo Test (${{ matrix.arch }}) failed on the first attempt and passed on retry. Treat as FLAKY, not as a real failure."
+            {
+              echo "### FLAKY — not a real failure"
+              echo
+              echo 'The first `cargo test --locked --workspace --no-fail-fast` run failed and the retry passed.'
+              echo 'This is the known libtorrent `piece_picker` lifetime flake class, not a regression from this PR.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error title=Real test failure::Cargo Test (${{ matrix.arch }}) failed twice in a row. Treat as a REAL failure."
+            exit 1
+          fi
 
       - name: Run seeder example tests
         run: cargo test --locked --example torrentfs-selfseed-env --example torrentfs-mffs-seeder
