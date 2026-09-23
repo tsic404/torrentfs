@@ -416,6 +416,16 @@ pub fn create_single_piece_torrent(announce_url: &str, name: &str) -> (Vec<u8>, 
 /// a byte-granular read on a cached file previously paid `post_torrent_updates`
 /// + a full piece-priority sweep on every read, regardless of the 1-byte size.
 pub fn build_multipiece_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
+    build_multipiece_torrent_named(announce_url, "multi.bin")
+}
+
+/// [`build_multipiece_torrent`] with a caller-chosen `name`.
+///
+/// The info hash covers the info dict, so `name` selects the swarm identity: a
+/// test that must not be discovered by another test's session (libtorrent LSD
+/// pairs two same-host sessions serving the same info hash) passes a name
+/// unique to itself.  Content and piece hashes are unchanged.
+pub fn build_multipiece_torrent_named(announce_url: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
     const PIECE_LEN: usize = 256 * 1024;
     const NUM_PIECES: usize = 4;
     let total = PIECE_LEN * NUM_PIECES;
@@ -443,7 +453,7 @@ pub fn build_multipiece_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
     t.extend_from_slice(b"6:lengthi");
     t.extend_from_slice(total.to_string().as_bytes());
     t.push(b'e');
-    t.extend_from_slice(b"4:name9:multi.bin");
+    t.extend_from_slice(format!("4:name{}:{}", name.len(), name).as_bytes());
     t.extend_from_slice(b"12:piece lengthi");
     t.extend_from_slice(PIECE_LEN.to_string().as_bytes());
     t.push(b'e');

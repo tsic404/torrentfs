@@ -1416,7 +1416,14 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
             else if (auto* sa = lt::alert_cast<lt::session_stats_alert>(alert)) {
                 out.type = LT_ALERT_SESSION_STATS;
                 lt::span<std::int64_t const> counters = sa->counters();
-                lt::span<lt::stats_metric const> metrics = lt::session_stats_metrics();
+                // `session_stats_metrics()` returns the metric table **by
+                // value**.  Binding that temporary straight to a span would
+                // leave the span dangling once the full expression ends, and
+                // the loop below would then read freed memory — an
+                // intermittent SIGSEGV in the alert consumer.  The table is
+                // static data, so capture it once.
+                static std::vector<lt::stats_metric> const metrics =
+                    lt::session_stats_metrics();
                 for (auto const& m : metrics) {
                     int idx = m.value_index;
                     if (idx < 0 || idx >= static_cast<int>(counters.size())) continue;
