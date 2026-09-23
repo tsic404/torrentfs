@@ -492,7 +492,7 @@ const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 /// The engine's worst-case read budget sums the state-transition
 /// wait, the recheck wait, this peer-discovery wait and the piece-wait window —
 /// the FUSE deferred-read deadline must exceed that sum.
-pub(crate) const PEER_WAIT_CAP_SECS: u64 = 9;
+pub const PEER_WAIT_CAP_SECS: u64 = 9;
 
 /// Upper bound (seconds) on the `force_recheck` wait in the stale-piece path.
 /// It runs before peer discovery in the same read, so it adds to the read
@@ -505,7 +505,7 @@ pub(crate) const RECHECK_WAIT_CAP_SECS: u64 = 10;
 /// after this short window rather than the full `read_timeout_secs`, which
 /// would only tie up the caller and its FUSE deferred-read deadline — unless a
 /// seeder connects mid-wait and upgrades the window back to the full timeout.
-pub(crate) const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
+pub const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
 
 /// Piece-wait window (seconds) for a read whose peer-discovery wait already
 /// elapsed without a seeder.  Zero: the swarm probe (`force_reannounce` + up to
