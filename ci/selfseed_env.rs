@@ -16,12 +16,13 @@ mod mffs_common;
 
 use mffs_common::{bencode_multifile_torrent, collect_files, hash_and_seed_files};
 use seeder_common::{
-    bencode_bytes, bencode_int, install_signal_handlers, seed_until_shutdown, session_config,
-    start_tracker, PIECE_LEN,
+    bencode_bytes, bencode_int, hold_out_of_swarm, install_signal_handlers, seed_until_shutdown,
+    session_config, start_tracker, PIECE_LEN,
 };
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use torrentfs::download::Session;
 use torrentfs::TorrentInfo;
@@ -100,6 +101,9 @@ struct Args {
     announce_host: String,
     torrent_out: PathBuf,
     url_out: PathBuf,
+    /// Seconds to stay out of the swarm after the torrent is written, before
+    /// the first announce (0 = announce immediately).
+    announce_delay_secs: u64,
     /// Payload directory of the multi-file torrent to serve alongside the
     /// single-file one, with the torrent name to bencode it under and the
     /// path to write it to.  All three are absent (single-file-only seeder)
@@ -123,6 +127,7 @@ fn parse_args() -> Args {
         announce_host: "127.0.0.1".to_string(),
         torrent_out: PathBuf::from("selfseed.torrent"),
         url_out: PathBuf::from("tracker.url"),
+        announce_delay_secs: 0,
         mffs: None,
     };
     // Collected while parsing and validated once every flag is known: the
@@ -148,6 +153,11 @@ fn parse_args() -> Args {
             "--announce-host" => args.announce_host = value_for!("--announce-host"),
             "--torrent-out" => args.torrent_out = value_for!("--torrent-out").into(),
             "--url-out" => args.url_out = value_for!("--url-out").into(),
+            "--announce-delay" => {
+                args.announce_delay_secs = value_for!("--announce-delay")
+                    .parse()
+                    .expect("bad announce delay")
+            }
             "--mffs-payload-dir" => {
                 mffs_payload_dir = Some(value_for!("--mffs-payload-dir").into())
             }
@@ -291,6 +301,14 @@ fn main() {
             "torrent total size must match the streamed payload"
         );
         mffs_info = Some(info);
+    }
+
+    // 5. Optional hold: both torrents are written and the tracker is live, but
+    // the swarm stays empty until the delay elapses.  A read issued meanwhile
+    // parks with its prefetch gradient published in `.stats`, which is what
+    // makes the `[7][6][5][4][3]` transient sampleable on a small payload.
+    if !hold_out_of_swarm(Duration::from_secs(args.announce_delay_secs)) {
+        return;
     }
 
     let config = session_config();

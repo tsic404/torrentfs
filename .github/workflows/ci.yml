@@ -286,6 +286,62 @@ jobs:
       - name: Run prefetch ladder e2e
         run: ./ci/tests/prefetch_ladder_e2e.sh
 
+  prefetch-ladder-selfseed-e2e:
+    name: Prefetch Ladder Selfseed E2E (4 MiB seed, delayed seeder)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: debian:sid-slim
+      # FUSE mount needs the device node and CAP_SYS_ADMIN; the runner VM's
+      # /dev/fuse is passed through (same flags the Docker image documents).
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
+          apt-get update
+          # libtorrent-rasterbar-dev is only packaged in experimental (see the
+          # test job above for why it is installed separately from the rest).
+          apt-get install -y --no-install-recommends \
+            -t experimental libtorrent-rasterbar-dev
+          apt-get install -y --no-install-recommends \
+            libssl-dev \
+            pkg-config \
+            clang \
+            libclang-dev \
+            libfuse-dev \
+            fuse3 \
+            curl \
+            ca-certificates
+          # torrentfs mounts with allow_other; fuse3 gates that on this line.
+          touch /etc/fuse.conf
+          grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-ladder-selfseed-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-sid21-ladder-cargo-
+
+      - name: Build torrentfs and the selfseed example
+        run: |
+          cargo build --locked --release
+          cargo build --locked --release --example torrentfs-selfseed-env
+
+      - name: Run selfseed prefetch ladder e2e
+        run: ./ci/tests/prefetch_ladder_selfseed_e2e.sh
+
   multifile-read-e2e:
     name: Multi-File Read E2E (seeded multi-file torrent)
     runs-on: ubuntu-24.04

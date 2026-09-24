@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Regression tests for ci/run_self_seed_env.sh payload-size and
-# --tracker-bind/--announce-host validation.
+# Regression tests for ci/run_self_seed_env.sh payload-size,
+# --tracker-bind/--announce-host and --announce-delay validation.
 # The script runs top-to-bottom (no "# ── main" marker), so extract
 # validate_size_arg and exercise its bounds directly, then run the real script
 # with invalid values to assert they fail before creating the output dir or
@@ -121,6 +121,31 @@ run_test "payload-mib rejects zero" \
 run_test "payload-mib rejects max+1 (8796093022208)" \
     'rc=0; ( validate_size_arg --payload-mib 8796093022208 8796093022207 MiB ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
 
+# --- validate_size_arg: --announce-delay accept ---
+
+run_test "announce-delay accepts 1" \
+    'validate_size_arg --announce-delay 1 3600 s'
+
+run_test "announce-delay accepts max 3600" \
+    'validate_size_arg --announce-delay 3600 3600 s'
+
+run_test "announce-delay accepts leading zeros (0006 = 6)" \
+    'validate_size_arg --announce-delay 0006 3600 s'
+
+# --- validate_size_arg: --announce-delay reject ---
+
+run_test "announce-delay rejects non-numeric" \
+    'rc=0; ( validate_size_arg --announce-delay abc 3600 s ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
+
+run_test "announce-delay rejects zero" \
+    'rc=0; ( validate_size_arg --announce-delay 0 3600 s ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
+
+run_test "announce-delay rejects negative" \
+    'rc=0; ( validate_size_arg --announce-delay -1 3600 s ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
+
+run_test "announce-delay rejects max+1 (3601)" \
+    'rc=0; ( validate_size_arg --announce-delay 3601 3600 s ) 2>/dev/null || rc=$?; [ "$rc" -eq 2 ]'
+
 # --- end-to-end: invalid value produces no output dir ---
 
 run_test "invalid --payload-gib exits 2 without creating output dir" \
@@ -136,6 +161,15 @@ run_test "invalid --payload-mib exits 2 without creating output dir" \
     'd="$(mktemp -d)"
 rc=0
 ( "$SCRIPT" --payload-mib 0 --output-dir "$d/out" ) 2>/dev/null || rc=$?
+created=1
+[ ! -e "$d/out" ] && created=0
+rm -rf "$d"
+[ "$rc" -eq 2 ] && [ "$created" -eq 0 ]'
+
+run_test "invalid --announce-delay exits 2 without creating output dir" \
+    'd="$(mktemp -d)"
+rc=0
+( "$SCRIPT" --announce-delay 0 --output-dir "$d/out" ) 2>/dev/null || rc=$?
 created=1
 [ ! -e "$d/out" ] && created=0
 rm -rf "$d"

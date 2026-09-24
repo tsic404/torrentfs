@@ -23,7 +23,11 @@
 #
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
+#        [--announce-delay SECONDS]
 #        (--port defaults to 0: the OS picks a free port, published in tracker.url)
+#        (--announce-delay holds the seeder out of the swarm for that long after
+#         the torrent is written, so a read issued meanwhile parks with its
+#         prefetch gradient published in .stats; default: no hold)
 #        → outputs under DIR when --output-dir is given, else under a fresh
 #          ci/selfseed/output/run.<pid>.<random>/ per run, so concurrent runs
 #          never overwrite each other's artifacts (old run directories are safe
@@ -90,6 +94,12 @@ PAYLOAD_GIB=""
 # bytes), so the later * 1024*1024 / * 1024*1024*1024 arithmetic cannot wrap.
 MAX_PAYLOAD_MIB=8796093022207
 MAX_PAYLOAD_GIB=8589934591
+# Seconds the seeder stays out of the swarm after writing its torrents; empty
+# (the default) means no hold — it announces as soon as the session is up.
+ANNOUNCE_DELAY=""
+# A hold longer than an hour is past any read window QA samples, so a bigger
+# value is a typo rather than a scenario.
+MAX_ANNOUNCE_DELAY=3600
 # 0 = OS-assigned free ephemeral port, reported in the announce URL the seeder
 # writes.  A fixed port would collide with a tracker left behind by a killed
 # run (the stale process holds it in LISTEN, which no SO_REUSEADDR relaxes).
@@ -104,6 +114,7 @@ while [[ $# -gt 0 ]]; do
         --port) TRACKER_PORT="$2"; shift 2 ;;
         --tracker-bind) TRACKER_BIND="$2"; shift 2 ;;
         --announce-host) ANNOUNCE_HOST="$2"; shift 2 ;;
+        --announce-delay) ANNOUNCE_DELAY="$2"; shift 2 ;;
         --output-dir)
             # `$# -lt 2` catches a missing value (would otherwise trip `set -u`
             # as an unbound-variable exit 1); `-z` catches an explicit empty
@@ -167,6 +178,11 @@ fi
 validate_size_arg "--payload-mib" "$PAYLOAD_MIB" "$MAX_PAYLOAD_MIB" "MiB"
 if [ -n "$PAYLOAD_GIB" ]; then
     validate_size_arg "--payload-gib" "$PAYLOAD_GIB" "$MAX_PAYLOAD_GIB" "GiB"
+fi
+if [ -n "$ANNOUNCE_DELAY" ]; then
+    # `validate_size_arg` rejects 0 as well: the hold exists to withhold the
+    # seeder, so "no hold" is the absence of the flag, not a zero value.
+    validate_size_arg "--announce-delay" "$ANNOUNCE_DELAY" "$MAX_ANNOUNCE_DELAY" "s"
 fi
 
 # Resolve a *working* cargo by probing `--version` on every PATH candidate (in
@@ -237,6 +253,9 @@ if [ -n "$TRACKER_BIND" ]; then
 fi
 if [ -n "$ANNOUNCE_HOST" ]; then
     SEED_ARGS+=(--announce-host "$ANNOUNCE_HOST")
+fi
+if [ -n "$ANNOUNCE_DELAY" ]; then
+    SEED_ARGS+=(--announce-delay "$ANNOUNCE_DELAY")
 fi
 SEED_ARGS+=( \
     --torrent-out "$OUTPUT_DIR/selfseed.torrent" \
