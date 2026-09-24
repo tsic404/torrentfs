@@ -365,6 +365,36 @@ pub fn install_signal_handlers() {
     }
 }
 
+/// Hold the seeder out of the swarm for `delay` before its first announce,
+/// polling [`SHUTDOWN`] every 500ms so a supervisor's SIGTERM does not wait
+/// the hold out.  Returns `false` when a shutdown signal arrived.
+///
+/// This is the throttle a small payload needs: a loopback seeder hands over
+/// the four prefetched pieces in milliseconds, so the `[7][6][5][4][3]`
+/// transient is gone before a ~200ms poll lands.  libtorrent does not
+/// rate-limit local peers, so only withholding the seeder stretches it.
+// `torrentfs-mffs-seeder` links this module but drives no hold, so the
+// function is dead in that example's compilation unit.
+#[allow(dead_code)]
+pub fn hold_out_of_swarm(delay: Duration) -> bool {
+    if delay.is_zero() {
+        return true;
+    }
+    eprintln!(
+        "[seeder] holding out of the swarm for {}s (announce delay)",
+        delay.as_secs()
+    );
+    // ceil-division keeps SHUTDOWN polling non-empty for sub-500ms delays.
+    for _ in 0..delay.as_millis().div_ceil(500) {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            eprintln!("[seeder] shutdown signal received — stopping");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    true
+}
+
 /// Loopback-only session config mirroring `tests/common/mod.rs`: no DHT, no
 /// UPnP/NAT-PMP, short connect timeout, aggressive announce.
 pub fn session_config() -> torrentfs::TorrentfsConfig {
