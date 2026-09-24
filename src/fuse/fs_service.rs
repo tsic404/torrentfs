@@ -1470,10 +1470,11 @@ impl FsService {
 
         // Destination parent missing → ENOENT, not ENOTDIR: the kernel
         // resolved the path but forwarded a stale or absent `newparent`
-        // inode. The trailing-slash form (`mv x missing/`) returns ENOTDIR
-        // from the kernel VFS itself during destination resolution, before
-        // this handler runs — standard Linux semantics, not interceptable
-        // from FUSE.
+        // inode. `mv x missing/` never reaches this handler with a
+        // non-directory source — the VFS answers ENOTDIR itself (fs/namei.c
+        // do_renameat2) before calling into FUSE, exactly as on ext4/xfs/
+        // tmpfs, so that wording is not ours to change. A directory source is
+        // forwarded and renamed, matching the local filesystems.
         let newparent_exists = self.inode_mgr.inodes.contains_key(&newparent)
             || self.inode_mgr.data_inodes.contains_key(&newparent);
         if !newparent_exists {
@@ -3811,9 +3812,10 @@ mod tests {
     /// Renaming into a destination whose parent inode is absent must surface
     /// `NotFound` (→ `ENOENT`, "no such file or directory"), not
     /// `NotDirectory` (→ `ENOTDIR`): the destination parent does not exist,
-    /// so "not a directory" misdescribes the failure. This is the contract
-    /// `mv metadata/seed metadata/nonexistent/` relies on when the kernel
-    /// forwards the rename with an already-resolved, but stale, parent inode.
+    /// so "not a directory" misdescribes the failure. This covers a rename
+    /// arriving with a `newparent` inode no longer in the tables — the
+    /// `mv metadata/seed metadata/nonexistent/` form cannot be its trigger,
+    /// since the kernel answers ENOTDIR for it before FUSE is consulted.
     #[test]
     fn rename_missing_destination_parent_returns_not_found() {
         let mut svc = service_with_db();
