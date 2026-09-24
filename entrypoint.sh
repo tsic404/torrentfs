@@ -382,61 +382,72 @@ ensure_fuse_device() {
 # directory ($XDG_DATA_HOME or ~/.local/share), or under --cache / --db when
 # those overrides are given.  A previous container run — e.g. an older image
 # that ran as a non-root user — can leave that tree owned by a different UID
-# (nobody:nogroup).  The current user then cannot write the DB (SQLite
+# (nobody:nogroup).  The daemon user then cannot write the DB (SQLite
 # ReadOnly) or the cache metadata, which silently disables the download
-# engine so every data read returns EIO.  Re-home the tree to the current
+# engine so every data read returns EIO.  Re-home the tree to the daemon
 # user before starting so a reused state volume is always writable.
 
-# Re-home one path to the current user.  Recurses only when the tree's
-# ownership does not already match the current user throughout.  A reused
+# First entry under $1 that the daemon user does not own; empty output means
+# the tree is already daemon-owned throughout.  The walk must recurse: a reused
 # volume can have a correct top-level owner but leftover nobody:nogroup files
 # underneath (old image state) — a top-level-only probe misses those, leaving
-# cache_metadata.txt unwritable and failing the download engine.  `find`
-# exits at the first mismatch, so a consistent GB-scale piece cache is only
-# walked read-only (no chown syscalls) on every cold start.  Skipped when the
-# path does not exist yet: torrentfs creates it fresh with correct ownership.
-rehome_ownership() {
-    local target="$1" probe
-    [ -e "$target" ] || return 0
-    # resolve_daemon_ids() runs first (main calls it before
-    # fix_state_dir_ownership); an empty daemon_uid would make `find ! -user ""`
-    # a probe failure and `chown -R ":"` a silent no-op that leaves the tree
-    # foreign-owned. Fail loudly if that contract is broken.
-    if [ -z "${daemon_uid:-}" ] || [ -z "${daemon_gid:-}" ]; then
-        echo "[entrypoint] ERROR: daemon identity not resolved; refusing to rehome $target" >&2
-        return 1
-    fi
-    # Capture find's exit status separately from its output: a consistent tree
-    # is status==0 AND empty output.  A non-zero status (unreadable subtree,
-    # unmapped nobody dir in a rootless userns, I/O error, faulty mount) is a
-    # probe failure — not a clean bill of health — so fall through to chown
-    # rather than silently skipping a leftover foreign-owned tree.
-    if probe="$(find "$target" \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null)"; then
-        if [ -z "$probe" ]; then
-            return 0
-        fi
-        # A foreign-owned entry was found. Warn before re-homing so a reused
-        # state volume's chown to the daemon user is visible rather than
-        # silent: the host-side owner (`torrentfs:torrentfs`) is a consequence
-        # of this re-home, not an image defect.
-        echo "[entrypoint] WARNING: foreign-owned files found in $target (first: $probe); re-homing to $daemon_uid:$daemon_gid" >&2
-    fi
-    if ! chown -R "$daemon_uid:$daemon_gid" "$target" 2>/dev/null; then
-        echo "[entrypoint] WARNING: could not chown $target to $daemon_uid:$daemon_gid" >&2
-    fi
+# cache_metadata.txt unwritable and failing the download engine.  `-quit` stops
+# at the first mismatch, so a consistent GB-scale piece cache is only walked
+# read-only (no chown syscalls) on every cold start.  A non-zero status means
+# the walk itself failed — unreadable subtree, unmapped UID in a user namespace,
+# I/O error — which is not a clean bill of health: the caller re-homes the path
+# rather than trust an incomplete probe.
+probe_foreign_ownership() {
+    find "$1" \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null
 }
 
+# Report a re-home as one explicit warning block: the level, the owner the tree
+# is being changed to, every affected path with the entry that flagged it, and
+# what the chown does to a bind-mounted host directory.  A shared mount's
+# ownership change is a host-visible side effect, and one line per path buried
+# in the startup log does not carry it; the block is printed ahead of the chowns
+# so the change is stated before it happens.  $@ = one detail line per path.
+warn_state_rehome() {
+    local detail
+    cat >&2 <<'BANNER'
+╔══════════════════════════════════════════════════════════════════════╗
+║  WARNING: torrentfs state directory ownership is being re-homed      ║
+╚══════════════════════════════════════════════════════════════════════╝
+BANNER
+    echo "[entrypoint] re-homing to $daemon_uid:$daemon_gid — the daemon user cannot write these paths," >&2
+    echo "[entrypoint] so torrentfs cannot persist its SQLite DB or cache metadata there and the" >&2
+    echo "[entrypoint] download engine silently disables. chown -R targets:" >&2
+    for detail in "$@"; do
+        echo "[entrypoint]   - $detail" >&2
+    done
+    echo "[entrypoint] A target that is a bind-mounted host directory changes ownership ON THE HOST" >&2
+    echo "[entrypoint] too — a host user whose UID differs from $daemon_uid:$daemon_gid loses access to it. To" >&2
+    echo "[entrypoint] keep the host ownership, pre-own the directory as $daemon_uid:$daemon_gid or run the" >&2
+    echo "[entrypoint] container with --user <uid>:<gid>." >&2
+}
+
+# Re-home the state tree(s) to the daemon user when a previous container run left
+# them foreign-owned.  A path that does not exist yet is skipped (torrentfs
+# creates it with correct ownership) and a consistent tree is only walked
+# read-only, so a healthy cold start pays no chown syscalls.
 fix_state_dir_ownership() {
     # Only root can re-home a foreign-owned tree; non-root runs (bare metal)
     # cannot chown and should not try.
     if ! is_root; then
         return 0
     fi
+    # resolve_daemon_ids() runs first (main calls it before
+    # fix_state_dir_ownership); an empty daemon_uid would make the probe's
+    # `! -user ""` fail and `chown -R ":"` a silent no-op that leaves the tree
+    # foreign-owned. Fail loudly if that contract is broken.
+    if [ -z "${daemon_uid:-}" ] || [ -z "${daemon_gid:-}" ]; then
+        echo "[entrypoint] ERROR: daemon identity not resolved; refusing to re-home state" >&2
+        return 1
+    fi
 
-    rehome_ownership "${XDG_DATA_HOME:-$daemon_home/.local/share}/torrentfs"
-
+    local -a candidates=("${XDG_DATA_HOME:-$daemon_home/.local/share}/torrentfs")
     if [ -n "${cache_arg:-}" ]; then
-        rehome_ownership "$cache_arg"
+        candidates+=("$cache_arg")
     fi
     if [ -n "${db_arg:-}" ]; then
         # --db names the SQLite file; SQLite writes its -wal / -shm sidecars
@@ -446,10 +457,45 @@ fix_state_dir_ownership() {
         db_dir="$(dirname "$db_arg")"
         case "$db_dir" in
             .|/|'') : ;;
-            *) rehome_ownership "$db_dir" ;;
+            *) candidates+=("$db_dir") ;;
         esac
-        rehome_ownership "$db_arg"
+        candidates+=("$db_arg")
     fi
+
+    # Probe every candidate before touching any of them: one warning naming all
+    # affected paths beats one message per path, and it lands before the chowns.
+    # Candidates are deduplicated by canonical path: a --db that sits directly
+    # in the state directory (or in --cache) would otherwise enter twice — as
+    # the --db parent and as the state/cache tree — and be probed, listed and
+    # chowned twice, as would a symlinked alias of either.
+    local -A seen=()
+    local -a rehome_paths=() rehome_detail=()
+    local path canon probe rc
+    for path in "${candidates[@]}"; do
+        [ -e "$path" ] || continue
+        canon="$(readlink -f "$path" 2>/dev/null)" || canon="$path"
+        [ -z "${seen[$canon]:-}" ] || continue
+        seen[$canon]=1
+        rc=0
+        probe="$(probe_foreign_ownership "$path")" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            rehome_paths+=("$path")
+            rehome_detail+=("$path (ownership probe failed — re-homing unverified)")
+        elif [ -n "$probe" ]; then
+            rehome_paths+=("$path")
+            rehome_detail+=("$path (first foreign entry: $probe)")
+        fi
+    done
+
+    if [ "${#rehome_paths[@]}" -gt 0 ]; then
+        warn_state_rehome "${rehome_detail[@]}"
+    fi
+    for path in "${rehome_paths[@]}"; do
+        if ! chown -R "$daemon_uid:$daemon_gid" "$path" 2>/dev/null; then
+            echo "[entrypoint] WARNING: could not chown $path to $daemon_uid:$daemon_gid" >&2
+        fi
+    done
+
     if [ -n "${log_file_arg:-}" ]; then
         prepare_log_file_parent "$log_file_arg"
     fi
@@ -460,7 +506,7 @@ fix_state_dir_ownership() {
 # torrentfs's open_log_file() runs as the daemon user (post-setpriv) and calls
 # create_dir_all() on the parent; every directory in that chain must already
 # exist and be traversable, and the leaf must be daemon-owned, or the daemon's
-# create/open fails with EACCES and torrentfs exits. rehome_ownership is the
+# create/open fails with EACCES and torrentfs exits. The state re-home is the
 # wrong tool here: it skips missing paths and `chown -R`s a whole shared tree
 # like /var/log. Instead we (running as root) mkdir -p the full chain and chown
 # only the leaf directory (no -R): parent traversal only needs +x, which
