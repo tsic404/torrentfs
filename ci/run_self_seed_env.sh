@@ -14,7 +14,10 @@
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
 #        (--port defaults to 0: the OS picks a free port, published in tracker.url)
-#        → outputs under ci/selfseed/output, or DIR when --output-dir is given
+#        → outputs under DIR when --output-dir is given, else under a fresh
+#          ci/selfseed/output/run.<pid>.<random>/ per run, so concurrent runs
+#          never overwrite each other's artifacts (old run directories are safe
+#          to delete: rm -rf ci/selfseed/output/run.*)
 
 set -euo pipefail
 
@@ -55,10 +58,22 @@ validate_size_arg() {
     fi
 }
 
+# Reserve a fresh output directory for this run under BASE (created on demand).
+# Concurrent runs (QA, CI, a developer) must not share one directory, or they
+# overwrite each other's payload/torrent/tracker.url.  `mktemp -d` reserves the
+# name atomically, so not even a recycled PID can adopt a dead run's artifacts.
+reserve_run_dir() {
+    local base="$1"
+    mkdir -p "$base"
+    mktemp -d "$base/run.$$.XXXXXX"
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_DIR="$SCRIPT_DIR/selfseed"
-OUTPUT_DIR="$ENV_DIR/output"
+# Empty until resolved: `--output-dir` fills it during parsing, otherwise a
+# per-run directory is reserved after validation (see the mkdir below).
+OUTPUT_DIR=""
 PAYLOAD_MIB=4
 PAYLOAD_GIB=""
 # Caps keep payload bytes within signed 64-bit (2^43 MiB = 2^33 GiB = 2^63
@@ -166,7 +181,14 @@ IFS=$old_ifs
 if [ -z "$CARGO" ]; then try_cargo "$HOME/.cargo/bin/cargo" \
     || { echo "no working cargo in PATH or $HOME/.cargo/bin/cargo" >&2; exit 1; }; fi
 
-mkdir -p "$OUTPUT_DIR"
+# Resolve the output directory only now, after every validation above, so an
+# invalid invocation still creates nothing.  A defaulted run gets its own
+# per-run directory; a caller-supplied one is used as given.
+if [ -z "$OUTPUT_DIR" ]; then
+    OUTPUT_DIR="$(reserve_run_dir "$ENV_DIR/output")"
+else
+    mkdir -p "$OUTPUT_DIR"
+fi
 cd "$ROOT_DIR"
 
 echo "[selfseed] building seeder (release)…"
