@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Regression tests for ci/run_self_seed_env.sh payload-size validation.
+# Regression tests for ci/run_self_seed_env.sh payload-size and
+# --tracker-bind/--announce-host validation.
 # The script runs top-to-bottom (no "# ── main" marker), so extract
 # validate_size_arg and exercise its bounds directly, then run the real script
 # with invalid values to assert they fail before creating the output dir or
 # building the seeder (the "no side effects" guarantee this validation exists
 # for).  Bounds match the signed-64-bit payload caps: 2^43-1 MiB / 2^33-1 GiB.
+# The bind/announce cases assert the same no-side-effect contract: an
+# unreachable pair, an IPv6 literal, or an unknown option exits 2 before any
+# directory is created (no real seeder is started).
 # Usage: ./ci/tests/self_seed_env_test.sh   Exit: 0 = pass, 1 = fail.
 
 set -euo pipefail
@@ -116,6 +120,44 @@ run_test "invalid --payload-mib exits 2 without creating output dir" \
     'd="$(mktemp -d)"
 rc=0
 ( "$SCRIPT" --payload-mib 0 --output-dir "$d/out" ) 2>/dev/null || rc=$?
+created=1
+[ ! -e "$d/out" ] && created=0
+rm -rf "$d"
+[ "$rc" -eq 2 ] && [ "$created" -eq 0 ]'
+
+# --- end-to-end: --tracker-bind/--announce-host validation ---
+
+run_test "mismatched --announce-host exits 2 without creating output dir" \
+    'd="$(mktemp -d)"
+rc=0
+( "$SCRIPT" --tracker-bind 127.0.0.1 --announce-host 10.0.0.1 --output-dir "$d/out" ) 2>/dev/null || rc=$?
+created=1
+[ ! -e "$d/out" ] && created=0
+rm -rf "$d"
+[ "$rc" -eq 2 ] && [ "$created" -eq 0 ]'
+
+run_test "IPv6 --announce-host exits 2 without creating output dir" \
+    'd="$(mktemp -d)"
+rc=0
+( "$SCRIPT" --announce-host "::1" --output-dir "$d/out" ) 2>/dev/null || rc=$?
+created=1
+[ ! -e "$d/out" ] && created=0
+rm -rf "$d"
+[ "$rc" -eq 2 ] && [ "$created" -eq 0 ]'
+
+run_test "IPv6 --tracker-bind exits 2 without creating output dir" \
+    'd="$(mktemp -d)"
+rc=0
+( "$SCRIPT" --tracker-bind "::1" --output-dir "$d/out" ) 2>/dev/null || rc=$?
+created=1
+[ ! -e "$d/out" ] && created=0
+rm -rf "$d"
+[ "$rc" -eq 2 ] && [ "$created" -eq 0 ]'
+
+run_test "unknown option exits 2 without creating output dir" \
+    'd="$(mktemp -d)"
+rc=0
+( "$SCRIPT" --bogus --output-dir "$d/out" ) 2>/dev/null || rc=$?
 created=1
 [ ! -e "$d/out" ] && created=0
 rm -rf "$d"
