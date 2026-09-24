@@ -2,16 +2,19 @@
 //! sample torrents frequently have no reachable seeders, so reads fail with
 //! `NoPeers` → ENODATA; this binary builds a deterministic single-file torrent
 //! and serves it via a local tracker + libtorrent seeder, fully offline.
-//! Flow: (1) start a minimal HTTP tracker, (2) stream the payload into the seed
-//! directory hashing each piece, (3) bencode a single-file .torrent, (4) run a
-//! libtorrent session in seeding state until killed. The tracker, bencoding
-//! helpers, and keep-alive loop are shared with `torrentfs-mffs-seeder` via
-//! [`seeder_common`] (`ci/seeder_common.rs`), which mirrors
-//! `tests/common/mod.rs` (`MiniTracker`, `TestHarness`).
+//! With `--mffs-payload-dir`/`--mffs-torrent-out` the same session also serves
+//! a multi-file torrent, so one run covers both QA layouts from a single
+//! seeder listen port (a second seeder process would fight it for libtorrent's
+//! default port).  Shared helpers live in [`seeder_common`] and
+//! [`mffs_common`].
 
 #[path = "seeder_common.rs"]
 mod seeder_common;
 
+#[path = "mffs_common.rs"]
+mod mffs_common;
+
+use mffs_common::{bencode_multifile_torrent, collect_files, hash_and_seed_files};
 use seeder_common::{
     bencode_bytes, bencode_int, install_signal_handlers, seed_until_shutdown, session_config,
     start_tracker, PIECE_LEN,
@@ -97,6 +100,19 @@ struct Args {
     announce_host: String,
     torrent_out: PathBuf,
     url_out: PathBuf,
+    /// Payload directory of the multi-file torrent to serve alongside the
+    /// single-file one, with the torrent name to bencode it under and the
+    /// path to write it to.  All three are absent (single-file-only seeder)
+    /// or all three present.
+    mffs: Option<MffsArgs>,
+}
+
+/// The optional multi-file half of the swarm: everything the second torrent
+/// needs that the single-file one does not share.
+struct MffsArgs {
+    payload_dir: PathBuf,
+    name: String,
+    torrent_out: PathBuf,
 }
 
 fn parse_args() -> Args {
@@ -107,7 +123,13 @@ fn parse_args() -> Args {
         announce_host: "127.0.0.1".to_string(),
         torrent_out: PathBuf::from("selfseed.torrent"),
         url_out: PathBuf::from("tracker.url"),
+        mffs: None,
     };
+    // Collected while parsing and validated once every flag is known: the
+    // multi-file half needs both its payload dir and its torrent path.
+    let mut mffs_payload_dir: Option<PathBuf> = None;
+    let mut mffs_torrent_out: Option<PathBuf> = None;
+    let mut mffs_name: Option<String> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
         macro_rules! value_for {
@@ -126,9 +148,31 @@ fn parse_args() -> Args {
             "--announce-host" => args.announce_host = value_for!("--announce-host"),
             "--torrent-out" => args.torrent_out = value_for!("--torrent-out").into(),
             "--url-out" => args.url_out = value_for!("--url-out").into(),
+            "--mffs-payload-dir" => {
+                mffs_payload_dir = Some(value_for!("--mffs-payload-dir").into())
+            }
+            "--mffs-torrent-out" => {
+                mffs_torrent_out = Some(value_for!("--mffs-torrent-out").into())
+            }
+            "--mffs-name" => mffs_name = Some(value_for!("--mffs-name")),
             other => panic!("unknown argument: {}", other),
         }
     }
+    args.mffs = match (mffs_payload_dir, mffs_torrent_out) {
+        (Some(payload_dir), Some(torrent_out)) => Some(MffsArgs {
+            payload_dir,
+            name: mffs_name.unwrap_or_else(|| "mffs".to_string()),
+            torrent_out,
+        }),
+        (None, None) => {
+            assert!(
+                mffs_name.is_none(),
+                "--mffs-name needs --mffs-payload-dir and --mffs-torrent-out"
+            );
+            None
+        }
+        _ => panic!("--mffs-payload-dir and --mffs-torrent-out must be given together"),
+    };
     args
 }
 
@@ -143,6 +187,19 @@ fn main() {
         .expect("failed to read payload")
         .len();
     assert!(payload_len > 0, "payload must not be empty");
+
+    // The optional multi-file payload is validated here too, so an unreadable
+    // or empty directory fails before the tracker and the torrent files exist.
+    let mffs_files = args
+        .mffs
+        .as_ref()
+        .map(|mffs| collect_files(&mffs.payload_dir));
+    if let Some(files) = &mffs_files {
+        assert!(
+            !files.is_empty(),
+            "multi-file payload dir must contain at least one file"
+        );
+    }
 
     // 2. Tracker — the announce URL must be live before we bencode.
     let tracker_port = start_tracker(&args.tracker_bind, args.tracker_port)
@@ -199,13 +256,63 @@ fn main() {
     );
     println!("[seeder] announcing to {}", announce_url);
 
+    // 4. Deterministic multi-file torrent over its payload directory; hashing
+    // and seeding share the same bounded pass as above.  It joins the
+    // single-file torrent in the session below: one tracker, one process.
+    let mut mffs_info = None;
+    if let Some(mffs) = &args.mffs {
+        let files = mffs_files
+            .as_ref()
+            .expect("multi-file payload collected above");
+        let (pieces, total_size) =
+            hash_and_seed_files(&mffs.payload_dir, files, &seed_dir, &mffs.name);
+        let dict = bencode_multifile_torrent(&announce_url, &mffs.name, files, &pieces);
+
+        std::fs::write(&mffs.torrent_out, &dict).expect("failed to write multi-file torrent");
+        println!(
+            "[mffs] wrote {} ({} bytes, {} files, {} pieces)",
+            mffs.torrent_out.display(),
+            dict.len(),
+            files.len(),
+            pieces.len() / 20
+        );
+
+        let info = TorrentInfo::from_bytes(dict).expect("failed to parse generated torrent");
+        println!(
+            "[mffs] name={} size={} bytes files={} info_hash={}",
+            info.name(),
+            info.total_size(),
+            info.num_files(),
+            hex::encode(info.info_hash().expect("info hash"))
+        );
+        assert_eq!(
+            info.total_size(),
+            total_size,
+            "torrent total size must match the streamed payload"
+        );
+        mffs_info = Some(info);
+    }
+
     let config = session_config();
     let mut session = Session::new(&config).expect("failed to create libtorrent session");
     let handle = session
         .add_torrent(&info, &seed_dir)
         .expect("failed to add torrent to session");
 
-    seed_until_shutdown(&handle);
+    // Every served torrent needs its own keep-alive entry (the tracker reaps
+    // peers per info_hash); the label is the torrent name QA reads under.
+    let mut torrents = vec![(name, handle)];
+    if let Some(mffs) = &args.mffs {
+        let mffs_handle = session
+            .add_torrent(
+                mffs_info.as_ref().expect("multi-file torrent built above"),
+                &seed_dir,
+            )
+            .expect("failed to add multi-file torrent to session");
+        torrents.push((mffs.name.as_str(), mffs_handle));
+    }
+
+    seed_until_shutdown(&torrents);
 }
 
 #[cfg(test)]

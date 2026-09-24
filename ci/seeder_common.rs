@@ -381,11 +381,22 @@ pub fn session_config() -> torrentfs::TorrentfsConfig {
     config
 }
 
-/// Wait for `handle` to reach a serving state, then re-announce at
-/// [`ANNOUNCE_INTERVAL`] forever (or until SIGINT/SIGTERM) so the swarm entry
-/// never expires.
-pub fn seed_until_shutdown(handle: &TorrentHandle) {
-    // Wait until we're actually serving before declaring readiness.
+/// Wait for every torrent in `torrents` to reach a serving state, then
+/// re-announce all of them at [`ANNOUNCE_INTERVAL`] forever (or until
+/// SIGINT/SIGTERM) so no swarm entry expires.
+///
+/// One run can serve several torrents from a single session (e.g. a
+/// single-file and a multi-file payload), and the tracker reaps peers per
+/// info_hash — so every handle must keep announcing, not just the first.  Each
+/// entry is `(label, handle)`, the label being the torrent name, which is what
+/// identifies the handle in the per-poll state log.
+pub fn seed_until_shutdown(torrents: &[(&str, TorrentHandle)]) {
+    assert!(
+        !torrents.is_empty(),
+        "seeder must serve at least one torrent"
+    );
+
+    // Wait until every torrent is actually serving before declaring readiness.
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         // A signal arriving during warmup must not wait out the 60s deadline:
@@ -395,15 +406,22 @@ pub fn seed_until_shutdown(handle: &TorrentHandle) {
             eprintln!("[seeder] shutdown signal received — stopping");
             return;
         }
-        let status = handle.status().expect("status failed");
-        eprintln!(
-            "[seeder] state={:?} progress={:.1}% seeds={} peers={}",
-            status.state,
-            status.progress * 100.0,
-            status.num_seeds,
-            status.num_peers
-        );
-        if status.state == TorrentState::Seeding || status.state == TorrentState::Finished {
+        let mut all_serving = true;
+        for (label, handle) in torrents {
+            let status = handle.status().expect("status failed");
+            eprintln!(
+                "[seeder] {} state={:?} progress={:.1}% seeds={} peers={}",
+                label,
+                status.state,
+                status.progress * 100.0,
+                status.num_seeds,
+                status.num_peers
+            );
+            if status.state != TorrentState::Seeding && status.state != TorrentState::Finished {
+                all_serving = false;
+            }
+        }
+        if all_serving {
             break;
         }
         if std::time::Instant::now() > deadline {
@@ -412,7 +430,9 @@ pub fn seed_until_shutdown(handle: &TorrentHandle) {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    handle.force_reannounce();
+    for (_, handle) in torrents {
+        handle.force_reannounce();
+    }
 
     println!("[seeder] ready — Ctrl-C to stop");
     loop {
@@ -433,7 +453,9 @@ pub fn seed_until_shutdown(handle: &TorrentHandle) {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        handle.force_reannounce();
+        for (_, handle) in torrents {
+            handle.force_reannounce();
+        }
     }
 }
 
