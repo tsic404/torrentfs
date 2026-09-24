@@ -704,12 +704,13 @@ run_test "fuse_device_exists does not crash" \
 # --- fix_state_dir_ownership ---
 # Re-homes the torrentfs state tree (default XDG dir, plus any --cache/--db
 # overrides) to the daemon user when a previous container run left any part of
-# it owned by a different UID.  `rehome_ownership` probes ownership
-# *recursively* via `find`, so a correct top-level directory with a leftover
-# nobody:nogroup file underneath still triggers the chown.  is_root, find, and
-# chown are stubbed (except the real-`find` tests), and daemon_uid/daemon_gid/
-# daemon_home are set directly (resolve_daemon_ids is covered separately) so no
-# real uid/chown runs on the test host.
+# it owned by a different UID.  The ownership probe walks *recursively* via
+# `find`, so a correct top-level directory with a leftover nobody:nogroup file
+# underneath still triggers the chown.  Every affected path is reported in one
+# WARNING block printed ahead of the chowns.  is_root, find, and chown are
+# stubbed (except the real-`find` tests), and daemon_uid/daemon_gid/daemon_home
+# are set directly (resolve_daemon_ids is covered separately) so no real
+# uid/chown runs on the test host.
 
 run_test "fix_state_dir_ownership skips when not root" \
     'is_root() { return 1; }
@@ -742,9 +743,82 @@ mkdir -p "$data_home/torrentfs"
 warn_file="$(mktemp)"
 XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
 rm -rf "$data_home"
-[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] && grep -q "re-homing to 0:0" "$warn_file"
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] \
+    && grep -q "WARNING" "$warn_file" \
+    && grep -q "$data_home/torrentfs" "$warn_file" \
+    && grep -q "re-homing to 0:0" "$warn_file"
 rc=$?
 rm -f "$warn_file"
+exit "$rc"'
+
+run_test "fix_state_dir_ownership warns before it chowns" \
+    'is_root() { return 0; }
+daemon_uid=1000; daemon_gid=1000
+find() { echo "/mismatch"; }
+chown() { echo "CHOWN $*"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+log="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership >"$log" 2>&1
+rm -rf "$data_home"
+warn_line="$(grep -m1 -n "WARNING" "$log" | cut -d: -f1)"
+chown_line="$(grep -m1 -n "CHOWN" "$log" | cut -d: -f1)"
+rm -f "$log"
+[ -n "$warn_line" ] && [ -n "$chown_line" ] && [ "$warn_line" -lt "$chown_line" ]'
+
+run_test "fix_state_dir_ownership names every affected path in one warning" \
+    'is_root() { return 0; }
+daemon_uid=1000; daemon_gid=1000
+find() { echo "/mismatch"; }
+chown() { :; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs" "$data_home/cache"
+cache_arg="$data_home/cache"
+warn_file="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
+rm -rf "$data_home"
+[ "$(grep -c "WARNING" "$warn_file")" -eq 1 ] \
+    && grep -q "$data_home/torrentfs" "$warn_file" \
+    && grep -q "$data_home/cache" "$warn_file"
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
+
+run_test "fix_state_dir_ownership re-homes a --db parent that is the state dir once" \
+    'is_root() { return 0; }
+daemon_uid=1000; daemon_gid=1000
+find() { echo "/mismatch"; }
+calls="$(mktemp)"
+chown() { echo "$*" >> "$calls"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/torrentfs"
+db_arg="$data_home/torrentfs/metadata.db"
+warn_file="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
+rm -rf "$data_home"
+[ "$(grep -c -- "-R 1000:1000 $data_home/torrentfs$" "$calls")" -eq 1 ] \
+    && [ "$(grep -c -- "- $data_home/torrentfs " "$warn_file")" -eq 1 ]
+rc=$?
+rm -f "$calls" "$warn_file"
+exit "$rc"'
+
+run_test "fix_state_dir_ownership de-duplicates candidates by canonical path" \
+    'is_root() { return 0; }
+daemon_uid=1000; daemon_gid=1000
+find() { echo "/mismatch"; }
+calls="$(mktemp)"
+chown() { echo "$*" >> "$calls"; }
+data_home="$(mktemp -d)"
+mkdir -p "$data_home/cache"
+ln -s "$data_home/cache" "$data_home/link"
+cache_arg="$data_home/cache"
+db_arg="$data_home/link/metadata.db"
+XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership 2>/dev/null
+rm -rf "$data_home"
+[ "$(grep -c -- "-R 1000:1000 $data_home/cache$" "$calls")" -eq 1 ] \
+    && ! grep -q -- "-R 1000:1000 $data_home/link$" "$calls"
+rc=$?
+rm -f "$calls"
 exit "$rc"'
 
 run_test "fix_state_dir_ownership skips chown when find detects no mismatch" \
@@ -755,11 +829,15 @@ called=""
 chown() { called="$*"; }
 data_home="$(mktemp -d)"
 mkdir -p "$data_home/torrentfs"
-XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+warn_file="$(mktemp)"
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
 rm -rf "$data_home"
-[ -z "$called" ]'
+[ -z "$called" ] && [ ! -s "$warn_file" ]
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
 
-run_test "fix_state_dir_ownership chowns silently when find probe fails (non-zero, empty)" \
+run_test "fix_state_dir_ownership warns and chowns when the find probe fails" \
     'is_root() { return 0; }
 daemon_uid=0; daemon_gid=0
 find() { return 1; }
@@ -770,7 +848,9 @@ mkdir -p "$data_home/torrentfs"
 warn_file="$(mktemp)"
 XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>"$warn_file"
 rm -rf "$data_home"
-[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] && [ ! -s "$warn_file" ]
+[ "$chown_args" = "-R 0:0 $data_home/torrentfs" ] \
+    && grep -q "WARNING" "$warn_file" \
+    && grep -q "$data_home/torrentfs" "$warn_file"
 rc=$?
 rm -f "$warn_file"
 exit "$rc"'
@@ -783,7 +863,7 @@ chown() { chown_args="$*"; }
 data_home="$(mktemp -d)"
 mkdir -p "$data_home/torrentfs/sub"
 touch "$data_home/torrentfs/sub/cache_metadata.txt"
-XDG_DATA_HOME="$data_home" fix_state_dir_ownership
+XDG_DATA_HOME="$data_home" fix_state_dir_ownership 2>/dev/null
 rm -rf "$data_home"
 [ "$chown_args" = "-R 12345:12345 $data_home/torrentfs" ]'
 
@@ -823,7 +903,7 @@ mkdir -p "$data_home/cache" "$data_home/db"
 touch "$data_home/db/metadata.db"
 cache_arg="$data_home/cache"
 db_arg="$data_home/db/metadata.db"
-XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership
+XDG_DATA_HOME="$data_home/nonexistent" fix_state_dir_ownership 2>/dev/null
 rm -rf "$data_home"
 echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/cache"
 echo "$chown_calls" | grep -q -- "-R 0:0 $data_home/db"
@@ -916,13 +996,17 @@ unset HOME
 resolve_daemon_ids
 [ "$daemon_uid" = 4242 ] && [ "$daemon_gid" = 4343 ] && [ "$daemon_home" = / ]'
 
-run_test "rehome_ownership refuses when daemon identity is unresolved" \
-    'unset daemon_uid daemon_gid
+run_test "fix_state_dir_ownership refuses when daemon identity is unresolved" \
+    'is_root() { return 0; }
+unset daemon_uid daemon_gid
+called=""
+chown() { called="$*"; }
 d="$(mktemp -d)"
+mkdir -p "$d/torrentfs"
 rc=0
-( rehome_ownership "$d" ) 2>/dev/null || rc=$?
+( XDG_DATA_HOME="$d" fix_state_dir_ownership ) 2>/dev/null || rc=$?
 rm -rf "$d"
-[ "$rc" -eq 1 ]'
+[ "$rc" -ne 0 ] && [ -z "$called" ]'
 
 run_test "run_daemon drops to torrentfs via setpriv" \
     'should_drop_privileges() { return 0; }

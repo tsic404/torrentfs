@@ -72,6 +72,17 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
   ghcr.io/tsic404/torrentfs:main
 ```
 
+The daemon runs as UID/GID 1000 in a rootful container, so a state volume owned
+by anyone else is re-homed on startup. The entrypoint probes the tree
+(recursively, stopping at the first foreign entry), prints a `WARNING` block
+naming every affected path, then `chown -R`s it to `1000:1000` — without the
+chown the daemon cannot write its DB or cache metadata and the download engine
+silently disables. A bind-mounted host directory changes ownership on the host
+too, which locks out a host user whose UID differs from 1000. To keep the host
+ownership, pre-own the directory (`sudo chown -R 1000:1000
+/host/torrentfs-state`) or run with `--user <uid>:<gid>` so the daemon user
+already matches.
+
 ### Shutdown, restart, and stale mounts
 
 `docker stop` / `podman stop` send SIGTERM first: torrentfs drains the download
