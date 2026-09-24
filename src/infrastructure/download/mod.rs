@@ -13,8 +13,10 @@ mod piece_store;
 mod session;
 mod types;
 
-pub(crate) use engine::NO_SEEDER_READ_TIMEOUT_SECS;
-pub use engine::{Command as DownloadCommand, DownloadEngine, DownloadSnapshot};
+pub use engine::{
+    Command as DownloadCommand, DownloadEngine, DownloadSnapshot, NO_SEEDER_READ_TIMEOUT_SECS,
+    PEER_WAIT_CAP_SECS,
+};
 pub use piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
 pub use piece_store::PieceStore;
 pub use session::{Session, TorrentHandle};

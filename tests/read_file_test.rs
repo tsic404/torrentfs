@@ -982,20 +982,19 @@ fn distinct_multipiece_torrent(announce_url: &str, name: &str) -> Vec<u8> {
     t
 }
 
-/// Integration test for the core invariant: a whole-file read (`cat`) on a
+/// Margin (seconds) added to the engine's own no-seeder wait windows when
+/// bounding the read in [`test_no_seeder_cat_does_not_block_healthy_read`],
+/// absorbing the engine's 200 ms poll granularity and command-queue latency.
+const NO_SEEDER_READ_BOUND_MARGIN_SECS: u64 = 5;
+
+/// Integration test for the core invariant: a whole-file `cat` on a
 /// no-seeder torrent must not block a healthy (seeded) read on the same
-/// engine.  Before the fix, a no-seeder whole-file read serialized healthy
-/// reads on the single engine thread behind a per-chunk no-seeder window
-/// (observed ~47s for a 4 MiB `cat`).  After the fix, a no-seeder read probes
-/// the empty swarm (a short peer-wait) then fails fast with `NoPeers` (0s
-/// piece-wait), so the engine is never occupied for the full read timeout.
-///
-/// Constructed as a dual-torrent scenario on one MiniTracker: a healthy
-/// single-piece torrent served by a real seeder, and a no-seeder multi-piece
-/// torrent (distinct info_hash, all-zero piece hashes, empty swarm) whose
-/// whole-file read must fail fast.  Both reads are issued concurrently; the
-/// healthy read is dispatched first so the single engine thread serves it
-/// immediately (proving it is not serialized behind the no-seeder `cat`).
+/// engine.  Before the fix, every 128 KiB chunk paid its own no-seeder
+/// window on the single engine thread (~47s for a 4 MiB `cat`); now the
+/// read is bounded by peer discovery plus at most one no-seeder piece-wait
+/// window — never the full read timeout per chunk.  Both reads run
+/// concurrently on a dual-torrent MiniTracker, healthy first, so a blocked
+/// healthy read proves serialization behind the no-seeder cat.
 #[test]
 fn test_no_seeder_cat_does_not_block_healthy_read() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1025,10 +1024,19 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
     // Keep every window this test measures short and deterministic: both the
     // peer-discovery wait (`min(read_timeout_secs, 9s)`) and the no-seeder
     // piece-wait (`min(read_timeout_secs, 15s)`) are capped by the read
-    // timeout, so a 6s timeout makes the read return at ~6s whichever branch it
-    // takes.  The default 30s lets the two branches differ by 9s, which the
-    // wave-shared engine thread can stretch past the assertion below.
+    // timeout, so each wait costs at most 6s and the two branches no longer
+    // differ by 9s.  The default 30s would, and the wave-shared engine thread
+    // can stretch that past the assertion below.
     config.timeouts.read_timeout_secs = Some(6);
+    // This test's premise is an empty no-seeder swarm.  LSD breaks it: the
+    // session discovers its own torrent via the host's other interfaces
+    // (`num_peers > 0`), which flips the read off the empty-swarm fast-fail
+    // onto the no-seeder piece-wait window.  The healthy torrent is found
+    // through the MiniTracker, so LSD is not needed here.
+    config.local_discovery.lsd_enabled = Some(false);
+    // Resolved once, right where the engine is built: the bound asserted below
+    // is derived from the windows this timeout caps.
+    let read_timeout_secs = config.timeouts.resolved_read_timeout_secs();
 
     let engine = Arc::new(
         torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
@@ -1162,12 +1170,8 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
         healthy_elapsed
     );
 
-    // The no-seeder whole-file read fails fast with `NoPeers` (not the full
-    // read_timeout, not a wrong error type).  With the 6s read timeout above
-    // the read returns at ~6s whichever branch it takes, so 15s is a wide
-    // margin over the legitimate path while still catching the pre-fix
-    // behaviour this test exists for (the no-seeder `cat` holding the engine
-    // for the full read timeout, ~47s for the 4 MiB case).
+    // The no-seeder whole-file read fails with `NoPeers` (not the full
+    // read_timeout, not a wrong error type).
     match no_seeder_result {
         Err(torrentfs::TorrentError::NoPeers(_)) => {}
         other => panic!(
@@ -1175,10 +1179,42 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
             other
         ),
     }
+    // Upper bound on this read's swarm wait: the engine's own windows, each
+    // capped by this test's read timeout exactly as the engine caps it — peer
+    // discovery (≤ `min(read_timeout, PEER_WAIT_CAP_SECS)`) plus the no-seeder
+    // piece-wait window (≤ `min(read_timeout, NO_SEEDER_READ_TIMEOUT_SECS)`).
+    // A peer that appears mid-discovery ends the first phase early but keeps
+    // the second, so the two add up; a bound covering only one of them fails
+    // whenever that peer appears.
+    let engine_no_seeder_wait_secs =
+        std::cmp::min(read_timeout_secs, torrentfs::download::PEER_WAIT_CAP_SECS)
+            + std::cmp::min(
+                read_timeout_secs,
+                torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS,
+            );
+    let no_seeder_upper_bound_secs = engine_no_seeder_wait_secs + NO_SEEDER_READ_BOUND_MARGIN_SECS;
+    // The bound is only a bound on the *capped* path while this test's timeout
+    // is what caps both waits — asserted, not assumed, so a raised timeout
+    // fails loudly here instead of silently widening what the assertion below
+    // tolerates.
     assert!(
-        no_seeder_elapsed < Duration::from_secs(15),
-        "no-seeder whole-file read took {:?}; expected fast NoPeers",
-        no_seeder_elapsed
+        read_timeout_secs <= torrentfs::download::PEER_WAIT_CAP_SECS
+            && read_timeout_secs <= torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS,
+        "this test's read timeout {}s must cap both no-seeder waits ({}s peer \
+         discovery / {}s piece wait); a larger timeout needs the bound below \
+         re-reasoned",
+        read_timeout_secs,
+        torrentfs::download::PEER_WAIT_CAP_SECS,
+        torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS
+    );
+    assert!(
+        no_seeder_elapsed < Duration::from_secs(no_seeder_upper_bound_secs),
+        "no-seeder whole-file read took {:?}; expected the capped no-seeder \
+         wait (≤{}s engine windows + {}s margin), not the pre-fix per-chunk \
+         behaviour (~47s for a 4 MiB cat)",
+        no_seeder_elapsed,
+        engine_no_seeder_wait_secs,
+        NO_SEEDER_READ_BOUND_MARGIN_SECS
     );
 
     // Stop and join the seeder thread so its listen binding is released
