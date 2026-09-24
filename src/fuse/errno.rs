@@ -38,8 +38,11 @@ impl From<FsError> for libc::c_int {
             // ("No data available") so the user sees a meaningful error
             // ("no available seeder" / "waiting for a seeder timed out")
             // instead of the generic EIO ("Input/output error") when the
-            // swarm has no seeder. Other download errors (failure, corrupt
-            // piece) still map to EIO.
+            // swarm has no seeder. A read the on-disk cache cannot serve —
+            // the piece it waits on is gone from the cache, or its range is
+            // larger than the whole cache — also lands on ENODATA (its error
+            // text names the cache, not the swarm). Other download errors
+            // (failure, corrupt piece) still map to EIO.
             FsError::NoPeers(_) | FsError::DownloadTimeout(_) => ENODATA,
             FsError::PieceNotReady(_) | FsError::DownloadFailed(_) => EIO,
             // ── internal / system ──

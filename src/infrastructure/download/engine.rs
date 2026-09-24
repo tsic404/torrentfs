@@ -601,53 +601,160 @@ fn advance_empty_swarm_since(
 /// so it says "no seeder connected", not "no seeder ever connected".  The
 /// daemon writes the line to its own stderr (operator-facing; a FUSE daemon
 /// has no channel into the reading client's stderr), letting the operator
-/// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`).  `truncated`
-/// marks the stale-piece path (a cached piece was purged or truncated and
-/// needed re-download), so "truncated + no seeder" is distinguishable from a
-/// plain cold read with no seeder.  Pure so the exact message is
-/// unit-testable without a running engine.
-pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32, truncated: bool) -> String {
-    if truncated {
-        format!(
-            "no seeder connected (Peers:{} Seeds:{}, truncated piece re-download)",
-            num_peers, num_seeds
-        )
-    } else {
-        format!(
-            "no seeder connected (Peers:{} Seeds:{})",
-            num_peers, num_seeds
-        )
-    }
+/// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`) and from a
+/// cache stall ([`cache_stall_stderr_hint`]).  Pure so the exact
+/// message is unit-testable without a running engine.
+pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
+    format!(
+        "no seeder connected (Peers:{} Seeds:{})",
+        num_peers, num_seeds
+    )
 }
 
 /// Format the `NoPeers` error returned when a piece-wait expires with zero
-/// connected seeders.  `truncated` distinguishes the two failure contexts the
-/// operator must tell apart: a plain cold read that simply has no seeder, vs.
-/// a read that began with a truncated/purged cached piece whose re-download
-/// (`force_recheck`) needs a seeder that is absent — the file cannot self-heal.
-/// Pure so the exact message is unit-testable without a running engine.
+/// connected seeders and no cache-side evidence.  A read waiting on data the
+/// on-disk cache no longer holds is a cache stall instead (see
+/// [`cache_stall_message`]): telling the operator to check the tracker for a
+/// `cache_size` problem is exactly the misattribution this split avoids.  Pure
+/// so the exact message is unit-testable without a running engine.
 pub(crate) fn no_peers_message(
     info_hash: &str,
     peer_wait_secs: u64,
     piece_wait_secs: u64,
-    truncated: bool,
 ) -> String {
-    if truncated {
-        format!(
-            "No seeder connected for info_hash {info_hash} after {:.0}s \
-             peer discovery + {:.0}s piece wait. A truncated piece needs \
-             re-download, but the torrent has no available seeder — the file \
-             cannot self-heal until a seeder connects.",
-            peer_wait_secs, piece_wait_secs
-        )
+    format!(
+        "No seeder connected for info_hash {info_hash} after {:.0}s \
+         peer discovery + {:.0}s piece wait. The torrent has no available \
+         seeder — check tracker health or try again later.",
+        peer_wait_secs, piece_wait_secs
+    )
+}
+
+/// What a read's piece-wait window actually ran out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadStallCause {
+    /// No seeder is connected and no cache-side evidence explains the stall,
+    /// so nothing in the swarm can serve the read.
+    NoSeeder,
+    /// The read is waiting on data the on-disk cache does not hold: the piece
+    /// it waits on was there and is gone, or its range cannot fit the cache at
+    /// all.  Either way the read cannot be served from the cache and depends
+    /// on a re-download.
+    CacheStall,
+    /// A seeder is connected and the cache holds the read, but the pieces did
+    /// not arrive inside the window.
+    SlowSwarm,
+}
+
+/// Classify a read whose piece-wait window elapsed.
+///
+/// `stale_blockers` holds every piece this read found stale — libtorrent's bit
+/// set but no usable on-disk data, i.e. the cache no longer holds data it once
+/// held.  It counts only when it still contains the piece the read is blocked
+/// on, so a stale observation for an already-served piece cannot colour a later
+/// swarm stall; it must hold *all* of them, because a `force_recheck` clears the
+/// bits of every missing piece at once, leaving no way to re-detect a piece
+/// whose bit was already cleared by the time the read reaches it.  A read range
+/// larger than the whole cache is the other cache-side evidence: its head
+/// pieces are evicted by its tail's download before the read captures them, and
+/// that is only reported with a seeder present (otherwise "no seeder" is the
+/// cause the operator must act on first).  Pure so the classification is
+/// unit-testable without a running engine.
+pub(crate) fn classify_read_stall(
+    num_seeds: i32,
+    stale_blockers: &[i32],
+    blocking_piece: i32,
+    read_span_bytes: u64,
+    cache_capacity_bytes: u64,
+) -> ReadStallCause {
+    if stale_blockers.contains(&blocking_piece) {
+        ReadStallCause::CacheStall
+    } else if num_seeds == 0 {
+        ReadStallCause::NoSeeder
+    } else if read_span_bytes > cache_capacity_bytes {
+        ReadStallCause::CacheStall
     } else {
-        format!(
-            "No seeder connected for info_hash {info_hash} after {:.0}s \
-             peer discovery + {:.0}s piece wait. The torrent has no available \
-             seeder — check tracker health or try again later.",
-            peer_wait_secs, piece_wait_secs
-        )
+        ReadStallCause::SlowSwarm
     }
+}
+
+/// Byte count as MiB, so a read-failure message carries numbers the operator
+/// can compare against `[cache] cache_size` (and the file size) directly.
+fn format_mib(bytes: u64) -> String {
+    format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// Format the stderr hint for a read stalled on the on-disk cache, mirroring
+/// [`no_seeder_stderr_hint`] so the operator can grep the two causes apart.
+/// `blocking_piece_stale` selects the evidence: the piece the read waits on is
+/// gone from the cache, vs. a read range larger than the whole cache.  Pure so
+/// the exact message is unit-testable without a running engine.
+pub(crate) fn cache_stall_stderr_hint(
+    read_span_bytes: u64,
+    cache_capacity_bytes: u64,
+    blocking_piece_stale: bool,
+) -> String {
+    let evidence = if blocking_piece_stale {
+        "piece the read waits on is gone from cache"
+    } else {
+        "read span exceeds cache"
+    };
+    format!(
+        "read stalled on the on-disk cache \
+         (cache_size={}, read span={}, {evidence}); raise [cache] cache_size if \
+         the cache is evicting data the read needs",
+        format_mib(cache_capacity_bytes),
+        format_mib(read_span_bytes)
+    )
+}
+
+/// Format the `Timeout` error for a read stalled on the on-disk cache rather
+/// than on the swarm.  It states the evidence without claiming *why* the data
+/// left the cache (eviction, a failed check, or removal outside the cache are
+/// indistinguishable here), gives both numbers (`cache_size` against the read
+/// span), both actions (size the cache to the file; the re-download needs a
+/// reachable seeder), and the swarm state — the bare `ENODATA` the FUSE layer
+/// returns cannot tell this apart from "no seeder" ([`no_peers_message`]) or
+/// "seeder slow" (the plain `Timeout` message).  Pure so the exact message is
+/// unit-testable without a running engine.
+pub(crate) fn cache_stall_message(
+    info_hash: &str,
+    piece_wait_secs: u64,
+    cache_capacity_bytes: u64,
+    read_span_bytes: u64,
+    blocking_piece_stale: bool,
+    num_seeds: i32,
+) -> String {
+    let cause = if blocking_piece_stale {
+        "the piece this read waits on was in the on-disk cache and is no \
+         longer there (evicted, purged after a failed check, or removed \
+         outside the cache), so it has to be re-downloaded"
+    } else {
+        "this read's range is larger than the whole on-disk cache, so its head \
+         pieces are evicted by its tail's download before the read captures \
+         them"
+    };
+    let action = if blocking_piece_stale {
+        "raise [cache] cache_size to at least the size of the file being read \
+         if the cache is evicting data the read still needs"
+    } else {
+        "raise [cache] cache_size to at least the size of the file being read \
+         so the read's pieces stay resident"
+    };
+    let swarm = if num_seeds > 0 {
+        "A seeder is connected, so the re-download itself is not blocked on \
+         the swarm"
+    } else {
+        "No seeder is connected, so the re-download cannot start until one \
+         connects"
+    };
+    format!(
+        "Read timed out for info_hash {info_hash} after {piece_wait_secs:.0}s \
+         piece wait: {cause}. cache_size = {capacity}, this read spans {span} — \
+         {action}. {swarm}.",
+        capacity = format_mib(cache_capacity_bytes),
+        span = format_mib(read_span_bytes),
+    )
 }
 
 /// Compute the partial-read bounds when the piece-wait window elapses. The
@@ -809,10 +916,18 @@ struct PendingRead {
     /// phase completes, so the `NoPeers` message reports it even when the
     /// piece wait then fast-fails at zero seconds.
     peer_wait_elapsed: Duration,
-    /// A stale (purged/truncated) cached piece was detected at read start, so
-    /// the read entered the recheck path.  Surfaces in the `NoPeers` message
-    /// to tell "truncated + no seeder" apart from a plain cold read.
-    had_truncated_piece: bool,
+    /// Every piece of this read's range whose data was found missing from the
+    /// on-disk cache although libtorrent's bit for it was set — i.e. the cache
+    /// no longer holds data it once held (evicted, purged after a failed
+    /// check, or removed outside the cache), so the read must re-download it.
+    /// *All* such pieces are kept, not just the first: a `force_recheck` clears
+    /// the bits of every missing piece at once, so a piece the read has not
+    /// reached yet can never be re-detected once its bit is cleared.  The
+    /// evidence counts at timeout only for the piece the read is blocked on
+    /// (see `classify_read_stall`); a stale observation for an already-served
+    /// piece cannot colour a later swarm stall because the read only advances
+    /// past a piece once it is usable again.
+    stale_blockers: Vec<i32>,
     /// The recheck has been observed in a checking state (TOCTOU guard).
     saw_checking: bool,
     /// Id of the reader this read registered with the scheduler, once the
@@ -847,9 +962,19 @@ impl PendingRead {
             has_seeder: false,
             piece_wait_start: now,
             peer_wait_elapsed: Duration::ZERO,
-            had_truncated_piece: false,
+            stale_blockers: Vec::new(),
             saw_checking: false,
             reader_id: None,
+        }
+    }
+
+    /// Record `piece_idx` as a piece of this read whose data the on-disk cache
+    /// no longer holds.  Idempotent: the read-start scan and the piece-wait
+    /// loop can both observe the same piece, and a recheck can leave it stale
+    /// for several polls.
+    fn record_stale_piece(&mut self, piece_idx: i32) {
+        if !self.stale_blockers.contains(&piece_idx) {
+            self.stale_blockers.push(piece_idx);
         }
     }
 }
@@ -1358,10 +1483,14 @@ impl EngineState {
     /// any exist, otherwise serve from local pieces or park it in a swarm-wait
     /// phase.  Returns `Some(result)` when the read finishes here.
     fn after_settling(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
-        // Keep the flag so a later `NoPeers` failure can say "truncated piece
-        // needs re-download" rather than a plain "no seeder" — the operator
-        // must tell the two apart.
-        let had_truncated_piece = self.has_stale_pieces(
+        // Record every stale piece in the read's range as this read's cache
+        // evidence: their data was in the cache and is gone, so the read has to
+        // re-download them.  All of them, not just the first — the recheck
+        // below clears every missing piece's bit at once, so a piece the read
+        // has not reached yet could never be re-detected afterwards.  The
+        // evidence only counts at timeout for the piece the read is blocked on
+        // (see `classify_read_stall`).
+        let stale_pieces = self.stale_pieces_in_range(
             &read.info_hash,
             read.start_piece,
             read.end_piece,
@@ -1369,8 +1498,10 @@ impl EngineState {
             read.num_pieces,
             read.total_size,
         );
-        if had_truncated_piece {
-            read.had_truncated_piece = true;
+        if !stale_pieces.is_empty() {
+            for piece_idx in stale_pieces {
+                read.record_stale_piece(piece_idx);
+            }
             tracing::info!(
                 "read_file_range: stale libtorrent piece state detected for \
                  info_hash={}, forcing recheck to clear bits for pieces {}-{}",
@@ -1648,14 +1779,17 @@ impl EngineState {
                     // We observed the checking state and it has now ended — the
                     // recheck is truly complete.
                     self.finish_recheck(read)
-                } else if !self.has_stale_pieces(
-                    &read.info_hash,
-                    read.start_piece,
-                    read.end_piece,
-                    read.piece_length,
-                    read.num_pieces,
-                    read.total_size,
-                ) {
+                } else if self
+                    .stale_pieces_in_range(
+                        &read.info_hash,
+                        read.start_piece,
+                        read.end_piece,
+                        read.piece_length,
+                        read.num_pieces,
+                        read.total_size,
+                    )
+                    .is_empty()
+                {
                     // The recheck cleared the stale bits even though the poll
                     // never saw a settling state (a small torrent rechecks
                     // faster than the poll).  This is the condition the recheck
@@ -1858,7 +1992,9 @@ impl EngineState {
                 // only in `after_settling`) because a whole-file read evicts
                 // earlier pieces as later ones download, turning them stale
                 // mid-wait — without this the wait runs out its 60s window.
-                read.had_truncated_piece = true;
+                // The piece blocking the read is the one whose data left the
+                // cache, so record it as the read's cache evidence.
+                read.record_stale_piece(piece_idx);
                 if self.start_recheck(read) {
                     return None;
                 }
@@ -1898,7 +2034,8 @@ impl EngineState {
 
     /// Resolve a read whose piece-wait window elapsed: return the contiguous
     /// prefix of completed pieces when there is one, otherwise the
-    /// `NoPeers`/`Timeout` error that distinguishes "no seeder" from "slow".
+    /// `NoPeers`/`Timeout` error that distinguishes "no seeder" from "slow" and
+    /// from a read stalled on the on-disk cache.
     fn read_timed_out(
         &mut self,
         read: &PendingRead,
@@ -1936,11 +2073,12 @@ impl EngineState {
             );
         }
 
-        // Distinguish "no seeder" from "slow download": zero connected seeders
-        // → `NoPeers`; seeders present but slow → `Timeout`.  If status is
-        // unavailable (handle gone, `status()` failed), fall back to `Timeout`
-        // — don't fabricate a zero-seeder swarm and mislead the user into
-        // checking tracker health for a stale handle.
+        // Tell the three stalls apart: no seeder (`NoPeers`), a read the
+        // on-disk cache window cannot cover (`Timeout` naming the cache), and
+        // a slow-but-healthy swarm (`Timeout`).  If status is unavailable
+        // (handle gone, `status()` failed), fall back to `Timeout` — don't
+        // fabricate a zero-seeder swarm and mislead the user into checking
+        // tracker health for a stale handle.
         let (progress, num_peers, num_seeds) = match self
             .handles
             .get(&read.info_hash)
@@ -1956,31 +2094,67 @@ impl EngineState {
                 )));
             }
         };
-        if num_seeds == 0 {
-            // A zero-seeder read has no seeder to serve it.  Write a one-line
-            // hint to the daemon's own stderr (operator-facing; FUSE has no
-            // channel into the client's stderr) via a direct, non-panicking
-            // write: `eprintln!` panics on a broken stderr (aborting this
-            // thread), and `tracing` writes to stdout, not stderr.
-            let _ = writeln!(
-                std::io::stderr(),
-                "{}",
-                no_seeder_stderr_hint(num_peers, num_seeds, read.had_truncated_piece)
-            );
-            return Err(TorrentError::NoPeers(no_peers_message(
-                &read.info_hash,
-                read.peer_wait_elapsed.as_secs(),
-                window.as_secs(),
-                read.had_truncated_piece,
-            )));
-        }
-        Err(TorrentError::Timeout(format!(
-            "Timed out waiting for piece {} after {:.0}s. \
-             Torrent progress: {:.2}%",
+        let read_span_bytes = read.end_offset.saturating_sub(read.absolute_offset);
+        // An unreadable capacity must not read as "the cache is too small":
+        // `u64::MAX` leaves only the stale-blocker evidence to classify a stall
+        // as a cache one.
+        let cache_capacity_bytes = self
+            .store
+            .cache_manager()
+            .lock()
+            .map(|c| c.max_cache_size())
+            .unwrap_or(u64::MAX);
+        let blocking_piece_stale = read.stale_blockers.contains(&piece_idx);
+        // Write the one-line hint to the daemon's own stderr (operator-facing;
+        // FUSE has no channel into the client's stderr) via a direct,
+        // non-panicking write: `eprintln!` panics on a broken stderr (aborting
+        // this thread), and `tracing` writes to stdout, not stderr.
+        match classify_read_stall(
+            num_seeds,
+            &read.stale_blockers,
             piece_idx,
-            window.as_secs(),
-            progress,
-        )))
+            read_span_bytes,
+            cache_capacity_bytes,
+        ) {
+            ReadStallCause::NoSeeder => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    no_seeder_stderr_hint(num_peers, num_seeds)
+                );
+                Err(TorrentError::NoPeers(no_peers_message(
+                    &read.info_hash,
+                    read.peer_wait_elapsed.as_secs(),
+                    window.as_secs(),
+                )))
+            }
+            ReadStallCause::CacheStall => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    cache_stall_stderr_hint(
+                        read_span_bytes,
+                        cache_capacity_bytes,
+                        blocking_piece_stale
+                    )
+                );
+                Err(TorrentError::Timeout(cache_stall_message(
+                    &read.info_hash,
+                    window.as_secs(),
+                    cache_capacity_bytes,
+                    read_span_bytes,
+                    blocking_piece_stale,
+                    num_seeds,
+                )))
+            }
+            ReadStallCause::SlowSwarm => Err(TorrentError::Timeout(format!(
+                "Timed out waiting for piece {} after {:.0}s. \
+                 Torrent progress: {:.2}%",
+                piece_idx,
+                window.as_secs(),
+                progress,
+            ))),
+        }
     }
 
     /// Advance every parked read by one step, resolving (and removing) the ones
@@ -2076,12 +2250,16 @@ impl EngineState {
         true
     }
 
-    /// detect whether any piece in the range has a stale
-    /// libtorrent bitmask — `have_piece == true` but the on-disk piece is
-    /// missing or shorter than its expected size (purged by cache
-    /// verification / manual `delete_piece`, or truncated externally).
-    /// Returns `true` if at least one such piece exists.
-    fn has_stale_pieces(
+    /// Every piece in the range whose libtorrent bitmask is stale —
+    /// `have_piece == true` but the on-disk piece is missing or shorter than
+    /// its expected size.  The data was in the cache and is no longer there;
+    /// `has_stale_piece` cannot tell eviction from a verification purge from a
+    /// file removed or truncated outside the cache, and all three leave the
+    /// piece needing a re-download.  Empty when no such piece exists.  Returns
+    /// *all* of them because the caller rechecks, and a `force_recheck` clears
+    /// every missing piece's bit at once — a piece skipped here could never be
+    /// re-detected.  The range is one read's span, so the vector stays small.
+    fn stale_pieces_in_range(
         &self,
         info_hash: &str,
         start_piece: i32,
@@ -2089,11 +2267,12 @@ impl EngineState {
         piece_length: u64,
         num_pieces: i32,
         total_size: u64,
-    ) -> bool {
+    ) -> Vec<i32> {
         let handle = match self.handles.get(info_hash) {
             Some(h) => h,
-            None => return false,
+            None => return Vec::new(),
         };
+        let mut stale = Vec::new();
         for piece_idx in start_piece..=end_piece {
             if handle.have_piece(piece_idx) {
                 let piece_key = PieceStore::piece_key(info_hash, piece_idx);
@@ -2104,11 +2283,11 @@ impl EngineState {
                     total_size,
                 );
                 if self.store.has_stale_piece(&piece_key, expected) {
-                    return true;
+                    stale.push(piece_idx);
                 }
             }
         }
-        false
+        stale
     }
 
     fn read_from_disk(
@@ -2427,8 +2606,9 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_empty_swarm_since, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
-        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight,
+        advance_empty_swarm_since, cache_stall_message, cache_stall_stderr_hint,
+        classify_read_stall, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
+        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight, ReadStallCause,
         NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
@@ -2488,39 +2668,169 @@ mod tests {
     /// the no-seeder stderr hint must use the exact message the
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
     /// live peer/seed counts — so a currently-empty swarm is distinguishable
-    /// from "seeder slow" (which surfaces as `DownloadTimeout`, not this hint).
+    /// from "seeder slow" and from a cache stall (which surface as different
+    /// hints).
     #[test]
     fn no_seeder_hint_reports_live_counts() {
         assert_eq!(
-            no_seeder_stderr_hint(0, 0, false),
+            no_seeder_stderr_hint(0, 0),
             "no seeder connected (Peers:0 Seeds:0)"
         );
         // Peers may be non-zero (leechers without the piece) while seeds stay 0.
         assert_eq!(
-            no_seeder_stderr_hint(3, 0, false),
+            no_seeder_stderr_hint(3, 0),
             "no seeder connected (Peers:3 Seeds:0)"
         );
-        // The truncated stale-piece path appends a marker so the operator can
-        // tell "truncated + no seeder" apart from a plain no-seeder read.
-        assert_eq!(
-            no_seeder_stderr_hint(0, 0, true),
-            "no seeder connected (Peers:0 Seeds:0, truncated piece re-download)"
+        assert!(!no_seeder_stderr_hint(0, 0).contains("cache"));
+    }
+
+    /// the `NoPeers` message describes an empty swarm only.  A read stalled on
+    /// the cache is reported by `cache_stall_message` — the bare `ENODATA` the
+    /// FUSE layer returns cannot tell the two apart, so the texts must differ.
+    #[test]
+    fn no_peers_message_points_at_the_tracker_only() {
+        let msg = no_peers_message("abc", 9, 15);
+        assert!(msg.contains("check tracker health"));
+        assert!(!msg.contains("cache_size"));
+        assert_ne!(
+            msg,
+            cache_stall_message("abc", 15, 1 << 20, 1 << 20, true, 0)
         );
     }
 
-    /// the `NoPeers` message must distinguish a plain cold read with no seeder
-    /// from a truncated/purged piece whose re-download needs a seeder that is
-    /// absent — the two failure contexts a reader can't otherwise tell apart
-    /// from the bare `ENODATA` the FUSE layer returns.
+    /// A read waiting on a piece the cache no longer holds — or a read range
+    /// larger than the whole cache — is a cache stall, not a swarm problem.
+    /// Only an empty swarm without cache-side evidence is "no seeder", and only
+    /// a seeder-backed read that fits the cache is "slow swarm".
     #[test]
-    fn no_peers_message_distinguishes_truncated_context() {
-        let plain = no_peers_message("abc", 9, 0, false);
-        let truncated = no_peers_message("abc", 9, 0, true);
-        assert!(plain.contains("check tracker health"));
-        assert!(!plain.contains("truncated"));
-        assert!(truncated.contains("truncated"));
-        assert!(truncated.contains("self-heal"));
-        assert_ne!(plain, truncated);
+    fn read_stall_cause_separates_cache_from_swarm() {
+        const CACHE: u64 = 1 << 20;
+        // No cache evidence, no seeder: the swarm is the cause.
+        assert_eq!(
+            classify_read_stall(0, &[], 0, CACHE, CACHE),
+            ReadStallCause::NoSeeder
+        );
+        // The read waits on a piece whose data left the cache, and no seeder
+        // can re-fetch it: still a cache stall — the data was resident and a
+        // larger cache would have served the read without any seeder.
+        assert_eq!(
+            classify_read_stall(0, &[0], 0, CACHE / 8, CACHE),
+            ReadStallCause::CacheStall
+        );
+        // Same with a seeder connected: the re-download is not blocked on the
+        // swarm, so the cache is what the read ran out of.
+        assert_eq!(
+            classify_read_stall(1, &[0], 0, CACHE / 8, CACHE),
+            ReadStallCause::CacheStall
+        );
+        // A read range larger than the cache cannot stay resident: a cache
+        // stall once a seeder is there to serve the re-download.
+        assert_eq!(
+            classify_read_stall(1, &[], 0, 4 * CACHE, CACHE),
+            ReadStallCause::CacheStall
+        );
+        // Range exactly filling the cache, seeder present, no cache evidence:
+        // the swarm was merely slow.
+        assert_eq!(
+            classify_read_stall(1, &[], 0, CACHE, CACHE),
+            ReadStallCause::SlowSwarm
+        );
+        // Unknown capacity (u64::MAX) can never be proven too small.
+        assert_eq!(
+            classify_read_stall(1, &[], 0, u64::MAX - 1, u64::MAX),
+            ReadStallCause::SlowSwarm
+        );
+    }
+
+    /// Cache evidence belongs to the piece the read is waiting on *now*: a
+    /// stale piece the read already re-downloaded and moved past must not
+    /// colour a later stall, or a slow swarm would be reported as a cache
+    /// problem (the read advanced past it, so the bit is no longer the
+    /// blocker).
+    #[test]
+    fn read_stall_cause_ignores_cache_evidence_for_a_served_piece() {
+        const CACHE: u64 = 1 << 20;
+        // Piece 0 was stale, got re-downloaded, and the read now waits on
+        // piece 1 with a connected seeder: a slow swarm, not a cache stall.
+        assert_eq!(
+            classify_read_stall(1, &[0], 1, CACHE / 8, CACHE),
+            ReadStallCause::SlowSwarm
+        );
+        // Without a seeder the same read is a plain no-seeder stall.
+        assert_eq!(
+            classify_read_stall(0, &[0], 1, CACHE / 8, CACHE),
+            ReadStallCause::NoSeeder
+        );
+    }
+
+    /// Several pieces of one read can lose their data at once, and the recheck
+    /// clears all their bits together: the evidence for a piece the read has
+    /// not reached yet has to survive on the recorded list, or the read's
+    /// eventual stall on it would be blamed on the swarm.
+    #[test]
+    fn read_stall_cause_keeps_evidence_for_pieces_not_yet_reached() {
+        const CACHE: u64 = 1 << 20;
+        // Pieces 0..=2 were all stale; the read re-downloaded 0, is waiting on
+        // 1, and 2 is still ahead of it.
+        assert_eq!(
+            classify_read_stall(1, &[0, 1, 2], 1, CACHE / 8, CACHE),
+            ReadStallCause::CacheStall
+        );
+        // Same read, no seeder connected.
+        assert_eq!(
+            classify_read_stall(0, &[0, 1, 2], 1, CACHE / 8, CACHE),
+            ReadStallCause::CacheStall
+        );
+    }
+
+    /// The cache-stall message must name the cache and both actions, and must
+    /// state which swarm state the read failed in — a user seeing only
+    /// `ENODATA` has no other way to tell a `cache_size` problem from a missing
+    /// seeder.  It must not claim *why* the data left the cache: eviction, a
+    /// verification purge and an external removal are indistinguishable here.
+    #[test]
+    fn cache_stall_message_names_cache_cause_and_swarm_state() {
+        let stale = cache_stall_message("abc", 15, 1 << 20, 1 << 20, true, 1);
+        assert!(stale.contains("was in the on-disk cache and is no longer there"));
+        assert!(stale.contains("evicted, purged after a failed check, or removed"));
+        assert!(stale.contains("cache_size = 1.00 MiB"));
+        assert!(stale.contains("this read spans 1.00 MiB"));
+        assert!(stale.contains("raise [cache] cache_size"));
+        assert!(stale.contains("not blocked on the swarm"));
+
+        // No stale evidence: the cause is the read range, not a removed piece,
+        // so the message must not claim the data ever was in the cache.
+        let oversized = cache_stall_message("abc", 15, 1 << 20, 4 << 20, false, 1);
+        assert!(oversized.contains("larger than the whole on-disk cache"));
+        assert!(!oversized.contains("is no longer there"));
+        assert!(!oversized.contains("purged"));
+
+        // No seeder connected: the re-download cannot start, and the message
+        // must say so instead of implying a healthy swarm.
+        let sourceless = cache_stall_message("abc", 15, 1 << 20, 1 << 20, true, 0);
+        assert!(sourceless.contains("cannot start until one connects"));
+        assert!(!sourceless.contains("not blocked on the swarm"));
+    }
+
+    /// The cache-stall hint is what the operator greps in the daemon's stderr:
+    /// it must carry the two numbers (so `[cache] cache_size` can be sized) and
+    /// the evidence marker, and must not read like the no-seeder hint.
+    #[test]
+    fn cache_stall_hint_reports_numbers_and_evidence() {
+        assert_eq!(
+            cache_stall_stderr_hint(1 << 20, 1 << 20, true),
+            "read stalled on the on-disk cache \
+             (cache_size=1.00 MiB, read span=1.00 MiB, piece the read waits on \
+             is gone from cache); raise [cache] cache_size if the cache is \
+             evicting data the read needs"
+        );
+        assert_eq!(
+            cache_stall_stderr_hint(4 << 20, 1 << 20, false),
+            "read stalled on the on-disk cache \
+             (cache_size=1.00 MiB, read span=4.00 MiB, read span exceeds cache); \
+             raise [cache] cache_size if the cache is evicting data the read \
+             needs"
+        );
     }
 
     /// the read budget must cover all five synchronous phases —
