@@ -950,6 +950,29 @@ run_test "wait_for_fuse_mount propagates torrentfs exit code on premature exit" 
 run_test "wait_for_fuse_mount treats clean exit without mount as failure (rc 1)" \
     'mountpoint_has_fuse() { return 1; }; kill() { return 1; }; wait() { return 0; }; rc=0; wait_for_fuse_mount 99999 /mnt 2>/dev/null || rc=$?; [ "$rc" -eq 1 ]'
 
+# --- should_recover_session ---
+# Only a severed session (the daemon's EXIT_SESSION_SEVERED) is recoverable, and
+# only while the recovery budget lasts. A detached mount must stay final: the
+# entrypoint must not resurrect a filesystem the operator unmounted.
+
+run_test "should_recover_session restarts a severed session" \
+    'should_recover_session "$DAEMON_EXIT_SESSION_SEVERED" 0'
+
+run_test "should_recover_session allows the last recovery in the budget" \
+    'should_recover_session "$DAEMON_EXIT_SESSION_SEVERED" "$((MAX_SESSION_RECOVERIES - 1))"'
+
+run_test "should_recover_session stops once the budget is spent" \
+    '! should_recover_session "$DAEMON_EXIT_SESSION_SEVERED" "$MAX_SESSION_RECOVERIES"'
+
+run_test "should_recover_session does not restart an external unmount" \
+    '! should_recover_session 102 0'
+
+run_test "should_recover_session does not restart a real failure" \
+    '! should_recover_session 1 0 && ! should_recover_session 101 0 && ! should_recover_session 0 0'
+
+run_test "should_recover_session codes do not collide with the other exits" \
+    'for code in 0 1 2 3 100 101 102 103; do [ "$DAEMON_EXIT_SESSION_SEVERED" -ne "$code" ] || exit 1; done'
+
 # ── summary ──────────────────────────────────────────────────────────────────
 
 echo ""
