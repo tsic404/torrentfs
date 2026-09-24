@@ -735,6 +735,33 @@ force_unmount_fuse() {
     return 1
 }
 
+# ── severed-session recovery ────────────────────────────────────────────────
+
+# torrentfs exits with this status when its FUSE connection was severed while
+# the mount was still attached (see EXIT_SESSION_SEVERED in src/main.rs): the
+# kernel aborted every in-flight request (ECONNABORTED, then ENOTCONN) without
+# detaching the mount, so nothing is wrong with the mountpoint itself —
+# restarting the daemon rebuilds the transport and the mount keeps working.
+# Every other status (config, mount, lock, clean shutdown, external unmount)
+# is a real outcome the container engine must see.
+DAEMON_EXIT_SESSION_SEVERED=104
+
+# Recovery is bounded: a mountpoint that keeps losing its connection must still
+# fail loudly instead of restarting forever.
+MAX_SESSION_RECOVERIES=3
+
+# Pause between a severed-session exit and the restart, so a fast exit loop
+# cannot spin the container at full CPU.
+SESSION_RECOVERY_BACKOFF_SECS=1
+
+# Decide whether a daemon that exited with status $1, having already spent $2
+# recoveries, should be restarted.  Returns 0 to restart, 1 to stop.
+should_recover_session() {
+    local rc="$1" used="$2"
+    [ "$rc" -eq "$DAEMON_EXIT_SESSION_SEVERED" ] || return 1
+    [ "$used" -lt "$MAX_SESSION_RECOVERIES" ]
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 echo "[entrypoint] torrentfs container startup" >&2
@@ -924,19 +951,41 @@ start_torrentfs_rootless() {
     }
     trap cleanup EXIT INT TERM
 
-    run_daemon torrentfs "$mountpoint" "$@" &
-    torrentfs_pid=$!
+    # A severed FUSE session is re-established by restarting the daemon; see
+    # start_torrentfs_rootful for the rationale.  The direct-mount path has no
+    # bind publish to restore, so recovery is just the mount itself.
+    local rc=0 recoveries=0
+    while :; do
+        local mount_rc=0
+        run_daemon torrentfs "$mountpoint" "$@" &
+        torrentfs_pid=$!
 
-    local mount_rc=0
-    wait_for_fuse_mount "$torrentfs_pid" "$mountpoint" || mount_rc=$?
-    if [ "$mount_rc" -ne 0 ]; then
-        exit "$mount_rc"
-    fi
+        wait_for_fuse_mount "$torrentfs_pid" "$mountpoint" || mount_rc=$?
+        if [ "$mount_rc" -ne 0 ]; then
+            exit "$mount_rc"
+        fi
 
-    echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
+        echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
 
-    local rc=0
-    wait "$torrentfs_pid" || rc=$?
+        rc=0
+        wait "$torrentfs_pid" || rc=$?
+        torrentfs_pid=""
+
+        if ! should_recover_session "$rc" "$recoveries"; then
+            break
+        fi
+        recoveries=$((recoveries + 1))
+        echo "[entrypoint] FUSE session severed (exit $rc) — restarting torrentfs (recovery $recoveries/$MAX_SESSION_RECOVERIES)" >&2
+        # The dead FUSE mount must be gone before the next mount: a stale mount
+        # would make the restart's readiness probe succeed on the dead mount. A
+        # mount that cannot be detached is not recoverable — stop instead.
+        if ! force_unmount_fuse "$mountpoint"; then
+            echo "[entrypoint] ERROR: cannot detach the dead FUSE mount at $mountpoint — not restarting" >&2
+            exit "$rc"
+        fi
+        sleep "$SESSION_RECOVERY_BACKOFF_SECS"
+    done
+
     # The daemon has stopped; detach any FUSE mount it left behind. If it exited
     # cleanly (0) but the mount cannot be detached, surface that as a distinct
     # status (103) so a false-clean shutdown does not leave the next
@@ -978,22 +1027,59 @@ start_torrentfs_rootful() {
     }
     trap cleanup EXIT INT TERM
 
-    run_daemon torrentfs "$internal_mnt" "$@" &
-    torrentfs_pid=$!
+    # A severed FUSE session is re-established by restarting the daemon: the
+    # mountpoint, the state directory (cache + DB) and the published bind mount
+    # all outlive the process, so recovery costs one mount, not a container
+    # restart.
+    local rc=0 recoveries=0
+    while :; do
+        local mount_rc=0
+        run_daemon torrentfs "$internal_mnt" "$@" &
+        torrentfs_pid=$!
 
-    local mount_rc=0
-    wait_for_fuse_mount "$torrentfs_pid" "$internal_mnt" || mount_rc=$?
-    if [ "$mount_rc" -ne 0 ]; then
-        exit "$mount_rc"
-    fi
+        wait_for_fuse_mount "$torrentfs_pid" "$internal_mnt" || mount_rc=$?
+        if [ "$mount_rc" -ne 0 ]; then
+            exit "$mount_rc"
+        fi
 
-    echo "[entrypoint] FUSE mount ready — publishing to $mountpoint" >&2
-    mount --bind "$internal_mnt" "$mountpoint"
+        echo "[entrypoint] FUSE mount ready — publishing to $mountpoint" >&2
+        mount --bind "$internal_mnt" "$mountpoint"
 
-    echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
+        echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
 
-    local rc=0
-    wait "$torrentfs_pid" || rc=$?
+        rc=0
+        wait "$torrentfs_pid" || rc=$?
+        torrentfs_pid=""
+
+        if ! should_recover_session "$rc" "$recoveries"; then
+            break
+        fi
+        recoveries=$((recoveries + 1))
+        echo "[entrypoint] FUSE session severed (exit $rc) — restarting torrentfs (recovery $recoveries/$MAX_SESSION_RECOVERIES)" >&2
+        # The dead FUSE mount and the bind that publishes it must be gone
+        # before the next mount: a stale mount would make the restart's
+        # readiness probe succeed on the dead mount and publish it. A mount
+        # that cannot be detached is not recoverable — stop instead.
+        if ! force_unmount_fuse "$internal_mnt"; then
+            echo "[entrypoint] ERROR: cannot detach the dead FUSE mount at $internal_mnt — not restarting" >&2
+            exit "$rc"
+        fi
+        # Lazy-detach the publish bind: a reader still holding the dead mount
+        # makes a plain umount fail with EBUSY — the sustained-read case this
+        # recovery exists for — and the next `mount --bind` would then stack on
+        # the dead bind, which nothing reclaims (force_unmount_fuse only probes
+        # the internal mountpoint) and which can reach the host via rshared.
+        # Lazy detach leaves the namespace regardless of holders; a FUSE mount
+        # still published afterwards means the detach did not take, so stop
+        # rather than publish on top of a dead mount.
+        umount -l "$mountpoint" 2>/dev/null || true
+        if mountpoint_has_fuse "$mountpoint"; then
+            echo "[entrypoint] ERROR: dead FUSE mount still published at $mountpoint — not restarting" >&2
+            exit "$rc"
+        fi
+        sleep "$SESSION_RECOVERY_BACKOFF_SECS"
+    done
+
     # The daemon has stopped; detach any FUSE mount it left behind. If it exited
     # cleanly (0) but the mount cannot be detached, surface that as a distinct
     # status (103) so a false-clean shutdown does not leave the next

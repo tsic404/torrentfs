@@ -535,7 +535,9 @@ fn wait_for_shutdown(
         // and best-effort detach whatever is still there; an unmount failure
         // must not mask the session-loss exit code.
         // A mountinfo read failure ("unknown") still attempts the detach.
-        if mountpoint_has_fuse_mount(mountpoint).unwrap_or(true) {
+        let still_attached = mountpoint_has_fuse_mount(mountpoint);
+        let exit_code = session_lost_exit_code(still_attached);
+        if still_attached.unwrap_or(true) {
             if unmount_fuse(mountpoint) {
                 info!(
                     "detached residual mount {} after session loss",
@@ -545,11 +547,19 @@ fn wait_for_shutdown(
                 warn!(
                     "residual mount {} could not be detached after session loss (exiting {})",
                     mountpoint.display(),
-                    EXIT_SESSION_LOST
+                    exit_code
                 );
             }
         }
-        std::process::exit(EXIT_SESSION_LOST);
+        if exit_code == EXIT_SESSION_SEVERED {
+            error!(
+                "FUSE connection at {} was severed while the mount was still \
+                 attached; exiting {} so the mount can be re-established",
+                mountpoint.display(),
+                exit_code
+            );
+        }
+        std::process::exit(exit_code);
     }
 
     info!("unmounting FUSE filesystem");
@@ -595,6 +605,30 @@ const EXIT_MOUNTPOINT_LOCKED: i32 = 101;
 /// to serve.  Distinct from the lock-held code so a supervisor can tell the
 /// two failure modes apart.
 const EXIT_SESSION_LOST: i32 = 102;
+
+/// Exit status used when the FUSE connection was severed while the mount was
+/// still attached (aborted connection, forced unmount).  The kernel fails
+/// every in-flight request with `ECONNABORTED` and every later one with
+/// `ENOTCONN`, but it does not detach the mount, so the transport can be
+/// rebuilt by restarting the daemon — a supervisor may recover instead of
+/// leaving the mount dead until the container is restarted.
+const EXIT_SESSION_SEVERED: i32 = 104;
+
+/// Exit status for a session that ended without a shutdown signal.
+///
+/// A FUSE mount still attached at the mountpoint means the connection was
+/// severed underneath a live mount, so re-mounting restores service and the
+/// loss is reported as recoverable ([`EXIT_SESSION_SEVERED`]).  A detached
+/// mount means an external `fusermount -u`: the operator asked for the
+/// filesystem to go away, so the loss stays final ([`EXIT_SESSION_LOST`]) and
+/// a supervisor must not undo it.  An unreadable mountinfo is also final —
+/// never restart on unknown state.
+fn session_lost_exit_code(mount_still_attached: Option<bool>) -> i32 {
+    match mount_still_attached {
+        Some(true) => EXIT_SESSION_SEVERED,
+        _ => EXIT_SESSION_LOST,
+    }
+}
 
 /// Failure modes for [`acquire_mountpoint_lock`], split so the caller can map
 /// a held lock onto the distinct `exit 101` status instead of a generic error.
@@ -876,6 +910,22 @@ mod tests {
         assert!(should_attempt_direct_unmount(0));
         assert!(!should_attempt_direct_unmount(1000));
         assert!(!should_attempt_direct_unmount(u32::MAX));
+    }
+
+    #[test]
+    fn severed_session_is_recoverable_only_while_the_mount_is_attached() {
+        // A still-attached mount means the connection was severed underneath
+        // it: the mount is usable again after a restart, so the loss must be
+        // reported with the recoverable code — and that code must differ from
+        // the final one, or a supervisor would restart on intentional
+        // unmounts too.
+        assert_eq!(session_lost_exit_code(Some(true)), EXIT_SESSION_SEVERED);
+        assert_ne!(EXIT_SESSION_SEVERED, EXIT_SESSION_LOST);
+        // An externally detached mount is the operator's `fusermount -u`:
+        // final, so a supervisor does not resurrect it.  Unknown mountinfo
+        // (None) is final as well — never restart on unknown state.
+        assert_eq!(session_lost_exit_code(Some(false)), EXIT_SESSION_LOST);
+        assert_eq!(session_lost_exit_code(None), EXIT_SESSION_LOST);
     }
 
     #[test]

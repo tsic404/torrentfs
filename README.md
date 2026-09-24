@@ -109,8 +109,16 @@ Two defenses live inside the image:
   `--user`, where the stale mount lives inside the container and the engine can
   still start it), the entrypoint probes the mountpoint for `ENOTCONN` at
   startup, lazy-unmounts a stale mount, and retries automatically.
+- **Severed-session recovery.** A FUSE connection can also be severed
+  underneath a *live* mount (kernel abort, forced unmount): every in-flight
+  request fails with `ECONNABORTED`, every later one with `ENOTCONN`, and the
+  mount is dead while the daemon still runs. The daemon reports that loss with
+  status `104` — distinct from `102`, which stays reserved for an external
+  `fusermount -u` — and the entrypoint restarts it (bounded to 3 attempts),
+  re-mounting and re-publishing the bind mount, so the container recovers
+  without a `docker restart`. An intentional unmount still stops the container.
 
-Neither can clear a host-side stale mount left by a `SIGKILL`: the entrypoint
+None of these can clear a host-side stale mount left by a `SIGKILL`: the entrypoint
 never runs because the engine refuses the restart first, so the host-side
 `umount -l` above is required. Give torrentfs enough time to stop to avoid the
 situation — `docker run --stop-timeout 30`, `podman run --stop-timeout 30`, or
