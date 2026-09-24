@@ -9,6 +9,10 @@
 # local seeder); the bug made it re-run `force_recheck_and_wait` on nearly
 # every FUSE read (~2s each), stretching a full `cat` into minutes.
 #
+# Second scenario: with the seeder stopped, reading the head the full-file read
+# evicted must report the cache on the daemon's stderr, not an empty swarm, so
+# a small `cache_size` is not mistaken for a missing seeder.
+#
 # Requires a rootful/FUSE-capable environment (the CI Docker image, or a host
 # with /dev/fuse).  Usage:
 #   ./ci/tests/small_cache_read_e2e.sh [torrentfs_binary] [mountpoint]
@@ -52,10 +56,15 @@ done
 [ -f "$SELFSEED_OUT/selfseed.torrent" ] || { echo "small_cache_read_e2e: seeder did not produce a torrent" >&2; exit 1; }
 
 # Small cache config: below the torrent size (4 MiB) and below a 1 MiB dd block
-# when CACHE_MIB < 1 — the "block > cache" condition from the QA repro.
+# when CACHE_MIB < 1 — the "block > cache" condition from the QA repro.  LSD and
+# DHT are off so the only peer is this script's own tracker+seeder: either would
+# otherwise let the daemon find an unrelated local seeder (the self-seed payload
+# is deterministic, so any host running this script has a peer for the same
+# info_hash) and hide the stall this test asserts.
 CACHE_BYTES=$((CACHE_MIB * 1024 * 1024))
 CONFIG_FILE="$(mktemp)"
-printf '[cache]\ncache_size = %d\n' "$CACHE_BYTES" > "$CONFIG_FILE"
+printf '[cache]\ncache_size = %d\n[local_discovery]\nlsd_enabled = false\n[dht]\nenabled = false\n' \
+    "$CACHE_BYTES" > "$CONFIG_FILE"
 
 mkdir -p "$MNT"
 CACHE_DIR="$(mktemp -d)"
@@ -110,4 +119,43 @@ if [ "$RECHECK_COUNT" -gt 20 ]; then
     echo "small_cache_read_e2e: FAIL — ${RECHECK_COUNT} rechecks (>20)" >&2
     exit 1
 fi
-echo "small_cache_read_e2e: PASS (dd ${ELAPSED}s, ${RECHECK_COUNT} rechecks)"
+
+# ── Cache stall message ──────────────────────────────────────────────────────
+# The same small cache with the seeder gone: the full-file read above evicted
+# the head pieces, so re-reading the head needs a re-download there is no
+# seeder for, and the read times out.  The daemon must name the cache on stderr
+# instead of reporting an empty swarm — the operator greps it to size
+# `[cache] cache_size` rather than chase the tracker.
+echo "[small_cache_read_e2e] cache stall (seeder stopped)…"
+# `run_self_seed_env.sh` runs the tracker+seeder as its own child, so the child
+# — not the wrapper — is what serves the swarm: kill both, or the re-download
+# still has a source and the read just gets slow instead of stalling.
+for child in $(pgrep -P "$SEEDER_PID" 2>/dev/null || true); do
+    kill "$child" 2>/dev/null || true
+done
+kill "$SEEDER_PID" 2>/dev/null || true
+SEEDER_PID=""
+# Give the swarm time to drain so the re-download has no source, then read the
+# head the full-file read evicted.
+sleep 5
+timeout 90 dd if="$DATA_FILE" of=/dev/null bs=256K count=1 status=none 2>/dev/null || true
+if ! grep -q 'read stalled on the on-disk cache' "$LOG_FILE"; then
+    echo "small_cache_read_e2e: FAIL — no cache stall hint on the daemon's stderr" >&2
+    echo "--- daemon log tail ---" >&2
+    tail -n 20 "$LOG_FILE" >&2
+    exit 1
+fi
+if ! grep -q 'piece the read waits on is gone from cache' "$LOG_FILE"; then
+    echo "small_cache_read_e2e: FAIL — cache stall hint does not report the stale piece" >&2
+    exit 1
+fi
+if ! grep -q 'raise \[cache\] cache_size' "$LOG_FILE"; then
+    echo "small_cache_read_e2e: FAIL — cache stall hint does not name the knob to turn" >&2
+    exit 1
+fi
+if ! grep -q 'No seeder is connected, so the re-download cannot start' "$LOG_FILE"; then
+    echo "small_cache_read_e2e: FAIL — cache stall message does not report the swarm state" >&2
+    exit 1
+fi
+
+echo "small_cache_read_e2e: PASS (dd ${ELAPSED}s, ${RECHECK_COUNT} rechecks, cache stall reported)"

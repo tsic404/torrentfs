@@ -63,12 +63,13 @@ impl PieceStore {
     }
 
     /// whether a piece is stale — libtorrent's `have_piece` says true
-    /// but the on-disk piece is missing or shorter than `expected` (external
-    /// purge or truncation), so it must be re-downloaded.  This is the unified
-    /// stale-detection primitive used by the engine's `has_stale_pieces`,
-    /// `all_pieces_local`, and the piece-wait loop.  `Path::exists` alone
-    /// would pass a truncated file, leaving the same EIO, so the real length
-    /// is compared instead.
+    /// but the on-disk piece is missing or shorter than `expected`: the cache
+    /// no longer holds data it once held (evicted under cache pressure, purged
+    /// after a failed check, or removed / truncated outside the cache), so the
+    /// piece must be re-downloaded.  This is the unified stale-detection
+    /// primitive used by the engine's `stale_pieces_in_range`, `all_pieces_local`,
+    /// and the piece-wait loop.  `Path::exists` alone would pass a truncated
+    /// file, leaving the same EIO, so the real length is compared instead.
     pub fn has_stale_piece(&self, piece_key: &str, expected: u64) -> bool {
         !self.has_piece_on_disk_at_least(piece_key, expected)
     }
@@ -449,7 +450,7 @@ mod tests {
     }
 
     /// `has_stale_piece` is the unified stale-detection primitive
-    /// used by the engine's `has_stale_pieces`, `all_pieces_local`, the
+    /// used by the engine's `stale_pieces_in_range`, `all_pieces_local`, the
     /// piece-wait loop, and the deadline-setting section.  After a purge,
     /// it must return `true` (piece file gone) so the engine knows the
     /// libtorrent bitmask is stale.

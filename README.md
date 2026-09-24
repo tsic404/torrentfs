@@ -184,6 +184,8 @@ A read's worst-case wait exceeds this value: the engine waits up to `read_timeou
 
 The on-disk piece cache size (`[cache] cache_size`, in bytes) defaults to 1 GiB. Set it below the torrent's total size to force LRU eviction and re-download on repeated reads.
 
+A read the cache cannot serve — the piece it waits on was there and is gone (evicted, purged after a failed check, or removed outside the cache), or its range is larger than the whole cache — times out with `ENODATA` like a missing seeder does, so the daemon names the cause on its own stderr: `read stalled on the on-disk cache (cache_size=1.00 MiB, read span=0.12 MiB, piece the read waits on is gone from cache); raise [cache] cache_size if the cache is evicting data the read needs`. Size `cache_size` to at least the size of the file being read so its pieces stay resident; the message also states whether a seeder is connected, since the re-download needs one. A genuine swarm problem is reported separately as `no seeder connected (Peers:N Seeds:M)`.
+
 Note: `[rate_limits] download_rate_limit` / `upload_rate_limit` (bytes per second, `0` = unlimited) do not apply to peers on the local network — libtorrent leaves loopback/local peers unthrottled by default. Use a peer address outside the local network (routable public address) to exercise rate limits.
 
 CLI flags: `torrentfs <mountpoint> [--db <path>] [--cache <dir>] [--config <file>] [--log-level <level>] [--log-file <path>] [--config-check]`.
