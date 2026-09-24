@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
 # Self-seeding QA environment for torrentfs. Public sample torrents usually
 # have no reachable seeders, so this builds a deterministic local swarm —
-# a local HTTP tracker, a single-file 4 MiB torrent, and a libtorrent seeder —
-# for real downloads without external infrastructure (no DHT/LSD/UPnP/NAT-PMP/
-# public trackers). By default the tracker binds 0.0.0.0 and the announce host
-# is the host's primary non-loopback IPv4, so libtorrent's per-interface
-# announces (it expands a wildcard listen interface into one socket per local
-# address) can reach the tracker on multi-interface hosts; a loopback-only
-# fallback (127.0.0.1/127.0.0.1) is used when no non-loopback address is
-# detectable. NOTE: binding 0.0.0.0 exposes the unauthenticated tracker to the
-# LAN (any host may query or inject peers); acceptable for a synthesized QA
-# payload, but pass --tracker-bind 127.0.0.1 to stay loopback-only.
+# a local HTTP tracker, a single-file 4 MiB torrent, a multi-file torrent
+# (movie/file_A, movie/file_B, movie/subdir/file_C), and one libtorrent seeder
+# serving both — for real downloads without external infrastructure (no
+# DHT/LSD/UPnP/NAT-PMP/public trackers). By default the tracker binds 0.0.0.0
+# and the announce host is the host's primary non-loopback IPv4, so libtorrent's
+# per-interface announces (it expands a wildcard listen interface into one
+# socket per local address) can reach the tracker on multi-interface hosts; a
+# loopback-only fallback (127.0.0.1/127.0.0.1) is used when no non-loopback
+# address is detectable. NOTE: binding 0.0.0.0 exposes the unauthenticated
+# tracker to the LAN (any host may query or inject peers); acceptable for a
+# synthesized QA payload, but pass --tracker-bind 127.0.0.1 to stay
+# loopback-only.
+#
+# Both torrents are served from one session, so the seeder keeps a single
+# listen port and one Ctrl-C stops everything. The multi-file payload is
+# piece-aligned on purpose (256 KiB pieces): file_A is pieces 0-3, file_B is
+# piece 4, subdir/file_C is pieces 5-6, so no piece is shared between two files
+# — "reading file_A left file_B's piece at []" is unambiguous, and two
+# concurrent reads (file_A + file_B) map to disjoint pieces.
+#
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
 #        (--port defaults to 0: the OS picks a free port, published in tracker.url)
@@ -203,6 +213,20 @@ else
         | tr '\0' 'a' > "$OUTPUT_DIR/payload.txt"
 fi
 
+# Multi-file payload: three files in a two-level tree, covering both multi-file
+# QA scenarios from one torrent — reading one file must prioritize only that
+# file's pieces, and two concurrent reads must not interfere.  Sizes are
+# piece-aligned (see the header) and each file has its own fill byte, so a
+# cross-file content mix-up shows up in a `cat` instead of reading as the same
+# payload.
+MFFS_NAME="movie"
+MFFS_DIR="$OUTPUT_DIR/$MFFS_NAME"
+echo "[selfseed] generating multi-file payload (${MFFS_NAME}/{file_A,file_B,subdir/file_C})…"
+mkdir -p "$MFFS_DIR/subdir"
+head -c 1048576 /dev/zero | tr '\0' 'a' > "$MFFS_DIR/file_A"
+head -c 262144 /dev/zero | tr '\0' 'b' > "$MFFS_DIR/file_B"
+head -c 524288 /dev/zero | tr '\0' 'c' > "$MFFS_DIR/subdir/file_C"
+
 echo "[selfseed] creating torrent + starting tracker…"
 SEED_ARGS=( \
     --payload "$OUTPUT_DIR/payload.txt" \
@@ -217,19 +241,25 @@ fi
 SEED_ARGS+=( \
     --torrent-out "$OUTPUT_DIR/selfseed.torrent" \
     --url-out "$OUTPUT_DIR/tracker.url" \
+    --mffs-payload-dir "$MFFS_DIR" \
+    --mffs-name "$MFFS_NAME" \
+    --mffs-torrent-out "$OUTPUT_DIR/$MFFS_NAME.torrent" \
 )
 "$ROOT_DIR/target/release/examples/torrentfs-selfseed-env" "${SEED_ARGS[@]}"
 
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo " Self-seed environment ready"
-echo "   torrent : $OUTPUT_DIR/selfseed.torrent"
+echo "   torrent : $OUTPUT_DIR/selfseed.torrent (single-file)"
 echo "   payload : $OUTPUT_DIR/payload.txt ($(wc -c < "$OUTPUT_DIR/payload.txt") bytes)"
+echo "   torrent : $OUTPUT_DIR/$MFFS_NAME.torrent (multi-file: $MFFS_NAME/file_A, $MFFS_NAME/file_B, $MFFS_NAME/subdir/file_C)"
 echo "   tracker : $(cat "$OUTPUT_DIR/tracker.url")"
 echo ""
 echo " Next steps:"
 echo "   1. cp '$OUTPUT_DIR/selfseed.torrent' <mountpoint>/metadata/"
-echo "   2. cat <mountpoint>/data/selfseed/selfseed   # served by the local seeder"
+echo "   2. cat <mountpoint>/data/selfseed.torrent/selfseed   # served by the local seeder"
+echo "   3. cp '$OUTPUT_DIR/$MFFS_NAME.torrent' <mountpoint>/metadata/"
+echo "   4. cat <mountpoint>/data/$MFFS_NAME.torrent/$MFFS_NAME/file_A   # multi-file: only file_A's pieces download"
 echo ""
 echo " Stop with Ctrl-C (or kill this shell)."
 echo "════════════════════════════════════════════════════════════"
