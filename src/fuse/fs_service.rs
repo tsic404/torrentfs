@@ -76,6 +76,33 @@ fn guard_empty_read(data: &[u8], size: u32) -> Result<(), FsError> {
     }
 }
 
+/// Cached listing of one `data/` directory.
+///
+/// The kernel reads a directory a few hundred entries at a time, so one `ls` of
+/// a 14 000-file torrent issues ~25 `readdir` calls; rebuilding the listing — a
+/// full SQL pass over the directory — for each of them burned ~1.2 s of
+/// dispatch CPU per `ls`. The listing is keyed by the state it was derived from
+/// (`data_readdir_state`), so any write or in-flight add invalidates it: there
+/// is no TTL, and a directory whose contents changed is never served stale.
+///
+/// Only the most recently listed directory is kept — the cache exists for the
+/// consecutive pages of one listing — which bounds its memory to one listing.
+struct DataReaddirCache {
+    ino: u64,
+    state: (u64, u64),
+    entries: Vec<DirEntry>,
+}
+
+/// Entries the kernel has not seen yet: it passes back the offset of the last
+/// entry it accepted, and every returned offset must be strictly greater.
+fn entries_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.offset > offset)
+        .cloned()
+        .collect()
+}
+
 pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -104,6 +131,9 @@ pub struct FsService {
     /// cache for removed `data/` entries, so the stale mirror vanishes
     /// at once instead of lingering for the 1s FUSE TTL.
     pub notifier: Arc<OnceLock<Option<Notifier>>>,
+    /// most recent `data/` listing, so the kernel's per-page `readdir` calls do
+    /// not each rebuild it. See [`DataReaddirCache`].
+    data_readdir_cache: Option<DataReaddirCache>,
 }
 
 // ── Kernel cache invalidation ─────────────────────────────────
@@ -217,6 +247,7 @@ impl FsService {
             listen_addr,
             metrics,
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         }
     }
 
@@ -592,14 +623,22 @@ impl FsService {
                 }
             }
             if let Some(db) = &self.db {
-                if let Some(entries) = DataResolver::readdir_data(
+                let state = DataResolver::current_state(db, &self.processing_torrents);
+                if let Some(cache) = &self.data_readdir_cache {
+                    if cache.ino == ino && cache.state == state {
+                        return Ok(entries_after_offset(&cache.entries, offset));
+                    }
+                }
+                // The listing carries the state it was built from, so the cache
+                // key can never describe a different snapshot than the entries.
+                if let Some(listing) = DataResolver::readdir_data(
                     &mut self.inode_mgr,
                     db,
                     &self.processing_torrents,
                     ino,
-                    offset,
                 ) {
-                    return Ok(entries
+                    let entries: Vec<DirEntry> = listing
+                        .entries
                         .into_iter()
                         .map(|(entry_ino, entry_offset, kind, name)| DirEntry {
                             ino: entry_ino,
@@ -607,7 +646,14 @@ impl FsService {
                             kind,
                             name,
                         })
-                        .collect());
+                        .collect();
+                    let page = entries_after_offset(&entries, offset);
+                    self.data_readdir_cache = Some(DataReaddirCache {
+                        ino,
+                        state: listing.state,
+                        entries,
+                    });
+                    return Ok(page);
                 }
             }
             return Err(FsError::NotFound);
@@ -2541,6 +2587,7 @@ mod tests {
             listen_addr: String::new(),
             metrics: metrics.clone(),
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         };
         (svc, info_hash, torrent_id, metrics)
     }
@@ -2619,6 +2666,7 @@ mod tests {
             listen_addr: String::new(),
             metrics,
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         }
     }
 
@@ -4626,6 +4674,7 @@ mod tests {
             listen_addr: String::new(),
             metrics,
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         }
     }
 
@@ -4873,6 +4922,170 @@ mod tests {
         assert_eq!(torrent.unwrap().filename, "valid.torrent");
     }
 
+    // ── data/ readdir paging + listing cache ────────────────────
+
+    /// Insert a torrent with `files` files, all inside one directory, and
+    /// return `(torrent root ino, inner directory ino)` resolved the way the
+    /// kernel resolves them (lookup by name).
+    fn insert_torrent_with_one_directory(
+        svc: &mut FsService,
+        filename: &str,
+        file_count: usize,
+    ) -> (u64, u64) {
+        let source_id = {
+            let db = svc.db.as_ref().unwrap().clone();
+            let mut guard = db.lock().unwrap();
+            match guard
+                .insert_torrent(
+                    "cat",
+                    "collection",
+                    filename,
+                    4096,
+                    "hash-pages",
+                    file_count as i64,
+                )
+                .unwrap()
+            {
+                InsertTorrentResult::Inserted(id) => id,
+                other => panic!("expected Inserted, got {other:?}"),
+            }
+        };
+        let files: Vec<FileEntry> = (0..file_count)
+            .map(|i| FileEntry {
+                path: format!("disc/track_{i:05}.flac"),
+                size: 4096,
+            })
+            .collect();
+        {
+            let db = svc.db.as_ref().unwrap().clone();
+            let mut guard = db.lock().unwrap();
+            guard.insert_files(source_id, &files).unwrap();
+        }
+
+        let source_dir = svc
+            .lookup(DATA_INO, "cat")
+            .expect("lookup cat")
+            .expect("cat source-path directory");
+        let root = svc
+            .lookup(source_dir.ino, filename)
+            .expect("lookup torrent root")
+            .expect("torrent root");
+        let inner = svc
+            .lookup(root.ino, "disc")
+            .expect("lookup disc")
+            .expect("inner directory");
+        (root.ino, inner.ino)
+    }
+
+    /// The kernel reads a `data/` directory one page at a time and passes back
+    /// the offset of the last entry it accepted. Walking a directory that way
+    /// must yield every entry exactly once and strictly increasing offsets —
+    /// the listing cache serves the later pages from the list the first page
+    /// built, so a shifted or stale list would duplicate or drop entries.
+    #[test]
+    fn readdir_pages_to_the_end_without_gaps_or_duplicates() {
+        let mut svc = service_with_db();
+        let file_count = 300;
+        let (_root_ino, dir_ino) =
+            insert_torrent_with_one_directory(&mut svc, "pages.torrent", file_count);
+
+        let mut names = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let page = svc.readdir(dir_ino, offset).expect("readdir page");
+            if page.is_empty() {
+                break;
+            }
+            assert!(
+                page.windows(2).all(|pair| pair[0].offset < pair[1].offset),
+                "offsets must strictly increase within a page"
+            );
+            assert!(
+                page[0].offset > offset,
+                "page must continue after the requested offset"
+            );
+            offset = page.last().unwrap().offset;
+            names.extend(page.into_iter().map(|entry| entry.name));
+        }
+
+        // `.`, `..` and the files themselves, each exactly once.
+        assert_eq!(
+            names.len(),
+            file_count + 2,
+            "walk must cover the whole listing"
+        );
+        let mut files: Vec<&String> = names
+            .iter()
+            .filter(|name| name.ends_with(".flac"))
+            .collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(files.len(), file_count);
+    }
+
+    /// The listing cache is keyed on the state it was derived from: a torrent
+    /// added after the listing was built must show up on the next `readdir`,
+    /// not only after a restart or a timer.
+    #[test]
+    fn readdir_reflects_a_torrent_added_after_the_listing_was_cached() {
+        let mut svc = service_with_db();
+        insert_torrent_row(&svc, "first.torrent");
+        assert!(readdir_names(&mut svc, DATA_INO).contains(&"first.torrent".to_string()));
+
+        insert_torrent_row(&svc, "second.torrent");
+        let names = readdir_names(&mut svc, DATA_INO);
+        assert!(
+            names.contains(&"first.torrent".to_string())
+                && names.contains(&"second.torrent".to_string()),
+            "listing must be refreshed after the database changed, got {names:?}"
+        );
+    }
+
+    /// A `.torrent` whose background add is still in flight shows up in `data/`
+    /// as a provisional entry. The listing cache is keyed on that in-flight set:
+    /// when the add goes away without a single SQL statement (no database, or the
+    /// first write failing — `total_changes` only counts statements that ran),
+    /// the next `readdir` must not keep serving the provisional entry.
+    #[test]
+    fn readdir_drops_a_provisional_entry_whose_add_left_without_a_write() {
+        let mut svc = service_with_db();
+        insert_torrent_row(&svc, "persisted.torrent");
+
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert((String::new(), "ghost.torrent".to_string()), ());
+        let names = readdir_names(&mut svc, DATA_INO);
+        assert!(
+            names.contains(&"ghost.torrent".to_string()),
+            "listing must show the in-flight add, got {names:?}"
+        );
+
+        svc.processing_torrents.lock().unwrap().clear();
+        let names = readdir_names(&mut svc, DATA_INO);
+        assert!(
+            !names.contains(&"ghost.torrent".to_string()),
+            "the provisional entry must vanish with its add, got {names:?}"
+        );
+        assert!(names.contains(&"persisted.torrent".to_string()));
+    }
+
+    fn insert_torrent_row(svc: &FsService, filename: &str) {
+        let db = svc.db.as_ref().unwrap().clone();
+        let mut guard = db.lock().unwrap();
+        guard
+            .insert_torrent("", "test", filename, 4096, &format!("hash-{filename}"), 1)
+            .unwrap();
+    }
+
+    fn readdir_names(svc: &mut FsService, ino: u64) -> Vec<String> {
+        svc.readdir(ino, 0)
+            .expect("readdir")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
     /// a DB write failure (e.g. disk full → SQLite
     /// `SystemIoFailure`) must not be silent.  Persistence runs on a detached
     /// thread (keeping the FUSE dispatcher unblocked) and records the
@@ -4903,6 +5116,7 @@ mod tests {
             listen_addr: String::new(),
             metrics,
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         };
 
         let (ino, fh) = create_torrent_file(&mut svc, "full.torrent");
@@ -5582,6 +5796,7 @@ mod tests {
             listen_addr: String::new(),
             metrics,
             notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
         };
 
         // `offset == file_size` (16) → `pieces_on_disk` says "empty range"

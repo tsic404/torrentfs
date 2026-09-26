@@ -26,6 +26,14 @@ impl Database {
         Ok(db)
     }
 
+    /// Monotonic count of rows this connection has changed. Callers use it as a
+    /// cheap "has anything been written?" version for cache invalidation: it
+    /// advances on every insert/update/delete, including rows written through
+    /// `Arc<Mutex<Database>>` by background threads.
+    pub fn total_changes(&self) -> u64 {
+        self.conn.total_changes()
+    }
+
     pub(crate) fn run_migrations(&mut self) -> Result<(), DbError> {
         let tx = self.conn.transaction()?;
         let user_version: i64 = tx
@@ -88,6 +96,35 @@ impl Database {
             }
         }
 
+        if user_version < 7 {
+            Self::migrate_v7(&self.conn)?;
+            self.conn.pragma_update(None, "user_version", 7)?;
+        }
+
+        Ok(())
+    }
+
+    /// Add the composite indexes that name lookups under `data/` rely on:
+    /// `torrent_files(directory_id, name)` for files and
+    /// `torrent_directories(torrent_id, parent_id, name)` for directories.
+    ///
+    /// The single-column indexes cannot serve `directory_id = ? AND name = ?` or
+    /// `torrent_id = ? AND parent_id IS ? AND name = ?` without visiting every
+    /// row of the parent, so resolving one name — every `lookup`, i.e. every
+    /// `stat`/`cd`/WebDAV PROPFIND entry — cost O(siblings): a multi-thousand-file
+    /// torrent hung `ls -l` for tens of minutes, and a torrent holding thousands
+    /// of subdirectories under one parent (a large collection) kept the same
+    /// shape for `ls -l` on that parent. Both indexes turn the lookup into a
+    /// single seek (`IS NULL` included); the directory one also covers the
+    /// listing query, whose prefix is `(torrent_id, parent_id)`.
+    pub(crate) fn migrate_v7(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_torrent_files_dir_name
+                 ON torrent_files(directory_id, name);
+
+             CREATE INDEX IF NOT EXISTS idx_torrent_dirs_torrent_parent_name
+                 ON torrent_directories(torrent_id, parent_id, name);",
+        )?;
         Ok(())
     }
 

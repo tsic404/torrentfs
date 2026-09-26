@@ -154,6 +154,48 @@ impl Database {
         Ok(files)
     }
 
+    /// Resolve a single file by name within `parent_dir_id` (`None` = the
+    /// torrent root), instead of materialising the whole directory to scan it
+    /// in Rust.
+    ///
+    /// The `(directory_id, name)` index makes this one seek; scanning the
+    /// directory is what made a name lookup O(files in directory).
+    pub fn get_torrent_file_by_name(
+        &self,
+        source_id: i64,
+        parent_dir_id: Option<i64>,
+        name: &str,
+    ) -> Result<Option<TorrentFile>, DbError> {
+        let Some(content_id) = self.resolve_content_id(source_id)? else {
+            return Ok(None);
+        };
+
+        let file = self
+            .conn
+            .query_row(
+                "SELECT id, torrent_id, directory_id, name, path, size, first_piece, last_piece, piece_start, piece_end
+                 FROM torrent_files WHERE torrent_id = ? AND directory_id IS ? AND name = ?",
+                params![content_id, parent_dir_id, name],
+                |row| {
+                    Ok(TorrentFile {
+                        id: row.get(0)?,
+                        torrent_id: row.get(1)?,
+                        directory_id: row.get(2)?,
+                        name: row.get(3)?,
+                        path: row.get(4)?,
+                        size: row.get(5)?,
+                        first_piece: row.get(6)?,
+                        last_piece: row.get(7)?,
+                        piece_start: row.get(8)?,
+                        piece_end: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(file)
+    }
+
     pub fn get_root_files(&self, source_id: i64) -> Result<Vec<TorrentFile>, DbError> {
         let Some(content_id) = self.resolve_content_id(source_id)? else {
             return Ok(Vec::new());

@@ -527,6 +527,191 @@ fn test_get_files_in_directory() {
     assert_eq!(dir_files.len(), 2);
 }
 
+/// `get_torrent_file_by_name` must resolve a name *within* the requested
+/// directory: the same name can exist in sibling directories, and the torrent
+/// root is its own namespace.
+#[test]
+fn test_get_torrent_file_by_name_scopes_to_directory() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    let source_id = match db
+        .insert_torrent("path1", "Test", "Test", 1024, "hash1", 4)
+        .unwrap()
+    {
+        InsertTorrentResult::Inserted(id) => id,
+        _ => panic!("Expected Inserted"),
+    };
+
+    let files = vec![
+        FileEntry {
+            path: "dir1/a.txt".to_string(),
+            size: 100,
+        },
+        FileEntry {
+            path: "dir2/a.txt".to_string(),
+            size: 200,
+        },
+        FileEntry {
+            path: "root.txt".to_string(),
+            size: 300,
+        },
+    ];
+    db.insert_files(source_id, &files).unwrap();
+
+    let dir1 = db
+        .get_torrent_directory(source_id, None, "dir1")
+        .unwrap()
+        .unwrap();
+
+    let nested = db
+        .get_torrent_file_by_name(source_id, Some(dir1.id), "a.txt")
+        .unwrap()
+        .expect("file in dir1");
+    assert_eq!(nested.size, 100);
+    assert_eq!(nested.path, "dir1/a.txt");
+
+    let root = db
+        .get_torrent_file_by_name(source_id, None, "root.txt")
+        .unwrap()
+        .expect("file in the torrent root");
+    assert_eq!(root.size, 300);
+
+    assert!(
+        db.get_torrent_file_by_name(source_id, None, "a.txt")
+            .unwrap()
+            .is_none(),
+        "a file inside dir1 must not resolve from the torrent root"
+    );
+    assert!(
+        db.get_torrent_file_by_name(source_id, Some(dir1.id), "root.txt")
+            .unwrap()
+            .is_none(),
+        "a root file must not resolve from dir1"
+    );
+    assert!(db
+        .get_torrent_file_by_name(source_id, Some(dir1.id), "missing.txt")
+        .unwrap()
+        .is_none());
+}
+
+/// Resolving one name must not walk the directory. With only the
+/// `directory_id` index, `directory_id = ? AND name = ?` visited every row of
+/// the directory, so each `lookup`/`stat` of a 14 000-file torrent paid that
+/// cost — `ls -l` on such a directory never finished.
+#[test]
+fn test_name_lookup_is_indexed_not_a_directory_scan() {
+    let db = Database::open_in_memory().unwrap();
+    let plan = query_plan(
+        &db.conn,
+        "SELECT id FROM torrent_files WHERE torrent_id = ? AND directory_id IS ? AND name = ?",
+    );
+
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_torrent_files_dir_name")),
+        "name lookup must be served by the (directory_id, name) index — the \
+         `directory_id`-only index still visits every row of the directory, \
+         plan was {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|step| step.contains("SCAN torrent_files")),
+        "name lookup must not scan torrent_files, plan was {plan:?}"
+    );
+}
+
+/// Sibling *directories* need the same treatment as sibling files: with only
+/// `idx_torrent_dirs_parent_id`, `torrent_id = ? AND parent_id IS ? AND name = ?`
+/// visits every subdirectory of the parent, so a collection holding thousands of
+/// subdirectories under one parent paid O(subdirectories) per `stat`.
+#[test]
+fn test_directory_name_lookup_is_indexed_not_a_directory_scan() {
+    let db = Database::open_in_memory().unwrap();
+    let sql = "SELECT id FROM torrent_directories \
+               WHERE torrent_id = ? AND parent_id IS ? AND name = ?";
+
+    let plan = query_plan(&db.conn, sql);
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_torrent_dirs_torrent_parent_name")),
+        "directory name lookup must be served by the \
+         (torrent_id, parent_id, name) index — the `parent_id`-only index still \
+         visits every subdirectory, plan was {plan:?}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .any(|step| step.contains("SCAN torrent_directories")),
+        "directory name lookup must not scan torrent_directories, plan was {plan:?}"
+    );
+}
+
+/// Plan of `sql`, with every placeholder bound to a dummy value (the planner
+/// picks the index from the constraint shape, not the bound value).
+fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut params = vec![
+        rusqlite::types::Value::Integer(1),
+        rusqlite::types::Value::Integer(1),
+        rusqlite::types::Value::Text("x".to_string()),
+    ];
+    params.truncate(sql.matches('?').count());
+
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("prepare plan query");
+    stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, String>(3)
+    })
+    .expect("query plan")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("collect plan")
+}
+
+fn index_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("query sqlite_master")
+        == 1
+}
+
+/// A state database written before the indexes existed sits at `user_version = 6`
+/// without them. Opening it must add both — otherwise every name lookup on the
+/// `data/` mirror keeps walking the parent, which is the hang they prevent.
+#[test]
+fn test_open_adds_name_lookup_index_to_pre_v7_database() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.db");
+
+    {
+        let db = Database::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_torrent_files_dir_name;
+                 DROP INDEX IF EXISTS idx_torrent_dirs_torrent_parent_name;",
+            )
+            .unwrap();
+        db.conn.pragma_update(None, "user_version", 6).unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let version: i64 = db
+        .conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    for index in [
+        "idx_torrent_files_dir_name",
+        "idx_torrent_dirs_torrent_parent_name",
+    ] {
+        assert!(
+            index_exists(&db.conn, index),
+            "opening a pre-v7 database must create {index}"
+        );
+    }
+}
+
 #[test]
 fn test_get_all_files_under_directory() {
     let mut db = Database::open_in_memory().unwrap();
