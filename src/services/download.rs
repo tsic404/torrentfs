@@ -77,6 +77,11 @@ impl DownloadService {
         self.engine.try_is_private(info_hash)
     }
 
+    /// Non-blocking tracker list (`url` + `tier`) for `.stats`.
+    pub fn try_trackers(&self, info_hash: &str) -> Option<Vec<crate::TrackerEntry>> {
+        self.engine.try_trackers(info_hash)
+    }
+
     /// Non-blocking "swarm empty for N seconds" check for `.stats`.
     pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
         self.engine.try_empty_swarm_secs(info_hash)

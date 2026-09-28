@@ -11,6 +11,7 @@ use crate::infrastructure::download::PieceStatus;
 use crate::infrastructure::download::PieceStore;
 use crate::infrastructure::download::SessionStats;
 use crate::infrastructure::download::NO_SEEDER_READ_TIMEOUT_SECS;
+use crate::infrastructure::metadata::TrackerEntry;
 use crate::infrastructure::metrics::MetricsSnapshot;
 use crate::services::download::DownloadService;
 
@@ -461,6 +462,32 @@ fn piece_block(piece_length: u64, pieces: &[PieceStatus]) -> String {
     out
 }
 
+/// Render the `.stats` `-- Trackers --` block for one torrent.
+///
+/// Entries render as `tier <n>  <url>` in BEP-12 announce order (lowest tier
+/// first, announce order kept inside a tier). `None` means no tracker list was
+/// obtained — no download service, a snapshot locked by the engine, no handle
+/// for this info_hash, or a failed handle read — so it renders cause-neutral:
+/// naming one cause, or "no trackers", would assert a fact the data never
+/// carried. `dht_nodes` is the session-wide DHT node count, marked `(global)`.
+fn write_trackers(output: &mut String, trackers: Option<&[TrackerEntry]>, dht_nodes: Option<i32>) {
+    output.push_str("\n-- Trackers --\n");
+    match trackers {
+        Some([]) => output.push_str("  No trackers — relying on DHT/LSD\n"),
+        Some(list) => {
+            let mut ordered: Vec<&TrackerEntry> = list.iter().collect();
+            ordered.sort_by_key(|entry| entry.tier);
+            for entry in ordered {
+                output.push_str(&format!("  tier {}  {}\n", entry.tier, entry.url));
+            }
+        }
+        None => output.push_str("  (unavailable — tracker list not read)\n"),
+    }
+    if let Some(nodes) = dht_nodes {
+        output.push_str(&format!("  DHT Nodes: {} (global)\n", nodes));
+    }
+}
+
 /// Consecutive seconds a torrent's swarm must stay empty (no peers, no seeds)
 /// before the `.stats` health alert fires.  Peer/seed counts are instantaneous
 /// samples that flap around zero while connections are established, so one
@@ -726,6 +753,18 @@ pub fn generate_torrent_stats(
     }
     output.push_str(&format!("info_hash: {}\n", t.info_hash));
     output.push_str(&format!("source_path: \"{}\"\n", t.source_path));
+
+    // -- Trackers -- announce targets, above the tracker_isolation line: for a
+    // private torrent this list is exactly what isolation keeps out of other
+    // sites' swarms. Both reads are snapshot reads, so rendering never blocks
+    // the FUSE dispatch thread on the engine.
+    let trackers = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_trackers(info_hash));
+    let dht_nodes = download_service
+        .as_ref()
+        .map(|ds| ds.snapshot_stats().dht_nodes);
+    write_trackers(&mut output, trackers.as_deref(), dht_nodes);
 
     // PT isolation info: show the private flag and whether
     // tracker merging is isolated. Private torrents (private=1 in the info
@@ -2137,6 +2176,75 @@ mod tests {
         assert_eq!(
             status_to_english(&display_status(&TorrentStatus::Pending, None)),
             "Pending"
+        );
+    }
+
+    #[test]
+    fn test_trackers_block_lists_tier_and_url_in_announce_order() {
+        // A multi-tier announce-list renders lowest tier first; announce order
+        // is preserved inside a tier (BEP-12 contact order).
+        let trackers = vec![
+            TrackerEntry {
+                tier: 2,
+                url: "udp://third.example:1337/announce".into(),
+            },
+            TrackerEntry {
+                tier: 0,
+                url: "http://first.example/announce".into(),
+            },
+            TrackerEntry {
+                tier: 0,
+                url: "http://second.example/announce".into(),
+            },
+        ];
+
+        let mut out = String::new();
+        write_trackers(&mut out, Some(&trackers), None);
+
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            vec![
+                "",
+                "-- Trackers --",
+                "  tier 0  http://first.example/announce",
+                "  tier 0  http://second.example/announce",
+                "  tier 2  udp://third.example:1337/announce",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_trackers_block_zero_trackers_points_at_dht_and_lsd() {
+        let mut out = String::new();
+        write_trackers(&mut out, Some(&[]), Some(412));
+
+        assert!(
+            out.contains("  No trackers — relying on DHT/LSD\n"),
+            "empty tracker list must name the DHT/LSD fallback, got:\n{out}"
+        );
+        assert!(
+            out.contains("  DHT Nodes: 412 (global)\n"),
+            "DHT count must be marked global (no per-torrent DHT view), got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_trackers_block_unread_list_claims_no_cause() {
+        // `None` covers three distinct states — the snapshot was locked, it
+        // holds no handle for the info_hash, or the handle read failed — so the
+        // block must pin none of them. It must not claim zero trackers either:
+        // only a definitive empty list may say there are no trackers.
+        let mut out = String::new();
+        write_trackers(&mut out, None, None);
+
+        assert!(
+            out.contains("  (unavailable — tracker list not read)\n"),
+            "an unread tracker list must say so, got:\n{out}"
+        );
+        assert!(!out.contains("No trackers"), "got:\n{out}");
+        assert!(
+            !out.contains("handle"),
+            "the block must not name a cause it cannot establish, got:\n{out}"
         );
     }
 }
