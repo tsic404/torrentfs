@@ -44,7 +44,7 @@ pub use piece_priority::PiecePriorityToml;
 pub use pieces::PiecesConfig;
 pub use proxy::ProxyConfig;
 pub use rate_limits::RateLimitsConfig;
-pub use timeouts::{TimeoutsConfig, DEFAULT_READ_TIMEOUT_SECS};
+pub use timeouts::{TimeoutsConfig, DEFAULT_PEER_DISCOVERY_WAIT_SECS, DEFAULT_READ_TIMEOUT_SECS};
 pub use tracker::TrackerConfig;
 pub use user_agent::UserAgentConfig;
 
@@ -413,6 +413,31 @@ read_timeout_secs = 10
         let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.read_timeout_secs, Some(10));
         assert_eq!(config.timeouts.resolved_read_timeout_secs(), 10);
+    }
+
+    #[test]
+    fn test_peer_discovery_wait_config() {
+        // Default: unset → the shipped discovery window, long enough to cover
+        // a cold mount's first announce.
+        let default_config = TorrentfsConfig::default_config();
+        assert_eq!(
+            default_config.timeouts.resolved_peer_discovery_wait_secs(),
+            DEFAULT_PEER_DISCOVERY_WAIT_SECS
+        );
+
+        // Non-positive value falls back to the default, like read_timeout_secs.
+        let non_positive: TorrentfsConfig =
+            toml::from_str("[timeouts]\npeer_discovery_wait_secs = 0\n").unwrap();
+        assert_eq!(
+            non_positive.timeouts.resolved_peer_discovery_wait_secs(),
+            DEFAULT_PEER_DISCOVERY_WAIT_SECS
+        );
+
+        // Custom window
+        let config: TorrentfsConfig =
+            toml::from_str("[timeouts]\npeer_discovery_wait_secs = 90\n").unwrap();
+        assert_eq!(config.timeouts.peer_discovery_wait_secs, Some(90));
+        assert_eq!(config.timeouts.resolved_peer_discovery_wait_secs(), 90);
     }
     #[test]
     fn test_config_rejects_unknown_section() {

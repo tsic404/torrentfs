@@ -15,7 +15,6 @@ mod types;
 
 pub use engine::{
     Command as DownloadCommand, DownloadEngine, DownloadSnapshot, NO_SEEDER_READ_TIMEOUT_SECS,
-    PEER_WAIT_CAP_SECS,
 };
 pub use piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
 pub use piece_store::PieceStore;

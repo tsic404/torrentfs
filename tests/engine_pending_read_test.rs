@@ -1,7 +1,8 @@
 //! Regression tests for reads parked on the swarm.
 //!
 //! A no-seeder read spends its peer-discovery window (up to
-//! `PEER_WAIT_CAP_SECS`) waiting for a seeder that will never arrive.  While
+//! `[timeouts] peer_discovery_wait_secs`, capped by the read timeout) waiting
+//! for a seeder that will never arrive.  While
 //! that wait ran inline on the engine thread, every other command on the same
 //! mount — including reads of healthy, fully cached torrents — queued behind
 //! it.  The fix parks such a read on the engine's pending-read queue and polls
@@ -9,8 +10,8 @@
 //! means several reads can be in flight on one torrent at once, so each holds
 //! its own reader id and releases exactly that reader.
 //!
-//! Ignored by default: they need a local tracker and spend ~10-13s of real
-//! wall-clock in the peer-wait window.  Run with
+//! Ignored by default: they need a local tracker and spend the shipped 30s
+//! peer-discovery window of real wall-clock waiting.  Run with
 //! `cargo test --test engine_pending_read_test -- --ignored`.
 
 mod common;
@@ -30,7 +31,7 @@ use torrentfs::download::DownloadEngine;
 /// the read had already finished; post-fix it is served on the next engine-loop
 /// iteration, while the read is still parked.
 #[test]
-#[ignore = "requires local tracker; ~10s wall-clock"]
+#[ignore = "requires local tracker; ~30s wall-clock"]
 fn parked_no_seeder_read_does_not_block_engine_commands() {
     // Serialize libtorrent session creation to avoid resource contention with
     // the other tests in this binary.
@@ -53,7 +54,8 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
 
     let mut config = local_test_config();
     // Large read timeout: the no-seeder read then parks in the peer-wait window
-    // (capped at 9s) instead of failing fast, which is the state under test.
+    // (the shipped `[timeouts] peer_discovery_wait_secs` window) instead of
+    // failing fast, which is the state under test.
     config.timeouts.read_timeout_secs = Some(60);
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
@@ -141,7 +143,7 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
 ///   announce schedule fired, turning intermittent ENODATA into persistent
 ///   `NoPeers`.
 #[test]
-#[ignore = "requires local tracker; ~22s wall-clock"]
+#[ignore = "requires local tracker; ~45s wall-clock"]
 fn concurrent_cold_reads_share_one_discovery_window() {
     let _session_guard = acquire_session_lock();
 
@@ -165,7 +167,8 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     // discovery keeps the swarm genuinely empty and the test deterministic.
     config.local_discovery.lsd_enabled = Some(false);
     // Large read timeout: a no-seeder read parks in the peer-wait window
-    // (capped at `PEER_WAIT_CAP_SECS`) instead of failing fast.
+    // (capped by `[timeouts] peer_discovery_wait_secs`) instead of failing
+    // fast.
     config.timeouts.read_timeout_secs = Some(60);
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
@@ -322,7 +325,7 @@ fn concurrent_cold_reads_all_succeed_with_a_seeder() {
 /// reader is released first), and the access window is narrowed to zero so each
 /// read's gradient is local and the two are distinguishable in `.stats`.
 #[test]
-#[ignore = "requires local tracker; ~13s wall-clock"]
+#[ignore = "requires local tracker; ~33s wall-clock"]
 fn concurrent_slow_reads_release_their_own_reader() {
     let _session_guard = acquire_session_lock();
 

@@ -192,6 +192,7 @@ listen_interfaces = "0.0.0.0:6881"
 
 [timeouts]
 read_timeout_secs = 60
+peer_discovery_wait_secs = 30
 
 [cache]
 cache_size = 67108864
@@ -199,7 +200,9 @@ cache_size = 67108864
 
 The FUSE read timeout (`[timeouts] read_timeout_secs`, in seconds) sets the per-phase wait applied to torrent state transitions and piece downloads during a read. It defaults to 60s — raise it when reading the first piece of a large cold file on a slow-but-healthy swarm, or lower it to fail fast on dead torrents. It is a torrentfs-level timeout and is not passed to libtorrent.
 
-A read's worst-case wait exceeds this value: the engine waits up to `read_timeout_secs` for the state transition, up to 10s for a stale-piece recheck, up to 9s for peer discovery, and up to `read_timeout_secs` again for the piece download — ~139s at the default, plus a 5s FUSE dispatch margin before the read surfaces `ENODATA`.
+The peer-discovery wait (`[timeouts] peer_discovery_wait_secs`, in seconds) is how long a read that finds an empty swarm waits for a peer or seeder to appear before the swarm counts as sourceless. It defaults to 30s, which covers a cold start — right after the mount, the tracker's first announce and the peer connect can take several seconds (measured ~9s in a container), and a shorter window would fail that first `cat` with `ENODATA` even though the torrent is healthy. The effective wait is `min(read_timeout_secs, peer_discovery_wait_secs)`, so a short read timeout still bounds the whole read; raise both to wait longer for a slow tracker or DHT bootstrap. Like `read_timeout_secs` it is torrentfs-level and is not passed to libtorrent. A read that does run out its window reports the elapsed discovery wait in the daemon's own stderr and names this key, so the wait is tuned rather than guessed.
+
+A read's worst-case wait exceeds `read_timeout_secs`: the engine waits up to `read_timeout_secs` for the state transition, up to 10s for a stale-piece recheck, up to `min(read_timeout_secs, peer_discovery_wait_secs)` for peer discovery (30s at the defaults), up to 15s more for the no-seeder piece wait, and up to `read_timeout_secs` again for the piece download — ~175s at the defaults, plus a 5s FUSE dispatch margin before the read surfaces `ENODATA`.
 
 The on-disk piece cache size (`[cache] cache_size`, in bytes) defaults to 1 GiB. Set it below the torrent's total size to force LRU eviction and re-download on repeated reads.
 

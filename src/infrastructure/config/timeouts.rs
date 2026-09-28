@@ -13,6 +13,16 @@ use crate::json_field_int;
 /// before the read surfaces ENODATA.
 pub const DEFAULT_READ_TIMEOUT_SECS: u64 = 60;
 
+/// Default peer-discovery wait (seconds) used when
+/// `peer_discovery_wait_secs` is unset or non-positive.
+///
+/// Every read that finds an empty swarm waits for a peer to appear before the
+/// swarm is declared sourceless. The wait must outlast the tracker's first
+/// announce plus the peer connect, or the first read of a fresh mount fails
+/// with `NoPeers` inside that cold window (measured ~9s in a container with a
+/// host-network tracker); 30s leaves room for a slower announce.
+pub const DEFAULT_PEER_DISCOVERY_WAIT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutsConfig {
@@ -28,6 +38,12 @@ pub struct TimeoutsConfig {
     /// [`DEFAULT_READ_TIMEOUT_SECS`] when unset or non-positive.
     /// This is a torrentfs-level timeout, not passed to libtorrent.
     pub read_timeout_secs: Option<i64>,
+    /// Seconds a read may wait for a peer to appear (peer discovery) before
+    /// the swarm is declared sourceless. Defaults to
+    /// [`DEFAULT_PEER_DISCOVERY_WAIT_SECS`] when unset or non-positive. Like
+    /// `read_timeout_secs` this is a torrentfs-level timeout, not passed to
+    /// libtorrent.
+    pub peer_discovery_wait_secs: Option<i64>,
 }
 
 impl TimeoutsConfig {
@@ -38,6 +54,15 @@ impl TimeoutsConfig {
             .filter(|&v| v > 0)
             .map(|v| v as u64)
             .unwrap_or(DEFAULT_READ_TIMEOUT_SECS)
+    }
+
+    /// Resolved peer-discovery wait: the configured value when positive,
+    /// otherwise [`DEFAULT_PEER_DISCOVERY_WAIT_SECS`].
+    pub fn resolved_peer_discovery_wait_secs(&self) -> u64 {
+        self.peer_discovery_wait_secs
+            .filter(|&v| v > 0)
+            .map(|v| v as u64)
+            .unwrap_or(DEFAULT_PEER_DISCOVERY_WAIT_SECS)
     }
 }
 
