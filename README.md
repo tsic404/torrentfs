@@ -83,6 +83,24 @@ ownership, pre-own the directory (`sudo chown -R 1000:1000
 /host/torrentfs-state`) or run with `--user <uid>:<gid>` so the daemon user
 already matches.
 
+`--cache <dir>` and `--db <file>` go through the same handover for paths that do
+not exist yet: torrentfs creates both itself, but only after the privilege drop,
+so a fresh root-owned state volume would make it exit with `EACCES`. The
+entrypoint `mkdir -p`s the cache directory and the `--db` parent as root and
+chowns those leaves to the daemon user, which is what makes a custom state path
+usable in a container:
+
+```bash
+docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  -v /host/torrentfs-state:/state \
+  ghcr.io/tsic404/torrentfs:main /mnt \
+  --cache /state/cache --db /state/db/metadata.db
+```
+
+A `--user <uid>:<gid>` run cannot chown: there the daemon user must already be
+able to write the paths it is given.
+
 ### Shutdown, restart, and stale mounts
 
 `docker stop` / `podman stop` send SIGTERM first: torrentfs drains the download

@@ -496,6 +496,10 @@ fix_state_dir_ownership() {
         fi
     done
 
+    # Existing trees are re-homed above; --cache / --db paths that do not exist
+    # yet are created and handed over here.
+    prepare_state_paths
+
     if [ -n "${log_file_arg:-}" ]; then
         prepare_log_file_parent "$log_file_arg"
     fi
@@ -555,6 +559,53 @@ prepare_log_file_parent() {
     fi
 }
 
+# Prepare the --cache / --db paths for the privilege drop.
+#
+# The daemon creates the cache directory and the SQLite DB (plus its -wal/-shm
+# sidecars) itself, but only after setpriv dropped it to the daemon user; a
+# freshly mounted state volume is root-owned, so the daemon's mkdir/open fails
+# with EACCES and torrentfs exits at startup. The state re-home misses these
+# paths when they do not exist yet (it skips missing candidates), so create
+# them here as root and hand the leaves to the daemon user. The default XDG
+# tree needs none of this: it lives under the daemon's own home directory.
+prepare_state_paths() {
+    if [ -n "${cache_arg:-}" ]; then
+        create_daemon_dir "$cache_arg" "--cache"
+    fi
+    if [ -n "${db_arg:-}" ]; then
+        create_daemon_dir "$(dirname "$db_arg")" "--db"
+    fi
+}
+
+# mkdir -p $1 and chown the leaf directory (no -R) to the daemon user, mirroring
+# prepare_log_file_parent. $2 names the flag for diagnostics.
+create_daemon_dir() {
+    local dir="$1" option="$2" normalized
+    # Leave `.` uncanonicalized so the root guard below still recognizes a bare
+    # filename: the daemon resolves it against the same cwd (the container
+    # WORKDIR), which must never be re-owned — same rule as the re-home.
+    case "$dir" in
+        .|/|'') : ;;
+        *)
+            # Canonicalize so `//` and `..` forms cannot slip past the guard.
+            if normalized="$(realpath -m "$dir" 2>/dev/null)"; then
+                dir="$normalized"
+            fi
+            ;;
+    esac
+    if [ "$dir" = "/" ] || [ "$dir" = "." ]; then
+        echo "[entrypoint] WARNING: $option path '$1' cannot be prepared for the daemon user" >&2
+        echo "[entrypoint]   (uid $daemon_uid); it must already be writable there." >&2
+        return 0
+    fi
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        echo "[entrypoint] ERROR: cannot create $option directory '$dir' for the daemon user" >&2
+        exit 1
+    fi
+    if ! chown "$daemon_uid:$daemon_gid" "$dir" 2>/dev/null; then
+        echo "[entrypoint] WARNING: could not chown $option directory '$dir' to $daemon_uid:$daemon_gid" >&2
+    fi
+}
 
 # Try a metadata-only stat on $1 and report whether it fails with ENOTCONN.
 # Used to detect a stale FUSE mount left behind by a previous container run
@@ -670,10 +721,11 @@ wait_for_fuse_mount() {
 
     if [ "$exited" -eq 1 ]; then
         echo "[entrypoint] ERROR: torrentfs exited with code $rc before the FUSE mount became ready" >&2
+        echo "[entrypoint]   torrentfs's own error above names the cause; so can these:" >&2
     else
         echo "[entrypoint] ERROR: FUSE mount at $target did not become ready within 30s" >&2
+        echo "[entrypoint]   The FUSE filesystem could not be mounted. Common causes:" >&2
     fi
-    echo "[entrypoint]   The FUSE filesystem could not be mounted. Common causes:" >&2
     echo "[entrypoint]     - missing --device /dev/fuse (or the fuse kernel module)" >&2
     echo "[entrypoint]     - missing --cap-add SYS_ADMIN (required for the mount syscall)" >&2
     echo "[entrypoint]     - Docker seccomp blocking /dev/fuse access even when the" >&2
