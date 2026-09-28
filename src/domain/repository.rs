@@ -91,6 +91,13 @@ pub trait FileRepository {
 
     fn get_files_in_directory(&self, directory_id: i64) -> Result<Vec<TorrentFile>, DbError>;
 
+    fn get_torrent_file_by_name(
+        &self,
+        torrent_id: i64,
+        parent_dir_id: Option<i64>,
+        name: &str,
+    ) -> Result<Option<TorrentFile>, DbError>;
+
     fn get_all_files_under_directory(&self, directory_id: i64)
         -> Result<Vec<TorrentFile>, DbError>;
 

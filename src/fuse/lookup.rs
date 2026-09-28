@@ -1,7 +1,9 @@
 //! DataResolver — resolves FUSE lookup operations for the data/ subtree.
 //! Extracted from TorrentFs to separate data tree resolution from the rest of FUSE handling.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use crate::db::Database;
@@ -16,6 +18,17 @@ pub struct DataResolver;
 /// alias for the readdir entry tuple returned by
 /// `readdir_pending_torrent` — avoids clippy `type_complexity` lint.
 type ReaddirEntries = (Vec<(u64, i64, FileKind, String)>, Vec<(u64, DataInode)>);
+
+/// `(database change count, in-flight add signature)` — the state a `data/`
+/// listing is derived from. A cached listing is valid only while this value is
+/// unchanged.
+pub type DataListingState = (u64, u64);
+
+/// Listing of one `data/` directory together with the state it was read from.
+pub struct DataListing {
+    pub entries: Vec<(u64, i64, FileKind, String)>,
+    pub state: DataListingState,
+}
 
 impl DataResolver {
     /// Resolve a child lookup within the data/ subtree.
@@ -182,30 +195,21 @@ impl DataResolver {
             ));
         }
 
-        let files = if let Some(pid) = parent_dir_id {
-            db_guard.get_files_in_directory(pid).ok()?
-        } else {
-            db_guard.get_root_files(torrent_id).ok()?
-        };
-
-        for file in files {
-            if file.name == name {
-                let ino = InodeManager::make_torrent_file_ino(file.id);
-                return Some((
-                    ino,
-                    DataInode::TorrentFile {
-                        torrent_id,
-                        file_id: file.id,
-                        name: file.name,
-                        size: file.size,
-                        torrent_source_path: String::new(),
-                        torrent_filename: String::new(),
-                    },
-                ));
-            }
-        }
-
-        None
+        let file = db_guard
+            .get_torrent_file_by_name(torrent_id, parent_dir_id, name)
+            .ok()??;
+        let ino = InodeManager::make_torrent_file_ino(file.id);
+        Some((
+            ino,
+            DataInode::TorrentFile {
+                torrent_id,
+                file_id: file.id,
+                name: file.name,
+                size: file.size,
+                torrent_source_path: String::new(),
+                torrent_filename: String::new(),
+            },
+        ))
     }
 
     /// Lookup a data inode and cache it. Returns (ino, FileType, size).
@@ -415,18 +419,23 @@ impl DataResolver {
     }
 
     /// collect pending torrent entries for a given `source_path`
-    /// that have a background `add_torrent` in-flight but no DB row yet.
-    /// Returns `(ino, DataInode, filename)` triples for injection into
-    /// `readdir_data` listings alongside DB-sourced torrents.
+    /// Collect pending torrent entries for a `source_path` — torrents whose
+    /// background `add_torrent` is in flight and has no DB row yet — plus the
+    /// signature of the in-flight add set they were taken from.
+    ///
+    /// Both come out of the same lock hold, which is what lets a cached listing
+    /// and its key agree: an add that shows up here is part of the returned
+    /// signature, and one that is not part of the signature cannot show up here.
     fn collect_pending_entries(
         inode_mgr: &InodeManager,
         processing_torrents: &Arc<Mutex<HashMap<(String, String), ()>>>,
         source_path: &str,
         existing_filenames: &[&str],
-    ) -> Vec<(u64, DataInode, String)> {
+    ) -> (Vec<(u64, DataInode, String)>, u64) {
         let Ok(guard) = processing_torrents.lock() else {
-            return Vec::new();
+            return (Vec::new(), 0);
         };
+        let signature = Self::signature_of(&guard);
         let mut result = Vec::new();
         for ((sp, filename), _) in guard.iter() {
             if sp != source_path {
@@ -447,7 +456,50 @@ impl DataResolver {
             };
             result.push((ino, data_inode, filename.clone()));
         }
-        result
+        (result, signature)
+    }
+
+    /// Signature of a set of in-flight adds: any insertion or removal changes
+    /// it. The steady state (no in-flight add) is `0` and allocation-free.
+    pub fn signature_of(torrents: &HashMap<(String, String), ()>) -> u64 {
+        if torrents.is_empty() {
+            return 0;
+        }
+        let mut hasher = DefaultHasher::new();
+        let mut keys: Vec<&(String, String)> = torrents.keys().collect();
+        keys.sort_unstable();
+        keys.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Signature of the current in-flight add set.
+    pub fn pending_signature(
+        processing_torrents: &Arc<Mutex<HashMap<(String, String), ()>>>,
+    ) -> u64 {
+        match processing_torrents.lock() {
+            Ok(torrents) => Self::signature_of(&torrents),
+            Err(_) => 0,
+        }
+    }
+
+    /// The state a listing would currently be derived from: the database change
+    /// count and the in-flight add signature. A cached listing is still valid
+    /// exactly while this value matches the one stored with it.
+    ///
+    /// Both halves are read under one hold — the pending lock inside the
+    /// database lock, the same nesting the listing build uses — so they describe
+    /// one instant. Read separately, a write that does not touch the in-flight
+    /// set (a rename or removal) could land between them, letting the stale
+    /// pre-write version compare equal to a cached key.
+    pub fn current_state(
+        db: &Arc<Mutex<Database>>,
+        processing_torrents: &Arc<Mutex<HashMap<(String, String), ()>>>,
+    ) -> DataListingState {
+        let Ok(db_guard) = db.lock() else {
+            return (0, Self::pending_signature(processing_torrents));
+        };
+        let db_version = db_guard.total_changes();
+        (db_version, Self::pending_signature(processing_torrents))
     }
 
     /// Evict stale pending entries from `data_inodes` whose `(source_path,
@@ -604,18 +656,29 @@ impl DataResolver {
         Some((entries, cache_entries))
     }
 
-    /// Generate readdir entries for a data/ inode.
+    /// Generate the listing of a `data/` directory together with the state it
+    /// was read from.
+    ///
+    /// `state` is captured from the *same* snapshot as `entries`: the database
+    /// change count under the database lock that serializes the listing queries,
+    /// and the in-flight-add signature under the pending lock that produced the
+    /// pending entries. A listing and its key therefore never disagree — an
+    /// in-flight add that appears in the listing is part of the signature, and
+    /// one that is not part of the signature cannot appear in the listing (the
+    /// add set is read while the same lock is held, not before or after the
+    /// listing was built).
     pub fn readdir_data(
         inode_mgr: &mut InodeManager,
         db: &Arc<Mutex<Database>>,
         processing_torrents: &Arc<Mutex<HashMap<(String, String), ()>>>,
         ino: u64,
-        offset: i64,
-    ) -> Option<Vec<(u64, i64, FileKind, String)>> {
+    ) -> Option<DataListing> {
         use super::inodes::{DATA_INO, ROOT_INO};
 
         let mut entries: Vec<(u64, i64, FileKind, String)> = Vec::new();
         let mut cache_entries: Vec<(u64, DataInode)> = Vec::new();
+        // Every arm assigns the state it built its entries from.
+        let state: DataListingState;
 
         if ino == DATA_INO {
             entries.push((DATA_INO, 1, FileKind::Directory, ".".to_string()));
@@ -623,6 +686,7 @@ impl DataResolver {
 
             {
                 let db_guard = db.lock().ok()?;
+                let db_version = db_guard.total_changes();
 
                 let mut offset_counter = 3i64;
 
@@ -674,7 +738,7 @@ impl DataResolver {
                     .map(|(_, _, _, n)| n.clone())
                     .collect();
                 let existing_refs: Vec<&str> = existing_names.iter().map(|s| s.as_str()).collect();
-                let pending = Self::collect_pending_entries(
+                let (pending, pending_signature) = Self::collect_pending_entries(
                     inode_mgr,
                     processing_torrents,
                     "",
@@ -688,18 +752,15 @@ impl DataResolver {
                 // evict stale pending inodes whose
                 // DB rows have now landed.
                 Self::evict_stale_pending(inode_mgr, "", &existing_refs);
+
+                state = (db_version, pending_signature);
             }
 
             for (cache_ino, cache_inode) in cache_entries {
                 inode_mgr.data_inodes.insert(cache_ino, cache_inode);
             }
 
-            return Some(
-                entries
-                    .into_iter()
-                    .filter(|(_, o, _, _)| *o > offset)
-                    .collect(),
-            );
+            return Some(DataListing { entries, state });
         }
 
         let data_inode = inode_mgr.data_inodes.get(&ino)?.clone();
@@ -723,6 +784,7 @@ impl DataResolver {
 
                 {
                     let db_guard = db.lock().ok()?;
+                    let db_version = db_guard.total_changes();
 
                     let mut offset_counter = 3i64;
 
@@ -778,7 +840,7 @@ impl DataResolver {
                         .collect();
                     let existing_refs: Vec<&str> =
                         existing_names.iter().map(|s| s.as_str()).collect();
-                    let pending = Self::collect_pending_entries(
+                    let (pending, pending_signature) = Self::collect_pending_entries(
                         inode_mgr,
                         processing_torrents,
                         &path,
@@ -792,6 +854,8 @@ impl DataResolver {
                     // evict stale pending inodes whose
                     // DB rows have now landed.
                     Self::evict_stale_pending(inode_mgr, &path, &existing_refs);
+
+                    state = (db_version, pending_signature);
                 }
 
                 for (cache_ino, cache_inode) in cache_entries {
@@ -842,9 +906,14 @@ impl DataResolver {
                             inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                         }
                     }
+                    // The bencode-derived listing is stable for as long as the
+                    // pending inode exists; keying it on the current state only
+                    // costs rebuilds, never staleness.
+                    state = Self::current_state(db, processing_torrents);
                 } else {
                     {
                         let db_guard = db.lock().ok()?;
+                        let db_version = db_guard.total_changes();
 
                         let mut offset_counter = 3i64;
 
@@ -899,6 +968,8 @@ impl DataResolver {
                             FileKind::RegularFile,
                             ".stats".to_string(),
                         ));
+
+                        state = (db_version, Self::pending_signature(processing_torrents));
                     }
 
                     for (cache_ino, cache_inode) in cache_entries {
@@ -962,9 +1033,13 @@ impl DataResolver {
                             inode_mgr.data_inodes.insert(cache_ino, cache_inode);
                         }
                     }
+                    // Bencode-derived listing: same reasoning as the pending
+                    // torrent root above.
+                    state = Self::current_state(db, processing_torrents);
                 } else {
                     {
                         let db_guard = db.lock().ok()?;
+                        let db_version = db_guard.total_changes();
 
                         let parent_ino = db_guard
                             .get_torrent_directory_by_id(dir_id)
@@ -1024,6 +1099,8 @@ impl DataResolver {
                             ));
                             offset_counter += 1;
                         }
+
+                        state = (db_version, Self::pending_signature(processing_torrents));
                     }
 
                     for (cache_ino, cache_inode) in cache_entries {
@@ -1036,12 +1113,7 @@ impl DataResolver {
             }
         }
 
-        Some(
-            entries
-                .into_iter()
-                .filter(|(_, o, _, _)| *o > offset)
-                .collect(),
-        )
+        Some(DataListing { entries, state })
     }
 
     /// Get the DB reference, returning a domain error on failure.
@@ -1250,11 +1322,123 @@ impl BencodeParser {
 #[cfg(test)]
 mod tests {
     use super::{DataInode, DataResolver, FileKind};
+
+    /// `readdir_data` result without the state it carries — tests that only
+    /// assert entries use this.
+    fn list(
+        inode_mgr: &mut InodeManager,
+        db: &Arc<Mutex<Database>>,
+        processing_torrents: &Arc<Mutex<HashMap<(String, String), ()>>>,
+        ino: u64,
+    ) -> Vec<(u64, i64, FileKind, String)> {
+        DataResolver::readdir_data(inode_mgr, db, processing_torrents, ino)
+            .expect("readdir_data")
+            .entries
+    }
     use crate::db::{Database, InsertTorrentResult};
     use crate::fuse::inodes::{InodeManager, DATA_INO};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// `current_state` must take both halves of the state under one hold: the
+    /// pending lock inside the database lock. Read separately, a write that does
+    /// not touch the in-flight set (a rename or removal) can land between them,
+    /// and the stale pre-write version then compares equal to a cached key —
+    /// serving one page from before the write. The listing build nests the same
+    /// way, so no reverse-order path is introduced.
+    #[test]
+    fn current_state_holds_the_database_lock_while_reading_the_pending_set() {
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let pending: Arc<Mutex<HashMap<(String, String), ()>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Hold the second half open, then start the state read.
+        let pending_guard = pending.lock().unwrap();
+        let reader = {
+            let db = db.clone();
+            let pending = pending.clone();
+            std::thread::spawn(move || DataResolver::current_state(&db, &pending))
+        };
+
+        // While the state read waits for the pending lock it must already hold
+        // the database lock, so no write can slip between the two halves.
+        let mut held = false;
+        for _ in 0..500 {
+            if db.try_lock().is_err() {
+                held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(pending_guard);
+        let state = reader.join().expect("state reader");
+
+        assert!(
+            held,
+            "state read must hold the database lock while it reads the pending set"
+        );
+        assert_eq!(state, (0, 0), "empty database, no in-flight add");
+
+        // The same value is what a listing built at this instant carries.
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+        let listing = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO)
+            .expect("data/ listing");
+        assert_eq!(listing.state, state);
+    }
+
+    /// The state returned with a listing is the state the entries were built
+    /// from: a listing can only carry a provisional entry if its state also
+    /// carries the in-flight add that produced it, and any database write moves
+    /// the state. That is what makes a cached listing and its key impossible to
+    /// disagree, so a stale listing can never be served.
+    #[test]
+    fn readdir_state_describes_the_listing_it_was_read_with() {
+        let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+
+        let listing = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO)
+            .expect("data/ listing");
+        assert_eq!(
+            listing.state.1, 0,
+            "no in-flight add ⇒ no pending signature"
+        );
+        assert!(!listing
+            .entries
+            .iter()
+            .any(|(_, _, _, name)| name == "ghost.torrent"));
+
+        let version = listing.state.0;
+        db.lock()
+            .unwrap()
+            .insert_torrent("", "test", "persisted.torrent", 4096, "hash-state", 1)
+            .unwrap();
+        let listing = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO)
+            .expect("data/ listing");
+        assert!(
+            listing.state.0 > version,
+            "a database write must move the listing state"
+        );
+        assert!(listing
+            .entries
+            .iter()
+            .any(|(_, _, _, name)| name == "persisted.torrent"));
+
+        pending
+            .lock()
+            .unwrap()
+            .insert((String::new(), "ghost.torrent".to_string()), ());
+        let listing = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO)
+            .expect("data/ listing");
+        assert!(listing
+            .entries
+            .iter()
+            .any(|(_, _, _, name)| name == "ghost.torrent"));
+        assert_ne!(
+            listing.state.1, 0,
+            "a listing carrying a provisional entry must carry the add in its state"
+        );
+    }
 
     /// Empty processing_torrents map for tests that don't exercise the
     /// pending-add fallback.
@@ -1310,9 +1494,7 @@ mod tests {
             },
         );
 
-        let entries =
-            DataResolver::readdir_data(&mut inode_mgr, &db, &empty_pending(), torrent_ino, 0)
-                .expect("readdir TorrentRoot returned entries");
+        let entries = list(&mut inode_mgr, &db, &empty_pending(), torrent_ino);
 
         let dotdot = dotdot_ino(&entries);
         let expected = InodeManager::make_source_path_dir_ino("a");
@@ -1333,9 +1515,7 @@ mod tests {
                 path: "a".to_string(),
             },
         );
-        let parent_entries =
-            DataResolver::readdir_data(&mut inode_mgr2, &db, &empty_pending(), parent_ino, 0)
-                .expect("readdir SourcePathDir returned entries");
+        let parent_entries = list(&mut inode_mgr2, &db, &empty_pending(), parent_ino);
         let dot = parent_entries
             .iter()
             .find(|(_, _, _, name)| name == ".")
@@ -1364,9 +1544,7 @@ mod tests {
             },
         );
 
-        let entries =
-            DataResolver::readdir_data(&mut inode_mgr, &db, &empty_pending(), torrent_ino, 0)
-                .expect("readdir returned entries");
+        let entries = list(&mut inode_mgr, &db, &empty_pending(), torrent_ino);
 
         assert_eq!(
             dotdot_ino(&entries),
@@ -1392,9 +1570,7 @@ mod tests {
             },
         );
 
-        let entries =
-            DataResolver::readdir_data(&mut inode_mgr, &db, &empty_pending(), torrent_ino, 0)
-                .expect("readdir returned entries");
+        let entries = list(&mut inode_mgr, &db, &empty_pending(), torrent_ino);
 
         assert_eq!(
             dotdot_ino(&entries),
@@ -1430,9 +1606,7 @@ mod tests {
                 },
             );
 
-            let entries =
-                DataResolver::readdir_data(&mut inode_mgr, &db, &empty_pending(), torrent_ino, 0)
-                    .expect("readdir returned entries");
+            let entries = list(&mut inode_mgr, &db, &empty_pending(), torrent_ino);
 
             assert_eq!(
                 dotdot_ino(&entries),
@@ -1567,8 +1741,7 @@ mod tests {
             .unwrap()
             .insert((String::new(), "pending.torrent".to_string()), ());
 
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO, 0)
-            .expect("readdir data/ returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, DATA_INO);
 
         // Find "pending.torrent" in the listing.
         let found = entries
@@ -1629,8 +1802,7 @@ mod tests {
         assert_ne!(ino_a, ino_b, "pending torrents must have distinct inodes");
 
         // readdir must show both, with distinct inos.
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO, 0)
-            .expect("readdir data/ returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, DATA_INO);
         let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
         assert!(names.contains(&"alpha.torrent"), "readdir includes alpha");
         assert!(names.contains(&"beta.torrent"), "readdir includes beta");
@@ -1705,8 +1877,7 @@ mod tests {
         assert_eq!(kind, FileKind::Directory);
 
         // readdir on the SourcePathDir must include "pending.torrent".
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, sp_ino, 0)
-            .expect("readdir SourcePathDir returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, sp_ino);
         let found = entries.iter().any(|(_, _, _, n)| n == "pending.torrent");
         assert!(found, "readdir SourcePathDir must include pending torrent");
 
@@ -1762,8 +1933,7 @@ mod tests {
 
         // readdir on data/ — must list the DB torrent and evict the stale
         // pending entry.
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO, 0)
-            .expect("readdir data/ returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, DATA_INO);
         assert!(
             entries.iter().any(|(_, _, _, n)| n == "test.torrent"),
             "DB torrent must be in listing"
@@ -1904,8 +2074,7 @@ mod tests {
     fn pending_torrent_root_readdir_lists_internal_files() {
         let (mut inode_mgr, db, pending, root_ino) = setup_pending_multifile("", "multi.torrent");
 
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
-            .expect("readdir pending root returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, root_ino);
 
         let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
         assert!(
@@ -1985,8 +2154,7 @@ mod tests {
                 .expect("lookup 'dir' should resolve");
 
         // readdir on the subdirectory should list 'sub.txt'.
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, dir_ino, 0)
-            .expect("readdir pending dir returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, dir_ino);
         let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
         assert!(
             names.contains(&"sub.txt"),
@@ -2021,8 +2189,7 @@ mod tests {
             setup_pending_multifile("sub", "multi.torrent");
 
         // readdir on the pending root should list internal entries.
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
-            .expect("readdir pending root under subdir returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, root_ino);
         let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
         assert!(
             names.contains(&"dir"),
@@ -2086,8 +2253,7 @@ mod tests {
         assert_eq!(size, 16, "single file size should be 16");
 
         // readdir should list 'foo'.
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, root_ino, 0)
-            .expect("readdir single-file pending root returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, root_ino);
         let names: Vec<&str> = entries.iter().map(|(_, _, _, n)| n.as_str()).collect();
         assert!(names.contains(&"foo"), "readdir should list 'foo'");
     }
@@ -2214,8 +2380,7 @@ mod tests {
 
         // readdir on data/ — must list the DB torrent and evict ALL stale
         // pending entries (root + dir + file).
-        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, &pending, DATA_INO, 0)
-            .expect("readdir data/ returned entries");
+        let entries = list(&mut inode_mgr, &db, &pending, DATA_INO);
         assert!(
             entries.iter().any(|(_, _, _, n)| n == "test.torrent"),
             "DB torrent must be in listing"

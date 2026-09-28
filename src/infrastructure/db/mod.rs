@@ -181,6 +181,15 @@ impl FileRepository for Database {
         self.get_files_in_directory(directory_id)
     }
 
+    fn get_torrent_file_by_name(
+        &self,
+        torrent_id: i64,
+        parent_dir_id: Option<i64>,
+        name: &str,
+    ) -> Result<Option<TorrentFile>, DbError> {
+        self.get_torrent_file_by_name(torrent_id, parent_dir_id, name)
+    }
+
     fn get_all_files_under_directory(
         &self,
         directory_id: i64,
