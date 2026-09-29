@@ -965,6 +965,74 @@ rc=0
 ( prepare_log_file_parent "/logs/../x" ) 2>/dev/null || rc=$?
 [ "$rc" -eq 1 ]'
 
+# --- prepare_state_paths / create_daemon_dir ---
+# The post-drop daemon creates the --cache directory and the --db file itself,
+# so a path that does not exist yet under a root-owned mount must be mkdir -p'd
+# as root and handed to the daemon user — the failure mode is
+# `docker run -v /host/state:/state … --cache /state/cache` exiting at startup.
+
+run_test "create_daemon_dir mkdir -p's the tree and chowns only the leaf" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir_calls=""; chown_calls=""
+mkdir() { mkdir_calls="$*"; }
+chown() { chown_calls="$*"; }
+create_daemon_dir "/state/cache" "--cache"
+[ "$mkdir_calls" = "-p /state/cache" ] && [ "$chown_calls" = "1000:1000 /state/cache" ]'
+
+run_test "create_daemon_dir never chowns the container root or a bare name" \
+    'daemon_uid=1000; daemon_gid=1000
+chown_calls=""; mkdir_calls=""
+chown() { chown_calls="$chown_calls|$*"; }
+mkdir() { mkdir_calls="$mkdir_calls|$*"; }
+create_daemon_dir "/" "--cache" 2>/dev/null
+create_daemon_dir "." "--db" 2>/dev/null
+create_daemon_dir "/state/.." "--cache" 2>/dev/null
+[ -z "$chown_calls" ] && [ -z "$mkdir_calls" ]'
+
+run_test "create_daemon_dir fails when the directory cannot be created" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir() { return 1; }
+rc=0; ( create_daemon_dir "/state/cache" "--cache" ) 2>/dev/null || rc=$?
+[ "$rc" -eq 1 ]'
+
+run_test "create_daemon_dir warns when chown fails" \
+    'daemon_uid=1000; daemon_gid=1000
+mkdir() { return 0; }
+chown() { return 1; }
+warn_file="$(mktemp)"
+create_daemon_dir "/state/cache" "--cache" 2>"$warn_file"
+grep -q "could not chown --cache directory" "$warn_file"
+rc=$?
+rm -f "$warn_file"
+exit "$rc"'
+
+run_test "prepare_state_paths creates and chowns the --cache dir and --db parent" \
+    'daemon_uid="$(id -u)"; daemon_gid="$(id -g)"
+state_dir="$(mktemp -d)"
+cache_arg="$state_dir/cache"
+db_arg="$state_dir/db/metadata.db"
+prepare_state_paths
+[ -d "$cache_arg" ] && [ -d "$state_dir/db" ] || exit 1
+[ "$(stat -c %u:%g "$cache_arg")" = "$daemon_uid:$daemon_gid" ] || exit 1
+[ "$(stat -c %u:%g "$state_dir/db")" = "$daemon_uid:$daemon_gid" ] || exit 1
+rm -rf "$state_dir"'
+
+run_test "prepare_state_paths is a no-op without --cache/--db" \
+    'cache_arg=""; db_arg=""
+create_daemon_dir() { echo "create_daemon_dir called without a state path" >&2; return 1; }
+prepare_state_paths'
+
+run_test "fix_state_dir_ownership prepares a --cache dir that does not exist yet" \
+    'is_root() { return 0; }
+daemon_uid="$(id -u)"; daemon_gid="$(id -g)"
+state_dir="$(mktemp -d)"
+cache_arg="$state_dir/cache"
+XDG_DATA_HOME="$state_dir/nonexistent" fix_state_dir_ownership
+[ -d "$cache_arg" ] && [ "$(stat -c %u:%g "$cache_arg")" = "$daemon_uid:$daemon_gid" ]
+rc=$?
+rm -rf "$state_dir"
+exit "$rc"'
+
 # --- should_drop_privileges / resolve_daemon_ids / run_daemon ---
 # The privilege-drop decision: drop only when root AND not in a rootless-podman
 # user namespace (where container UID 0 already maps to the invoking host user).
