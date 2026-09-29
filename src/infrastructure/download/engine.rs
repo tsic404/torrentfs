@@ -107,6 +107,30 @@ pub struct DownloadSnapshot {
     /// for an info_hash whose status could not be read — so `None` never means
     /// "empty for zero seconds", it means "not observed empty".
     pub empty_swarm_secs: HashMap<String, u64>,
+    /// Per-info_hash state of the reads parked in the engine for it, from the
+    /// same `pending_reads` pass.  An absent info_hash means no read is parked
+    /// (nobody is waiting), which `.stats` renders differently from a wait of
+    /// zero seconds; both fields of an entry therefore always agree.
+    pub waiting_reads: HashMap<String, WaitingReads>,
+    /// Per-info_hash seconds a seeder has been connected with a zero download
+    /// rate while a read waits — the sustained form of the `.stats` slow-swarm
+    /// signal.  Absent for a torrent that is not in that state.
+    pub slow_swarm_secs: HashMap<String, u64>,
+}
+
+/// Reads parked waiting for one torrent, aggregated for `.stats`.
+///
+/// A parked read is a read the engine is holding until data arrives, whichever
+/// phase it is in (`WaitState`, `Recheck`, peer wait, piece wait) — so the
+/// count and the age always describe the same set, and `.stats` can never
+/// report a wait with zero readers beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitingReads {
+    /// Whole seconds the oldest parked read has been waiting.  One continuous
+    /// window per read: a phase switch does not restart it.
+    pub oldest_secs: u64,
+    /// Reads currently parked for this torrent.
+    pub count: u32,
 }
 
 /// Handle to a running download engine.  Cheap to clone (`Send + Sync`).
@@ -175,6 +199,11 @@ struct EngineState {
     /// End of the current reader-demand window; `None` until the first
     /// `.stats` read.
     reader_demand_until: Option<Instant>,
+    /// Per-info_hash instant a seeder was last connected with a zero download
+    /// rate while a read waited.  Same continuous-window treatment as
+    /// [`Self::empty_swarm_since`], so the `.stats` slow-swarm alert fires on a
+    /// sustained stall rather than on the zero rate of a just-connected seeder.
+    slow_swarm_since: HashMap<String, Instant>,
 }
 
 impl DownloadEngine {
@@ -280,6 +309,7 @@ impl DownloadEngine {
                     reader_demand: thread_reader_demand,
                     seen_reader_demand: 0,
                     reader_demand_until: None,
+                    slow_swarm_since: HashMap::new(),
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -394,6 +424,37 @@ impl DownloadEngine {
             .try_lock()
             .ok()?
             .empty_swarm_secs
+            .get(info_hash)
+            .copied()
+    }
+
+    /// Non-blocking parked-read state for this info_hash from the last engine
+    /// snapshot, or `None` when no read of that torrent is parked.  Both facts
+    /// `.stats` shows about waiting — the oldest read's age and the number of
+    /// parked reads — come from this one entry, so they can never contradict
+    /// each other.  Used by `.stats` without blocking on the engine command
+    /// channel.
+    pub fn try_waiting_reads(&self, info_hash: &str) -> Option<WaitingReads> {
+        self.mark_reader_demand();
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .waiting_reads
+            .get(info_hash)
+            .copied()
+    }
+
+    /// Non-blocking "a connected seeder has delivered nothing for this many
+    /// seconds while a read waited" check from the last engine snapshot.
+    /// `None` when the snapshot has no entry — the torrent is not in that
+    /// state.  Used by `.stats` to keep the slow-swarm alert off a zero rate
+    /// sampled before the seeder's first block arrives.
+    pub fn try_slow_swarm_secs(&self, info_hash: &str) -> Option<u64> {
+        self.mark_reader_demand();
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .slow_swarm_secs
             .get(info_hash)
             .copied()
     }
@@ -648,23 +709,27 @@ fn swarm_is_empty(num_peers: i32, num_seeds: i32) -> bool {
     num_peers == 0 && num_seeds == 0
 }
 
-/// Advance the per-info_hash "swarm has been empty since" clock.
+/// Advance a per-info_hash "condition has held since" clock.
 ///
-/// `samples` holds one `(info_hash, is_empty)` entry per handle whose status
-/// could be read.  A swarm that stays empty keeps its original start instant —
-/// the published age is therefore one *continuous* empty window, not the time
-/// since the last sample.  A swarm that gains a peer/seed drops its entry, so
-/// its next empty window starts a fresh clock; entries for handles that
-/// disappeared are dropped with it (the returned map only covers `samples`).
-/// Pure so the clock semantics are unit-testable without a running engine.
-fn advance_empty_swarm_since(
+/// `samples` holds one `(info_hash, holds)` entry per handle.  A condition that
+/// keeps holding keeps its original start instant — the published age is
+/// therefore one *continuous* window, not the time since the last sample.  A
+/// condition that stops drops its entry, so its next window starts a fresh
+/// clock; entries for handles that disappeared are dropped with it (the
+/// returned map only covers `samples`).  Pure so the clock semantics are
+/// unit-testable without a running engine.
+///
+/// Used for the empty-swarm clock (`.stats` health alert) and the slow-swarm
+/// clock (seeder connected, zero download rate, a read waiting): both are
+/// instantaneous samples that flap, so both alerts need a sustained window.
+fn advance_condition_since(
     previous: &HashMap<String, Instant>,
     samples: &[(String, bool)],
     now: Instant,
 ) -> HashMap<String, Instant> {
     samples
         .iter()
-        .filter(|(_, is_empty)| *is_empty)
+        .filter(|(_, holds)| *holds)
         .map(|(info_hash, _)| {
             let since = previous.get(info_hash).copied().unwrap_or(now);
             (info_hash.clone(), since)
@@ -802,6 +867,50 @@ fn should_publish_after_command(
     since_last_publish: Duration,
 ) -> bool {
     !is_read || (is_watched && since_last_publish >= SNAPSHOT_INTERVAL)
+}
+
+/// Age in whole seconds of every clock in `since`, sampled at `now`.
+fn elapsed_secs_since(since: &HashMap<String, Instant>, now: Instant) -> HashMap<String, u64> {
+    since
+        .iter()
+        .map(|(info_hash, since)| {
+            (
+                info_hash.clone(),
+                now.saturating_duration_since(*since).as_secs(),
+            )
+        })
+        .collect()
+}
+
+/// Aggregate the engine's parked reads into the per-info_hash `.stats` wait
+/// state.
+///
+/// `waits` holds one `(info_hash, waiting_since)` entry per parked read, so one
+/// pass yields both facts `.stats` shows about a torrent's waiting: how long its
+/// *oldest* read has waited — a second reader joining a torrent already waiting
+/// for a minute must not reset the report to zero — and how many reads are
+/// parked.  An info_hash with no parked read gets no entry, which is how the
+/// renderer tells "nobody waiting" from "waited zero seconds".  Pure so the
+/// aggregation rule is unit-testable without a running engine.
+fn aggregate_waiting_reads<'a>(
+    waits: impl Iterator<Item = (&'a str, Instant)>,
+    now: Instant,
+) -> HashMap<String, WaitingReads> {
+    let mut waiting_reads: HashMap<String, WaitingReads> = HashMap::new();
+    for (info_hash, waiting_since) in waits {
+        let waited = now.saturating_duration_since(waiting_since).as_secs();
+        waiting_reads
+            .entry(info_hash.to_string())
+            .and_modify(|waits| {
+                waits.oldest_secs = waits.oldest_secs.max(waited);
+                waits.count += 1;
+            })
+            .or_insert(WaitingReads {
+                oldest_secs: waited,
+                count: 1,
+            });
+    }
+    waiting_reads
 }
 
 /// Format the stderr hint emitted when a read times out with zero connected
@@ -1184,6 +1293,10 @@ struct PendingRead {
     /// priority gradient has been applied.  Released by id so a concurrent read
     /// on the same torrent never releases the wrong reader.
     reader_id: Option<ReadId>,
+    /// When this read began waiting.  Never reset by a phase transition, so
+    /// `.stats` reports one continuous wait per read instead of restarting the
+    /// clock at every peer-wait → piece-wait switch.
+    waiting_since: Instant,
 }
 
 impl PendingRead {
@@ -1215,6 +1328,7 @@ impl PendingRead {
             stale_blockers: Vec::new(),
             saw_checking: false,
             reader_id: None,
+            waiting_since: now,
         }
     }
 
@@ -2853,17 +2967,30 @@ impl EngineState {
             }
         }
         let now = Instant::now();
-        self.empty_swarm_since = advance_empty_swarm_since(&self.empty_swarm_since, &swarms, now);
-        let empty_swarm_secs = self
-            .empty_swarm_since
+        self.empty_swarm_since = advance_condition_since(&self.empty_swarm_since, &swarms, now);
+        let empty_swarm_secs = elapsed_secs_since(&self.empty_swarm_since, now);
+        let waiting_reads = aggregate_waiting_reads(
+            self.pending_reads
+                .iter()
+                .map(|read| (read.info_hash.as_str(), read.waiting_since)),
+            now,
+        );
+        // A seeder with a zero download rate is only a stall once it has held
+        // for a while: the sample right after a connection lands before the
+        // first block, so a single zero rate is not evidence of no progress.
+        let slow_swarms: Vec<(String, bool)> = statuses
             .iter()
-            .map(|(info_hash, since)| {
+            .map(|(info_hash, status)| {
                 (
                     info_hash.clone(),
-                    now.saturating_duration_since(*since).as_secs(),
+                    status.num_seeds >= 1
+                        && status.download_rate == 0
+                        && waiting_reads.contains_key(info_hash),
                 )
             })
             .collect();
+        self.slow_swarm_since = advance_condition_since(&self.slow_swarm_since, &slow_swarms, now);
+        let slow_swarm_secs = elapsed_secs_since(&self.slow_swarm_since, now);
         if let Ok(mut snap) = self.snapshot.lock() {
             *snap = DownloadSnapshot {
                 statuses,
@@ -2871,6 +2998,8 @@ impl EngineState {
                 trackers,
                 private_torrents: self.private_torrents.clone(),
                 empty_swarm_secs,
+                waiting_reads,
+                slow_swarm_secs,
             };
         }
     }
@@ -2922,13 +3051,13 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_empty_swarm_since, advance_reader_demand, cache_stall_message,
-        cache_stall_stderr_hint, classify_read_stall, discovery_window_advice, no_peers_message,
-        no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds, peer_discovery_window_secs,
-        piece_wait_window_secs, read_wait_budget_secs, reader_demand_is_live,
-        should_publish_after_command, swarm_is_empty, ColdFlight, NoSeederWait, ReadStallCause,
-        NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS, READER_DEMAND_TTL,
-        SNAPSHOT_INTERVAL,
+        advance_condition_since, advance_reader_demand, aggregate_waiting_reads,
+        cache_stall_message, cache_stall_stderr_hint, classify_read_stall, discovery_window_advice,
+        no_peers_message, no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds,
+        peer_discovery_window_secs, piece_wait_window_secs, read_wait_budget_secs,
+        reader_demand_is_live, should_publish_after_command, swarm_is_empty, ColdFlight,
+        NoSeederWait, ReadStallCause, WaitingReads, NO_SEEDER_FAST_FAIL_SECS,
+        NO_SEEDER_READ_TIMEOUT_SECS, READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
     };
     use crate::infrastructure::config::{
         DEFAULT_PEER_DISCOVERY_WAIT_SECS, DEFAULT_READ_TIMEOUT_SECS,
@@ -3373,12 +3502,12 @@ mod tests {
         assert!(!swarm_is_empty(3, 2));
     }
 
-    /// the empty-swarm clock must measure one continuous window: an empty
-    /// sample starts the clock, subsequent empty samples keep the original
-    /// start, a non-empty sample drops the entry, and a handle absent from the
-    /// next sample set is dropped entirely.
+    /// a "condition has held since" clock must measure one continuous window:
+    /// a holding sample starts the clock, subsequent holding samples keep the
+    /// original start, a sample that stops holding drops the entry, and a
+    /// handle absent from the next sample set is dropped entirely.
     #[test]
-    fn empty_swarm_since_tracks_continuous_window() {
+    fn advance_condition_since_tracks_continuous_window() {
         use std::collections::HashMap;
         use std::time::{Duration, Instant};
 
@@ -3387,28 +3516,71 @@ mod tests {
         let t2 = t0 + Duration::from_secs(9);
 
         let mut previous: HashMap<String, Instant> = HashMap::new();
-        previous = advance_empty_swarm_since(&previous, &[("a".into(), true)], t0);
+        previous = advance_condition_since(&previous, &[("a".into(), true)], t0);
         assert_eq!(previous.get("a"), Some(&t0));
 
         // still empty at t1 → keeps the original start, so the published age
         // measures the continuous window (5s), not the last sample.
         previous =
-            advance_empty_swarm_since(&previous, &[("a".into(), true), ("b".into(), true)], t1);
+            advance_condition_since(&previous, &[("a".into(), true), ("b".into(), true)], t1);
         assert_eq!(previous.get("a"), Some(&t0));
         assert_eq!(previous.get("b"), Some(&t1));
 
         // "a" gains a peer at t2 → dropped; "b" stays empty → keeps t1.
         previous =
-            advance_empty_swarm_since(&previous, &[("a".into(), false), ("b".into(), true)], t2);
+            advance_condition_since(&previous, &[("a".into(), false), ("b".into(), true)], t2);
         assert!(!previous.contains_key("a"));
         assert_eq!(previous.get("b"), Some(&t1));
 
         // "b" gains a peer, then goes empty again → a fresh clock at t2, not
         // the pre-connection start it had before.
-        previous = advance_empty_swarm_since(&previous, &[("b".into(), false)], t2);
+        previous = advance_condition_since(&previous, &[("b".into(), false)], t2);
         assert!(!previous.contains_key("b"));
-        previous = advance_empty_swarm_since(&previous, &[("b".into(), true)], t2);
+        previous = advance_condition_since(&previous, &[("b".into(), true)], t2);
         assert_eq!(previous.get("b"), Some(&t2));
+    }
+
+    /// one pass must yield both facts `.stats` shows about a torrent's waiting:
+    /// the oldest parked read's age and how many are parked.  The oldest wins
+    /// (a late reader must not reset the report), and an info_hash with no
+    /// parked read stays absent so `.stats` can drop its wait lines.
+    #[test]
+    fn waiting_reads_report_oldest_age_and_count() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(12);
+        let waits = [
+            ("torrent-a", t0),
+            // A reader that joined 7s ago must not reset torrent-a's wait,
+            // but it must still be counted.
+            ("torrent-a", t0 + Duration::from_secs(5)),
+            ("torrent-b", t0 + Duration::from_secs(7)),
+        ];
+        let published = aggregate_waiting_reads(
+            waits.iter().map(|(info_hash, since)| (*info_hash, *since)),
+            now,
+        );
+        assert_eq!(
+            published.get("torrent-a"),
+            Some(&WaitingReads {
+                oldest_secs: 12,
+                count: 2
+            })
+        );
+        assert_eq!(
+            published.get("torrent-b"),
+            Some(&WaitingReads {
+                oldest_secs: 5,
+                count: 1
+            })
+        );
+        assert_eq!(published.get("torrent-c"), None);
+
+        let empty: HashMap<String, WaitingReads> =
+            aggregate_waiting_reads(std::iter::empty::<(&str, Instant)>(), now);
+        assert!(empty.is_empty());
     }
 
     /// a read with a connected seeder uses the full window so a

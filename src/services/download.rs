@@ -12,7 +12,7 @@ use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::download::{
-    DownloadEngine, PieceStatus, PieceStore, SessionStats, TorrentStatus,
+    DownloadEngine, PieceStatus, PieceStore, SessionStats, TorrentStatus, WaitingReads,
 };
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
@@ -85,6 +85,19 @@ impl DownloadService {
     /// Non-blocking "swarm empty for N seconds" check for `.stats`.
     pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
         self.engine.try_empty_swarm_secs(info_hash)
+    }
+
+    /// Non-blocking parked-read state for `.stats`: how long the oldest read of
+    /// this torrent has been waiting and how many are parked, from one engine
+    /// snapshot entry (or `None` when no read is parked).
+    pub fn try_waiting_reads(&self, info_hash: &str) -> Option<WaitingReads> {
+        self.engine.try_waiting_reads(info_hash)
+    }
+
+    /// Non-blocking "a connected seeder has delivered nothing for N seconds
+    /// while a read waited" check for `.stats`.
+    pub fn try_slow_swarm_secs(&self, info_hash: &str) -> Option<u64> {
+        self.engine.try_slow_swarm_secs(info_hash)
     }
 
     /// Query the current tracker list on a torrent handle.
