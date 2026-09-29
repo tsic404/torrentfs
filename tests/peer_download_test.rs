@@ -319,18 +319,18 @@ fn test_transient_peer_fast_exit() {
 /// of blocking the engine thread for the full `read_timeout_secs` — the
 /// regression where a no-seeder `cat` serialized every other read/write on the
 /// mount for ~60s.  With a large read timeout (60s) the no-seeder read must
-/// still return well before that window (peer-wait ≤9s, then an immediate
-/// fast-fail `NoPeers` once peer discovery elapsed ≈ 9s), proving the short
+/// still return well before that window (peer-discovery window = 30s, then an
+/// immediate fast-fail `NoPeers` once peer discovery elapsed), proving the short
 /// no-seeder cap takes effect.
 ///
-/// Ignored by default: it needs a local tracker and spends ~10s of real
-/// wall-clock waiting for the peer-wait cap to elapse.  Run with
+/// Ignored by default: it needs a local tracker and spends ~30s of real
+/// wall-clock waiting for the peer-discovery window to elapse.  Run with
 /// `cargo test --test peer_download_test test_no_seeder_read_fails_fast -- --ignored`.
 ///
 /// Own info_hash: LSD pairs two sessions serving one info_hash on a host, so
 /// on the shared test swarm this binary's seeder test would answer the read.
 #[test]
-#[ignore = "requires local tracker; ~10s wall-clock"]
+#[ignore = "requires local tracker; ~30s wall-clock"]
 fn test_no_seeder_read_fails_fast() {
     use common::{create_single_piece_torrent, MiniTracker};
 
@@ -348,7 +348,8 @@ fn test_no_seeder_read_fails_fast() {
     println!("Info hash: {}", info_hash);
 
     // Large read timeout: without the no-seeder cap this read would block the
-    // engine for peer-wait(9s) + piece-wait(60s) ≈ 69s before returning NoPeers.
+    // engine for peer-wait(30s) + piece-wait(60s) ≈ 90s before returning
+    // NoPeers.
     let mut config = local_test_config();
     config.timeouts.read_timeout_secs = Some(60);
 

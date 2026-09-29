@@ -23,7 +23,9 @@
 # `run_self_seed_env.sh` also builds).  Usage:
 #   ./ci/tests/prefetch_ladder_selfseed_e2e.sh [torrentfs_binary] [mountpoint]
 #   env: ANNOUNCE_DELAY_S (default 6 — must outlast the mount→read startup but
-#          stay inside the reader's ~9s peer-discovery window),
+#          stay inside the reader's peer-discovery window,
+#          `[timeouts] peer_discovery_wait_secs` capped by read_timeout_secs —
+#          30s at the shipped defaults),
 #        PAYLOAD_MIB (default 4), READ_MIB (default 1), POLL_S (default 0.2),
 #        READ_TIMEOUT_S (default 60), TRACKER_PORT (default 0 = OS-assigned),
 #        SELFSEED_OUT (default /tmp/ladder_selfseed_out)

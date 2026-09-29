@@ -492,10 +492,14 @@ fn write_trackers(output: &mut String, trackers: Option<&[TrackerEntry]>, dht_no
 /// before the `.stats` health alert fires.  Peer/seed counts are instantaneous
 /// samples that flap around zero while connections are established, so one
 /// empty sample is not a health signal: alerting on it contradicts the `Peers:`
-/// line a reader saw moments earlier or later.  Bound to the engine's
-/// no-seeder read window cap ([`NO_SEEDER_READ_TIMEOUT_SECS`]): the longest a
-/// read waits for a seeder before failing, so a shorter configured
-/// `read_timeout_secs` only makes this grace the more conservative of the two.
+/// line a reader saw moments earlier or later.  Sized from the engine's
+/// no-seeder *piece-wait* window ([`NO_SEEDER_READ_TIMEOUT_SECS`]), not from
+/// the peer-discovery window: a read that is still waiting for the swarm keeps
+/// its pieces wanted (`priority > 0`), and that `active_download` signal — not
+/// this grace — holds the alert off through the discovery phase, which may last
+/// `[timeouts] peer_discovery_wait_secs` (30s by default).  A shorter configured
+/// `read_timeout_secs`, which caps this piece-wait window, only makes the grace
+/// the more conservative of the two.
 const HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS: u64 = NO_SEEDER_READ_TIMEOUT_SECS;
 
 /// Render the `.stats` health alert line. The alert fires on a *sustained*

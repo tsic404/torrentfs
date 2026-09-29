@@ -117,6 +117,9 @@ pub struct DownloadEngine {
     snapshot: Arc<Mutex<DownloadSnapshot>>,
     metrics: Arc<Metrics>,
     read_timeout_secs: u64,
+    /// Configured peer-discovery wait; [`peer_discovery_window_secs`] applies
+    /// the `read_timeout_secs` cap on top of it.
+    peer_discovery_wait_secs: u64,
 }
 
 /// State owned exclusively by the engine thread.
@@ -130,6 +133,9 @@ struct EngineState {
     private_torrents: HashMap<String, bool>,
     store: PieceStore,
     read_timeout_secs: u64,
+    /// Configured peer-discovery wait; [`peer_discovery_window_secs`] applies
+    /// the `read_timeout_secs` cap on top of it.
+    peer_discovery_wait_secs: u64,
     scheduler: PieceScheduler,
     cache_dir: String,
     metrics: Arc<Metrics>,
@@ -185,6 +191,7 @@ impl DownloadEngine {
         );
 
         let read_timeout_secs = config.timeouts.resolved_read_timeout_secs();
+        let peer_discovery_wait_secs = config.timeouts.resolved_peer_discovery_wait_secs();
 
         let (tx, rx) = mpsc::channel::<Command>();
         let stopping = Arc::new(AtomicBool::new(false));
@@ -243,6 +250,7 @@ impl DownloadEngine {
                     scheduler,
                     cache_dir: cache_dir_str,
                     read_timeout_secs,
+                    peer_discovery_wait_secs,
                     metrics: thread_metrics,
                     snapshot: thread_snapshot,
                     stopping: thread_stopping,
@@ -274,6 +282,7 @@ impl DownloadEngine {
             snapshot,
             metrics,
             read_timeout_secs,
+            peer_discovery_wait_secs,
         })
     }
 
@@ -365,7 +374,7 @@ impl DownloadEngine {
     /// with ENODATA while the read is still legitimately waiting for a slow
     /// seeder.
     pub fn read_wait_budget_secs(&self) -> u64 {
-        read_wait_budget_secs(self.read_timeout_secs)
+        read_wait_budget_secs(self.read_timeout_secs, self.peer_discovery_wait_secs)
     }
 
     // ── Command senders ──────────────────────────────────────────────
@@ -507,12 +516,6 @@ impl Drop for DownloadEngine {
 /// piece-priority vector instead (see [`PieceScheduler::recompute`]).
 const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 
-/// Upper bound (seconds) on the peer-discovery wait in the slow read path.
-/// The engine's worst-case read budget sums the state-transition
-/// wait, the recheck wait, this peer-discovery wait and the piece-wait window —
-/// the FUSE deferred-read deadline must exceed that sum.
-pub const PEER_WAIT_CAP_SECS: u64 = 9;
-
 /// Upper bound (seconds) on the `force_recheck` wait in the stale-piece path.
 /// It runs before peer discovery in the same read, so it adds to the read
 /// budget.
@@ -528,28 +531,45 @@ pub const NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
 
 /// Piece-wait window (seconds) for a read whose peer-discovery wait already
 /// elapsed without a seeder.  Zero: the swarm probe (`force_reannounce` + up to
-/// [`PEER_WAIT_CAP_SECS`]) already gave a seeder time to appear; finding none
-/// means the read is sourceless, so the piece-wait loop fails on its first
-/// iteration rather than spending the no-seeder window again.  A whole-file
-/// `cat` fans out into one 128 KiB chunk read per command, each previously
-/// paying its own 15s window.
+/// [`peer_discovery_window_secs`] — the `[timeouts] peer_discovery_wait_secs`
+/// window capped by `read_timeout_secs`) already gave a seeder time to appear;
+/// finding none means the read is sourceless, so the piece-wait loop fails on
+/// its first iteration rather than spending the no-seeder window again.  A
+/// whole-file `cat` fans out into one 128 KiB chunk read per command, each
+/// previously paying its own 15s window.
 pub(crate) const NO_SEEDER_FAST_FAIL_SECS: u64 = 0;
+
+/// Peer-discovery window (seconds) for a read that finds an empty swarm: how
+/// long it waits for a peer or seeder to appear before the swarm counts as
+/// sourceless.
+///
+/// The configured discovery wait
+/// (`[timeouts] peer_discovery_wait_secs`, default
+/// [`DEFAULT_PEER_DISCOVERY_WAIT_SECS`]) is what covers a cold mount's first
+/// read — the tracker announce plus peer connect that a read arriving right
+/// after the mount would otherwise fail inside.  It stays capped by
+/// `read_timeout_secs`, so a short read timeout still bounds the whole read
+/// instead of being extended by a long discovery window.  Pure so the
+/// effective window is unit-testable without a running engine.
+fn peer_discovery_window_secs(read_timeout_secs: u64, peer_discovery_wait_secs: u64) -> u64 {
+    std::cmp::min(read_timeout_secs, peer_discovery_wait_secs)
+}
 
 /// Worst-case seconds a single `read_file_range` call may block its caller (a
 /// FUSE deferred-read worker) before returning its own result: the
 /// state-transition wait (`read_timeout_secs`), the recheck wait (≤
 /// [`RECHECK_WAIT_CAP_SECS`]), the peer-discovery wait (≤
-/// [`PEER_WAIT_CAP_SECS`]) and the piece-wait window.  The piece-wait worst
-/// case is a seeder connecting at the very end of the short no-seeder window
-/// (≤ [`NO_SEEDER_READ_TIMEOUT_SECS`]) and then getting a full
+/// [`peer_discovery_window_secs`]) and the piece-wait window.  The piece-wait
+/// worst case is a seeder connecting at the very end of the short no-seeder
+/// window (≤ [`NO_SEEDER_READ_TIMEOUT_SECS`]) and then getting a full
 /// `read_timeout_secs` window from its connect time (the window resets on
 /// seeder connect — see [`EngineState::poll_piece_wait`]).
 ///
 /// This is the budget the FUSE deferred-read deadline must cover.  Pure so it
 /// is unit-testable without a running engine.
-pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64) -> u64 {
+pub(crate) fn read_wait_budget_secs(read_timeout_secs: u64, peer_discovery_wait_secs: u64) -> u64 {
     let recheck_wait = std::cmp::min(read_timeout_secs, RECHECK_WAIT_CAP_SECS);
-    let peer_wait = std::cmp::min(read_timeout_secs, PEER_WAIT_CAP_SECS);
+    let peer_wait = peer_discovery_window_secs(read_timeout_secs, peer_discovery_wait_secs);
     let no_seeder_wait = std::cmp::min(read_timeout_secs, NO_SEEDER_READ_TIMEOUT_SECS);
     read_timeout_secs
         .saturating_add(recheck_wait)
@@ -614,6 +634,98 @@ fn advance_empty_swarm_since(
         .collect()
 }
 
+/// Which window ended a read that timed out with no seeder connected, with the
+/// numbers and the advice the operator-facing texts need.
+///
+/// Peer discovery and the no-seeder piece wait are the only two waits that can
+/// end such a read, and only the discovery one is operator-tunable — so both the
+/// stderr hint and the `NoPeers` message must name the window that actually
+/// elapsed, and must not recommend a setting that cannot change the outcome.
+/// Pure so the mapping is unit-testable without a running engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoSeederWait {
+    /// The read spent its peer-discovery window on an empty swarm and never
+    /// saw a seeder, so that window is what ended it.
+    PeerDiscoveryWindow {
+        /// Effective window: `min(read_timeout_secs, peer_discovery_wait_secs)`.
+        secs: u64,
+        /// Which of those two timeouts has to move to widen it (see
+        /// [`discovery_window_advice`]) — the window is a `min` of the two, so
+        /// naming the other one would not widen it.
+        advice: &'static str,
+    },
+    /// The read ended in the no-seeder piece wait, which is
+    /// `[timeouts] peer_discovery_wait_secs`-independent (it derives from
+    /// `read_timeout_secs`, with [`NO_SEEDER_READ_TIMEOUT_SECS`] capping it
+    /// while no seeder is connected): either the discovery phase never ran out
+    /// its window (a leecher-only swarm, or a peer that appeared during it), or
+    /// a seeder connected only after the window elapsed and the piece wait
+    /// restarted with the full `read_timeout_secs` window, so that longer wait
+    /// is the one that elapsed.
+    NoSeederPieceWait {
+        /// The piece-wait window that elapsed.
+        secs: u64,
+        /// The discovery window the read did not run out, so both waits are
+        /// visible in the message.
+        discovery_window_secs: u64,
+    },
+}
+
+/// Which setting caps the effective peer-discovery window and therefore has to
+/// move to widen it.
+///
+/// The window is `min(read_timeout_secs, peer_discovery_wait_secs)`, so advising
+/// the non-binding one of the two would send the operator to a knob that cannot
+/// widen the window — the criterion both texts in this family follow.  Pure so
+/// the mapping is unit-testable without a running engine.
+fn discovery_window_advice(read_timeout_secs: u64, peer_discovery_wait_secs: u64) -> &'static str {
+    if peer_discovery_wait_secs < read_timeout_secs {
+        // The discovery knob is the smaller of the two: raising it widens the
+        // window, up to the read timeout.
+        "raise [timeouts] peer_discovery_wait_secs and retry"
+    } else if read_timeout_secs < peer_discovery_wait_secs {
+        // The read timeout is the smaller: it caps the window, so raising the
+        // discovery knob alone cannot widen it.
+        "raise [timeouts] read_timeout_secs (it caps the window) and retry"
+    } else {
+        // Both bound the window at the same value: either alone leaves it
+        // exactly where it is, so both have to move.
+        "raise [timeouts] peer_discovery_wait_secs and read_timeout_secs \
+         together (either alone leaves the window unchanged) and retry"
+    }
+}
+
+/// Which of the two waits ended this read, carrying the advice for it.
+///
+/// The discovery window ended the read only when the read exhausted that window
+/// on an empty swarm *and* no seeder ever connected: that leaves the piece wait
+/// at zero ([`NO_SEEDER_FAST_FAIL_SECS`]), so the discovery window is the only
+/// wait the read spent.  A seeder that connects after the window elapsed does
+/// not rescue the read — it restarts the piece wait at the full
+/// `read_timeout_secs` — but it does end the discovery window's claim on the
+/// outcome, so `has_seeder` must veto the discovery attribution: that read is
+/// ended by the piece wait it went on to spend, and no `[timeouts]` value
+/// widens it.  Pure so the mapping is unit-testable without a running engine.
+fn no_seeder_wait(
+    is_peer_wait_exhausted: bool,
+    has_seeder: bool,
+    discovery_window_secs: u64,
+    piece_wait_secs: u64,
+    discovery_advice: &'static str,
+) -> NoSeederWait {
+    if is_peer_wait_exhausted && !has_seeder {
+        NoSeederWait::PeerDiscoveryWindow {
+            secs: discovery_window_secs,
+            advice: discovery_advice,
+        }
+    } else {
+        NoSeederWait::NoSeederPieceWait {
+            secs: piece_wait_secs,
+            discovery_window_secs,
+        }
+    }
+}
+
 /// Format the stderr hint emitted when a read times out with zero connected
 /// seeders.  The message describes the *current* swarm state at
 /// timeout — a seeder that connected and left during the wait also lands here,
@@ -621,32 +733,61 @@ fn advance_empty_swarm_since(
 /// daemon writes the line to its own stderr (operator-facing; a FUSE daemon
 /// has no channel into the reading client's stderr), letting the operator
 /// tell "no seeder" apart from "seeder slow" (`DownloadTimeout`) and from a
-/// cache stall ([`cache_stall_stderr_hint`]).  Pure so the exact
+/// cache stall ([`cache_stall_stderr_hint`]).
+///
+/// [`NoSeederWait`] carries which window actually ended the read and, for the
+/// discovery one, which timeout has to move to widen it: pointing a read whose
+/// discovery window was not what ended it — a leecher-only swarm, a peer that
+/// arrived mid-discovery, or a seeder that connected only after the window
+/// elapsed and then left — at `[timeouts] peer_discovery_wait_secs` would send
+/// the operator to a knob that cannot change the outcome.  Pure so the exact
 /// message is unit-testable without a running engine.
-pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32) -> String {
-    format!(
-        "no seeder connected (Peers:{} Seeds:{})",
-        num_peers, num_seeds
-    )
+pub(crate) fn no_seeder_stderr_hint(num_peers: i32, num_seeds: i32, wait: NoSeederWait) -> String {
+    let counts = format!("no seeder connected (Peers:{num_peers} Seeds:{num_seeds})");
+    match wait {
+        NoSeederWait::PeerDiscoveryWindow { secs, advice } => {
+            format!("{counts} within the {secs}s peer-discovery window; {advice}")
+        }
+        NoSeederWait::NoSeederPieceWait { secs, .. } => format!(
+            "{counts} after the {secs}s no-seeder piece wait; no seeder is \
+             present in the swarm"
+        ),
+    }
 }
 
 /// Format the `NoPeers` error returned when a piece-wait expires with zero
 /// connected seeders and no cache-side evidence.  A read waiting on data the
 /// on-disk cache no longer holds is a cache stall instead (see
 /// [`cache_stall_message`]): telling the operator to check the tracker for a
-/// `cache_size` problem is exactly the misattribution this split avoids.  Pure
-/// so the exact message is unit-testable without a running engine.
-pub(crate) fn no_peers_message(
-    info_hash: &str,
-    peer_wait_secs: u64,
-    piece_wait_secs: u64,
-) -> String {
-    format!(
-        "No seeder connected for info_hash {info_hash} after {:.0}s \
-         peer discovery + {:.0}s piece wait. The torrent has no available \
-         seeder — check tracker health or try again later.",
-        peer_wait_secs, piece_wait_secs
-    )
+/// `cache_size` problem is exactly the misattribution this split avoids.
+///
+/// The advice follows [`no_seeder_stderr_hint`]'s criterion — never recommend a
+/// setting that cannot change this read's outcome.  The discovery branch states
+/// the effective window's formula (`min` of the two timeouts) and names the one
+/// that caps it; the piece-wait branch states that its window derives from
+/// `read_timeout_secs` and that `[timeouts] peer_discovery_wait_secs` does not
+/// size it, so retrying with a larger discovery window would change nothing
+/// while the swarm still has a peer.  Pure so the exact message is
+/// unit-testable without a running engine.
+pub(crate) fn no_peers_message(info_hash: &str, peer_wait_secs: u64, wait: NoSeederWait) -> String {
+    match wait {
+        NoSeederWait::PeerDiscoveryWindow { secs, advice } => format!(
+            "No seeder connected for info_hash {info_hash} after {peer_wait_secs}s \
+             of peer discovery (window {secs}s = min(read_timeout_secs, \
+             peer_discovery_wait_secs)). The torrent has no available seeder — \
+             check tracker health, or {advice}."
+        ),
+        NoSeederWait::NoSeederPieceWait {
+            secs,
+            discovery_window_secs,
+        } => format!(
+            "No seeder connected for info_hash {info_hash} after {peer_wait_secs}s \
+             of peer discovery (window {discovery_window_secs}s) + {secs}s \
+             no-seeder piece wait. That wait derives from read_timeout_secs, not \
+             from [timeouts] peer_discovery_wait_secs — check tracker health, or \
+             retry once a seeder joins."
+        ),
+    }
 }
 
 /// What a read's piece-wait window actually ran out of.
@@ -931,9 +1072,11 @@ struct PendingRead {
     has_seeder: bool,
     /// Start of the piece-wait window; resets when a seeder connects.
     piece_wait_start: Instant,
-    /// Actual peer-discovery wait (≤ [`PEER_WAIT_CAP_SECS`]) once the peer-wait
-    /// phase completes, so the `NoPeers` message reports it even when the
-    /// piece wait then fast-fails at zero seconds.
+    /// Actual peer-discovery wait once the peer-wait phase completes, bounded
+    /// by [`peer_discovery_window_secs`] (the `[timeouts]
+    /// peer_discovery_wait_secs` window capped by `read_timeout_secs`), so the
+    /// `NoPeers` message reports it even when the piece wait then fast-fails at
+    /// zero seconds.
     peer_wait_elapsed: Duration,
     /// Every piece of this read's range whose data was found missing from the
     /// on-disk cache although libtorrent's bit for it was set — i.e. the cache
@@ -1648,12 +1791,20 @@ impl EngineState {
         None
     }
 
+    /// Effective peer-discovery window for this engine:
+    /// [`peer_discovery_window_secs`] over the configured wait and the read
+    /// timeout this engine was built with.
+    fn peer_discovery_window_secs(&self) -> u64 {
+        peer_discovery_window_secs(self.read_timeout_secs, self.peer_discovery_wait_secs)
+    }
+
     /// Park a read in the peer-discovery phase: the swarm looked empty, so
     /// attach it to the info_hash's shared cold flight (creating the flight and
     /// kicking one re-announce when it is the first reader of this cold
     /// period) and give peers a bounded window to appear.
     fn enter_peer_wait(&mut self, read: &mut PendingRead) {
-        let window = Duration::from_secs(std::cmp::min(self.read_timeout_secs, PEER_WAIT_CAP_SECS));
+        let window_secs = self.peer_discovery_window_secs();
+        let window = Duration::from_secs(window_secs);
         // A flight whose window already elapsed is stale — attaching to it
         // would fail this read on its first poll, and only libtorrent's own
         // announce schedule could ever refresh the swarm.  Retire it so this
@@ -1669,6 +1820,15 @@ impl EngineState {
             self.cold_flights.remove(&read.info_hash);
         }
         if !self.cold_flights.contains_key(&read.info_hash) {
+            // One line per cold flight (not per read, not per piece): the
+            // wait itself is otherwise silent for its whole window, which reads
+            // as a hang in the daemon log.
+            tracing::info!(
+                "read_file_range {}: swarm empty — waiting up to {}s for a \
+                 peer to appear (peer discovery)",
+                read.info_hash,
+                window_secs
+            );
             // First cold reader of this info_hash: kick the swarm once.  A
             // concurrent reader attaching below must not re-announce — the
             // flight already covers discovery for the whole torrent.
@@ -2136,15 +2296,22 @@ impl EngineState {
             cache_capacity_bytes,
         ) {
             ReadStallCause::NoSeeder => {
+                let wait = no_seeder_wait(
+                    read.is_peer_wait_exhausted,
+                    read.has_seeder,
+                    self.peer_discovery_window_secs(),
+                    window.as_secs(),
+                    discovery_window_advice(self.read_timeout_secs, self.peer_discovery_wait_secs),
+                );
                 let _ = writeln!(
                     std::io::stderr(),
                     "{}",
-                    no_seeder_stderr_hint(num_peers, num_seeds)
+                    no_seeder_stderr_hint(num_peers, num_seeds, wait)
                 );
                 Err(TorrentError::NoPeers(no_peers_message(
                     &read.info_hash,
                     read.peer_wait_elapsed.as_secs(),
-                    window.as_secs(),
+                    wait,
                 )))
             }
             ReadStallCause::CacheStall => {
@@ -2631,11 +2798,14 @@ impl EngineState {
 mod tests {
     use super::{
         advance_empty_swarm_since, cache_stall_message, cache_stall_stderr_hint,
-        classify_read_stall, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
-        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight, ReadStallCause,
+        classify_read_stall, discovery_window_advice, no_peers_message, no_seeder_stderr_hint,
+        no_seeder_wait, partial_read_bounds, peer_discovery_window_secs, piece_wait_window_secs,
+        read_wait_budget_secs, swarm_is_empty, ColdFlight, NoSeederWait, ReadStallCause,
         NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
     };
-    use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
+    use crate::infrastructure::config::{
+        DEFAULT_PEER_DISCOVERY_WAIT_SECS, DEFAULT_READ_TIMEOUT_SECS,
+    };
     use std::time::{Duration, Instant};
 
     /// A cold flight is the shared peer-discovery window of one info_hash: its
@@ -2693,33 +2863,169 @@ mod tests {
     /// operator greps for — `no seeder connected (Peers:N Seeds:M)` with the
     /// live peer/seed counts — so a currently-empty swarm is distinguishable
     /// from "seeder slow" and from a cache stall (which surface as different
-    /// hints).
+    /// hints).  The advice is selected by which window actually ended the read,
+    /// because only the discovery one is operator-tunable.
     #[test]
     fn no_seeder_hint_reports_live_counts() {
         assert_eq!(
-            no_seeder_stderr_hint(0, 0),
-            "no seeder connected (Peers:0 Seeds:0)"
+            no_seeder_stderr_hint(
+                0,
+                0,
+                NoSeederWait::PeerDiscoveryWindow {
+                    secs: 30,
+                    advice: "raise [timeouts] peer_discovery_wait_secs and retry",
+                }
+            ),
+            "no seeder connected (Peers:0 Seeds:0) within the 30s peer-discovery \
+             window; raise [timeouts] peer_discovery_wait_secs and retry"
         );
         // Peers may be non-zero (leechers without the piece) while seeds stay 0.
+        // This read ended in the piece wait, so the hint names that window
+        // instead of the discovery knob.
         assert_eq!(
-            no_seeder_stderr_hint(3, 0),
-            "no seeder connected (Peers:3 Seeds:0)"
+            no_seeder_stderr_hint(
+                3,
+                0,
+                NoSeederWait::NoSeederPieceWait {
+                    secs: 12,
+                    discovery_window_secs: 30,
+                }
+            ),
+            "no seeder connected (Peers:3 Seeds:0) after the 12s no-seeder piece \
+             wait; no seeder is present in the swarm"
         );
-        assert!(!no_seeder_stderr_hint(0, 0).contains("cache"));
+        assert!(!no_seeder_stderr_hint(
+            0,
+            0,
+            NoSeederWait::PeerDiscoveryWindow {
+                secs: 30,
+                advice: "raise [timeouts] peer_discovery_wait_secs and retry",
+            }
+        )
+        .contains("cache"));
+    }
+
+    /// The no-seeder hint must name the window that actually ended the read:
+    /// the discovery window only when the read exhausted it on an empty swarm
+    /// and never saw a seeder, otherwise the piece wait it ended in.  Naming
+    /// the discovery knob in the latter cases would point the operator at a
+    /// knob that cannot change this read's outcome.
+    #[test]
+    fn no_seeder_wait_names_the_window_that_elapsed() {
+        const DISCOVERY_ADVICE: &str = "raise [timeouts] peer_discovery_wait_secs and retry";
+        // Peer discovery ran out on an empty swarm and no seeder ever
+        // connected: the piece wait stays at zero, so the discovery window is
+        // the only wait the read spent.
+        assert_eq!(
+            no_seeder_wait(true, false, 30, 0, DISCOVERY_ADVICE),
+            NoSeederWait::PeerDiscoveryWindow {
+                secs: 30,
+                advice: DISCOVERY_ADVICE,
+            }
+        );
+        // A peer was already there (leecher-only swarm) or connected during
+        // discovery: the piece wait ended the read, not the discovery window.
+        assert_eq!(
+            no_seeder_wait(false, false, 30, 12, DISCOVERY_ADVICE),
+            NoSeederWait::NoSeederPieceWait {
+                secs: 12,
+                discovery_window_secs: 30,
+            }
+        );
+        // A seeder connected only after the discovery window elapsed, so the
+        // piece wait restarted at the full read timeout and then ended the
+        // read; the discovery window is not what the read ran out.
+        assert_eq!(
+            no_seeder_wait(true, true, 30, 60, DISCOVERY_ADVICE),
+            NoSeederWait::NoSeederPieceWait {
+                secs: 60,
+                discovery_window_secs: 30,
+            }
+        );
+    }
+
+    /// The discovery window is `min(read_timeout_secs, peer_discovery_wait_secs)`,
+    /// so the advice must name whichever of the two caps it — recommending the
+    /// other would send the operator to a knob that cannot widen the window.
+    /// Equal values need both, since raising either alone leaves the `min` as it
+    /// is.
+    #[test]
+    fn discovery_window_advice_names_the_binding_knob() {
+        // Shipped defaults (read_timeout 60, discovery wait 30): the discovery
+        // wait is the smaller one.
+        let discovery_binds = discovery_window_advice(60, 30);
+        assert!(discovery_binds.contains("raise [timeouts] peer_discovery_wait_secs"));
+        assert!(!discovery_binds.contains("read_timeout_secs"));
+        // A short read timeout caps the window: the discovery knob alone cannot
+        // widen it.
+        let timeout_binds = discovery_window_advice(4, 30);
+        assert!(timeout_binds.contains("raise [timeouts] read_timeout_secs"));
+        assert!(timeout_binds.contains("caps the window"));
+        // Both equal: either alone leaves the window unchanged.
+        let both_bind = discovery_window_advice(30, 30);
+        assert!(both_bind.contains("peer_discovery_wait_secs and read_timeout_secs together"));
     }
 
     /// the `NoPeers` message describes an empty swarm only.  A read stalled on
     /// the cache is reported by `cache_stall_message` — the bare `ENODATA` the
     /// FUSE layer returns cannot tell the two apart, so the texts must differ.
+    /// Each branch must also name the window the read ran out of and, for the
+    /// discovery window, the formula and the knob that actually widen it — a
+    /// read that ended in the piece wait must not be pointed at the discovery
+    /// knob, which cannot change its outcome.
     #[test]
     fn no_peers_message_points_at_the_tracker_only() {
-        let msg = no_peers_message("abc", 9, 15);
-        assert!(msg.contains("check tracker health"));
-        assert!(!msg.contains("cache_size"));
+        let discovery = no_peers_message(
+            "abc",
+            9,
+            NoSeederWait::PeerDiscoveryWindow {
+                secs: 30,
+                advice: "raise [timeouts] peer_discovery_wait_secs and retry",
+            },
+        );
+        assert!(discovery.contains("check tracker health"));
+        assert!(discovery.contains("raise [timeouts] peer_discovery_wait_secs"));
+        assert!(
+            discovery.contains("(window 30s = min(read_timeout_secs, peer_discovery_wait_secs))")
+        );
+        assert!(!discovery.contains("cache_size"));
         assert_ne!(
-            msg,
+            discovery,
             cache_stall_message("abc", 15, 1 << 20, 1 << 20, true, 0)
         );
+
+        // Piece-wait branch: states the fact and names the window's source; it
+        // must not hand out the discovery knob as advice.
+        let piece_wait = no_peers_message(
+            "abc",
+            9,
+            NoSeederWait::NoSeederPieceWait {
+                secs: 12,
+                discovery_window_secs: 30,
+            },
+        );
+        assert!(piece_wait.contains("check tracker health"));
+        assert!(piece_wait.contains("derives from read_timeout_secs"));
+        assert!(piece_wait.contains("not from [timeouts] peer_discovery_wait_secs"));
+        assert!(
+            !piece_wait.contains("raise [timeouts]"),
+            "the piece-wait branch must not advise a timeout that cannot widen its window: {piece_wait}"
+        );
+        assert!(!piece_wait.contains("cache_size"));
+    }
+
+    /// The discovery window is the configured wait capped by `read_timeout_secs`
+    /// — a short read timeout bounds the whole read instead of being extended by
+    /// a long discovery window, and a short window still caps a long one.
+    #[test]
+    fn peer_discovery_window_is_capped_by_the_read_timeout() {
+        assert_eq!(
+            peer_discovery_window_secs(60, DEFAULT_PEER_DISCOVERY_WAIT_SECS),
+            DEFAULT_PEER_DISCOVERY_WAIT_SECS
+        );
+        assert_eq!(peer_discovery_window_secs(4, 30), 4);
+        assert_eq!(peer_discovery_window_secs(60, 120), 60);
+        assert_eq!(peer_discovery_window_secs(120, 120), 120);
     }
 
     /// A read waiting on a piece the cache no longer holds — or a read range
@@ -2864,23 +3170,34 @@ mod tests {
     /// ticket while the engine is still legitimately waiting.
     #[test]
     fn budget_covers_all_slow_path_phases() {
-        // Default read_timeout_secs = 60 (DEFAULT_READ_TIMEOUT_SECS):
-        //   60 (state) + 10 (recheck cap) + 9 (peer cap) + 15 (no-seeder cap)
-        //   + 60 (piece) = 154s.
-        assert_eq!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS), 154);
+        // Shipped defaults: read_timeout_secs = 60 (DEFAULT_READ_TIMEOUT_SECS)
+        // and peer_discovery_wait_secs = 30 (DEFAULT_PEER_DISCOVERY_WAIT_SECS):
+        //   60 (state) + 10 (recheck cap) + 30 (peer discovery) + 15 (no-seeder
+        //   cap) + 60 (piece) = 175s.
+        assert_eq!(
+            read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS),
+            60 + 10 + 30 + 15 + 60
+        );
+        // A discovery window below the other caps contributes only its own
+        // value, and one above the read timeout is capped by it.
+        assert_eq!(read_wait_budget_secs(60, 9), 60 + 10 + 9 + 15 + 60);
+        assert_eq!(read_wait_budget_secs(60, 300), 60 + 10 + 60 + 15 + 60);
         // Short timeout still caps every phase at the timeout itself.
-        assert_eq!(read_wait_budget_secs(4), 4 + 4 + 4 + 4 + 4);
+        assert_eq!(read_wait_budget_secs(4, 30), 4 + 4 + 4 + 4 + 4);
         // Timeout below every cap.
-        assert_eq!(read_wait_budget_secs(2), 2 + 2 + 2 + 2 + 2);
+        assert_eq!(read_wait_budget_secs(2, 30), 2 + 2 + 2 + 2 + 2);
     }
 
     #[test]
     fn budget_exceeds_legacy_deadline_for_default_timeout() {
         // The old FUSE deadline was `read_timeout_secs + 5` — shorter than
         // the engine's worst-case budget and even its peer-wait+piece-wait
-        // path. At the default timeout the budget (154s) still exceeds the
+        // path. At the default timeout the budget (175s) still exceeds the
         // legacy deadline (65s), so a slow seeder is never expired early.
-        assert!(read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS) > DEFAULT_READ_TIMEOUT_SECS + 5);
+        assert!(
+            read_wait_budget_secs(DEFAULT_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS)
+                > DEFAULT_READ_TIMEOUT_SECS + 5
+        );
     }
 
     /// a no-seeder read must never wait the full read timeout — it caps at
