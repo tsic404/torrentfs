@@ -28,6 +28,14 @@ pub const PENDING_TORRENT_INO_BASE: u64 = 5_000_000;
 pub const PENDING_TORRENT_DIR_INO_BASE: u64 = 6_000_000;
 pub const PENDING_TORRENT_FILE_INO_BASE: u64 = 7_000_000;
 pub const STATS_INO_OFFSET: u64 = 10_000_000;
+/// Offset of the per-torrent `.read-errors` diagnostics inode:
+/// `dir_ino + READ_ERRORS_INO_OFFSET`. Sits one band above the `.stats` band.
+pub const READ_ERRORS_INO_OFFSET: u64 = 20_000_000;
+
+/// Width of the inode band reserved for one virtual companion file (`dir_ino`
+/// plus the file's offset). Each band is far wider than the data inode ranges
+/// below `STATS_INO_OFFSET`, so a derived inode stays inside its own band.
+const VIRTUAL_INO_BAND: u64 = 10_000_000;
 
 /// Row cap for the ID-derived data inode ranges (`DATA_TORRENT` /
 /// `DATA_DIR` / `DATA_FILE`), each encoded as `base + id` — one inode
@@ -56,6 +64,11 @@ const _: () = assert!(SOURCE_PATH_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
 const _: () = assert!(PENDING_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
 const _: () = assert!(PENDING_TORRENT_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
 const _: () = assert!(PENDING_TORRENT_FILE_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+// The two virtual-file bands must not overlap: both are derived by adding an
+// offset to a directory inode, and both satisfy `is_data_ino`, so an overlap
+// would let `.read-errors` be classified as `.stats` (or vice versa) in the
+// guards that run before the data/ guard.
+const _: () = assert!(STATS_INO_OFFSET + VIRTUAL_INO_BAND <= READ_ERRORS_INO_OFFSET);
 
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
 pub static NEXT_FH: AtomicU64 = AtomicU64::new(1);
@@ -282,13 +295,33 @@ impl InodeManager {
 
     /// Check if an inode is a stats inode (derived from a directory inode).
     pub fn is_stats_ino(ino: u64) -> bool {
-        ino >= STATS_INO_OFFSET && ino < STATS_INO_OFFSET + 10_000_000
+        (STATS_INO_OFFSET..STATS_INO_OFFSET + VIRTUAL_INO_BAND).contains(&ino)
     }
 
     /// Get the parent directory inode from a stats inode.
     pub fn stats_ino_to_dir_ino(ino: u64) -> Option<u64> {
         if Self::is_stats_ino(ino) {
             Some(ino - STATS_INO_OFFSET)
+        } else {
+            None
+        }
+    }
+
+    /// Derive the `.read-errors` diagnostics inode from a torrent-root inode.
+    pub fn make_read_errors_ino(dir_ino: u64) -> u64 {
+        dir_ino + READ_ERRORS_INO_OFFSET
+    }
+
+    /// Check if an inode is a `.read-errors` inode (derived from a directory
+    /// inode).
+    pub fn is_read_errors_ino(ino: u64) -> bool {
+        (READ_ERRORS_INO_OFFSET..READ_ERRORS_INO_OFFSET + VIRTUAL_INO_BAND).contains(&ino)
+    }
+
+    /// Get the torrent-root inode a `.read-errors` inode derives from.
+    pub fn read_errors_ino_to_dir_ino(ino: u64) -> Option<u64> {
+        if Self::is_read_errors_ino(ino) {
+            Some(ino - READ_ERRORS_INO_OFFSET)
         } else {
             None
         }
@@ -629,5 +662,41 @@ mod tests {
         assert_eq!(InodeManager::stats_ino_to_dir_ino(DATA_INO), None);
         assert_eq!(InodeManager::stats_ino_to_dir_ino(ROOT_INO), None);
         assert_eq!(InodeManager::stats_ino_to_dir_ino(0), None);
+    }
+
+    // ── read-errors ino derivation round-trip ──
+
+    /// `.read-errors` is per-torrent, so its inode must round-trip back to the
+    /// torrent root it belongs to: resolving it to the wrong directory would
+    /// report one torrent's failures under another's name.
+    #[test]
+    fn test_read_errors_ino_round_trips_to_dir() {
+        let dir_ino = DATA_TORRENT_INO_BASE + 7;
+        let ino = InodeManager::make_read_errors_ino(dir_ino);
+        assert_eq!(ino, dir_ino + READ_ERRORS_INO_OFFSET);
+        assert!(InodeManager::is_read_errors_ino(ino));
+        assert_eq!(InodeManager::read_errors_ino_to_dir_ino(ino), Some(dir_ino));
+        assert_eq!(InodeManager::read_errors_ino_to_dir_ino(DATA_INO), None);
+    }
+
+    /// The `.stats` and `.read-errors` bands must stay disjoint: both are
+    /// derived from a directory inode and both satisfy `is_data_ino`, so a
+    /// collision would render the wrong file's content.
+    #[test]
+    fn test_read_errors_and_stats_bands_are_disjoint() {
+        let dir_ino = DATA_INO;
+        assert!(!InodeManager::is_read_errors_ino(
+            InodeManager::make_stats_ino(dir_ino)
+        ));
+        assert!(!InodeManager::is_stats_ino(
+            InodeManager::make_read_errors_ino(dir_ino)
+        ));
+        assert!(InodeManager::is_read_errors_ino(READ_ERRORS_INO_OFFSET));
+        assert!(!InodeManager::is_read_errors_ino(
+            READ_ERRORS_INO_OFFSET - 1
+        ));
+        assert!(!InodeManager::is_read_errors_ino(
+            READ_ERRORS_INO_OFFSET + VIRTUAL_INO_BAND
+        ));
     }
 }

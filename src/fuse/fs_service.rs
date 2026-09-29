@@ -43,6 +43,7 @@ use super::inodes::{
 #[cfg(test)]
 use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
 use super::lookup::DataResolver;
+use super::read_errors::generate_read_errors;
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
 /// maximum number of entries in the L1 range cache.  Each entry
@@ -74,6 +75,21 @@ fn guard_empty_read(data: &[u8], size: u32) -> Result<(), FsError> {
     } else {
         Ok(())
     }
+}
+
+/// Slice a virtual file's freshly rendered content for one FUSE read.
+///
+/// Virtual files (`.stats`, `.read-errors`) are rendered per call, so the
+/// kernel's `offset` is applied against the current content: an offset past the
+/// end is a short (empty) read, never an error, and the result never exceeds the
+/// content the lookup advertised.
+fn virtual_file_slice(content: &[u8], offset: i64, size: u32) -> Vec<u8> {
+    let offset = offset as usize;
+    if offset >= content.len() {
+        return Vec::new();
+    }
+    let end = std::cmp::min(offset.saturating_add(size as usize), content.len());
+    content[offset..end].to_vec()
 }
 
 /// Cached listing of one `data/` directory.
@@ -385,9 +401,13 @@ impl FsService {
             });
         }
 
-        // Handle .stats virtual file for data/ subtree directories.
-        if name == ".stats" {
-            if parent == DATA_INO {
+        // Handle the virtual companion files of data/ subtree directories:
+        // `.stats` (aggregate state) and `.read-errors` (recent read failures,
+        // per torrent only — the log is keyed by info_hash).
+        if name == ".stats" || name == ".read-errors" {
+            let is_read_errors = name == ".read-errors";
+
+            if name == ".stats" && parent == DATA_INO {
                 let stats_ino = InodeManager::make_stats_ino(parent);
                 let content = self.generate_dir_stats_content("");
                 return Ok(Some(Entry {
@@ -400,7 +420,7 @@ impl FsService {
 
             if let Some(data_inode) = self.inode_mgr.data_inodes.get(&parent) {
                 match data_inode {
-                    DataInode::SourcePathDir { path } => {
+                    DataInode::SourcePathDir { path } if !is_read_errors => {
                         let stats_ino = InodeManager::make_stats_ino(parent);
                         let content = self.generate_dir_stats_content(path);
                         return Ok(Some(Entry {
@@ -411,13 +431,20 @@ impl FsService {
                         }));
                     }
                     DataInode::TorrentRoot { torrent_id, .. } => {
-                        let stats_ino = InodeManager::make_stats_ino(parent);
-                        let content = self.generate_torrent_stats_for_id(*torrent_id);
+                        let (ino, content) = if is_read_errors {
+                            (
+                                InodeManager::make_read_errors_ino(parent),
+                                self.generate_read_errors_for_id(*torrent_id),
+                            )
+                        } else {
+                            (
+                                InodeManager::make_stats_ino(parent),
+                                self.generate_torrent_stats_for_id(*torrent_id),
+                            )
+                        };
                         return Ok(Some(Entry {
-                            ino: stats_ino,
-                            attr: self
-                                .inode_mgr
-                                .attr_for_file(stats_ino, content.len() as u64),
+                            ino,
+                            attr: self.inode_mgr.attr_for_file(ino, content.len() as u64),
                         }));
                     }
                     _ => return Ok(None),
@@ -494,6 +521,11 @@ impl FsService {
                     return Ok(self.inode_mgr.attr_for_file(ino, content.len() as u64));
                 }
 
+                if InodeManager::is_read_errors_ino(ino) {
+                    let content = self.generate_read_errors_for_ino(ino);
+                    return Ok(self.inode_mgr.attr_for_file(ino, content.len() as u64));
+                }
+
                 if InodeManager::is_data_ino(ino) {
                     if let Some(data_inode) = self.inode_mgr.data_inodes.get(&ino) {
                         return Ok(match data_inode {
@@ -553,10 +585,14 @@ impl FsService {
         // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
         // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
         // be classified as stats *before* the data/ guard — otherwise they
-        // would wrongly return EROFS instead of EPERM.
-        // Invariant: data base + slot width < STATS_INO_OFFSET (compile-time
-        // asserts in `src/fuse/inodes.rs`).
-        if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
+        // would wrongly return EROFS instead of EPERM.  The same holds for the
+        // `.read-errors` band above it.
+        // Invariant: data base + slot width < STATS_INO_OFFSET <
+        // READ_ERRORS_INO_OFFSET (compile-time asserts in `src/fuse/inodes.rs`).
+        if ino == STATS_INO
+            || InodeManager::is_stats_ino(ino)
+            || InodeManager::is_read_errors_ino(ino)
+        {
             return Err(FsError::NotPermitted);
         }
         if InodeManager::is_data_namespace(ino) {
@@ -754,7 +790,7 @@ impl FsService {
                 Ok(fh.into())
             }
             _ => {
-                if InodeManager::is_stats_ino(ino) {
+                if InodeManager::is_stats_ino(ino) || InodeManager::is_read_errors_ino(ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
                     return Ok(fh.into());
@@ -881,14 +917,18 @@ impl FsService {
     }
 
     pub fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> FsResult<u32> {
-        // `.stats` files have virtual, immutable attributes — not a read-only
-        // namespace — so a write is rejected with `EPERM` (`NotPermitted`),
-        // matching `setattr` and `symlink`. Stats-derived
+        // `.stats` / `.read-errors` files have virtual, immutable attributes —
+        // not a read-only namespace — so a write is rejected with `EPERM`
+        // (`NotPermitted`), matching `setattr` and `symlink`. Stats-derived
         // inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000) also satisfy
         // `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must be classified
         // as stats *before* the data/ guard below — otherwise they would
-        // wrongly return EROFS instead of EPERM.
-        if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
+        // wrongly return EROFS instead of EPERM. The same holds for the
+        // `.read-errors` band.
+        if ino == STATS_INO
+            || InodeManager::is_stats_ino(ino)
+            || InodeManager::is_read_errors_ino(ino)
+        {
             return Err(FsError::NotPermitted);
         }
 
@@ -1389,15 +1429,16 @@ impl FsService {
     ) -> FsResult<Option<i64>> {
         let mut removed_id = None;
 
-        // `.stats` is a reserved virtual filename whose files have
-        // immutable attributes — `rm` on it returns `EPERM` (`NotPermitted`),
-        // matching `write`, `setattr`, and `symlink`.
+        // `.stats` and `.read-errors` are reserved virtual filenames whose
+        // files have immutable attributes — `rm` on them returns `EPERM`
+        // (`NotPermitted`), matching `write`, `setattr`, and `symlink`.
         // The root `.stats` (`STATS_INO`) previously fell
         // through the metadata-child guard below → `EACCES`; the `data/`
         // subtree `.stats` (derived stats inode) previously hit the data/
-        // guard → `EROFS`.  Both are rejections, but `.stats` must return a
-        // single `EPERM` consistent with every other mutating operation on it.
-        if name == ".stats" {
+        // guard → `EROFS`.  Both are rejections, but a virtual file must
+        // return a single `EPERM` consistent with every other mutating
+        // operation on it.
+        if name == ".stats" || name == ".read-errors" {
             return Err(FsError::NotPermitted);
         }
         if InodeManager::is_data_namespace(parent) {
@@ -1915,25 +1956,24 @@ impl FsService {
     pub fn read(&mut self, ino: u64, offset: i64, size: u32) -> FsResult<ReadOutcome> {
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Err(FsError::IsDirectory),
-            STATS_INO => {
-                let offset = offset as usize;
-                let stats = self.generate_global_stats_content();
-                if offset >= stats.len() {
-                    Ok(ReadOutcome::Ready(Vec::new()))
-                } else {
-                    let end = std::cmp::min(offset + size as usize, stats.len());
-                    Ok(ReadOutcome::Ready(stats[offset..end].to_vec()))
-                }
-            }
+            STATS_INO => Ok(ReadOutcome::Ready(virtual_file_slice(
+                &self.generate_global_stats_content(),
+                offset,
+                size,
+            ))),
             _ => {
                 if InodeManager::is_stats_ino(ino) {
                     let stats = self.generate_data_stats_for_ino(ino);
-                    let offset = offset as usize;
-                    if offset >= stats.len() {
-                        return Ok(ReadOutcome::Ready(Vec::new()));
-                    }
-                    let end = std::cmp::min(offset + size as usize, stats.len());
-                    return Ok(ReadOutcome::Ready(stats[offset..end].to_vec()));
+                    return Ok(ReadOutcome::Ready(virtual_file_slice(&stats, offset, size)));
+                }
+
+                if InodeManager::is_read_errors_ino(ino) {
+                    let read_errors = self.generate_read_errors_for_ino(ino);
+                    return Ok(ReadOutcome::Ready(virtual_file_slice(
+                        &read_errors,
+                        offset,
+                        size,
+                    )));
                 }
 
                 if InodeManager::is_data_ino(ino) {
@@ -2309,6 +2349,44 @@ impl FsService {
             }
             _ => b"Stats not available for this inode\n".to_vec(),
         }
+    }
+
+    // ── Read-errors diagnostics ─────────────────────────────────────────────
+
+    /// Render `.read-errors` for a derived `.read-errors` inode by resolving
+    /// the torrent root it derives from.
+    fn generate_read_errors_for_ino(&self, ino: u64) -> Vec<u8> {
+        let dir_ino = match InodeManager::read_errors_ino_to_dir_ino(ino) {
+            Some(d) => d,
+            None => return b"Invalid read-errors inode\n".to_vec(),
+        };
+        match self.inode_mgr.data_inodes.get(&dir_ino) {
+            Some(DataInode::TorrentRoot { torrent_id, .. }) => {
+                self.generate_read_errors_for_id(*torrent_id)
+            }
+            _ => b"Read errors not available for this inode\n".to_vec(),
+        }
+    }
+
+    /// Render `.read-errors` for a torrent id: its info_hash keys the engine's
+    /// failure log. Empty when the torrent is gone (pending torrents have no DB
+    /// row yet) or never failed a read.
+    fn generate_read_errors_for_id(&self, torrent_id: i64) -> Vec<u8> {
+        // Resolve name + info_hash under a short-lived DB lock, then release it
+        // before reading the engine log, which takes its own lock.
+        let (name, info_hash) = match self.db.as_ref().and_then(|db| db.lock().ok()) {
+            Some(db_guard) => match db_guard.get_torrent_by_id(torrent_id).ok().flatten() {
+                Some(torrent) => (torrent.name, torrent.info_hash),
+                None => return Vec::new(),
+            },
+            None => return Vec::new(),
+        };
+        let failures = self
+            .download_service
+            .as_ref()
+            .and_then(|ds| ds.try_read_failures(&info_hash))
+            .unwrap_or_default();
+        generate_read_errors(&name, &info_hash, &failures)
     }
 }
 
@@ -5840,13 +5918,81 @@ mod tests {
         assert_eq!(name, "c");
     }
 
-    /// `inval_data_entry` is a no-op when no `Notifier` is wired
-    /// (the test/constructor path — `OnceLock` is empty).  The call must
-    /// not panic.
+    /// `.read-errors` is the per-torrent companion file next to `.stats`: a
+    /// lookup in a torrent root resolves to the derived inode, the read renders
+    /// that torrent's engine failure log (empty here — nothing failed), and the
+    /// file is immutable like `.stats`.
     #[test]
-    fn inval_data_entry_noop_without_notifier() {
-        let svc = bare_service();
-        // No notifier set — this must be a silent no-op.
-        svc.inval_data_entry(DATA_INO, "foo.torrent");
+    fn read_errors_virtual_file_is_served_for_torrent_roots() {
+        let torrent_bytes = minimal_torrent_bytes();
+        let (mut svc, _info_hash, torrent_id, _metrics) = service_with_torrent(&torrent_bytes);
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        svc.download_service = Some(Arc::new(
+            DownloadService::new(cache_dir.path(), &TorrentfsConfig::default_config())
+                .expect("download service"),
+        ));
+
+        // The torrent root (`data/<filename>`) as the data/ readdir caches it.
+        let root_ino = InodeManager::make_torrent_root_ino(torrent_id);
+        svc.inode_mgr.data_inodes.insert(
+            root_ino,
+            DataInode::TorrentRoot {
+                torrent_id,
+                source_path: "src".to_string(),
+                name: "foo".to_string(),
+                filename: "foo.torrent".to_string(),
+            },
+        );
+
+        let entry = svc
+            .lookup(root_ino, ".read-errors")
+            .expect("lookup must succeed")
+            .expect(".read-errors must exist in a torrent root");
+        assert_eq!(entry.ino, InodeManager::make_read_errors_ino(root_ino));
+        // No read failed yet: the file exists and is empty.
+        assert_eq!(entry.attr.size, 0);
+
+        let outcome = svc.read(entry.ino, 0, 4096).expect("read .read-errors");
+        assert!(
+            matches!(&outcome, ReadOutcome::Ready(data) if data.is_empty()),
+            "a torrent with no failed read must render empty content"
+        );
+
+        // A virtual file is immutable, exactly like its `.stats` sibling.
+        assert_eq!(
+            svc.write(entry.ino, 0, b"x").unwrap_err(),
+            FsError::NotPermitted
+        );
+        assert_eq!(
+            svc.setattr(entry.ino, None).unwrap_err(),
+            FsError::NotPermitted
+        );
+
+        // The sibling `.stats` still resolves to its own inode: the two
+        // virtual-file bands must not alias each other.
+        let stats_entry = svc
+            .lookup(root_ino, ".stats")
+            .expect("lookup .stats")
+            .expect(".stats must exist in a torrent root");
+        assert_eq!(stats_entry.ino, InodeManager::make_stats_ino(root_ino));
+
+        // The log is keyed by info_hash, so `.read-errors` exists only where a
+        // single torrent is in scope — not at the `data/` root and not in a
+        // source-path directory, which cover several torrents.
+        assert!(svc
+            .lookup(DATA_INO, ".read-errors")
+            .expect("lookup at data/ root")
+            .is_none());
+        let source_dir_ino = InodeManager::make_source_path_dir_ino("src");
+        svc.inode_mgr.data_inodes.insert(
+            source_dir_ino,
+            DataInode::SourcePathDir {
+                path: "src".to_string(),
+            },
+        );
+        assert!(svc
+            .lookup(source_dir_ino, ".read-errors")
+            .expect("lookup in source-path dir")
+            .is_none());
     }
 }

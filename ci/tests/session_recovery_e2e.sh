@@ -135,7 +135,7 @@ wait_for_fuse_mount() {
 wait_for_data_file() {
     local deadline=$((SECONDS + 60)) found=""
     while [ "$SECONDS" -lt "$deadline" ]; do
-        found="$(find "$MNT/data" -type f ! -name '.stats' 2>/dev/null | head -n1 || true)"
+        found="$(find "$MNT/data" -type f ! -name '.stats' ! -name '.read-errors' 2>/dev/null | head -n1 || true)"
         [ -n "$found" ] && { printf '%s\n' "$found"; return 0; }
         sleep 1
     done

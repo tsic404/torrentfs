@@ -10,6 +10,7 @@
 mod engine;
 mod piece_scheduler;
 mod piece_store;
+mod read_failures;
 mod session;
 mod types;
 
@@ -19,5 +20,6 @@ pub use engine::{
 };
 pub use piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
 pub use piece_store::PieceStore;
+pub use read_failures::{ReadFailure, ReadStallCause};
 pub use session::{Session, TorrentHandle};
 pub use types::{FilePieceInfo, SessionStats, TorrentState, TorrentStatus};

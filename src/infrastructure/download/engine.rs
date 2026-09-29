@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::alert::{AlertConsumer, SharedSessionStats};
@@ -30,6 +30,7 @@ use tracing::{info, warn};
 
 use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus, ReadId};
 use super::piece_store::PieceStore;
+use super::read_failures::{ReadFailure, ReadFailureLog, ReadStallCause};
 use super::session::{Session, TorrentHandle};
 use super::types::{SessionStats, TorrentState, TorrentStatus};
 
@@ -110,6 +111,9 @@ pub struct DownloadEngine {
     cache_manager: Arc<Mutex<CacheManager>>,
     shared_stats: SharedSessionStats,
     snapshot: Arc<Mutex<DownloadSnapshot>>,
+    /// Recent read failures per info_hash, shared with the engine thread and
+    /// with the FUSE side reading `data/<name>/.read-errors`.
+    read_failures: Arc<Mutex<ReadFailureLog>>,
     metrics: Arc<Metrics>,
     read_timeout_secs: u64,
 }
@@ -129,6 +133,10 @@ struct EngineState {
     cache_dir: String,
     metrics: Arc<Metrics>,
     snapshot: Arc<Mutex<DownloadSnapshot>>,
+    /// Recent read failures per info_hash (see [`ReadFailureLog`]).  Shared
+    /// rather than owned so a failure is visible to the FUSE side the instant
+    /// the read fails, not on the next snapshot publish.
+    read_failures: Arc<Mutex<ReadFailureLog>>,
     stopping: Arc<AtomicBool>,
     alert_consumer: Option<AlertConsumer>,
     /// Piece-completion events forwarded by the alert consumer thread,
@@ -185,6 +193,7 @@ impl DownloadEngine {
         let stopping = Arc::new(AtomicBool::new(false));
         let shared_stats = SharedSessionStats::new();
         let snapshot = Arc::new(Mutex::new(DownloadSnapshot::default()));
+        let read_failures = Arc::new(Mutex::new(ReadFailureLog::default()));
 
         // The libtorrent `Session` owns a raw pointer and is not `Send`, so it
         // must be created on the engine thread itself.  Everything else moved
@@ -197,6 +206,7 @@ impl DownloadEngine {
         let thread_snapshot = snapshot.clone();
         let thread_stopping = stopping.clone();
         let thread_metrics = metrics.clone();
+        let thread_read_failures = read_failures.clone();
 
         let thread_shared_stats = shared_stats.clone();
         let handle = std::thread::Builder::new()
@@ -240,6 +250,7 @@ impl DownloadEngine {
                     read_timeout_secs,
                     metrics: thread_metrics,
                     snapshot: thread_snapshot,
+                    read_failures: thread_read_failures,
                     stopping: thread_stopping,
                     alert_consumer: Some(alert_consumer),
                     piece_finished_rx,
@@ -267,6 +278,7 @@ impl DownloadEngine {
             cache_manager,
             shared_stats: shared_stats.clone(),
             snapshot,
+            read_failures,
             metrics,
             read_timeout_secs,
         })
@@ -330,6 +342,17 @@ impl DownloadEngine {
             .empty_swarm_secs
             .get(info_hash)
             .copied()
+    }
+
+    /// Non-blocking read-failure lookup for `data/<name>/.read-errors`: the
+    /// most recent failures of `info_hash`, newest first.  `None` only when the
+    /// log is momentarily locked, so the caller can tell "busy" from "never
+    /// failed a read" (the latter is an empty log, not a missing one).
+    pub fn try_read_failures(&self, info_hash: &str) -> Option<Vec<ReadFailure>> {
+        self.read_failures
+            .try_lock()
+            .ok()
+            .map(|log| log.recent(info_hash))
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -628,22 +651,6 @@ pub(crate) fn no_peers_message(
          seeder — check tracker health or try again later.",
         peer_wait_secs, piece_wait_secs
     )
-}
-
-/// What a read's piece-wait window actually ran out of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadStallCause {
-    /// No seeder is connected and no cache-side evidence explains the stall,
-    /// so nothing in the swarm can serve the read.
-    NoSeeder,
-    /// The read is waiting on data the on-disk cache does not hold: the piece
-    /// it waits on was there and is gone, or its range cannot fit the cache at
-    /// all.  Either way the read cannot be served from the cache and depends
-    /// on a re-download.
-    CacheStall,
-    /// A seeder is connected and the cache holds the read, but the pieces did
-    /// not arrive inside the window.
-    SlowSwarm,
 }
 
 /// Classify a read whose piece-wait window elapsed.
@@ -2105,28 +2112,30 @@ impl EngineState {
             .map(|c| c.max_cache_size())
             .unwrap_or(u64::MAX);
         let blocking_piece_stale = read.stale_blockers.contains(&piece_idx);
-        // Write the one-line hint to the daemon's own stderr (operator-facing;
-        // FUSE has no channel into the client's stderr) via a direct,
-        // non-panicking write: `eprintln!` panics on a broken stderr (aborting
-        // this thread), and `tracing` writes to stdout, not stderr.
-        match classify_read_stall(
+        let cause = classify_read_stall(
             num_seeds,
             &read.stale_blockers,
             piece_idx,
             read_span_bytes,
             cache_capacity_bytes,
-        ) {
+        );
+        // Write the one-line hint to the daemon's own stderr (operator-facing;
+        // FUSE has no channel into the client's stderr) via a direct,
+        // non-panicking write: `eprintln!` panics on a broken stderr (aborting
+        // this thread), and `tracing` writes to stdout, not stderr.
+        let (error, message) = match cause {
             ReadStallCause::NoSeeder => {
                 let _ = writeln!(
                     std::io::stderr(),
                     "{}",
                     no_seeder_stderr_hint(num_peers, num_seeds)
                 );
-                Err(TorrentError::NoPeers(no_peers_message(
+                let message = no_peers_message(
                     &read.info_hash,
                     read.peer_wait_elapsed.as_secs(),
                     window.as_secs(),
-                )))
+                );
+                (TorrentError::NoPeers(message.clone()), message)
             }
             ReadStallCause::CacheStall => {
                 let _ = writeln!(
@@ -2138,23 +2147,44 @@ impl EngineState {
                         blocking_piece_stale
                     )
                 );
-                Err(TorrentError::Timeout(cache_stall_message(
+                let message = cache_stall_message(
                     &read.info_hash,
                     window.as_secs(),
                     cache_capacity_bytes,
                     read_span_bytes,
                     blocking_piece_stale,
                     num_seeds,
-                )))
+                );
+                (TorrentError::Timeout(message.clone()), message)
             }
-            ReadStallCause::SlowSwarm => Err(TorrentError::Timeout(format!(
-                "Timed out waiting for piece {} after {:.0}s. \
-                 Torrent progress: {:.2}%",
-                piece_idx,
-                window.as_secs(),
-                progress,
-            ))),
+            ReadStallCause::SlowSwarm => {
+                let message = format!(
+                    "Timed out waiting for piece {} after {:.0}s. \
+                     Torrent progress: {:.2}%",
+                    piece_idx,
+                    window.as_secs(),
+                    progress,
+                );
+                (TorrentError::Timeout(message.clone()), message)
+            }
+        };
+        // Record the failure before returning it.  The reader only ever sees
+        // the bare errno, so `data/<name>/.read-errors` is the one channel
+        // carrying the cause and the swarm state it was observed in.
+        if let Ok(mut log) = self.read_failures.lock() {
+            log.record(
+                &read.info_hash,
+                ReadFailure {
+                    cause,
+                    message,
+                    at: SystemTime::now(),
+                    num_peers,
+                    num_seeds,
+                    progress: progress as f64,
+                },
+            );
         }
+        Err(error)
     }
 
     /// Advance every parked read by one step, resolving (and removing) the ones
@@ -2608,10 +2638,11 @@ mod tests {
     use super::{
         advance_empty_swarm_since, cache_stall_message, cache_stall_stderr_hint,
         classify_read_stall, no_peers_message, no_seeder_stderr_hint, partial_read_bounds,
-        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight, ReadStallCause,
+        piece_wait_window_secs, read_wait_budget_secs, swarm_is_empty, ColdFlight,
         NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
     };
     use crate::infrastructure::config::DEFAULT_READ_TIMEOUT_SECS;
+    use crate::infrastructure::download::ReadStallCause;
     use std::time::{Duration, Instant};
 
     /// A cold flight is the shared peer-discovery window of one info_hash: its

@@ -188,7 +188,7 @@ cp "$SELFSEED_OUT/selfseed.torrent" "$MNT/metadata/"
 # the read starts well inside the hold.
 DATA_FILE=""
 for _ in $(seq 1 600); do
-    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' 2>/dev/null | head -n1 || true)"
+    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' ! -name '.read-errors' 2>/dev/null | head -n1 || true)"
     [ -n "$DATA_FILE" ] && break
     sleep 0.05
 done

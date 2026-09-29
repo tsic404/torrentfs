@@ -22,7 +22,7 @@ use common::{
     acquire_session_lock, build_multipiece_torrent_named, create_single_piece_torrent,
     local_test_config, MiniTracker, TestHarness,
 };
-use torrentfs::download::DownloadEngine;
+use torrentfs::download::{DownloadEngine, ReadStallCause};
 
 /// While a no-seeder read is parked in its peer-wait window, a synchronous
 /// engine command must still be served promptly.  Pre-fix the engine thread sat
@@ -124,6 +124,32 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
          had already finished: the read blocked the engine thread",
         probe_elapsed.as_secs_f64()
     );
+
+    // The failed read is now readable from inside the mount as
+    // `data/<name>/.read-errors`.  The client only ever saw the bare errno, so
+    // the record must carry the same message the read failed with, the
+    // classification, and the swarm state at that moment.
+    let failures = engine
+        .try_read_failures(&info_hash)
+        .expect("read-failure log not readable");
+    assert_eq!(
+        failures.len(),
+        1,
+        "one failed read must leave exactly one record, got {failures:?}"
+    );
+    let failure = &failures[0];
+    assert_eq!(failure.cause, ReadStallCause::NoSeeder);
+    assert_eq!(
+        failure.num_seeds, 0,
+        "the record must report the sourceless swarm it was observed in: {failure:?}"
+    );
+    match &read_result {
+        Err(torrentfs::TorrentError::NoPeers(message)) => assert_eq!(
+            &failure.message, message,
+            "the record must carry the message the read failed with"
+        ),
+        other => panic!("expected a NoPeers failure, got {other:?}"),
+    }
 }
 
 /// Concurrent cold reads of one info_hash share a single discovery window

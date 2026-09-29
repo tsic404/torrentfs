@@ -901,6 +901,12 @@ impl DataResolver {
                             FileKind::RegularFile,
                             ".stats".to_string(),
                         ));
+                        entries.push((
+                            InodeManager::make_read_errors_ino(ino),
+                            next_offset + 1,
+                            FileKind::RegularFile,
+                            ".read-errors".to_string(),
+                        ));
 
                         for (cache_ino, cache_inode) in p_cache {
                             inode_mgr.data_inodes.insert(cache_ino, cache_inode);
@@ -967,6 +973,12 @@ impl DataResolver {
                             offset_counter,
                             FileKind::RegularFile,
                             ".stats".to_string(),
+                        ));
+                        entries.push((
+                            InodeManager::make_read_errors_ino(ino),
+                            offset_counter + 1,
+                            FileKind::RegularFile,
+                            ".read-errors".to_string(),
                         ));
 
                         state = (db_version, Self::pending_signature(processing_torrents));

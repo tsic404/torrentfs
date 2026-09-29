@@ -87,11 +87,27 @@ cp "$SELFSEED_OUT/selfseed.torrent" "$MNT/metadata/"
 # Wait for the data/ directory to materialise after the torrent is persisted.
 DATA_FILE=""
 for _ in $(seq 1 60); do
-    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' 2>/dev/null | head -n1 || true)"
+    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' ! -name '.read-errors' 2>/dev/null | head -n1 || true)"
     [ -n "$DATA_FILE" ] && break
     sleep 1
 done
 [ -n "$DATA_FILE" ] || { echo "small_cache_read_e2e: data file did not appear" >&2; exit 1; }
+
+# `.read-errors` is the per-torrent companion of `.stats`.  No read has been
+# issued yet, so the mount must serve it and it must be empty — an operator must
+# never read a placeholder as a failure.
+TORRENT_ROOT="$(dirname "$DATA_FILE")"
+READ_ERRORS_FILE="$TORRENT_ROOT/.read-errors"
+echo "[small_cache_read_e2e] .read-errors before any read…"
+if [ ! -f "$READ_ERRORS_FILE" ]; then
+    echo "small_cache_read_e2e: FAIL — $READ_ERRORS_FILE did not appear" >&2
+    exit 1
+fi
+if [ -s "$READ_ERRORS_FILE" ]; then
+    echo "small_cache_read_e2e: FAIL — .read-errors is non-empty before any read:" >&2
+    cat "$READ_ERRORS_FILE" >&2
+    exit 1
+fi
 
 echo "[small_cache_read_e2e] sequential full-file read (dd bs=1M)…"
 START="$(date +%s)"
@@ -155,6 +171,36 @@ if ! grep -q 'raise \[cache\] cache_size' "$LOG_FILE"; then
 fi
 if ! grep -q 'No seeder is connected, so the re-download cannot start' "$LOG_FILE"; then
     echo "small_cache_read_e2e: FAIL — cache stall message does not report the swarm state" >&2
+    exit 1
+fi
+
+# The same failure, read back from inside the mount.  The client only ever saw
+# ENODATA, so `data/<name>/.read-errors` is the one place carrying the cause,
+# the reason text, the instant, the swarm state, and the action to take.
+echo "[small_cache_read_e2e] .read-errors after the cache stall…"
+if [ ! -f "$READ_ERRORS_FILE" ]; then
+    echo "small_cache_read_e2e: FAIL — $READ_ERRORS_FILE vanished" >&2
+    exit 1
+fi
+cat "$READ_ERRORS_FILE" >&2
+if ! grep -qE '^\[[0-9]+\] cause: CacheStall$' "$READ_ERRORS_FILE"; then
+    echo "small_cache_read_e2e: FAIL — .read-errors does not classify the stall as CacheStall" >&2
+    exit 1
+fi
+if ! grep -q '^message: Read timed out for info_hash ' "$READ_ERRORS_FILE"; then
+    echo "small_cache_read_e2e: FAIL — .read-errors does not carry the failure's reason text" >&2
+    exit 1
+fi
+if ! grep -q '^at: 20[0-9][0-9]-' "$READ_ERRORS_FILE"; then
+    echo "small_cache_read_e2e: FAIL — .read-errors does not carry the failure instant" >&2
+    exit 1
+fi
+if ! grep -q '^swarm: Peers:[0-9]* Seeds:[0-9]* Progress:' "$READ_ERRORS_FILE"; then
+    echo "small_cache_read_e2e: FAIL — .read-errors does not carry the swarm state" >&2
+    exit 1
+fi
+if ! grep -qF 'suggested action: raise [cache] cache_size' "$READ_ERRORS_FILE"; then
+    echo "small_cache_read_e2e: FAIL — .read-errors does not carry the action to take" >&2
     exit 1
 fi
 

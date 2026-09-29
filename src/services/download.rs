@@ -12,7 +12,7 @@ use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::download::{
-    DownloadEngine, PieceStatus, PieceStore, SessionStats, TorrentStatus,
+    DownloadEngine, PieceStatus, PieceStore, ReadFailure, SessionStats, TorrentStatus,
 };
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
@@ -80,6 +80,14 @@ impl DownloadService {
     /// Non-blocking "swarm empty for N seconds" check for `.stats`.
     pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
         self.engine.try_empty_swarm_secs(info_hash)
+    }
+
+    /// Non-blocking read-failure lookup for `.read-errors`: the most recent
+    /// failures of `info_hash`, newest first.  `None` when the log is
+    /// momentarily locked; an empty vector means the torrent never failed a
+    /// read.
+    pub fn try_read_failures(&self, info_hash: &str) -> Option<Vec<ReadFailure>> {
+        self.engine.try_read_failures(info_hash)
     }
 
     /// Query the current tracker list on a torrent handle.

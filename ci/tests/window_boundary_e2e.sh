@@ -186,7 +186,7 @@ mountpoint -q "$MNT" || { tail -20 "$TORRENTFS_LOG" >&2; fail "FUSE mount did no
 cp "$SELFSEED_OUT/selfseed.torrent" "$MNT/metadata/"
 DATA_FILE=""
 for _ in $(seq 1 60); do
-    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' 2>/dev/null | head -n1 || true)"
+    DATA_FILE="$(find "$MNT/data" -type f ! -name '.stats' ! -name '.read-errors' 2>/dev/null | head -n1 || true)"
     [ -n "$DATA_FILE" ] && break
     sleep 1
 done

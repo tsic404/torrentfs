@@ -14,6 +14,7 @@ pub mod fs_service;
 pub mod fs_types;
 pub mod inodes;
 pub mod lookup;
+pub mod read_errors;
 pub mod stats;
 pub mod worker_pool;
 
