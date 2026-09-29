@@ -429,8 +429,10 @@ fn has_cached_piece(pieces: &[PieceStatus]) -> bool {
     pieces.iter().any(|p| p.is_cached)
 }
 
-/// Whether any piece is currently wanted by an active reader (`priority > 0`).
-/// An elevated piece means a reader is actively fetching bytes.
+/// Whether any piece currently carries a reader priority (`priority > 0`).
+/// True while a reader holds its own gradient — and also while a released
+/// reader's gradient is retained as the prefetch window, so this is *not* a
+/// live-reader signal; use the scheduler's reader count for that.
 fn has_active_reader(pieces: &[PieceStatus]) -> bool {
     pieces.iter().any(|p| p.priority > 0)
 }
@@ -502,31 +504,66 @@ fn write_trackers(output: &mut String, trackers: Option<&[TrackerEntry]>, dht_no
 /// the more conservative of the two.
 const HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS: u64 = NO_SEEDER_READ_TIMEOUT_SECS;
 
-/// Render the `.stats` health alert line. The alert fires on a *sustained*
-/// empty swarm — zero connected peers/seeds (`num_peers == 0 && num_seeds == 0`)
-/// for at least [`HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS`] seconds. Counts reflect
-/// live connections, not tracker reachability, so the wording describes
-/// observed state, not an unreachable tracker. `download_complete` suppresses
-/// it (zero peers is the expected end state of a finished torrent);
-/// `active_download` also suppresses it (the transient zero-peer window before
-/// the tracker announce returns is not a degradation).
+/// Consecutive seconds a torrent must report a connected seeder with a zero
+/// download rate before the `.stats` slow-swarm alert fires.  `download_rate`
+/// is an instantaneous sample and a just-connected seeder has not delivered its
+/// first block yet, so one zero sample is not a stall — alerting on it would
+/// fire on every healthy connection.  Long enough to cover connection setup and
+/// a bursty rate window, short enough to surface a stalled seeder well inside
+/// the read's wait window.
+const HEALTH_ALERT_SLOW_SWARM_GRACE_SECS: u64 = 5;
+
+/// Render the per-torrent `.stats` health alert line, or `None` when the
+/// observed state needs no explanation: a read waiting on an empty swarm (no
+/// grace — a blocked reader is not a flapping peer count), a connected seeder
+/// that has delivered nothing for [`HEALTH_ALERT_SLOW_SWARM_GRACE_SECS`], or a
+/// sustained empty swarm with no download in progress.  `download_complete`
+/// suppresses every alert — zero peers is then the expected end state — and
+/// counts reflect live connections, not tracker reachability.
 fn health_alert(
     num_peers: i32,
     num_seeds: i32,
+    download_rate: i64,
     empty_swarm_secs: u64,
+    slow_swarm_secs: u64,
     download_complete: bool,
     active_download: bool,
-) -> Option<&'static str> {
+    is_read_waiting: bool,
+) -> Option<String> {
+    if download_complete {
+        return None;
+    }
+    // A blocked reader is evidence the empty sample is not connections still
+    // flapping, so this alert needs no grace window.
+    if num_peers == 0 && num_seeds == 0 && is_read_waiting {
+        return Some(format!(
+            "  ⚠ Waiting for peers ({empty_swarm_secs}s) — no connected peers; \
+             a reader is waiting\n"
+        ));
+    }
+    // Connected yet delivering nothing — a bare peer count cannot express it.
+    // The rate must have held at zero for the grace window: the sample right
+    // after a seeder connects lands before its first block.
+    if num_seeds >= 1
+        && download_rate == 0
+        && is_read_waiting
+        && slow_swarm_secs >= HEALTH_ALERT_SLOW_SWARM_GRACE_SECS
+    {
+        return Some(format!(
+            "  ⚠ Slow swarm: seeder connected but no progress for {slow_swarm_secs}s\n"
+        ));
+    }
     if num_peers == 0
         && num_seeds == 0
         && empty_swarm_secs >= HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS
-        && !download_complete
         && !active_download
     {
-        Some("  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n")
-    } else {
-        None
+        return Some(
+            "  ⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable\n"
+                .to_string(),
+        );
     }
+    None
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -683,12 +720,28 @@ pub fn generate_torrent_stats(
         .as_ref()
         .map(|(_, pieces)| has_cached_piece(pieces) || has_active_reader(pieces))
         .unwrap_or(false);
+    // The reads the engine is holding for this torrent: one snapshot entry
+    // yields both the oldest wait and the count, so `Waiting`, `Waited` and
+    // `Active readers` can never disagree — including while a parked read is
+    // still settling or rechecking, before it holds any piece priority. An
+    // absent entry means no read is parked, which is not the same as waiting
+    // zero seconds, so the lines are dropped rather than zeroed.
+    let waiting_reads = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_waiting_reads(info_hash));
+    let is_read_waiting = waiting_reads.is_some();
     // How long the swarm has been continuously empty, from the engine's
     // per-tick samples. An absent entry (no handle, unreadable status, or a
     // live peer/seed) is not an observed empty swarm, so it counts as zero.
     let empty_swarm_secs = download_service
         .as_ref()
         .and_then(|ds| ds.try_empty_swarm_secs(info_hash))
+        .unwrap_or(0);
+    // How long a connected seeder has delivered nothing while a read waited.
+    // Zero when the torrent is not in that state.
+    let slow_swarm_secs = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_slow_swarm_secs(info_hash))
         .unwrap_or(0);
     output.push_str("-- Status --\n");
     output.push_str(&format!("  Name: {}\n", t.name));
@@ -723,14 +776,40 @@ pub fn generate_torrent_stats(
     // -- Peers --
     output.push_str("\n-- Peers --\n");
     output.push_str(&format!("  Peers: {}  Seeds: {}\n", num_peers, num_seeds));
+    // Wait-period fields, all three read from the one parked-read entry above.
+    // `Waiting` is the state — the engine is holding a read right now — and
+    // `Waited` carries that read's age; the peer-wait age, when there is one,
+    // sits on the alert line (nothing is connected).
+    output.push_str(if is_read_waiting {
+        "  Waiting: yes\n"
+    } else {
+        "  Waiting: no\n"
+    });
+    // The oldest parked read's own wait, which also covers a connected-but-slow
+    // seeder the peer wait does not. Dropped once no read is parked.
+    if let Some(waits) = waiting_reads {
+        output.push_str(&format!("  Waited: {}s\n", waits.oldest_secs));
+    }
+    // How many reads the engine is holding. Counted from the same aggregation,
+    // so this is not the piece grid's `[N]` markers below: a torrent whose
+    // readers have all released keeps its retained prefetch gradient but has no
+    // parked read, and reports 0 here.
+    output.push_str(&format!(
+        "  Active readers: {}\n",
+        waiting_reads.map(|waits| waits.count).unwrap_or(0)
+    ));
+
     let health = health_alert(
         num_peers,
         num_seeds,
+        dl_rate,
         empty_swarm_secs,
+        slow_swarm_secs,
         download_complete,
         active_download,
+        is_read_waiting,
     );
-    if let Some(line) = health {
+    if let Some(line) = &health {
         output.push_str(line);
     }
 
@@ -2004,8 +2083,17 @@ mod tests {
         // the alert fires on a sustained empty swarm but must not claim the
         // tracker is unreachable — connected-peer count is not a
         // tracker-reachability signal.
-        let line = health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false)
-            .expect("alert should fire at 0/0 after the grace window");
+        let line = health_alert(
+            0,
+            0,
+            0,
+            HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+            0,
+            false,
+            false,
+            false,
+        )
+        .expect("alert should fire at 0/0 after the grace window");
         assert!(
             !line.contains("tracker may be unreachable"),
             "must not claim tracker unreachable: {line}"
@@ -2026,11 +2114,21 @@ mod tests {
         // peer counts flap around zero while the tracker announce and
         // connections settle, so no alert may fire on such a sample.
         assert!(
-            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS - 1, false, false).is_none(),
+            health_alert(
+                0,
+                0,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS - 1,
+                0,
+                false,
+                false,
+                false,
+            )
+            .is_none(),
             "no alert for an empty swarm still inside the grace window"
         );
         assert!(
-            health_alert(0, 0, 0, false, false).is_none(),
+            health_alert(0, 0, 0, 0, 0, false, false, false).is_none(),
             "no alert for an unobserved/just-empty swarm"
         );
     }
@@ -2038,7 +2136,17 @@ mod tests {
     #[test]
     fn test_health_alert_with_peers() {
         assert!(
-            health_alert(3, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
+            health_alert(
+                3,
+                0,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                0,
+                false,
+                false,
+                false
+            )
+            .is_none(),
             "no alert when peers > 0"
         );
     }
@@ -2046,16 +2154,36 @@ mod tests {
     #[test]
     fn test_health_alert_with_seeds() {
         assert!(
-            health_alert(0, 2, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
-            "no alert when seeds > 0"
+            health_alert(
+                0,
+                2,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                0,
+                false,
+                false,
+                false
+            )
+            .is_none(),
+            "no alert when seeds > 0 and no reader is waiting"
         );
     }
 
     #[test]
     fn test_health_alert_both_present() {
         assert!(
-            health_alert(5, 1, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, false).is_none(),
-            "no alert when peers and seeds > 0"
+            health_alert(
+                5,
+                1,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                0,
+                false,
+                false,
+                false
+            )
+            .is_none(),
+            "no alert when peers and seeds > 0 and no reader is waiting"
         );
     }
 
@@ -2064,8 +2192,36 @@ mod tests {
         // a fully downloaded torrent legitimately has zero peers;
         // the health alert must not fire when download is complete.
         assert!(
-            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, true, false).is_none(),
+            health_alert(
+                0,
+                0,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                0,
+                true,
+                false,
+                false
+            )
+            .is_none(),
             "no alert when download is complete even at 0 peers / 0 seeds"
+        );
+        assert!(
+            health_alert(0, 0, 0, 0, 0, true, false, true).is_none(),
+            "no alert when download is complete even with a parked read"
+        );
+        assert!(
+            health_alert(
+                1,
+                1,
+                0,
+                0,
+                HEALTH_ALERT_SLOW_SWARM_GRACE_SECS,
+                true,
+                true,
+                true
+            )
+            .is_none(),
+            "no alert when a finished torrent's read is served from cache"
         );
     }
 
@@ -2075,8 +2231,120 @@ mod tests {
         // tracker announce returns, a download that is actively fetching
         // bytes must not raise a health alert.
         assert!(
-            health_alert(0, 0, HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS, false, true).is_none(),
+            health_alert(
+                0,
+                0,
+                0,
+                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                0,
+                false,
+                true,
+                false
+            )
+            .is_none(),
             "no alert while a download is actively fetching bytes"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_waiting_for_peers_with_parked_read() {
+        // A read parked on an empty swarm is a real wait, so the alert fires
+        // immediately — the grace window only guards the no-reader case, where
+        // an empty sample is just connections flapping.
+        let line = health_alert(0, 0, 0, 0, 0, false, true, true)
+            .expect("a parked read on an empty swarm must alert without the grace window");
+        assert!(
+            line.contains("⚠ Waiting for peers (0s)"),
+            "should name the wait and its age: {line}"
+        );
+        assert!(
+            line.contains("no connected peers"),
+            "should describe the observed swarm: {line}"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_waiting_for_peers_reports_empty_swarm_age() {
+        let line = health_alert(0, 0, 0, 7, 0, false, true, true)
+            .expect("alert while a read waits on an empty swarm");
+        assert!(
+            line.contains("⚠ Waiting for peers (7s)"),
+            "should report how long the swarm has been empty: {line}"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_slow_swarm_with_seeder() {
+        // Seeder connected, read parked, no bytes arriving: the state a bare
+        // peer count cannot express.
+        let line = health_alert(
+            1,
+            1,
+            0,
+            0,
+            HEALTH_ALERT_SLOW_SWARM_GRACE_SECS,
+            false,
+            true,
+            true,
+        )
+        .expect("a connected seeder delivering nothing must alert");
+        assert_eq!(
+            line,
+            format!(
+                "  ⚠ Slow swarm: seeder connected but no progress for {}s\n",
+                HEALTH_ALERT_SLOW_SWARM_GRACE_SECS
+            )
+        );
+    }
+
+    #[test]
+    fn test_health_alert_slow_swarm_requires_sustained_window() {
+        // The sample right after a seeder connects lands before its first
+        // block, so a single zero rate is not a stall.
+        assert!(
+            health_alert(
+                1,
+                1,
+                0,
+                0,
+                HEALTH_ALERT_SLOW_SWARM_GRACE_SECS - 1,
+                false,
+                true,
+                true
+            )
+            .is_none(),
+            "no alert for a zero rate younger than the grace window"
+        );
+        let line = health_alert(1, 1, 0, 0, 7, false, true, true)
+            .expect("alert once the stall has held past the grace window");
+        assert!(
+            line.contains("no progress for 7s"),
+            "should report how long the seeder has stalled: {line}"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_slow_swarm_requires_zero_rate() {
+        // Bytes flowing with a seeder connected is steady state, not a stall.
+        assert!(
+            health_alert(1, 1, 65_536, 0, 30, false, true, true).is_none(),
+            "no alert while the seeder is delivering bytes"
+        );
+        // A seeder with no parked read is seeding, not stalling, however long
+        // its rate has been zero.
+        assert!(
+            health_alert(1, 1, 0, 0, 30, false, false, false).is_none(),
+            "no alert when no read is parked"
+        );
+    }
+
+    #[test]
+    fn test_health_alert_steady_download_silent() {
+        // Data arriving with a read parked and peers present: the steady state
+        // must stay free of alert lines.
+        assert!(
+            health_alert(2, 1, 2_097_152, 0, 0, false, true, true).is_none(),
+            "steady download must not alert"
         );
     }
 
