@@ -24,7 +24,7 @@ use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::alert::{AlertConsumer, SharedSessionStats};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
-use crate::infrastructure::metadata::TorrentInfo;
+use crate::infrastructure::metadata::{TorrentInfo, TrackerEntry};
 use crate::infrastructure::metrics::Metrics;
 use tracing::{info, warn};
 
@@ -90,6 +90,11 @@ pub struct DownloadSnapshot {
     pub statuses: HashMap<String, TorrentStatus>,
     /// Per-info_hash `(piece_length, piece statuses)`.
     pub pieces: HashMap<String, (u64, Vec<PieceStatus>)>,
+    /// Per-info_hash announce targets (`url` + `tier`) of the live handle,
+    /// including trackers merged from a duplicate info_hash. Absent when the
+    /// info_hash has no handle or its tracker list could not be read — an
+    /// absent entry never means "no trackers".
+    pub trackers: HashMap<String, Vec<TrackerEntry>>,
     /// Per-info_hash private flag. A torrent is "private" when
     /// its info dict has `private=1` (BEP-27). Private torrents are isolated
     /// from cross-site tracker merging to prevent passkey leakage and peer
@@ -300,6 +305,20 @@ impl DownloadEngine {
             .try_lock()
             .ok()?
             .pieces
+            .get(info_hash)
+            .cloned()
+    }
+
+    /// Non-blocking announce targets from the last engine snapshot: the
+    /// handle's tracker list (`url` + `tier`), after any tracker merge.  `None`
+    /// when the snapshot was locked, or holds no readable list for the
+    /// info_hash — never "zero trackers", which is `Some(vec![])`.  Used by
+    /// `.stats` to show which trackers the torrent announces to.
+    pub fn try_trackers(&self, info_hash: &str) -> Option<Vec<TrackerEntry>> {
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .trackers
             .get(info_hash)
             .cloned()
     }
@@ -2516,6 +2535,7 @@ impl EngineState {
     fn publish_snapshot(&mut self) {
         let mut statuses = HashMap::new();
         let mut pieces = HashMap::new();
+        let mut trackers = HashMap::new();
         let mut swarms: Vec<(String, bool)> = Vec::new();
         // request libtorrent to refresh per-torrent statistics
         // before reading status. Without this, `status().num_peers` can
@@ -2529,6 +2549,9 @@ impl EngineState {
                     swarm_is_empty(status.num_peers, status.num_seeds),
                 ));
                 statuses.insert(info_hash.clone(), status);
+            }
+            if let Ok(list) = handle.trackers() {
+                trackers.insert(info_hash.clone(), list);
             }
             if let Some(num_pieces) = self.scheduler.num_pieces(info_hash) {
                 if let Ok(status) = self.build_pieces_status(info_hash, num_pieces) {
@@ -2553,6 +2576,7 @@ impl EngineState {
             *snap = DownloadSnapshot {
                 statuses,
                 pieces,
+                trackers,
                 private_torrents: self.private_torrents.clone(),
                 empty_swarm_secs,
             };
