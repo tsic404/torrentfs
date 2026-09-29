@@ -4,8 +4,10 @@
 //! (control plane). Callers send [`Command`]s over `mpsc` and receive on a
 //! `sync_channel`, so raw libtorrent pointers never cross a thread boundary
 //! (hence the dropped `unsafe impl Send`). Non-blocking `.stats` reads use a
-//! shared [`DownloadSnapshot`] refreshed each tick, replacing the old big-lock
-//! `try_lock`.
+//! shared [`DownloadSnapshot`], republished each tick only while a `.stats`
+//! reader is looking (see [`READER_DEMAND_TTL`]) and refreshed immediately by
+//! mutating commands; an unread daemon does no periodic FFI work.  This
+//! replaces the old big-lock `try_lock`.
 //!
 //! A read that has to wait on the swarm never blocks the engine thread: it is
 //! parked on [`EngineState::pending_reads`] and advanced one step per loop
@@ -14,7 +16,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -120,6 +122,11 @@ pub struct DownloadEngine {
     /// Configured peer-discovery wait; [`peer_discovery_window_secs`] applies
     /// the `read_timeout_secs` cap on top of it.
     peer_discovery_wait_secs: u64,
+    /// Counter bumped by every `.stats` accessor; the engine thread opens a
+    /// fresh [`READER_DEMAND_TTL`] window whenever it observes a change, which
+    /// is what keeps the periodic snapshot publish and session-stats sample
+    /// running while someone is looking at `.stats`.
+    reader_demand: Arc<AtomicU64>,
 }
 
 /// State owned exclusively by the engine thread.
@@ -159,6 +166,15 @@ struct EngineState {
     /// Kept across ticks so the published age measures one continuous empty
     /// window instead of the time since the last snapshot.
     empty_swarm_since: HashMap<String, Instant>,
+    /// Accessor counter shared with the engine handle (see
+    /// [`DownloadEngine::mark_reader_demand`]).
+    reader_demand: Arc<AtomicU64>,
+    /// Counter value observed on the last iteration; a change opens a fresh
+    /// reader-demand window.
+    seen_reader_demand: u64,
+    /// End of the current reader-demand window; `None` until the first
+    /// `.stats` read.
+    reader_demand_until: Option<Instant>,
 }
 
 impl DownloadEngine {
@@ -197,6 +213,7 @@ impl DownloadEngine {
         let stopping = Arc::new(AtomicBool::new(false));
         let shared_stats = SharedSessionStats::new();
         let snapshot = Arc::new(Mutex::new(DownloadSnapshot::default()));
+        let reader_demand = Arc::new(AtomicU64::new(0));
 
         // The libtorrent `Session` owns a raw pointer and is not `Send`, so it
         // must be created on the engine thread itself.  Everything else moved
@@ -209,6 +226,7 @@ impl DownloadEngine {
         let thread_snapshot = snapshot.clone();
         let thread_stopping = stopping.clone();
         let thread_metrics = metrics.clone();
+        let thread_reader_demand = reader_demand.clone();
 
         let thread_shared_stats = shared_stats.clone();
         let handle = std::thread::Builder::new()
@@ -259,6 +277,9 @@ impl DownloadEngine {
                     pending_reads: Vec::new(),
                     cold_flights: HashMap::new(),
                     empty_swarm_since: HashMap::new(),
+                    reader_demand: thread_reader_demand,
+                    seen_reader_demand: 0,
+                    reader_demand_until: None,
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -283,6 +304,7 @@ impl DownloadEngine {
             metrics,
             read_timeout_secs,
             peer_discovery_wait_secs,
+            reader_demand,
         })
     }
 
@@ -295,11 +317,23 @@ impl DownloadEngine {
 
     /// Cached session stats snapshot.
     pub fn snapshot_stats(&self) -> SessionStats {
+        self.mark_reader_demand();
         self.shared_stats.snapshot()
+    }
+
+    /// Note that a `.stats` reader just consumed the shared snapshot.
+    ///
+    /// The engine publishes the snapshot and samples session stats only while
+    /// a reader is looking (see [`READER_DEMAND_TTL`]); a counter rather than a
+    /// flag so a read that lands while the engine is publishing still opens a
+    /// fresh window instead of being swallowed by the publish in flight.
+    fn mark_reader_demand(&self) {
+        self.reader_demand.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Non-blocking torrent status from the last engine snapshot.
     pub fn try_torrent_status(&self, info_hash: &str) -> Option<TorrentStatus> {
+        self.mark_reader_demand();
         self.snapshot
             .try_lock()
             .ok()?
@@ -310,6 +344,7 @@ impl DownloadEngine {
 
     /// Non-blocking piece status from the last engine snapshot.
     pub fn try_pieces_status(&self, info_hash: &str) -> Option<(u64, Vec<PieceStatus>)> {
+        self.mark_reader_demand();
         self.snapshot
             .try_lock()
             .ok()?
@@ -324,6 +359,7 @@ impl DownloadEngine {
     /// info_hash — never "zero trackers", which is `Some(vec![])`.  Used by
     /// `.stats` to show which trackers the torrent announces to.
     pub fn try_trackers(&self, info_hash: &str) -> Option<Vec<TrackerEntry>> {
+        self.mark_reader_demand();
         self.snapshot
             .try_lock()
             .ok()?
@@ -338,6 +374,7 @@ impl DownloadEngine {
     /// handle in the snapshot. Used by `.stats` to display the PT isolation
     /// state.
     pub fn try_is_private(&self, info_hash: &str) -> Option<bool> {
+        self.mark_reader_demand();
         self.snapshot
             .try_lock()
             .ok()?
@@ -352,6 +389,7 @@ impl DownloadEngine {
     /// swarm currently has a peer/seed.  Used by `.stats` to keep the health
     /// alert off a transient empty sample.
     pub fn try_empty_swarm_secs(&self, info_hash: &str) -> Option<u64> {
+        self.mark_reader_demand();
         self.snapshot
             .try_lock()
             .ok()?
@@ -726,6 +764,46 @@ fn no_seeder_wait(
     }
 }
 
+/// Advance the reader-demand window from the accessor counter.
+///
+/// A counter change opens a fresh [`READER_DEMAND_TTL`] window; an unchanged
+/// counter leaves it where it is, so a reader that stops lets it lapse.
+/// Returns the counter value to remember and the window end.  Pure so the
+/// window semantics are unit-testable without a running engine.
+fn advance_reader_demand(
+    observed: u64,
+    seen: u64,
+    until: Option<Instant>,
+    now: Instant,
+) -> (u64, Option<Instant>) {
+    if observed == seen {
+        (seen, until)
+    } else {
+        (observed, Some(now + READER_DEMAND_TTL))
+    }
+}
+
+/// Whether a reader-demand window is still open at `now`.  Pure so the
+/// expiry boundary is unit-testable without a running engine.
+fn reader_demand_is_live(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|deadline| now < deadline)
+}
+
+/// Whether a command should trigger a snapshot publish.
+///
+/// A mutating command (handle add/remove, tracker merge) changes what `.stats`
+/// reports, so it publishes immediately.  A read command changes nothing
+/// observable: it refreshes the rate-limited snapshot only for a watching
+/// reader, which is what keeps that reader's status fresh during a read burst.
+/// Pure so the gating is unit-testable without a running engine.
+fn should_publish_after_command(
+    is_read: bool,
+    is_watched: bool,
+    since_last_publish: Duration,
+) -> bool {
+    !is_read || (is_watched && since_last_publish >= SNAPSHOT_INTERVAL)
+}
+
 /// Format the stderr hint emitted when a read times out with zero connected
 /// seeders.  The message describes the *current* swarm state at
 /// timeout — a seeder that connected and left during the wait also lands here,
@@ -944,10 +1022,20 @@ fn partial_read_bounds(
 
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
 /// thread (`set_alert_notify`), so this interval bounds `.stats` staleness
-/// for per-torrent status/pieces and also drives the session-stats sample
-/// request: each tick fires `post_session_stats`, whose alert
-/// the consumer drains into the shared stats snapshot.
+/// for per-torrent status/pieces, and it paces the session-stats sample
+/// request (`post_session_stats`, drained by the consumer into the shared
+/// stats snapshot).  Both are published only while a `.stats` reader is
+/// watching — see [`READER_DEMAND_TTL`].
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a `.stats` read keeps the periodic snapshot publish and
+/// session-stats sample alive (`.stats` is their only consumer).  Each new
+/// read reopens the window, so staleness is bounded by the reader's own
+/// polling interval: a reader polling no slower than this sees the publish
+/// cadence unchanged, a slower one sees the snapshot from the end of its
+/// previous window, and a one-off read after an idle spell sees the previous
+/// publish — the read right after it is fresh.
+const READER_DEMAND_TTL: Duration = Duration::from_secs(2);
 
 /// Poll cadence for parked reads while at least one is waiting on the swarm.
 /// Matches the old inline piece-wait poll so a parked read observes a newly
@@ -1173,6 +1261,11 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     // `PENDING_READ_POLL_INTERVAL`: gating housekeeping on the publish timer
     // would then starve the flush for the whole duration of a parked read.
     let mut last_housekeeping = Instant::now();
+    // Session-stats sample cadence for a watching `.stats` reader.  Also
+    // separate from `last_publish`: a burst of read commands keeps the loop
+    // out of its timeout branch, and each one would otherwise fire its own
+    // `post_session_stats`.
+    let mut last_stats_sample = Instant::now();
     loop {
         // Poll parked reads on the short cadence so a waiting read is checked
         // at roughly the old inline piece-wait granularity; with none parked,
@@ -1182,16 +1275,23 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
         } else {
             PENDING_READ_POLL_INTERVAL
         };
+        // Open a fresh window when a `.stats` accessor has fired since the
+        // last look; `is_watched` then gates every periodic FFI call below.
+        let is_watched = state.refresh_reader_demand();
         match rx.recv_timeout(wait) {
             Ok(cmd) => {
                 let is_read = matches!(cmd, Command::ReadFileRange { .. });
                 let stop = state.handle_command(cmd);
                 state.drain_piece_finished();
                 state.poll_pending_reads();
-                if !state.pending_reads.is_empty() {
+                let has_parked_read = !state.pending_reads.is_empty();
+                if has_parked_read
+                    || (is_watched && last_stats_sample.elapsed() >= SNAPSHOT_INTERVAL)
+                {
                     state.refresh_session_stats();
+                    last_stats_sample = Instant::now();
                 }
-                if !is_read || last_publish.elapsed() >= SNAPSHOT_INTERVAL {
+                if should_publish_after_command(is_read, is_watched, last_publish.elapsed()) {
                     state.publish_snapshot();
                     last_publish = Instant::now();
                 }
@@ -1218,10 +1318,12 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 }
                 state.drain_piece_finished();
                 state.poll_pending_reads();
-                if housekeeping || !state.pending_reads.is_empty() {
+                let has_parked_read = !state.pending_reads.is_empty();
+                if has_parked_read || (housekeeping && is_watched) {
                     state.refresh_session_stats();
+                    last_stats_sample = Instant::now();
                 }
-                if last_publish.elapsed() >= SNAPSHOT_INTERVAL {
+                if is_watched && last_publish.elapsed() >= SNAPSHOT_INTERVAL {
                     state.publish_snapshot();
                     last_publish = Instant::now();
                 }
@@ -1250,6 +1352,24 @@ impl EngineState {
     /// This is the sole producer for the `.stats` Global Rates counters.
     fn refresh_session_stats(&self) {
         self.session.post_stats();
+    }
+
+    /// Open a fresh reader-demand window if a `.stats` accessor has fired since
+    /// the last look, and report whether one is live now.  `false` means no
+    /// consumer for the snapshot: the periodic publish and session-stats
+    /// sample are then skipped entirely.
+    fn refresh_reader_demand(&mut self) -> bool {
+        let observed = self.reader_demand.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let (seen, until) = advance_reader_demand(
+            observed,
+            self.seen_reader_demand,
+            self.reader_demand_until,
+            now,
+        );
+        self.seen_reader_demand = seen;
+        self.reader_demand_until = until;
+        reader_demand_is_live(until, now)
     }
 
     /// Handle one command; returns `true` when the engine should stop.
@@ -2699,6 +2819,11 @@ impl EngineState {
     }
 
     /// Publish the current engine state into the shared snapshot.
+    ///
+    /// Costs one `post_torrent_updates` FFI round trip (libtorrent rebuilds a
+    /// `torrent_status` per handle), a status/tracker read per handle and one
+    /// cache lookup per piece, so the loop calls it only while a `.stats`
+    /// reader is looking (see [`READER_DEMAND_TTL`]).
     fn publish_snapshot(&mut self) {
         let mut statuses = HashMap::new();
         let mut pieces = HashMap::new();
@@ -2797,11 +2922,13 @@ impl EngineState {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_empty_swarm_since, cache_stall_message, cache_stall_stderr_hint,
-        classify_read_stall, discovery_window_advice, no_peers_message, no_seeder_stderr_hint,
-        no_seeder_wait, partial_read_bounds, peer_discovery_window_secs, piece_wait_window_secs,
-        read_wait_budget_secs, swarm_is_empty, ColdFlight, NoSeederWait, ReadStallCause,
-        NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS,
+        advance_empty_swarm_since, advance_reader_demand, cache_stall_message,
+        cache_stall_stderr_hint, classify_read_stall, discovery_window_advice, no_peers_message,
+        no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds, peer_discovery_window_secs,
+        piece_wait_window_secs, read_wait_budget_secs, reader_demand_is_live,
+        should_publish_after_command, swarm_is_empty, ColdFlight, NoSeederWait, ReadStallCause,
+        NO_SEEDER_FAST_FAIL_SECS, NO_SEEDER_READ_TIMEOUT_SECS, READER_DEMAND_TTL,
+        SNAPSHOT_INTERVAL,
     };
     use crate::infrastructure::config::{
         DEFAULT_PEER_DISCOVERY_WAIT_SECS, DEFAULT_READ_TIMEOUT_SECS,
@@ -3335,5 +3462,67 @@ mod tests {
             partial_read_bounds(4, 3, 262_144, 1_048_576, 1_200_000),
             None
         );
+    }
+
+    /// A `.stats` accessor that the engine has already seen must not move the
+    /// demand window: only a new accessor (a changed counter) opens a fresh
+    /// one, so the window measures "is someone still reading" rather than
+    /// "has anyone ever read".
+    #[test]
+    fn reader_demand_window_opens_only_on_a_new_accessor() {
+        let now = Instant::now();
+        let window = Some(now + READER_DEMAND_TTL);
+
+        assert_eq!(advance_reader_demand(1, 1, window, now), (1, window));
+
+        let (seen, until) = advance_reader_demand(2, 1, window, now);
+        assert_eq!(seen, 2);
+        assert_eq!(until, Some(now + READER_DEMAND_TTL));
+    }
+
+    /// The window is live strictly before its deadline and dead at it — the
+    /// boundary decides whether an idle daemon resumes publishing.
+    #[test]
+    fn reader_demand_window_expires_at_its_deadline() {
+        let now = Instant::now();
+        let deadline = now + READER_DEMAND_TTL;
+
+        assert!(reader_demand_is_live(Some(deadline), now));
+        assert!(reader_demand_is_live(
+            Some(deadline),
+            deadline - Duration::from_millis(1)
+        ));
+        assert!(!reader_demand_is_live(Some(deadline), deadline));
+        assert!(!reader_demand_is_live(None, now));
+    }
+
+    /// The window must outlast the publish cadence: a reader polling `.stats`
+    /// once per `SNAPSHOT_INTERVAL` has to keep the engine publishing between
+    /// two of its reads, otherwise a monitoring reader would see the engine
+    /// fall idle between polls and its second read would be stale.  Slower
+    /// readers are outside that guarantee by design — their staleness is
+    /// bounded by their own polling interval (see [`READER_DEMAND_TTL`]).
+    #[test]
+    fn reader_demand_window_covers_the_publish_cadence() {
+        assert!(READER_DEMAND_TTL >= 2 * SNAPSHOT_INTERVAL);
+    }
+
+    /// A mutating command always publishes — it changes what `.stats` reports —
+    /// while a read command only refreshes the rate-limited snapshot for a
+    /// watching reader: an unwatched read burst (`dd bs=1 count=N`) must not
+    /// rebuild the piece grid every tick.
+    #[test]
+    fn read_commands_publish_only_for_a_watching_reader() {
+        let early = SNAPSHOT_INTERVAL - Duration::from_millis(1);
+
+        assert!(should_publish_after_command(false, false, Duration::ZERO));
+        assert!(should_publish_after_command(false, true, early));
+        assert!(!should_publish_after_command(
+            true,
+            false,
+            SNAPSHOT_INTERVAL
+        ));
+        assert!(!should_publish_after_command(true, true, early));
+        assert!(should_publish_after_command(true, true, SNAPSHOT_INTERVAL));
     }
 }
