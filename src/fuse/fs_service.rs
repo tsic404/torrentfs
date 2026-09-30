@@ -1948,7 +1948,7 @@ impl FsService {
                         let offset = offset as usize;
                         let read_size = size as usize;
 
-                        info!(
+                        debug!(
                             "Read request for torrent file: {} (torrent_id={}, file_id={}, offset={}, size={})",
                             name, torrent_id, file_id, offset, read_size
                         );
@@ -2085,9 +2085,14 @@ impl FsService {
                                     cache.insert(cache_key.clone(), data.clone());
                                 }
                             }
-                            info!(
-                                "Successfully read {} bytes from torrent file \
-                                 (torrent_id={}, file_id={})",
+                            // `info!` here printed ~2 lines per 128 KiB chunk, so a
+                            // single `cat`/`cp` of a large seed produced hundreds of
+                            // thousands of identical lines.  Read activity is observable
+                            // in `.stats` (per-layer read counts: Cache L1/L2/L3 hits,
+                            // deferred reads); byte totals are not tracked — per-chunk
+                            // detail stays at DEBUG.
+                            debug!(
+                                "Read {} bytes from torrent file (torrent_id={}, file_id={}, cache=L2)",
                                 data.len(),
                                 torrent_id,
                                 file_id
