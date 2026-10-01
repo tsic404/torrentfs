@@ -104,6 +104,7 @@ jobs:
         run: |
           bash -n ./ci/tests/small_cache_read_e2e.sh
           bash -n ./ci/tests/small_cache_steady_state_e2e.sh
+          bash -n ./ci/tests/slow_swarm_e2e.sh
 
   deploy-rootful-test:
     name: Deploy Rootful Shell Tests
@@ -346,6 +347,9 @@ jobs:
 
       - name: Run small-cache steady-state e2e
         run: ./ci/tests/small_cache_steady_state_e2e.sh
+
+      - name: Run slow-swarm e2e
+        run: ./ci/tests/slow_swarm_e2e.sh
 
   multifile-read-e2e:
     name: Multi-File Read E2E (seeded multi-file torrent)

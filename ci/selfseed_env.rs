@@ -11,6 +11,9 @@
 #[path = "seeder_common.rs"]
 mod seeder_common;
 
+#[path = "stall_peer.rs"]
+mod stall_peer;
+
 #[path = "mffs_common.rs"]
 mod mffs_common;
 
@@ -104,6 +107,11 @@ struct Args {
     /// Seconds to stay out of the swarm after the torrent is written, before
     /// the first announce (0 = announce immediately).
     announce_delay_secs: u64,
+    /// Serve a stalled peer instead of the libtorrent seeder: a handshake and a
+    /// complete bitfield, then no data.  Gives the swarm a *connected* seeder
+    /// with a zero download rate — the state a loopback libtorrent seeder can
+    /// never hold, since it serves every requested piece immediately.
+    stall_peer: bool,
     /// Payload directory of the multi-file torrent to serve alongside the
     /// single-file one, with the torrent name to bencode it under and the
     /// path to write it to.  All three are absent (single-file-only seeder)
@@ -128,6 +136,7 @@ fn parse_args() -> Args {
         torrent_out: PathBuf::from("selfseed.torrent"),
         url_out: PathBuf::from("tracker.url"),
         announce_delay_secs: 0,
+        stall_peer: false,
         mffs: None,
     };
     // Collected while parsing and validated once every flag is known: the
@@ -158,6 +167,7 @@ fn parse_args() -> Args {
                     .parse()
                     .expect("bad announce delay")
             }
+            "--stall-peer" => args.stall_peer = true,
             "--mffs-payload-dir" => {
                 mffs_payload_dir = Some(value_for!("--mffs-payload-dir").into())
             }
@@ -308,6 +318,24 @@ fn main() {
     // parks with its prefetch gradient published in `.stats`, which is what
     // makes the `[7][6][5][4][3]` transient sampleable on a small payload.
     if !hold_out_of_swarm(Duration::from_secs(args.announce_delay_secs)) {
+        return;
+    }
+
+    // 6. Stall mode: swap the libtorrent seeder for a peer that connects and
+    // advertises every piece but never sends one.  Both torrents are served by
+    // the same fake peer, so the flag means the same swarm layout either way.
+    if args.stall_peer {
+        let mut stall_torrents = vec![stall_peer::StallTorrent {
+            info_hash: info.info_hash().expect("info hash"),
+            num_pieces: info.num_pieces(),
+        }];
+        if let Some(mffs_info) = &mffs_info {
+            stall_torrents.push(stall_peer::StallTorrent {
+                info_hash: mffs_info.info_hash().expect("info hash"),
+                num_pieces: mffs_info.num_pieces(),
+            });
+        }
+        stall_peer::run(stall_torrents, &announce_url).expect("stalled peer failed");
         return;
     }
 
