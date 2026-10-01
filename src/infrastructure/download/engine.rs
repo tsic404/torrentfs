@@ -186,6 +186,9 @@ struct EngineState {
     /// run a single probe and share its outcome instead of each starting its
     /// own window and making its own "no seeder" decision.
     cold_flights: HashMap<String, ColdFlight>,
+    /// Per-info_hash verdict of the last probe that found the swarm empty,
+    /// inherited by the reads that follow it (see [`SourcelessSwarm`]).
+    sourceless: HashMap<String, SourcelessSwarm>,
     /// Per-info_hash instant the swarm last became empty (no peers, no seeds).
     /// Kept across ticks so the published age measures one continuous empty
     /// window instead of the time since the last snapshot.
@@ -305,6 +308,7 @@ impl DownloadEngine {
                     piece_finished_rx,
                     pending_reads: Vec::new(),
                     cold_flights: HashMap::new(),
+                    sourceless: HashMap::new(),
                     empty_swarm_since: HashMap::new(),
                     reader_demand: thread_reader_demand,
                     seen_reader_demand: 0,
@@ -1218,6 +1222,66 @@ impl ColdFlight {
     }
 }
 
+/// A finished probe's verdict that a swarm has neither a peer nor a seed, kept
+/// past the end of the probe's window so the reads that follow it do not each
+/// re-open a cold flight.
+///
+/// A whole-file `cat` reaches the engine as one read per FUSE chunk, and with
+/// an empty swarm every chunk used to pay a full discovery window of its own:
+/// three chunks spent three windows (3 × 12s measured) waiting for a seeder
+/// none of those windows could produce, while the first window's verdict
+/// already spoke for all of them.  The verdict is evidence with a shelf life:
+/// it speaks only for a swarm that is still empty, so it is dropped the moment
+/// a peer or seed connects (checked against a live status read before the
+/// verdict is applied) and it lapses one window after the probe gave up — the
+/// next read then probes again, which is what keeps a seeder that came online
+/// after the probe reachable.
+struct SourcelessSwarm {
+    /// Instant the probe gave up: the verdict's epoch and its TTL anchor.
+    at: Instant,
+    /// The probe's discovery window, reused as the verdict's TTL and its
+    /// re-announce cadence.
+    window: Duration,
+    /// How long the probe's discovery wait actually ran, so an inheriting read
+    /// reports the same elapsed window a fresh probe would have reported.
+    elapsed: Duration,
+    /// Instant of the last announce this verdict drove.  It starts at the
+    /// probe's end — the probe announced at its own half-window mark and then
+    /// waited the rest out — so the first inherited read re-announces only a
+    /// half-window later.
+    last_announce: Instant,
+}
+
+impl SourcelessSwarm {
+    fn new(at: Instant, window: Duration, elapsed: Duration) -> Self {
+        Self {
+            at,
+            window,
+            elapsed,
+            last_announce: at,
+        }
+    }
+
+    /// Whether the verdict still speaks for the swarm: less than one window has
+    /// passed since the probe gave up.  At the boundary the verdict is spent —
+    /// a read arriving there probes again instead of inheriting stale evidence.
+    fn is_live(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) < self.window
+    }
+
+    /// Whether an inheriting read owes the swarm a re-announce, marking it
+    /// taken.  One announce per half-window keeps the probe's cadence alive —
+    /// the inheriting reads do not wait, so nothing else would drive discovery
+    /// — without letting a burst of chunk reads announce once per read.
+    fn take_reannounce(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last_announce) < self.window / 2 {
+            return false;
+        }
+        self.last_announce = now;
+        true
+    }
+}
+
 /// A read that passed validation and is ready to be served or parked.
 struct PreparedRead {
     info: Arc<TorrentInfo>,
@@ -1589,6 +1653,9 @@ impl EngineState {
                 info_hash
             );
         }
+        // The fresh handle announces on its own schedule again, so a verdict
+        // left by an earlier handle must not suppress its reads.
+        self.sourceless.remove(&info_hash);
         // Record the private flag so that tracker merging can
         // check it without re-parsing the torrent_info on every duplicate
         // add. The flag is immutable for the lifetime of the info_hash.
@@ -1610,6 +1677,7 @@ impl EngineState {
         self.scheduler.remove_torrent(info_hash);
         self.private_torrents.remove(info_hash);
         self.cold_flights.remove(info_hash);
+        self.sourceless.remove(info_hash);
         Ok(())
     }
 
@@ -1937,9 +2005,14 @@ impl EngineState {
         true
     }
 
-    /// Serve a read from local pieces when possible; otherwise apply the reader
-    /// priority gradient and park it in a swarm-wait phase.  Returns
-    /// `Some(result)` when the read finished here.
+    /// Serve a read from local pieces when possible, or against a recent
+    /// probe's sourceless verdict when the swarm is still empty; otherwise
+    /// apply the reader priority gradient and park it in a swarm-wait phase.
+    /// Returns `Some(result)` when the read finished here.
+    ///
+    /// The verdict is applied before the gradient is registered: an inheriting
+    /// read fails fast, and `reader_added` scales with torrent size and exists
+    /// only to drive a download it would never start.
     fn begin_waiting(&mut self, read: &mut PendingRead) -> Option<TorrentResult<Vec<u8>>> {
         // A fully-cached read must not run the download machinery:
         // `reader_added`/`publish_snapshot`/`release_reader` scale with torrent
@@ -1965,6 +2038,75 @@ impl EngineState {
                 read.end_offset,
                 read.size,
             ));
+        }
+
+        // A recent probe's verdict (see [`SourcelessSwarm`]) stands in for this
+        // read's own discovery window: the read inherits the probe's outcome
+        // instead of re-spending the window, which is what keeps a whole-file
+        // `cat` — one read per FUSE chunk — from paying a window per chunk.
+        if self.sourceless.contains_key(&read.info_hash) {
+            // Only a live status read can tell whether the verdict still speaks
+            // for the swarm: the read may have sat in the settle/recheck phases
+            // while a peer or seed connected, which spends the verdict.
+            if let Some(status) = self
+                .handles
+                .get(&read.info_hash)
+                .and_then(|h| h.status().ok())
+            {
+                read.status = status;
+            }
+            let now = Instant::now();
+            let inherited = match self.sourceless.get_mut(&read.info_hash) {
+                Some(verdict)
+                    if swarm_is_empty(read.status.num_peers, read.status.num_seeds)
+                        && verdict.is_live(now) =>
+                {
+                    Some((verdict.elapsed, verdict.take_reannounce(now)))
+                }
+                _ => None,
+            };
+            if let Some((elapsed, is_reannounce_due)) = inherited {
+                // This read does not wait, so nothing else drives discovery
+                // while the verdict suppresses it: keep the probe's own
+                // announce cadence, which is what lets a seeder that joined
+                // after the probe be found by a later read.
+                if is_reannounce_due {
+                    if let Some(handle) = self.handles.get(&read.info_hash) {
+                        if !handle.force_reannounce() {
+                            tracing::debug!(
+                                "read_file_range {}: force_reannounce rejected (non-fatal)",
+                                read.info_hash
+                            );
+                        }
+                    }
+                }
+                // The verdict stands in for the discovery window, not for the
+                // data: pieces this read already holds are still served, as the
+                // short read `read_timed_out` builds from the prefix.  The
+                // range-wide check above is false as soon as one piece of the
+                // range is missing, so advance `current_piece` past the locally
+                // available prefix first — otherwise a read that spans a cached
+                // prefix and missing pieces reports zero bytes for data it has.
+                while read.current_piece <= read.end_piece
+                    && self.piece_is_local(
+                        &read.info_hash,
+                        read.current_piece,
+                        read.piece_length,
+                        read.num_pieces,
+                        read.total_size,
+                    )
+                {
+                    read.current_piece += 1;
+                }
+                read.is_peer_wait_exhausted = true;
+                read.peer_wait_elapsed = elapsed;
+                return Some(self.read_timed_out(read, read.current_piece, Duration::ZERO));
+            }
+            // Spent — a peer or seed is present, or the verdict aged out — so
+            // this read runs its own discovery or download from here.  The
+            // status refresh above already routed it (see the swarm check
+            // below).
+            self.sourceless.remove(&read.info_hash);
         }
 
         // ReaderAdded: elevate priority for this read.  Publish immediately so
@@ -2017,6 +2159,7 @@ impl EngineState {
         // With zero connected peers/seeds, kick the swarm immediately: after a
         // delete + re-add the fresh handle's first announce can land outside
         // the tracker's min-interval, timing out an otherwise-healthy read.
+        // (A live verdict would have ended this read above, so it probes.)
         if swarm_is_empty(read.status.num_peers, read.status.num_seeds) {
             self.enter_peer_wait(read);
         } else {
@@ -2279,7 +2422,25 @@ impl EngineState {
             // would fail every later read instantly and leave discovery to
             // libtorrent's own (possibly minutes-long) announce schedule.
             self.cold_flights.remove(&read.info_hash);
-            read.peer_wait_elapsed = Instant::now().saturating_duration_since(read.phase_start);
+            let now = Instant::now();
+            read.peer_wait_elapsed = now.saturating_duration_since(read.phase_start);
+            if read.is_peer_wait_exhausted {
+                // Record the probe's verdict for the reads that follow it: with
+                // the swarm still empty they inherit it instead of each
+                // re-opening a cold flight and re-spending this window (see
+                // [`SourcelessSwarm`]).
+                self.sourceless.insert(
+                    read.info_hash.clone(),
+                    SourcelessSwarm::new(
+                        now,
+                        Duration::from_secs(self.peer_discovery_window_secs()),
+                        read.peer_wait_elapsed,
+                    ),
+                );
+            } else {
+                // A peer or seed arrived inside the window, so no verdict.
+                self.sourceless.remove(&read.info_hash);
+            }
             self.enter_piece_wait(read);
             return None;
         }
@@ -2296,6 +2457,7 @@ impl EngineState {
                 self.publish_snapshot();
                 if has_swarm {
                     self.cold_flights.remove(&read.info_hash);
+                    self.sourceless.remove(&read.info_hash);
                     read.peer_wait_elapsed =
                         Instant::now().saturating_duration_since(read.phase_start);
                     self.enter_piece_wait(read);
@@ -2617,6 +2779,52 @@ impl EngineState {
         }
     }
 
+    /// Whether one piece of a read range is available locally right now: the
+    /// handle has it and its on-disk data is present, or the piece store holds
+    /// it complete.  A stale bit — `have_piece` true but the file gone or
+    /// truncated — is *not* local: that piece has to be re-downloaded.
+    fn piece_is_local(
+        &self,
+        info_hash: &str,
+        piece_idx: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) -> bool {
+        let handle = match self.handles.get(info_hash) {
+            Some(h) => h,
+            None => return false,
+        };
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let complete = self
+            .store
+            .cache_manager()
+            .lock()
+            .map(|c| {
+                PieceStore::is_piece_complete_in_cache(
+                    &c,
+                    &piece_key,
+                    piece_idx,
+                    piece_length,
+                    num_pieces,
+                    total_size,
+                )
+            })
+            .unwrap_or(false);
+        // use the unified stale detection — `have_piece` true
+        // but the on-disk file is gone or truncated means the bit is
+        // stale; the piece is NOT available locally and must be
+        // re-downloaded.
+        let have_valid = handle.have_piece(piece_idx)
+            && !self.store.has_stale_piece(
+                &piece_key,
+                PieceStore::expected_piece_size(piece_idx, piece_length, num_pieces, total_size),
+            );
+        have_valid || complete
+    }
+
+    /// Whether every piece of a read range is available locally
+    /// (see [`Self::piece_is_local`]).
     fn all_pieces_local(
         &self,
         info_hash: &str,
@@ -2626,48 +2834,9 @@ impl EngineState {
         num_pieces: i32,
         total_size: u64,
     ) -> bool {
-        let handle = match self.handles.get(info_hash) {
-            Some(h) => h,
-            None => return false,
-        };
-        for piece_idx in start_piece..=end_piece {
-            let piece_key = PieceStore::piece_key(info_hash, piece_idx);
-            let complete = self
-                .store
-                .cache_manager()
-                .lock()
-                .map(|c| {
-                    PieceStore::is_piece_complete_in_cache(
-                        &c,
-                        &piece_key,
-                        piece_idx,
-                        piece_length,
-                        num_pieces,
-                        total_size,
-                    )
-                })
-                .unwrap_or(false);
-            // use the unified stale detection — `have_piece` true
-            // but the on-disk file is gone or truncated means the bit is
-            // stale; the piece is NOT available locally and must be
-            // re-downloaded.
-            let have = handle.have_piece(piece_idx);
-            let have_valid = if have {
-                let expected = PieceStore::expected_piece_size(
-                    piece_idx,
-                    piece_length,
-                    num_pieces,
-                    total_size,
-                );
-                !self.store.has_stale_piece(&piece_key, expected)
-            } else {
-                false
-            };
-            if !have_valid && !complete {
-                return false;
-            }
-        }
-        true
+        (start_piece..=end_piece).all(|piece_idx| {
+            self.piece_is_local(info_hash, piece_idx, piece_length, num_pieces, total_size)
+        })
     }
 
     /// Every piece in the range whose libtorrent bitmask is stale —
@@ -3056,7 +3225,7 @@ mod tests {
         no_peers_message, no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds,
         peer_discovery_window_secs, piece_wait_window_secs, read_wait_budget_secs,
         reader_demand_is_live, should_publish_after_command, swarm_is_empty, ColdFlight,
-        NoSeederWait, ReadStallCause, WaitingReads, NO_SEEDER_FAST_FAIL_SECS,
+        NoSeederWait, ReadStallCause, SourcelessSwarm, WaitingReads, NO_SEEDER_FAST_FAIL_SECS,
         NO_SEEDER_READ_TIMEOUT_SECS, READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
     };
     use crate::infrastructure::config::{
@@ -3112,6 +3281,57 @@ mod tests {
         assert!(
             !flight.take_reannounce(start + Duration::from_secs(9)),
             "a second attached reader must not re-announce again"
+        );
+    }
+
+    /// A sourceless verdict speaks for exactly one window of wall-clock after
+    /// the probe gave up: a read arriving inside that window inherits the
+    /// probe's outcome instead of re-spending the window, and a read arriving
+    /// at the boundary probes again — that lapse is what keeps a seeder that
+    /// came online after the probe reachable by a retry.
+    #[test]
+    fn sourceless_verdict_lapses_one_window_after_the_probe() {
+        let at = Instant::now();
+        let window = Duration::from_secs(12);
+        let verdict = SourcelessSwarm::new(at, window, window);
+
+        assert!(verdict.is_live(at), "a fresh verdict is live");
+        assert!(verdict.is_live(at + Duration::from_millis(11_999)));
+        assert!(
+            !verdict.is_live(at + window),
+            "the verdict must be spent exactly one window after the probe"
+        );
+        assert!(!verdict.is_live(at + Duration::from_secs(60)));
+    }
+
+    /// The verdict's re-announce cadence matches the probe's own: one announce
+    /// per half-window, repeated for as long as the verdict lives — the reads
+    /// inheriting it do not wait, so nothing else drives discovery, and a
+    /// seeder that joined after the probe must still be found.  A burst of
+    /// chunk reads inside one half-window must not each announce.
+    #[test]
+    fn sourceless_verdict_reannounces_once_per_half_window() {
+        let at = Instant::now();
+        let window = Duration::from_secs(10);
+        let mut verdict = SourcelessSwarm::new(at, window, window);
+
+        assert!(
+            !verdict.take_reannounce(at),
+            "the probe announced at its own half-window mark, so an inheriting \
+             read must not announce immediately after it"
+        );
+        assert!(!verdict.take_reannounce(at + Duration::from_secs(4)));
+        assert!(
+            verdict.take_reannounce(at + Duration::from_secs(5)),
+            "an inheriting read must announce once half the window elapsed"
+        );
+        assert!(
+            !verdict.take_reannounce(at + Duration::from_secs(9)),
+            "a later read inside the same half-window must not announce again"
+        );
+        assert!(
+            verdict.take_reannounce(at + Duration::from_secs(10)),
+            "the cadence keeps running while the verdict is live"
         );
     }
 

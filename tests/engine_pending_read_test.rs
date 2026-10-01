@@ -129,19 +129,19 @@ fn parked_no_seeder_read_does_not_block_engine_commands() {
 }
 
 /// Concurrent cold reads of one info_hash share a single discovery window
-/// (single flight), and that window retires when it ends.
+/// (single flight), and the probe that ends it speaks for the reads that
+/// follow.
 ///
 /// Two end-to-end observable properties, each discriminating against a
 /// different regression:
 /// * a reader joining *inside* the window fails at the shared deadline instead
 ///   of opening a window of its own (pre-flight, N concurrent readers ran N
 ///   independent probes);
-/// * a reader arriving *after* the window gets a fresh flight — a new
-///   `force_reannounce` and a fresh window — instead of failing instantly
-///   against an expired one.  Retaining the expired flight would leave a seeder
-///   that came online after the probe unreachable until libtorrent's own
-///   announce schedule fired, turning intermittent ENODATA into persistent
-///   `NoPeers`.
+/// * a reader arriving *after* the window inherits the probe's sourceless
+///   verdict instead of re-spending the window.  Per-window probing made a
+///   whole-file `cat` — one read per FUSE chunk — cost one window per chunk;
+///   the verdict lapses one window after the probe (see `SourcelessSwarm`), so
+///   a seeder that came online later is still reachable by a retry.
 #[test]
 #[ignore = "requires local tracker; ~45s wall-clock"]
 fn concurrent_cold_reads_share_one_discovery_window() {
@@ -241,21 +241,25 @@ fn concurrent_cold_reads_share_one_discovery_window() {
     );
 
     // ── A reader arriving after the window elapsed ────────────────────
-    // The flight retired with the window, so this read must probe again: a
-    // fresh `force_reannounce` and a fresh window.
-    let recovery_start = Instant::now();
-    let recovery = engine.read_file_range(info.clone(), 0, 0, 4096);
-    let recovery_elapsed = recovery_start.elapsed();
+    // The probe that just gave up left a sourceless verdict behind, so this
+    // read inherits its outcome instead of re-spending the window: a whole-file
+    // `cat` split into N reads must not cost N windows.  That the verdict still
+    // lets a seeder arriving later be found — the property the expired flight's
+    // retirement used to carry — is asserted by the verdict's lapse in
+    // `read_file_test::test_repeat_read_reuses_the_sourceless_verdict` and by
+    // `read_file_test::test_seeder_joining_after_a_sourceless_verdict_is_reachable`.
+    let repeat_start = Instant::now();
+    let repeat = engine.read_file_range(info.clone(), 0, 0, 4096);
+    let repeat_elapsed = repeat_start.elapsed();
     assert!(
-        recovery.is_err(),
+        repeat.is_err(),
         "no seeder is reachable, so the read must fail"
     );
     assert!(
-        recovery_elapsed >= Duration::from_secs(8),
-        "a reader arriving after the window waited only {:.1}s; the expired \
-         flight must be retired so this read probes again instead of failing \
-         instantly",
-        recovery_elapsed.as_secs_f64()
+        repeat_elapsed < JOIN_DELAY / 2,
+        "a reader arriving inside the probe's verdict waited {:.1}s; it must \
+         inherit the verdict instead of re-spending the discovery window",
+        repeat_elapsed.as_secs_f64()
     );
 }
 
