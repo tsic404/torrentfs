@@ -44,7 +44,10 @@ pub use piece_priority::PiecePriorityToml;
 pub use pieces::PiecesConfig;
 pub use proxy::ProxyConfig;
 pub use rate_limits::RateLimitsConfig;
-pub use timeouts::{TimeoutsConfig, DEFAULT_PEER_DISCOVERY_WAIT_SECS, DEFAULT_READ_TIMEOUT_SECS};
+pub use timeouts::{
+    TimeoutsConfig, DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
+    DEFAULT_READ_TIMEOUT_SECS,
+};
 pub use tracker::TrackerConfig;
 pub use user_agent::UserAgentConfig;
 
@@ -339,6 +342,8 @@ max_connections = 200
 
 [timeouts]
 read_timeout_secs = 60
+peer_wait_cap_secs = 30
+no_seeder_read_timeout_secs = 20
 
 [local_discovery]
 lsd_enabled = false
@@ -353,6 +358,8 @@ lsd_enabled = false
         );
         assert_eq!(config.connections.max_connections, Some(200));
         assert_eq!(config.timeouts.read_timeout_secs, Some(60));
+        assert_eq!(config.timeouts.resolved_peer_wait_cap_secs(), Some(30));
+        assert_eq!(config.timeouts.resolved_no_seeder_read_timeout_secs(), 20);
         assert_eq!(config.local_discovery.lsd_enabled, Some(false));
 
         // Verify JSON output includes the settings
@@ -439,6 +446,53 @@ read_timeout_secs = 10
         assert_eq!(config.timeouts.peer_discovery_wait_secs, Some(90));
         assert_eq!(config.timeouts.resolved_peer_discovery_wait_secs(), 90);
     }
+
+    #[test]
+    fn test_peer_wait_cap_config() {
+        // Default: unset → no extra cap, so the discovery window stays the one
+        // the read timeout and `peer_discovery_wait_secs` agree on.
+        let default_config = TorrentfsConfig::default_config();
+        assert_eq!(default_config.timeouts.resolved_peer_wait_cap_secs(), None);
+
+        // Non-positive means the same as unset — a cap of zero seconds would
+        // fail every cold read on its first poll.
+        let non_positive: TorrentfsConfig =
+            toml::from_str("[timeouts]\npeer_wait_cap_secs = 0\n").unwrap();
+        assert_eq!(non_positive.timeouts.resolved_peer_wait_cap_secs(), None);
+
+        // Custom cap
+        let config: TorrentfsConfig =
+            toml::from_str("[timeouts]\npeer_wait_cap_secs = 5\n").unwrap();
+        assert_eq!(config.timeouts.peer_wait_cap_secs, Some(5));
+        assert_eq!(config.timeouts.resolved_peer_wait_cap_secs(), Some(5));
+    }
+
+    #[test]
+    fn test_no_seeder_read_timeout_config() {
+        // Default: unset → the shipped no-seeder piece-wait window.
+        let default_config = TorrentfsConfig::default_config();
+        assert_eq!(
+            default_config
+                .timeouts
+                .resolved_no_seeder_read_timeout_secs(),
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS
+        );
+
+        // Non-positive value falls back to the default, like read_timeout_secs.
+        let non_positive: TorrentfsConfig =
+            toml::from_str("[timeouts]\nno_seeder_read_timeout_secs = 0\n").unwrap();
+        assert_eq!(
+            non_positive.timeouts.resolved_no_seeder_read_timeout_secs(),
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS
+        );
+
+        // Custom window
+        let config: TorrentfsConfig =
+            toml::from_str("[timeouts]\nno_seeder_read_timeout_secs = 60\n").unwrap();
+        assert_eq!(config.timeouts.no_seeder_read_timeout_secs, Some(60));
+        assert_eq!(config.timeouts.resolved_no_seeder_read_timeout_secs(), 60);
+    }
+
     #[test]
     fn test_config_rejects_unknown_section() {
         let dir = tempfile::TempDir::new().unwrap();
