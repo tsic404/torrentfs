@@ -1013,6 +1013,314 @@ fn test_peer_appearing_mid_read_returns_data() {
     drop(harness_seed);
 }
 
+/// A probe's verdict that a swarm is sourceless is inherited by the reads that
+/// follow it, so a whole-file `cat` — which reaches the engine as one read per
+/// FUSE chunk — spends one discovery window instead of one per chunk.  The
+/// verdict is also evidence with a shelf life: it must lapse one window after
+/// the probe, so a later read probes again and can still find a seeder that
+/// came online after the probe.
+///
+/// Deterministic: unique info_hash with a dead tracker URL and LSD off, so no
+/// peer can ever appear and the discovery window is what ends every read here.
+#[test]
+fn test_repeat_read_reuses_the_sourceless_verdict() {
+    let _slot = wave_slot();
+
+    let torrent_data = distinct_torrent("sourceless-verdict.iso");
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    // The read timeout must not be what ends these reads: at 60s it leaves the
+    // 2s discovery knob as the binding window of the `min`.
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.peer_discovery_wait_secs = Some(2);
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    // ── First read: the probe spends the whole discovery window ────────
+    let probe_start = std::time::Instant::now();
+    let probe = engine.read_file_range(info.clone(), 0, 0, 4096);
+    let probe_elapsed = probe_start.elapsed();
+    match probe {
+        Err(torrentfs::TorrentError::NoPeers(msg)) => {
+            assert!(
+                msg.contains("raise [timeouts] peer_discovery_wait_secs"),
+                "the probe's NoPeers must name the window that ended it: {msg}"
+            );
+        }
+        other => panic!(
+            "expected NoPeers for a sourceless read, got {:?} after {:.2}s",
+            other.map(|data| data.len()),
+            probe_elapsed.as_secs_f64()
+        ),
+    }
+    assert!(
+        probe_elapsed >= Duration::from_millis(1500),
+        "the probe returned after only {:.2}s: it must spend this test's 2s \
+         discovery window before declaring the swarm sourceless",
+        probe_elapsed.as_secs_f64()
+    );
+
+    // ── Second read: the chunk a `cat` asks for next ───────────────────
+    let repeat_start = std::time::Instant::now();
+    let repeat = engine.read_file_range(info.clone(), 0, 4096, 4096);
+    let repeat_elapsed = repeat_start.elapsed();
+    match repeat {
+        Err(torrentfs::TorrentError::NoPeers(msg)) => {
+            assert!(
+                msg.contains("raise [timeouts] peer_discovery_wait_secs"),
+                "an inherited verdict must report the discovery window that \
+                 produced it: {msg}"
+            );
+        }
+        other => panic!(
+            "expected NoPeers for a sourceless read, got {:?} after {:.2}s",
+            other.map(|data| data.len()),
+            repeat_elapsed.as_secs_f64()
+        ),
+    }
+    assert!(
+        repeat_elapsed < Duration::from_millis(1000),
+        "the read after the probe took {:.2}s: it re-spent the discovery window \
+         instead of inheriting the probe's verdict",
+        repeat_elapsed.as_secs_f64()
+    );
+
+    // ── The verdict lapses after one window ────────────────────────────
+    // A read arriving after that must run its own probe: the lapse is what
+    // keeps a seeder that came online after the probe reachable by a retry.
+    thread::sleep(Duration::from_secs(3));
+    let later_start = std::time::Instant::now();
+    let later = engine.read_file_range(info.clone(), 0, 8192, 4096);
+    let later_elapsed = later_start.elapsed();
+    assert!(
+        later.is_err(),
+        "no peer can reach this swarm, so the read must fail"
+    );
+    assert!(
+        later_elapsed >= Duration::from_millis(1500),
+        "a read after the verdict lapsed waited only {:.2}s: it must probe \
+         again instead of inheriting an aged-out verdict",
+        later_elapsed.as_secs_f64()
+    );
+
+    engine.shutdown();
+}
+
+/// A sourceless verdict suppresses the *wait*, not discovery: a seeder that
+/// joins after a probe declared the swarm sourceless is still reachable by the
+/// reads that follow, and the read once it is connected is served the seeded
+/// bytes.  A verdict that stopped the probe's announce cadence — or that
+/// outlived the swarm's emptiness — would wedge the torrent into permanent
+/// `NoPeers` and fail here.
+#[test]
+fn test_seeder_joining_after_a_sourceless_verdict_is_reachable() {
+    let _slot = wave_slot();
+
+    const FIXTURE_NAME: &str = "seeder-after-verdict.txt";
+
+    let tracker = common::MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    let (torrent_data, file_content) =
+        common::create_single_piece_torrent(&announce_url, FIXTURE_NAME);
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"),
+    );
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    // Tracker-only discovery: the swarm must be genuinely empty for the probe,
+    // and the seeder introduced below is what refills it.
+    config.local_discovery.lsd_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+    // The 2s discovery window is the only window this test measures; the long
+    // read timeout keeps the no-seeder piece wait out of the way of the
+    // served-read assertion below.
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.peer_discovery_wait_secs = Some(2);
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+    engine.ensure_handle(info.clone()).expect("ensure_handle");
+
+    // ── Probe the empty swarm: this is what records the verdict ────────
+    match engine.read_file_range(info.clone(), 0, 0, 50) {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {}
+        other => panic!(
+            "an empty swarm must probe then fail with NoPeers, got {:?}",
+            other.map(|data| data.len())
+        ),
+    }
+
+    // ── A seeder joins the swarm after that verdict ────────────────────
+    let seeder_stop = Arc::new(AtomicBool::new(false));
+    let seeder_handle = {
+        let content = file_content.clone();
+        let seeder_torrent = torrent_data.clone();
+        let stop = Arc::clone(&seeder_stop);
+        thread::spawn(move || {
+            let seed_dir = tempfile::TempDir::new().expect("seed dir");
+            std::fs::write(seed_dir.path().join(FIXTURE_NAME), &content).expect("write seed file");
+            let mut cfg = local_test_config();
+            cfg.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+            let mut session =
+                torrentfs::download::Session::new(&cfg).expect("seeder: failed to create session");
+            let si = torrentfs::TorrentInfo::from_bytes(seeder_torrent).expect("seeder parse");
+            let handle = session
+                .add_torrent(&si, seed_dir.path())
+                .expect("seeder add");
+            loop {
+                if let Ok(s) = handle.status() {
+                    if matches!(
+                        s.state,
+                        torrentfs::download::TorrentState::Seeding
+                            | torrentfs::download::TorrentState::Finished
+                    ) {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+
+    // ── The app retries until the seeder is discovered ─────────────────
+    // Reads inside the verdict fail fast; the cadence the verdict keeps alive
+    // re-announces, so a later retry observes the connected seeder, drops the
+    // verdict, and downloads the piece.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match engine.read_file_range(info.clone(), 0, 0, 50) {
+            Ok(data) => {
+                assert_eq!(
+                    &data[..50],
+                    &file_content[..50],
+                    "the read served after the seeder joined must return the \
+                     seeded bytes"
+                );
+                break;
+            }
+            Err(torrentfs::TorrentError::NoPeers(_)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the seeder never became reachable across {} retries: the \
+                     sourceless verdict wedged discovery",
+                    attempts
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("unexpected read error: {:?}", e),
+        }
+    }
+
+    seeder_stop.store(true, Ordering::Relaxed);
+    seeder_handle.join().expect("seeder thread panicked");
+    engine.shutdown();
+}
+
+/// A read that inherits a sourceless verdict still serves the pieces it holds
+/// locally: the verdict stands in for the discovery window, not for the data.
+/// The prefix is produced by a real download (only the download path registers
+/// a piece as locally complete), then the seeder leaves so the rest of the
+/// range is unreachable; the read must return the cached prefix as a short
+/// read instead of reporting zero bytes for a range it partly has.
+#[test]
+fn test_inherited_verdict_still_serves_the_cached_prefix() {
+    let _slot = wave_slot();
+
+    const NAME: &str = "verdict_cached_prefix.bin";
+    const PIECE_LEN: u32 = 256 * 1024;
+    const FILE_SIZE: u32 = PIECE_LEN * 4;
+
+    let mut harness = TestHarness::with_torrent(|announce_url| {
+        common::build_multipiece_torrent_named(announce_url, NAME)
+    });
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent"),
+    );
+    let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    // Tracker-only discovery: once the seeder leaves, the swarm is genuinely
+    // empty and the 2s discovery window is what ends every later read.
+    config.local_discovery.lsd_enabled = Some(false);
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.peer_discovery_wait_secs = Some(2);
+    // Only the piece a read touches is wanted (no step-ahead, no access
+    // window), so downloading piece 0 leaves pieces 1..3 unavailable: the read
+    // under test spans a cached prefix plus pieces nobody can serve.
+    config.piece_priority.access_window_mb = Some(0);
+    config.piece_priority.step_priorities = Some([0, 0, 0, 0]);
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    engine.ensure_handle(info.clone()).expect("ensure_handle");
+
+    // ── Piece 0 downloads from the live seeder and lands in the cache ──
+    let prefix = engine
+        .read_file_range(info.clone(), 0, 0, PIECE_LEN)
+        .expect("the first piece must download from the live seeder");
+    assert_eq!(
+        prefix,
+        harness.file_content[..PIECE_LEN as usize],
+        "the cached prefix must be the seeded bytes"
+    );
+
+    // ── The seeder leaves, so the range's remaining pieces cannot arrive ──
+    harness.stop_seeder();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let is_empty = engine
+            .try_torrent_status(&info_hash)
+            .is_some_and(|s| s.num_peers == 0 && s.num_seeds == 0);
+        if is_empty {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the swarm never read as empty after the seeder stopped"
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // ── The probe records the sourceless verdict for this info_hash ────
+    // A missing piece (the last one) with nobody to fetch it from: this read
+    // spends the discovery window and leaves the verdict behind.
+    match engine.read_file_range(info.clone(), 0, u64::from(FILE_SIZE - PIECE_LEN), 4096) {
+        Err(torrentfs::TorrentError::NoPeers(_)) => {}
+        other => panic!(
+            "a missing piece on an empty swarm must probe then fail with \
+             NoPeers, got {:?}",
+            other.map(|data| data.len())
+        ),
+    }
+
+    // ── The inherited read still serves the cached prefix ──────────────
+    let data = engine
+        .read_file_range(info.clone(), 0, 0, FILE_SIZE)
+        .expect("the inherited verdict must serve the cached prefix, not zero bytes");
+    assert_eq!(
+        data,
+        harness.file_content[..PIECE_LEN as usize],
+        "the inherited read must return the cached prefix as a short read"
+    );
+
+    engine.shutdown();
+}
+
 /// Build a structurally valid single-file `.torrent` whose piece hashes are
 /// all zero.  Parsing and handle creation only need valid structure (not
 /// correct hashes); distinct `name`s yield distinct info hashes.
