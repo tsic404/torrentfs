@@ -302,7 +302,7 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 |-------|------|
 | `main` | Entry point: CLI args, FUSE mount, bootstrap |
 | `fuse` | FUSE protocol adapter: `Filesystem` trait impl + inode management. No DB/download/seeding logic |
-| `services` | Orchestration: `TorrentService` (torrent lifecycle), `DownloadService` (piece download), `SeedingService` (seeding management) |
+| `services` | Orchestration: `TorrentService` (torrent lifecycle), `DownloadService` (piece download + seeding via the shared session) |
 | `domain` | Pure data models and repository traits (`Torrent`, `TorrentFile`, `TorrentRepository`) |
 | `infrastructure` | Concrete implementations: `db` (SQLite), `download` (libtorrent session), `cache` (LRU piece cache), `config` (TOML), `metadata` (.torrent parsing) |
 

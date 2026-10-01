@@ -2,7 +2,6 @@ pub mod domain;
 pub mod error;
 pub mod fuse;
 pub mod infrastructure;
-pub mod seeding;
 pub mod services;
 
 // Re-exports for backward compatibility — old paths still work
@@ -29,6 +28,4 @@ pub use domain::{
 pub use domain::fs_error::{FsError, FsResult};
 pub use error::{is_transient_read_error, TorrentError, TorrentResult};
 pub use fuse::{FsService, TorrentFs};
-pub use seeding::{SeedingInfo, SeedingManager, SeedingState};
 pub use services::download::DownloadService;
-pub use services::seeding::SeedingService;

@@ -4,7 +4,6 @@
 //! Returns `FsError` (a domain error), never raw errno — the errno mapping is
 //! the FUSE adapter's job. This module does not import `libc`.
 
-use crate::seeding::SeedingManager;
 use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, FileEntry, MoveOverwriteResult, TorrentFile};
@@ -20,7 +19,6 @@ use super::download::DownloadService;
 pub struct TorrentService {
     db: Arc<Mutex<Database>>,
     download_service: Option<Arc<DownloadService>>,
-    seeding_manager: Option<Arc<SeedingManager>>,
 }
 /// Result of synchronously persisting a torrent into the database.
 ///
@@ -37,15 +35,10 @@ pub struct PersistedTorrent {
 }
 
 impl TorrentService {
-    pub fn new(
-        db: Arc<Mutex<Database>>,
-        download_service: Option<Arc<DownloadService>>,
-        seeding_manager: Option<Arc<SeedingManager>>,
-    ) -> Self {
+    pub fn new(db: Arc<Mutex<Database>>, download_service: Option<Arc<DownloadService>>) -> Self {
         Self {
             db,
             download_service,
-            seeding_manager,
         }
     }
 
@@ -172,7 +165,7 @@ impl TorrentService {
         // pieces purged, so libtorrent never checks a torrent whose files
         // are vanishing underneath it.
         if let Some(old) = &persisted.stale_info_hash {
-            self.release_engine_and_seeding(old);
+            self.release_engine_handle(old);
             self.purge_pieces_cache(old);
         }
 
@@ -235,10 +228,9 @@ impl TorrentService {
     /// Remove a torrent from the database by filename and source_path.
     ///
     /// After the DB record is deleted, when no other torrent still references
-    /// the same info_hash: purge the on-disk pieces cache, release the
-    /// DownloadEngine handle (and its scheduler state), and remove the
-    /// SeedingManager seed — so a long-running daemon does not accumulate
-    /// handles or keep announcing a deleted torrent.
+    /// the same info_hash: purge the on-disk pieces cache and release the
+    /// DownloadEngine handle (and its scheduler state) — so a long-running
+    /// daemon does not accumulate handles or keep announcing a deleted torrent.
     pub fn remove_torrent(
         &self,
         filename: &str,
@@ -298,7 +290,7 @@ impl TorrentService {
             // removal inherits a stale have-piece bitmap (complete but gone),
             // forcing the recheck path → NoPeers if no peer connected. Releasing
             // first lets libtorrent tear down against intact files.
-            self.release_engine_and_seeding(&info_hash);
+            self.release_engine_handle(&info_hash);
             self.purge_pieces_cache(&info_hash);
         }
 
@@ -367,23 +359,15 @@ impl TorrentService {
         }
     }
 
-    /// Release the DownloadEngine handle and the SeedingManager seed for an
-    /// info_hash.  Best-effort: the DB row and pieces cache are already gone,
-    /// so a transient engine/seeding failure only leaves a stale handle that a
-    /// restart clears — it never desyncs DB vs. cache.
-    fn release_engine_and_seeding(&self, info_hash: &str) {
+    /// Release the DownloadEngine handle for an info_hash.  Best-effort: the DB
+    /// row and pieces cache are already gone, so a transient engine failure only
+    /// leaves a stale handle that a restart clears — it never desyncs DB vs.
+    /// cache.
+    fn release_engine_handle(&self, info_hash: &str) {
         if let Some(ds) = &self.download_service {
             if let Err(e) = ds.remove_handle(info_hash) {
                 warn!(
                     "Failed to remove DownloadEngine handle for info_hash={}: {:?}",
-                    info_hash, e
-                );
-            }
-        }
-        if let Some(sm) = &self.seeding_manager {
-            if let Err(e) = sm.remove_seed(info_hash) {
-                warn!(
-                    "Failed to remove seeding seed for info_hash={}: {:?}",
                     info_hash, e
                 );
             }
@@ -482,7 +466,7 @@ impl TorrentService {
         if let Some(info_hash) = purge_info_hash {
             // Release the libtorrent handle BEFORE purging piece files (same
             // ordering as `remove_torrent`).
-            self.release_engine_and_seeding(&info_hash);
+            self.release_engine_handle(&info_hash);
             self.purge_pieces_cache(&info_hash);
         }
 
@@ -630,7 +614,7 @@ mod tests {
             insert_torrent(&mut guard, "src", "foo.torrent", &info_hash);
         }
 
-        let svc = TorrentService::new(db_arc, Some(download_service.clone()), None);
+        let svc = TorrentService::new(db_arc, Some(download_service.clone()));
 
         let pieces_dir = cache_dir.join("pieces").join(&info_hash);
         assert!(pieces_dir.exists());
@@ -663,7 +647,7 @@ mod tests {
             insert_torrent(&mut guard, "b", "foo.torrent", &info_hash);
         }
 
-        let svc = TorrentService::new(db_arc, Some(download_service.clone()), None);
+        let svc = TorrentService::new(db_arc, Some(download_service.clone()));
 
         let pieces_dir = cache_dir.join("pieces").join(&info_hash);
         assert!(pieces_dir.exists());
@@ -676,48 +660,6 @@ mod tests {
         let cache = download_service.get_cache_manager().unwrap();
         let guard = cache.lock().unwrap();
         assert!(guard.has_piece(&piece_key));
-    }
-
-    /// `release_engine_and_seeding` must be called when the last DB reference
-    /// to an info_hash is deleted.  This test wires a real
-    /// SeedingManager into the service and asserts that after remove_torrent
-    /// the seeding manager no longer tracks the info_hash.
-    #[test]
-    fn test_remove_torrent_releases_seeding_manager() {
-        let temp_dir = TempDir::new().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-        let config = TorrentfsConfig::default_config();
-
-        let info_hash = "aabbccdd00112233445566778899aabbccdd0011".to_string();
-        let download_service = Arc::new(DownloadService::new(&cache_dir, &config).unwrap());
-        let seeding_manager =
-            Arc::new(crate::seeding::SeedingManager::new(&cache_dir, &config).unwrap());
-
-        let db = Database::open_in_memory().unwrap();
-        let db_arc = Arc::new(Mutex::new(db));
-        {
-            let mut guard = db_arc.lock().unwrap();
-            insert_torrent(&mut guard, "src", "foo.torrent", &info_hash);
-        }
-
-        let svc = TorrentService::new(
-            db_arc,
-            Some(download_service),
-            Some(seeding_manager.clone()),
-        );
-
-        // Before removal the SeedingManager has no handle yet (none was
-        // added); remove_torrent must still call remove_seed without panic
-        // (idempotent).  After removal, has_handle returns false.
-        assert!(!seeding_manager.has_handle(&info_hash));
-
-        let removed = svc.remove_torrent("foo.torrent", "src").unwrap();
-        assert_eq!(removed, Some((1, info_hash.clone())));
-
-        // remove_seed was called (best-effort, no-op if no handle existed);
-        // the seeding manager must not track the deleted info_hash.
-        assert!(!seeding_manager.has_handle(&info_hash));
-        assert!(seeding_manager.get_all_seeds().is_empty());
     }
 
     // ── PT isolation tests ──────────────────────────────────
@@ -828,7 +770,7 @@ mod tests {
     /// content must release the OLD info-hash's engine state — the pieces
     /// cache for `cache/pieces/<old>/` must be purged, not leaked. (The
     /// engine handle itself is released via the same
-    /// `release_engine_and_seeding` call; here we assert the observable
+    /// `release_engine_handle` call; here we assert the observable
     /// on-disk/metadata effect.)
     #[test]
     fn add_torrent_overwrite_purges_old_info_hash_pieces() {
@@ -855,7 +797,7 @@ mod tests {
         let config = TorrentfsConfig::default_config();
         let download_service = Arc::new(DownloadService::new(&cache_dir, &config).unwrap());
         let db = Arc::new(Mutex::new(Database::open_in_memory().unwrap()));
-        let svc = TorrentService::new(db.clone(), Some(download_service.clone()), None);
+        let svc = TorrentService::new(db.clone(), Some(download_service.clone()));
 
         // First add: creates the handle + registers a piece for the OLD hash.
         svc.add_torrent(&old_bytes, "src", "foo.torrent").unwrap();
