@@ -23,11 +23,15 @@
 #
 # Usage: ./ci/run_self_seed_env.sh [--payload-mib N] [--payload-gib N] [--port PORT]
 #        [--tracker-bind IP] [--announce-host IP] [--output-dir DIR]
-#        [--announce-delay SECONDS]
+#        [--announce-delay SECONDS] [--stall-peer]
 #        (--port defaults to 0: the OS picks a free port, published in tracker.url)
 #        (--announce-delay holds the seeder out of the swarm for that long after
 #         the torrent is written, so a read issued meanwhile parks with its
 #         prefetch gradient published in .stats; default: no hold)
+#        (--stall-peer serves a peer that connects and advertises a complete
+#         bitfield but never sends data, instead of the libtorrent seeder: the
+#         swarm then reports a connected seeder with a zero download rate, which
+#         is what the .stats slow-swarm alert observes)
 #        → outputs under DIR when --output-dir is given, else under a fresh
 #          ci/selfseed/output/run.<pid>.<random>/ per run, so concurrent runs
 #          never overwrite each other's artifacts (old run directories are safe
@@ -106,6 +110,7 @@ MAX_ANNOUNCE_DELAY=3600
 TRACKER_PORT=0
 TRACKER_BIND=""
 ANNOUNCE_HOST=""
+STALL_PEER=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -115,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --tracker-bind) TRACKER_BIND="$2"; shift 2 ;;
         --announce-host) ANNOUNCE_HOST="$2"; shift 2 ;;
         --announce-delay) ANNOUNCE_DELAY="$2"; shift 2 ;;
+        --stall-peer) STALL_PEER=1; shift ;;
         --output-dir)
             # `$# -lt 2` catches a missing value (would otherwise trip `set -u`
             # as an unbound-variable exit 1); `-z` catches an explicit empty
@@ -256,6 +262,9 @@ if [ -n "$ANNOUNCE_HOST" ]; then
 fi
 if [ -n "$ANNOUNCE_DELAY" ]; then
     SEED_ARGS+=(--announce-delay "$ANNOUNCE_DELAY")
+fi
+if [ -n "$STALL_PEER" ]; then
+    SEED_ARGS+=(--stall-peer)
 fi
 SEED_ARGS+=( \
     --torrent-out "$OUTPUT_DIR/selfseed.torrent" \

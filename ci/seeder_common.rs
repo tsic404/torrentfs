@@ -342,6 +342,15 @@ pub fn start_tracker(bind_addr: &str, port: u16) -> std::io::Result<u16> {
 /// Polling a 500ms sleep keeps the loop signal-responsive.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// True once a SIGINT/SIGTERM has been observed, so long-running helpers
+/// (the seeding loop, the stalled slow-swarm peer) can stop promptly.
+// `torrentfs-mffs-seeder` links this module but drives no stalled peer, so the
+// function is dead in that example's compilation unit.
+#[allow(dead_code)]
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
+
 /// Async-signal-safe handler: only stores an atomic flag, mirroring
 /// `src/main.rs::handle_shutdown_signal`.
 extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
