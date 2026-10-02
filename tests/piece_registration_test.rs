@@ -201,30 +201,94 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     // window and complete in the background — never through a read's
     // piece-wait loop. Their registration therefore proves the piece_finished
     // alert reached the engine (the alert_mask must include piece_progress).
-    let data = engine
-        .read_file_range(info.clone(), 0, 0, PIECE_LEN as u32)
-        .expect("first-piece read timed out");
+    // The read itself is not what this case asserts, so a transient
+    // NoPeers/Timeout verdict on a loaded host is retried rather than failed
+    // (same bounded-retry pattern as `test_read_registers_prefetched_pieces`).
+    const FIRST_READ_ALLOWANCE_SECS: u64 = 120;
+    let read_deadline = std::time::Instant::now() + Duration::from_secs(FIRST_READ_ALLOWANCE_SECS);
+    let mut first_piece = None;
+    while std::time::Instant::now() < read_deadline {
+        match engine.read_file_range(info.clone(), 0, 0, PIECE_LEN as u32) {
+            Ok(d) => {
+                first_piece = Some(d);
+                break;
+            }
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
+    }
+    let data = first_piece.expect("first-piece read timed out");
     assert_eq!(data.len(), PIECE_LEN);
     assert_eq!(&data[..], &content[..PIECE_LEN]);
 
     let info_hash = hex::encode(info.info_hash().unwrap());
+    let piece_key = |p: i32| format!("{}:piece:{}", info_hash, p);
     let cm = engine.cache_manager();
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+
+    // Two bounded polls, because the pipeline mixes a stage the design bounds
+    // with stages it does not: the background download and libtorrent's
+    // post-write hash verification are swarm/disk bound, while the alert ->
+    // engine convergence is bounded by registered constants. Waiting on them
+    // separately keeps a loaded host failing the precondition instead of
+    // masquerading as an alert-path regression.
+
+    // (1) Download precondition: libtorrent's `write_piece` writes every block
+    // straight to the final piece path, so a full-size piece file is the
+    // download-complete signal.
+    const PREFETCH_DOWNLOAD_ALLOWANCE_SECS: u64 = 120;
+    let download_deadline =
+        std::time::Instant::now() + Duration::from_secs(PREFETCH_DOWNLOAD_ALLOWANCE_SECS);
     loop {
         let guard = cm.lock().unwrap();
-        let all_verified = (1..NUM_PIECES).all(|p| {
-            let key = format!("{}:piece:{}", info_hash, p);
-            guard.has_piece(&key) && guard.is_piece_verified(&key)
-        });
+        let is_on_disk = (1..NUM_PIECES)
+            .all(|p| guard.piece_on_disk_at_least(&piece_key(p as i32), PIECE_LEN as u64));
         drop(guard);
-        if all_verified {
+        if is_on_disk {
             break;
         }
         assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for background-prefetch piece registration"
+            std::time::Instant::now() < download_deadline,
+            "background prefetch did not write pieces 1..={} to disk within {}s",
+            NUM_PIECES - 1,
+            PREFETCH_DOWNLOAD_ALLOWANCE_SECS
         );
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    // (2) Alert path: `drain_piece_finished` registers the piece and clears it
+    // from the scheduler's wanted set. The alert's own bound is registered
+    // (the consumer's missed-wakeup fallback `SAFETY_NET_TIMEOUT`, 1s, plus
+    // one engine-loop round, 1s), but the piece file reaching full size is not
+    // the same event as the alert: libtorrent still hash-verifies the piece on
+    // its disk thread first, a step the design bounds no more than it bounds
+    // the download. The allowance therefore has to absorb that verification
+    // plus host scheduling slack in addition to the registered 2s.
+    const ALERT_CONVERGENCE_ALLOWANCE_SECS: u64 = 120;
+    let alert_deadline =
+        std::time::Instant::now() + Duration::from_secs(ALERT_CONVERGENCE_ALLOWANCE_SECS);
+    loop {
+        let guard = cm.lock().unwrap();
+        let is_registered = (1..NUM_PIECES).all(|p| {
+            let key = piece_key(p as i32);
+            guard.has_piece(&key) && guard.is_piece_verified(&key)
+        });
+        drop(guard);
+        let is_wanted_cleared = engine
+            .get_pieces_status(&info_hash, NUM_PIECES as i32)
+            .expect("piece status query failed")
+            .iter()
+            .all(|s| s.priority == 0);
+        if is_registered && is_wanted_cleared {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < alert_deadline,
+            "piece_finished alert did not reach the engine within {}s \
+             (registered={}, wanted_cleared={})",
+            ALERT_CONVERGENCE_ALLOWANCE_SECS,
+            is_registered,
+            is_wanted_cleared
+        );
+        thread::sleep(Duration::from_millis(200));
     }
 
     // Sanity: every piece is now verified — piece 0 via the read path,
