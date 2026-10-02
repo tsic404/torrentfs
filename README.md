@@ -195,6 +195,96 @@ file (ext4, tmpfs, …) and not only on FUSE. Nothing is read, the exit status
 stays 0, and no errno from the filesystem is involved. Pass `status=none` to
 silence it (`dd … status=none`).
 
+### Low-peer troubleshooting
+
+A read that cannot be served inside the wait budget returns the prefix of
+pieces that did complete as a short read, and fails with `ENODATA`
+("No data available") when nothing completed. On a swarm with few peers that
+is expected behaviour, not a filesystem fault — and the errno never carries
+the reason. The cause is observable in the per-torrent `.stats` while the read
+is parked, and in the daemon log and stderr after it fails. Nothing inside the
+mount reports it: read-failure details go to the log and stderr only, with no
+per-torrent diagnostics file (the `.read-errors` design was dropped).
+
+| What the swarm is doing | `.stats` (`cat /mnt/torrentfs/data/<name>/.stats`) | Daemon log / stderr |
+|---|---|---|
+| **0 seeders** — no connected peer holds the data | `Seeds: 0`; a parked read shows `Waiting: yes`, `Waited: <n>s`, `Active readers: <k>`; an empty swarm with a parked read alerts as `⚠ Waiting for peers (<n>s) — no connected peers; a reader is waiting` | `read_file_range <hash>: swarm empty — waiting up to <w>s for a peer to appear (peer discovery)` while it waits; on failure `no seeder connected (Peers:0 Seeds:0) within the <w>s peer-discovery window; …` (nothing appeared) or `… after the <w>s no-seeder piece wait; no seeder is present in the swarm` (peers connected, none a seeder) |
+| **1 slow seeder** — connected but delivering nothing | `Seeds: ≥1` with `Rate: ↓ 0 B/s`; `⚠ Slow swarm: seeder connected but no progress for <n>s` while a reader waits | no dedicated stderr line — the failure is logged at WARN: `Failed to read torrent file data (async): Timeout("Timed out waiting for piece <p> after <w>s. Torrent progress: <p>%")` |
+| **tracker not answering** — announces yield no peers | `Peers: 0  Seeds: 0`; `-- Trackers --` renders the announce targets — one `tier 0  <url>` row per URL, `No trackers — relying on DHT/LSD` when the torrent has none, or `(unavailable — tracker list not read)` when the list could not be read — followed by the session-wide `DHT Nodes: <n> (global)`; a sustained empty swarm with no parked read adds `⚠ Health: 0 peers / 0 seeds — no connected peers; tracker may be reachable` (it claims no reachability, only that no peer is connected) | the same `no seeder connected (Peers:0 Seeds:0) …` line as the 0-seeder case. Neither surface reports the tracker's reply — torrentfs exposes no announce results, so "tracker answered with 0 peers" and "no announce arrived" are indistinguishable here; both take the same next step: check that the announce target is reachable from the daemon (host network, firewall — see below) and that the swarm is actually seeding |
+
+While a read is parked, the per-torrent `-- Peers --` block reports the wait:
+
+```text
+  Peers: 0  Seeds: 0
+  Waiting: yes
+  Waited: 42s
+  Active readers: 1
+  ⚠ Waiting for peers (51s) — no connected peers; a reader is waiting
+```
+
+`Waiting: yes` means the engine is holding at least one read for this torrent
+right now; `Waited: <n>s` is the oldest parked read's own age (it keeps growing
+while that read stays parked, and the line is dropped — rather than reporting
+zero — once none is); `Active readers:` counts the reads parked for this
+torrent. All three come from one snapshot, so they cannot disagree. The seconds
+inside an alert are a different clock — `⚠ Waiting for peers (<n>s)` counts how
+long the swarm has been continuously empty, and `⚠ Slow swarm: … for <n>s` how
+long the connected seeder has delivered nothing — so neither is expected to
+match `Waited:`. The alert line names what a bare peer count cannot: a blocked
+reader on an empty swarm (`⚠ Waiting for peers`), a connected seeder that has
+delivered nothing (`⚠ Slow swarm`), or a sustained empty swarm with no reader
+waiting and no download in progress (`⚠ Health`); every alert is suppressed
+once all pieces are cached. `.stats` is a snapshot refreshed about once per
+second while it is being read, so the first read after an idle period can
+return the previous snapshot and the next one is current — read it twice when
+the value matters.
+
+To read the failure cause, grep the daemon's streams (direct run: the terminal,
+or `--log-file`):
+
+```bash
+docker logs <container> 2>&1 | grep -E 'no seeder connected|read stalled on the on-disk cache|Failed to read'
+```
+
+The engine writes two of the causes to its own stderr at the moment the read
+fails (the FUSE client only ever sees `ENODATA`, so this is where the reason
+exists):
+
+- `no seeder connected (Peers:<N> Seeds:<M>) within the <w>s peer-discovery window; <advice>` — the discovery window ran out with nothing that could serve the read; `<advice>` names the timeout that actually caps that window (`[timeouts] read_timeout_secs` when it is the smaller of the two, `peer_discovery_wait_secs` when it is, or both when they are equal).
+- `no seeder connected (Peers:<N> Seeds:<M>) after the <w>s no-seeder piece wait; no seeder is present in the swarm` — peers are connected but none seeds (or the only seeder joined after the window and left). This window derives from `read_timeout_secs`; a larger `peer_discovery_wait_secs` cannot widen it.
+- `read stalled on the on-disk cache (cache_size=…, read span=…, <evidence>); raise [cache] cache_size if the cache is evicting data the read needs` — the swarm is not the problem; the read outgrew the cache (`piece the read waits on is gone from cache` or `read span exceeds cache`). Size `cache_size` to at least the file being read.
+
+Otherwise the failure is logged at WARN (`Failed to read from torrent file
+…` / `Failed to read torrent file data (async): …`); the slow-seeder case
+appears only there.
+
+For libtorrent-level detail (piece reads, writes and hashes), restart the
+daemon with `TORRENTFS_DIAG=1` set — the gate is read once, so it must be set
+when the daemon starts:
+
+```bash
+docker run … -e TORRENTFS_DIAG=1 … ghcr.io/tsic404/torrentfs:main /mnt
+TORRENTFS_DIAG=1 ./target/release/torrentfs /mnt/torrentfs
+```
+
+Those `[DIAG]` lines are off by default because they flood stderr during an
+active download; turn them off once they have answered whether blocks arrive
+at all.
+
+A container runs in its own network namespace, so `127.0.0.1` inside it is the
+container, not the host: a swarm whose tracker or seeder lives on the host's
+loopback never connects and looks exactly like a dead swarm (empty `.stats`,
+`no seeder connected`). Run the container with `--network host` to share the
+host's namespace — that is what a host-side self-seed setup needs. Sharing the
+namespace also shares the host's ports: torrentfs leaves
+`[connections] listen_interfaces` unset (libtorrent's `0.0.0.0:6881`), so move
+it to another port when the host seeder already listens on 6881. On a multi-NIC
+host the kernel can pick a non-loopback source address even for a connection
+configured to use `127.0.0.1`, leaving it stalled before the handshake
+(`ss -tn` shows `SYN-SENT`) and making a healthy host-local tracker/seeder look
+unreachable; that is host routing, not a torrentfs setting — re-run on a
+single-NIC host, or one with working loopback routing.
+
 ### Configuration
 
 ```bash
