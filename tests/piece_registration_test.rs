@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -156,25 +157,36 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     const NUM_PIECES: usize = 4;
     let (torrent_data, content) = build_torrent(&announce_url, PIECE_LEN, NUM_PIECES);
 
-    // Seeder holding the complete file.
+    // Seeder holding ONLY piece 0 (the file is truncated to one piece):
+    // pieces 1..=3 must stay undownloadable until the first read has settled,
+    // so no priority-zeroing path other than the piece_finished alert can run
+    // for them (see the wanted-set comment below). Once the read is done the
+    // test writes the full file and flips `complete_seeder`; the seeder then
+    // rechecks and starts serving the remaining pieces.
     let seed_dir = tempfile::TempDir::new().unwrap();
-    std::fs::write(seed_dir.path().join("multi.bin"), &content).unwrap();
+    let seed_file = seed_dir.path().join("multi.bin");
+    std::fs::write(&seed_file, &content[..PIECE_LEN]).unwrap();
     let stop = Arc::new(std::sync::Mutex::new(false));
     let stop_clone = Arc::clone(&stop);
+    let complete_seeder = Arc::new(AtomicBool::new(false));
+    let complete_clone = Arc::clone(&complete_seeder);
     let td_clone = torrent_data.clone();
     let seeder = thread::spawn(move || {
         let config = local_test_config();
         let mut session = Session::new(&config).unwrap();
         let info = TorrentInfo::from_bytes(td_clone).unwrap();
         let handle = session.add_torrent(&info, seed_dir.path()).unwrap();
+        let mut rechecked = false;
         loop {
             if *stop_clone.lock().unwrap() {
                 break;
             }
-            if let Ok(s) = handle.status() {
-                let _ = matches!(s.state, TorrentState::Seeding | TorrentState::Finished);
+            if !rechecked && complete_clone.load(Ordering::Relaxed) {
+                handle.force_recheck();
+                handle.force_reannounce();
+                rechecked = true;
             }
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(200));
         }
     });
 
@@ -197,6 +209,8 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
     let info = Arc::new(TorrentInfo::from_bytes(torrent_data).unwrap());
 
+    let info_hash = hex::encode(info.info_hash().unwrap());
+
     // Read only piece 0. Pieces 1..=3 are then prefetched by the read-ahead
     // window and complete in the background — never through a read's
     // piece-wait loop. Their registration therefore proves the piece_finished
@@ -204,23 +218,80 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     // The read itself is not what this case asserts, so a transient
     // NoPeers/Timeout verdict on a loaded host is retried rather than failed
     // (same bounded-retry pattern as `test_read_registers_prefetched_pieces`).
+    // The wanted-set half of the verdict must attribute the priority drop to
+    // the piece_finished alert, so every priority-zeroing source has to be
+    // ruled out: (a) the init baseline at handle creation, (b) `recompute`
+    // forcing cached/on-disk pieces to 0 on reader events — and
+    // `has_piece_on_disk` checks mere file existence, so a piece only has to
+    // start downloading to qualify, (c) `recompute`'s idle bulk reset when
+    // nothing is wanted any more, and (d) `piece_ready`. The partial seeder
+    // keeps pieces 1..=3 off disk until after `reader_released` — the last
+    // reader event in this test — so (a) precedes the baseline the sampler
+    // records while the read is parked, (b) finds nothing on disk for them at
+    // the one remaining reader event and never runs again (no more reads, no
+    // recheck without a read, and the 1 GiB default cache cannot evict four
+    // pieces), (c) cannot fire because the released reader's gradient is
+    // retained as the prefetch window, and only (d) remains. An absolute
+    // `priority == 0` check cannot make this distinction: 0 is also the idle
+    // baseline, and on a fast host (b) reaches it without any alert.
+    const BASELINE_ALLOWANCE_SECS: u64 = 30;
     const FIRST_READ_ALLOWANCE_SECS: u64 = 120;
-    let read_deadline = std::time::Instant::now() + Duration::from_secs(FIRST_READ_ALLOWANCE_SECS);
-    let mut first_piece = None;
-    while std::time::Instant::now() < read_deadline {
-        match engine.read_file_range(info.clone(), 0, 0, PIECE_LEN as u32) {
-            Ok(d) => {
-                first_piece = Some(d);
-                break;
+    let (data, baseline) = thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(BASELINE_ALLOWANCE_SECS);
+            let mut peaks = vec![0i32; NUM_PIECES];
+            loop {
+                if let Ok(statuses) = engine.get_pieces_status(&info_hash, NUM_PIECES as i32) {
+                    for (peak, status) in peaks.iter_mut().zip(statuses.iter()) {
+                        *peak = (*peak).max(status.priority);
+                    }
+                    if peaks[1..].iter().all(|&p| p > 0) {
+                        return Ok(peaks);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "pieces 1..={} never all entered the wanted set within {}s \
+                         (peak priorities observed: {:?})",
+                        NUM_PIECES - 1,
+                        BASELINE_ALLOWANCE_SECS,
+                        peaks
+                    ));
+                }
+                thread::sleep(Duration::from_millis(50));
             }
-            Err(_) => thread::sleep(Duration::from_secs(1)),
+        });
+
+        let read_deadline =
+            std::time::Instant::now() + Duration::from_secs(FIRST_READ_ALLOWANCE_SECS);
+        let mut first_piece = None;
+        while std::time::Instant::now() < read_deadline {
+            match engine.read_file_range(info.clone(), 0, 0, PIECE_LEN as u32) {
+                Ok(d) => {
+                    first_piece = Some(d);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_secs(1)),
+            }
         }
-    }
-    let data = first_piece.expect("first-piece read timed out");
+        let data = first_piece.expect("first-piece read timed out");
+
+        let baseline = sampler
+            .join()
+            .expect("baseline sampler thread panicked")
+            .unwrap_or_else(|msg| panic!("{msg}"));
+        (data, baseline)
+    });
     assert_eq!(data.len(), PIECE_LEN);
     assert_eq!(&data[..], &content[..PIECE_LEN]);
 
-    let info_hash = hex::encode(info.info_hash().unwrap());
+    // Pieces 1..=3 could not be downloaded before this point — the seeder had
+    // only piece 0 — so their sampled baseline is still the live priority and
+    // no zeroing path has run for them yet. Complete the seeder's data now;
+    // its recheck starts serving the remaining pieces.
+    std::fs::write(&seed_file, &content).unwrap();
+    complete_seeder.store(true, Ordering::Relaxed);
+
     let piece_key = |p: i32| format!("{}:piece:{}", info_hash, p);
     let cm = engine.cache_manager();
 
@@ -272,21 +343,24 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
             guard.has_piece(&key) && guard.is_piece_verified(&key)
         });
         drop(guard);
-        let is_wanted_cleared = engine
+        // Wanted-set cleanup = each prefetched piece dropped strictly below
+        // the peak priority the sampler recorded (`piece_ready` drives it to
+        // 0); the absolute value alone cannot distinguish cleanup from idle.
+        let priorities = engine
             .get_pieces_status(&info_hash, NUM_PIECES as i32)
-            .expect("piece status query failed")
-            .iter()
-            .all(|s| s.priority == 0);
+            .expect("piece status query failed");
+        let is_wanted_cleared = (1..NUM_PIECES).all(|p| priorities[p].priority < baseline[p]);
         if is_registered && is_wanted_cleared {
             break;
         }
         assert!(
             std::time::Instant::now() < alert_deadline,
             "piece_finished alert did not reach the engine within {}s \
-             (registered={}, wanted_cleared={})",
+             (registered={}, priorities={:?}, baseline={:?})",
             ALERT_CONVERGENCE_ALLOWANCE_SECS,
             is_registered,
-            is_wanted_cleared
+            priorities.iter().map(|s| s.priority).collect::<Vec<_>>(),
+            baseline
         );
         thread::sleep(Duration::from_millis(200));
     }
