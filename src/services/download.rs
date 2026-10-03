@@ -130,6 +130,12 @@ impl DownloadService {
         self.engine.read_wait_budget_secs()
     }
 
+    /// Configured no-seeder piece-wait window (seconds).  `.stats` sizes its
+    /// empty-swarm health grace from this.
+    pub fn no_seeder_read_timeout_secs(&self) -> u64 {
+        self.engine.no_seeder_read_timeout_secs()
+    }
+
     /// Get the CacheManager shared with the download session.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
         Some(self.cache_manager.clone())

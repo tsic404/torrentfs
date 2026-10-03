@@ -639,6 +639,67 @@ fn test_peer_discovery_wait_is_configurable() {
     );
 }
 
+/// The optional peer-wait cap bounds the peer-discovery window: with
+/// `[timeouts] peer_wait_cap_secs = 2`, a read on an empty swarm gives up after
+/// ~2s although the configured discovery wait (30s by default) asks for far
+/// longer, and the `NoPeers` text names the cap as the binding knob.
+///
+/// Deterministic: unique info_hash with a dead tracker URL and DHT/LSD
+/// disabled, so no peer can ever appear.
+#[test]
+fn test_peer_wait_cap_secs_bounds_the_discovery_window() {
+    let _slot = wave_slot();
+    // Unique info_hash (distinct name) so no other test's seeder or leaked
+    // seeder thread can be discovered and serve the read.
+    let torrent_data = distinct_torrent("capped-peer-window.iso");
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = common::local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    // Both other bounds are far larger than the cap, so only the cap can end
+    // this read: an ignored cap would spend the 30s discovery window instead.
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.peer_wait_cap_secs = Some(2);
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    let start = std::time::Instant::now();
+    let result = engine.read_file_range(info, 0, 0, 50);
+    let elapsed = start.elapsed();
+
+    let msg = match result {
+        Err(torrentfs::TorrentError::NoPeers(msg)) => msg,
+        other => panic!(
+            "a sourceless read must fail with NoPeers, got {:?} after {:.2}s",
+            other,
+            elapsed.as_secs_f64()
+        ),
+    };
+    println!("NoPeers after {:.2}s: {msg}", elapsed.as_secs_f64());
+    assert!(
+        msg.contains(
+            "window 2s = min(read_timeout_secs, peer_discovery_wait_secs, peer_wait_cap_secs)"
+        ),
+        "the NoPeers window must show the configured cap in its formula: {msg}"
+    );
+    assert!(
+        msg.contains("raise [timeouts] peer_wait_cap_secs (it caps the window)"),
+        "the NoPeers advice must name the cap that binds the window: {msg}"
+    );
+    // The read waited its capped window (2s) and then failed fast; the shipped
+    // 30s discovery window would hold this caller for 30s.
+    assert!(
+        elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(15),
+        "read returned NoPeers after {:.2}s; the configured 2s peer-wait cap \
+         must bound the 30s discovery window",
+        elapsed.as_secs_f64()
+    );
+}
+
 /// RAII guard that stops and joins a background leecher thread on drop.
 ///
 /// Drop runs on both normal exit and panic unwind, so a failed assertion in
@@ -663,7 +724,10 @@ impl Drop for LeecherGuard {
 /// read must NOT fast-fail once peer discovery elapses.  The empty-swarm
 /// fast-fail (`is_peer_wait_exhausted`) may only be set when BOTH peer and
 /// seed counts are zero; a leecher is still a potential source (or a future
-/// seeder), so it keeps the regular no-seeder piece-wait window.
+/// seeder), so it keeps the regular no-seeder piece-wait window — here
+/// configured to 12s via `[timeouts] no_seeder_read_timeout_secs`, with a 60s
+/// read timeout that no longer caps it, so the window the read reports can only
+/// be the configured one.
 ///
 /// Deterministic: a download-mode leecher session (empty save dir → `left` is
 /// the full file size) announces to the tracker before the read, so the
@@ -734,12 +798,16 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
     config.local_discovery.lsd_enabled = Some(false);
     config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
     // The leecher-only swarm has no seeder, so the piece-wait window is
-    // min(read_timeout_secs, 15s); the 12s read timeout keeps the test
-    // bounded.  Peer discovery is pinned to its former fixed 9s window
+    // min(read_timeout_secs, no_seeder_read_timeout_secs).  The 60s read
+    // timeout deliberately stays above the configured 12s no-seeder window, so
+    // the 12s the message and the timing assertion below see can only come from
+    // `[timeouts] no_seeder_read_timeout_secs` — the shipped 15s default would
+    // show up as 15s.  Peer discovery is pinned to its former fixed 9s window
     // (`[timeouts] peer_discovery_wait_secs`) so the boundary asserted at the
     // end — the ~9s fast-fail path versus the ~12.5s leecher path — stays a
     // 3s gap, independent of the shipped default.
-    config.timeouts.read_timeout_secs = Some(12);
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.no_seeder_read_timeout_secs = Some(12);
     config.timeouts.peer_discovery_wait_secs = Some(9);
 
     let engine = Arc::new(
@@ -791,6 +859,14 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
                 !msg.contains("raise [timeouts]"),
                 "the piece-wait NoPeers message must not advise a timeout knob: {msg}"
             );
+            // The window it names is the configured one: `read_timeout_secs`
+            // (60s here) cannot produce this number, only
+            // `no_seeder_read_timeout_secs` (12s) can.
+            assert!(
+                msg.contains("+ 12s no-seeder piece wait"),
+                "the NoPeers message must report the configured no-seeder \
+                 window, not the shipped default: {msg}"
+            );
             // The exact message is the evidence for the branch assertion above,
             // so a CI failure shows it instead of only the elapsed time.
             println!(
@@ -816,9 +892,10 @@ fn test_leecher_only_swarm_read_does_not_fast_fail() {
     // NoPeers right after the 9s discovery window this test pins
     // (`peer_discovery_wait_secs`), and the 200ms poll granularity plus the
     // final status refresh put that in ~9.0-9.2s; the leecher path adds the
-    // 12s piece-wait window (`min(read_timeout_secs, 15s)`), so it returns at
-    // ≥ ~12.5s.  `>= 10s` sits in the gap — below the correct path's lower
-    // bound, above the fast-fail path's upper bound.
+    // configured no-seeder window (`min(read_timeout_secs,
+    // no_seeder_read_timeout_secs)` = 12s here), so it returns at ≥ ~12.5s.
+    // `>= 10s` sits in the gap — below the correct path's lower bound, above
+    // the fast-fail path's upper bound.
     assert!(
         elapsed >= Duration::from_secs(10),
         "read returned NoPeers after {:.2}s — a leecher-only swarm fast-failed \
@@ -1105,6 +1182,94 @@ fn test_repeat_read_reuses_the_sourceless_verdict() {
         later_elapsed >= Duration::from_millis(1500),
         "a read after the verdict lapsed waited only {:.2}s: it must probe \
          again instead of inheriting an aged-out verdict",
+        later_elapsed.as_secs_f64()
+    );
+
+    engine.shutdown();
+}
+
+/// The optional peer-wait cap governs the sourceless verdict's shelf life too:
+/// with `[timeouts] peer_wait_cap_secs = 2` the discovery window is the capped
+/// 2s, so a repeat read inside it inherits the probe's verdict (one window per
+/// `cat`, not one per chunk) while a read arriving after it probes again — a
+/// verdict that outlived its capped window would keep a seeder that came online
+/// after the probe unreachable.
+///
+/// Deterministic: unique info_hash with a dead tracker URL and LSD off, so no
+/// peer can ever appear and the capped window is what ends every read here.
+#[test]
+fn test_peer_wait_cap_bounds_the_sourceless_verdict() {
+    let _slot = wave_slot();
+
+    let torrent_data = distinct_torrent("capped-verdict.iso");
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.local_discovery.lsd_enabled = Some(false);
+    // Neither the 60s read timeout nor the 30s discovery wait is the window
+    // here: the 2s cap is the binding term of the `min`.
+    config.timeouts.read_timeout_secs = Some(60);
+    config.timeouts.peer_wait_cap_secs = Some(2);
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+
+    // ── First read: the probe spends the capped window ─────────────────
+    let probe_start = std::time::Instant::now();
+    let probe = engine.read_file_range(info.clone(), 0, 0, 4096);
+    let probe_elapsed = probe_start.elapsed();
+    match probe {
+        Err(torrentfs::TorrentError::NoPeers(msg)) => {
+            assert!(
+                msg.contains("raise [timeouts] peer_wait_cap_secs"),
+                "the capped window's NoPeers must name the cap as the binding \
+                 setting: {msg}"
+            );
+        }
+        other => panic!(
+            "expected NoPeers for a sourceless read, got {:?} after {:.2}s",
+            other.map(|data| data.len()),
+            probe_elapsed.as_secs_f64()
+        ),
+    }
+    assert!(
+        probe_elapsed >= Duration::from_millis(1500),
+        "the probe returned after only {:.2}s: it must spend the capped 2s \
+         discovery window before declaring the swarm sourceless",
+        probe_elapsed.as_secs_f64()
+    );
+
+    // ── Second read: inherits the verdict, no second window ────────────
+    let repeat_start = std::time::Instant::now();
+    let repeat = engine.read_file_range(info.clone(), 0, 4096, 4096);
+    let repeat_elapsed = repeat_start.elapsed();
+    assert!(
+        matches!(repeat, Err(torrentfs::TorrentError::NoPeers(_))),
+        "an inherited verdict must still fail the read with NoPeers"
+    );
+    assert!(
+        repeat_elapsed < Duration::from_millis(1000),
+        "the read after the probe took {:.2}s: it re-spent the capped window \
+         instead of inheriting the probe's verdict",
+        repeat_elapsed.as_secs_f64()
+    );
+
+    // ── The verdict lapses with the capped window, not the 30s wait ────
+    thread::sleep(Duration::from_secs(3));
+    let later_start = std::time::Instant::now();
+    let later = engine.read_file_range(info.clone(), 0, 8192, 4096);
+    let later_elapsed = later_start.elapsed();
+    assert!(
+        later.is_err(),
+        "no peer can reach this swarm, so the read must fail"
+    );
+    assert!(
+        later_elapsed >= Duration::from_millis(1500),
+        "a read after the capped verdict lapsed waited only {:.2}s: the verdict \
+         outlived its capped window (it must lapse with the window the cap \
+         sizes, not the uncapped discovery wait)",
         later_elapsed.as_secs_f64()
     );
 
@@ -1582,16 +1747,16 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
     // discovery (≤ `min(read_timeout, DEFAULT_PEER_DISCOVERY_WAIT_SECS)`, the
     // discovery window this test leaves at its shipped default) plus the
     // no-seeder piece-wait window (≤ `min(read_timeout,
-    // NO_SEEDER_READ_TIMEOUT_SECS)`).  A peer that appears mid-discovery ends
-    // the first phase early but keeps the second, so the two add up; a bound
-    // covering only one of them fails whenever that peer appears.
+    // DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS)`, the shipped default since this
+    // test leaves `no_seeder_read_timeout_secs` unset).  A peer that appears
+    // mid-discovery ends the first phase early but keeps the second, so the two
+    // add up; a bound covering only one of them fails whenever that peer
+    // appears.
     let default_peer_discovery_wait_secs = torrentfs::config::DEFAULT_PEER_DISCOVERY_WAIT_SECS;
+    let default_no_seeder_wait_secs = torrentfs::config::DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS;
     let engine_no_seeder_wait_secs =
         std::cmp::min(read_timeout_secs, default_peer_discovery_wait_secs)
-            + std::cmp::min(
-                read_timeout_secs,
-                torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS,
-            );
+            + std::cmp::min(read_timeout_secs, default_no_seeder_wait_secs);
     let no_seeder_upper_bound_secs = engine_no_seeder_wait_secs + NO_SEEDER_READ_BOUND_MARGIN_SECS;
     // The bound is only a bound on the *capped* path while this test's timeout
     // is what caps both waits — asserted, not assumed, so a raised timeout
@@ -1599,13 +1764,13 @@ fn test_no_seeder_cat_does_not_block_healthy_read() {
     // tolerates.
     assert!(
         read_timeout_secs <= default_peer_discovery_wait_secs
-            && read_timeout_secs <= torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS,
+            && read_timeout_secs <= default_no_seeder_wait_secs,
         "this test's read timeout {}s must cap both no-seeder waits ({}s peer \
          discovery / {}s piece wait); a larger timeout needs the bound below \
          re-reasoned",
         read_timeout_secs,
         default_peer_discovery_wait_secs,
-        torrentfs::download::NO_SEEDER_READ_TIMEOUT_SECS
+        default_no_seeder_wait_secs
     );
     assert!(
         no_seeder_elapsed < Duration::from_secs(no_seeder_upper_bound_secs),

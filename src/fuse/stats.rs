@@ -7,10 +7,10 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
+use crate::infrastructure::config::DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS;
 use crate::infrastructure::download::PieceStatus;
 use crate::infrastructure::download::PieceStore;
 use crate::infrastructure::download::SessionStats;
-use crate::infrastructure::download::NO_SEEDER_READ_TIMEOUT_SECS;
 use crate::infrastructure::metadata::TrackerEntry;
 use crate::infrastructure::metrics::MetricsSnapshot;
 use crate::services::download::DownloadService;
@@ -494,15 +494,21 @@ fn write_trackers(output: &mut String, trackers: Option<&[TrackerEntry]>, dht_no
 /// before the `.stats` health alert fires.  Peer/seed counts are instantaneous
 /// samples that flap around zero while connections are established, so one
 /// empty sample is not a health signal: alerting on it contradicts the `Peers:`
-/// line a reader saw moments earlier or later.  Sized from the engine's
-/// no-seeder *piece-wait* window ([`NO_SEEDER_READ_TIMEOUT_SECS`]), not from
-/// the peer-discovery window: a read that is still waiting for the swarm keeps
-/// its pieces wanted (`priority > 0`), and that `active_download` signal — not
-/// this grace — holds the alert off through the discovery phase, which may last
-/// `[timeouts] peer_discovery_wait_secs` (30s by default).  A shorter configured
-/// `read_timeout_secs`, which caps this piece-wait window, only makes the grace
+/// line a reader saw moments earlier or later.  The grace is the engine's
+/// configured no-seeder *piece-wait* window
+/// (`[timeouts] no_seeder_read_timeout_secs`), not the peer-discovery window: a
+/// read that is still waiting for the swarm keeps its pieces wanted
+/// (`priority > 0`), and that `active_download` signal — not this grace — holds
+/// the alert off through the discovery phase, which may last
+/// `[timeouts] peer_discovery_wait_secs` (30s by default).  A shorter
+/// `read_timeout_secs`, which caps the piece-wait window, only makes the grace
 /// the more conservative of the two.
-const HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS: u64 = NO_SEEDER_READ_TIMEOUT_SECS;
+fn empty_swarm_grace_secs(download_service: &Option<Arc<DownloadService>>) -> u64 {
+    download_service
+        .as_ref()
+        .map(|ds| ds.no_seeder_read_timeout_secs())
+        .unwrap_or(DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS)
+}
 
 /// Consecutive seconds a torrent must report a connected seeder with a zero
 /// download rate before the `.stats` slow-swarm alert fires.  `download_rate`
@@ -517,14 +523,16 @@ const HEALTH_ALERT_SLOW_SWARM_GRACE_SECS: u64 = 5;
 /// observed state needs no explanation: a read waiting on an empty swarm (no
 /// grace — a blocked reader is not a flapping peer count), a connected seeder
 /// that has delivered nothing for [`HEALTH_ALERT_SLOW_SWARM_GRACE_SECS`], or a
-/// sustained empty swarm with no download in progress.  `download_complete`
-/// suppresses every alert — zero peers is then the expected end state — and
-/// counts reflect live connections, not tracker reachability.
+/// sustained empty swarm with no download in progress (its grace is the
+/// engine's configured no-seeder window, see [`empty_swarm_grace_secs`]).
+/// `download_complete` suppresses every alert — zero peers is then the expected
+/// end state — and counts reflect live connections, not tracker reachability.
 fn health_alert(
     num_peers: i32,
     num_seeds: i32,
     download_rate: i64,
     empty_swarm_secs: u64,
+    empty_swarm_grace_secs: u64,
     slow_swarm_secs: u64,
     download_complete: bool,
     active_download: bool,
@@ -555,7 +563,7 @@ fn health_alert(
     }
     if num_peers == 0
         && num_seeds == 0
-        && empty_swarm_secs >= HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS
+        && empty_swarm_secs >= empty_swarm_grace_secs
         && !active_download
     {
         return Some(
@@ -804,6 +812,7 @@ pub fn generate_torrent_stats(
         num_seeds,
         dl_rate,
         empty_swarm_secs,
+        empty_swarm_grace_secs(download_service),
         slow_swarm_secs,
         download_complete,
         active_download,
@@ -2087,7 +2096,8 @@ mod tests {
             0,
             0,
             0,
-            HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
             0,
             false,
             false,
@@ -2118,7 +2128,8 @@ mod tests {
                 0,
                 0,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS - 1,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS - 1,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 false,
                 false,
@@ -2128,8 +2139,29 @@ mod tests {
             "no alert for an empty swarm still inside the grace window"
         );
         assert!(
-            health_alert(0, 0, 0, 0, 0, false, false, false).is_none(),
+            health_alert(
+                0,
+                0,
+                0,
+                0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                0,
+                false,
+                false,
+                false
+            )
+            .is_none(),
             "no alert for an unobserved/just-empty swarm"
+        );
+        // A configured no-seeder window of 60s moves the grace with it: no
+        // alert 15s in, where the shipped default would already fire.
+        assert!(
+            health_alert(0, 0, 0, 15, 60, 0, false, false, false).is_none(),
+            "no alert while the configured grace has not elapsed"
+        );
+        assert!(
+            health_alert(0, 0, 0, 60, 60, 0, false, false, false).is_some(),
+            "the alert must still fire once the configured grace elapses"
         );
     }
 
@@ -2140,7 +2172,8 @@ mod tests {
                 3,
                 0,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 false,
                 false,
@@ -2158,7 +2191,8 @@ mod tests {
                 0,
                 2,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 false,
                 false,
@@ -2176,7 +2210,8 @@ mod tests {
                 5,
                 1,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 false,
                 false,
@@ -2196,7 +2231,8 @@ mod tests {
                 0,
                 0,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 true,
                 false,
@@ -2206,7 +2242,18 @@ mod tests {
             "no alert when download is complete even at 0 peers / 0 seeds"
         );
         assert!(
-            health_alert(0, 0, 0, 0, 0, true, false, true).is_none(),
+            health_alert(
+                0,
+                0,
+                0,
+                0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                0,
+                true,
+                false,
+                true
+            )
+            .is_none(),
             "no alert when download is complete even with a parked read"
         );
         assert!(
@@ -2215,6 +2262,7 @@ mod tests {
                 1,
                 0,
                 0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 HEALTH_ALERT_SLOW_SWARM_GRACE_SECS,
                 true,
                 true,
@@ -2235,7 +2283,8 @@ mod tests {
                 0,
                 0,
                 0,
-                HEALTH_ALERT_EMPTY_SWARM_GRACE_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 0,
                 false,
                 true,
@@ -2251,8 +2300,18 @@ mod tests {
         // A read parked on an empty swarm is a real wait, so the alert fires
         // immediately — the grace window only guards the no-reader case, where
         // an empty sample is just connections flapping.
-        let line = health_alert(0, 0, 0, 0, 0, false, true, true)
-            .expect("a parked read on an empty swarm must alert without the grace window");
+        let line = health_alert(
+            0,
+            0,
+            0,
+            0,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+            0,
+            false,
+            true,
+            true,
+        )
+        .expect("a parked read on an empty swarm must alert without the grace window");
         assert!(
             line.contains("⚠ Waiting for peers (0s)"),
             "should name the wait and its age: {line}"
@@ -2265,8 +2324,18 @@ mod tests {
 
     #[test]
     fn test_health_alert_waiting_for_peers_reports_empty_swarm_age() {
-        let line = health_alert(0, 0, 0, 7, 0, false, true, true)
-            .expect("alert while a read waits on an empty swarm");
+        let line = health_alert(
+            0,
+            0,
+            0,
+            7,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+            0,
+            false,
+            true,
+            true,
+        )
+        .expect("alert while a read waits on an empty swarm");
         assert!(
             line.contains("⚠ Waiting for peers (7s)"),
             "should report how long the swarm has been empty: {line}"
@@ -2282,6 +2351,7 @@ mod tests {
             1,
             0,
             0,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
             HEALTH_ALERT_SLOW_SWARM_GRACE_SECS,
             false,
             true,
@@ -2307,6 +2377,7 @@ mod tests {
                 1,
                 0,
                 0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
                 HEALTH_ALERT_SLOW_SWARM_GRACE_SECS - 1,
                 false,
                 true,
@@ -2315,8 +2386,18 @@ mod tests {
             .is_none(),
             "no alert for a zero rate younger than the grace window"
         );
-        let line = health_alert(1, 1, 0, 0, 7, false, true, true)
-            .expect("alert once the stall has held past the grace window");
+        let line = health_alert(
+            1,
+            1,
+            0,
+            0,
+            DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+            7,
+            false,
+            true,
+            true,
+        )
+        .expect("alert once the stall has held past the grace window");
         assert!(
             line.contains("no progress for 7s"),
             "should report how long the seeder has stalled: {line}"
@@ -2327,13 +2408,35 @@ mod tests {
     fn test_health_alert_slow_swarm_requires_zero_rate() {
         // Bytes flowing with a seeder connected is steady state, not a stall.
         assert!(
-            health_alert(1, 1, 65_536, 0, 30, false, true, true).is_none(),
+            health_alert(
+                1,
+                1,
+                65_536,
+                0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                30,
+                false,
+                true,
+                true
+            )
+            .is_none(),
             "no alert while the seeder is delivering bytes"
         );
         // A seeder with no parked read is seeding, not stalling, however long
         // its rate has been zero.
         assert!(
-            health_alert(1, 1, 0, 0, 30, false, false, false).is_none(),
+            health_alert(
+                1,
+                1,
+                0,
+                0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                30,
+                false,
+                false,
+                false
+            )
+            .is_none(),
             "no alert when no read is parked"
         );
     }
@@ -2343,7 +2446,18 @@ mod tests {
         // Data arriving with a read parked and peers present: the steady state
         // must stay free of alert lines.
         assert!(
-            health_alert(2, 1, 2_097_152, 0, 0, false, true, true).is_none(),
+            health_alert(
+                2,
+                1,
+                2_097_152,
+                0,
+                DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS,
+                0,
+                false,
+                true,
+                true
+            )
+            .is_none(),
             "steady download must not alert"
         );
     }

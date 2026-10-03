@@ -887,3 +887,54 @@ fn test_engine_cache_size_non_positive_falls_back() {
     drop(cm);
     engine.shutdown();
 }
+
+/// The wait-semantics knobs belong to the accepted schema: `--config-check`
+/// must accept a config that sets `peer_wait_cap_secs` and
+/// `no_seeder_read_timeout_secs` (unknown keys are rejected, so this fails if
+/// either is missing from `[timeouts]`).
+#[test]
+fn test_config_check_accepts_wait_semantics_timeouts() {
+    assert_accepted(
+        &run_config_check("[timeouts]\npeer_wait_cap_secs = 5\nno_seeder_read_timeout_secs = 60\n"),
+        "peer_wait_cap_secs / no_seeder_read_timeout_secs",
+    );
+}
+
+/// The engine resolves the wait-semantics knobs from config: the peer-wait cap
+/// shortens the peer-discovery term of the read budget and the no-seeder window
+/// sizes its own term, so `.stats` health sizing and the FUSE deferred-read
+/// deadline follow the operator's values.
+#[test]
+fn test_engine_wait_timeouts_resolve_from_config() {
+    use torrentfs::download::DownloadEngine;
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = TorrentfsConfig::default_config();
+    config.dht.enabled = Some(false);
+    config.performance.aio_threads = Some(2);
+    // read_timeout stays at its 60s default, as does the 30s discovery wait.
+    config.timeouts.peer_wait_cap_secs = Some(20);
+    config.timeouts.no_seeder_read_timeout_secs = Some(45);
+
+    let engine = DownloadEngine::new(cache_dir.path(), &config).unwrap();
+    assert_eq!(engine.no_seeder_read_timeout_secs(), 45);
+    // 60 (state) + 10 (recheck) + 20 (discovery, capped) + 45 (no-seeder) + 60.
+    assert_eq!(engine.read_wait_budget_secs(), 60 + 10 + 20 + 45 + 60);
+    engine.shutdown();
+
+    // Non-positive values fall back to the shipped defaults: no extra cap on
+    // the discovery window, and the 15s no-seeder window.
+    let mut non_positive = TorrentfsConfig::default_config();
+    non_positive.dht.enabled = Some(false);
+    non_positive.performance.aio_threads = Some(2);
+    non_positive.timeouts.peer_wait_cap_secs = Some(0);
+    non_positive.timeouts.no_seeder_read_timeout_secs = Some(-1);
+
+    let engine = DownloadEngine::new(cache_dir.path(), &non_positive).unwrap();
+    assert_eq!(
+        engine.no_seeder_read_timeout_secs(),
+        torrentfs::config::DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS
+    );
+    assert_eq!(engine.read_wait_budget_secs(), 60 + 10 + 30 + 15 + 60);
+    engine.shutdown();
+}
