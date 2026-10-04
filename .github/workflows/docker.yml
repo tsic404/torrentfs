@@ -135,12 +135,31 @@ jobs:
         run: |
           while IFS= read -r tag; do
             echo "Merging: $tag <- ${tag}-amd64 + ${tag}-arm64"
-            docker buildx imagetools create -t "$tag" "${tag}-amd64" "${tag}-arm64"
+            docker buildx imagetools create -t "$tag" \
+              --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+              "${tag}-amd64" "${tag}-arm64"
           done <<< "${{ steps.meta.outputs.tags }}"
 
-      - name: Verify multi-arch manifests
+      # Regression guard: index and both arch children must carry this event's sha, else the publish went stale.
+      - name: Assert manifest revision matches event sha
         run: |
+          failed=0
           while IFS= read -r tag; do
-            echo "=== $tag ==="
-            docker buildx imagetools inspect "$tag" --raw | docker run --rm -i alpine:latest sh -c 'apk add -q jq >/dev/null 2>&1; jq -r ".manifests[] | \"  \(.platform.architecture)/\(.platform.os)\""'
+            echo "=== $tag (expect revision $GITHUB_SHA) ==="
+            info="$(docker buildx imagetools inspect "$tag" --format '{{json .}}')"
+            for platform in linux/amd64 linux/arm64; do
+              rev="$(jq -r --arg p "$platform" '.image[$p].config.Labels["org.opencontainers.image.revision"] // empty' <<<"$info")"
+              echo "  $platform revision=$rev"
+              if [ "$rev" != "$GITHUB_SHA" ]; then
+                echo "::error::$tag $platform revision '${rev:-missing}' != event sha $GITHUB_SHA"
+                failed=1
+              fi
+            done
+            index_rev="$(docker buildx imagetools inspect "$tag" --raw | jq -r '.annotations["org.opencontainers.image.revision"] // empty')"
+            echo "  index annotation revision=$index_rev"
+            if [ "$index_rev" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag index annotation revision '${index_rev:-missing}' != event sha $GITHUB_SHA"
+              failed=1
+            fi
           done <<< "${{ steps.meta.outputs.tags }}"
+          exit "$failed"
