@@ -614,6 +614,35 @@ const EXIT_SESSION_LOST: i32 = 102;
 /// leaving the mount dead until the container is restarted.
 const EXIT_SESSION_SEVERED: i32 = 104;
 
+/// Exit status used when `/dev/fuse` exists but opening it is denied: the
+/// runtime (Docker's default seccomp profile / device cgroup) blocks `open()`
+/// even when the entrypoint's `mknod` succeeded, so the device cannot be
+/// ensured — the same container-level failure family as a missing device.
+const EXIT_FUSE_DEVICE_UNUSABLE: i32 = 100;
+
+/// Classify an `open("/dev/fuse")` failure: `EACCES`/`EPERM` means the
+/// runtime blocks the device despite its node existing. Other errors (e.g.
+/// `ENODEV` with the fuse module unloaded) stay unmapped and keep the generic
+/// mount-failure classification.
+fn fuse_device_open_exit_code(e: &io::Error) -> Option<i32> {
+    match e.kind() {
+        io::ErrorKind::PermissionDenied => Some(EXIT_FUSE_DEVICE_UNUSABLE),
+        _ => None,
+    }
+}
+
+/// Probe `/dev/fuse` after a mount failure: opening the device for read/write
+/// is what the mount itself needs, so a permission-denied probe identifies
+/// the device as the failing layer instead of the mountpoint or options.
+fn fuse_device_unusable_exit_code() -> Option<i32> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .err()
+        .and_then(|e| fuse_device_open_exit_code(&e))
+}
+
 /// Exit status for a session that ended without a shutdown signal.
 ///
 /// A FUSE mount still attached at the mountpoint means the connection was
@@ -895,6 +924,20 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            // The mount failing while /dev/fuse itself cannot be opened means
+            // the runtime blocks the device (seccomp / device cgroup), not
+            // the mount: classify it as "device cannot be ensured" so
+            // supervisors see the same code as for a missing device.
+            if let Some(code) = fuse_device_unusable_exit_code() {
+                error!(
+                    "Mount failed and /dev/fuse cannot be opened: {}. The container \
+                     runtime is blocking device access — pass --device /dev/fuse, \
+                     or add --security-opt seccomp=unconfined for Docker's default \
+                     seccomp profile.",
+                    error_msg
+                );
+                std::process::exit(code);
+            }
             error!("Failed to mount filesystem: {}", error_msg);
             std::process::exit(1);
         }
@@ -926,6 +969,29 @@ mod tests {
         // (None) is final as well — never restart on unknown state.
         assert_eq!(session_lost_exit_code(Some(false)), EXIT_SESSION_LOST);
         assert_eq!(session_lost_exit_code(None), EXIT_SESSION_LOST);
+    }
+
+    #[test]
+    fn fuse_device_open_error_maps_only_permission_denied() {
+        // EACCES and EPERM both surface as PermissionDenied: the runtime
+        // blocks open() even though the node exists (seccomp / device
+        // cgroup), which the container contract groups with a missing device.
+        assert_eq!(
+            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::EACCES)),
+            Some(100)
+        );
+        assert_eq!(
+            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::EPERM)),
+            Some(100)
+        );
+        // An unusable-for-other-reasons device (e.g. module unloaded) must
+        // keep the generic mount-failure classification, not claim code 100.
+        assert_eq!(
+            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::ENODEV)),
+            None
+        );
+        assert_ne!(EXIT_FUSE_DEVICE_UNUSABLE, EXIT_MOUNTPOINT_LOCKED);
+        assert_ne!(EXIT_FUSE_DEVICE_UNUSABLE, EXIT_SESSION_LOST);
     }
 
     #[test]
