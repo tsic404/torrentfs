@@ -620,27 +620,58 @@ const EXIT_SESSION_SEVERED: i32 = 104;
 /// ensured — the same container-level failure family as a missing device.
 const EXIT_FUSE_DEVICE_UNUSABLE: i32 = 100;
 
-/// Classify an `open("/dev/fuse")` failure: `EACCES`/`EPERM` means the
-/// runtime blocks the device despite its node existing. Other errors (e.g.
-/// `ENODEV` with the fuse module unloaded) stay unmapped and keep the generic
-/// mount-failure classification.
-fn fuse_device_open_exit_code(e: &io::Error) -> Option<i32> {
-    match e.kind() {
-        io::ErrorKind::PermissionDenied => Some(EXIT_FUSE_DEVICE_UNUSABLE),
-        _ => None,
+/// Exit status used when the mount call itself is refused with
+/// `io::ErrorKind::PermissionDenied` — the operation never reached the device
+/// (see `main-entry.md` step 18).
+const EXIT_MOUNT_PERMISSION_DENIED: i32 = 2;
+
+/// Outcome of the `/dev/fuse` probe run after a non-permission mount failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FuseProbeResult {
+    /// `open("/dev/fuse")` was denied: the node exists but the runtime
+    /// (seccomp / device cgroup) blocks it, so the device cannot be ensured.
+    Blocked,
+    /// The device opened, or failed for another reason (e.g. `ENODEV` with
+    /// the fuse module unloaded): the device is not the blocking layer.
+    NotBlocked,
+}
+
+impl FuseProbeResult {
+    /// Map an `open("/dev/fuse")` failure: `EACCES`/`EPERM` both surface as
+    /// `PermissionDenied`, which the container contract groups with a missing
+    /// device; every other errno keeps the generic mount-failure family.
+    fn from_open_error(e: &io::Error) -> Self {
+        match e.kind() {
+            io::ErrorKind::PermissionDenied => FuseProbeResult::Blocked,
+            _ => FuseProbeResult::NotBlocked,
+        }
     }
 }
 
 /// Probe `/dev/fuse` after a mount failure: opening the device for read/write
-/// is what the mount itself needs, so a permission-denied probe identifies
-/// the device as the failing layer instead of the mountpoint or options.
-fn fuse_device_unusable_exit_code() -> Option<i32> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")
-        .err()
-        .and_then(|e| fuse_device_open_exit_code(&e))
+/// is what the mount itself needs, so a denied probe identifies the device as
+/// the failing layer instead of the mountpoint or the mount options.
+fn probe_fuse_device() -> FuseProbeResult {
+    match OpenOptions::new().read(true).write(true).open("/dev/fuse") {
+        Ok(_) => FuseProbeResult::NotBlocked,
+        Err(e) => FuseProbeResult::from_open_error(&e),
+    }
+}
+
+/// Classify a mount failure onto its exit code (`main-entry.md` step 18): a
+/// permission-denied mount is refused before the device is reached, otherwise
+/// a blocked `/dev/fuse` probe reclassifies the failure as a device problem,
+/// and everything else stays generic.
+///
+/// `probe` is a thunk because step 18 runs it only on the non-permission path.
+fn classify_mount_error(kind: io::ErrorKind, probe: impl FnOnce() -> FuseProbeResult) -> i32 {
+    if kind == io::ErrorKind::PermissionDenied {
+        return EXIT_MOUNT_PERMISSION_DENIED;
+    }
+    match probe() {
+        FuseProbeResult::Blocked => EXIT_FUSE_DEVICE_UNUSABLE,
+        FuseProbeResult::NotBlocked => 1,
+    }
 }
 
 /// Exit status for a session that ended without a shutdown signal.
@@ -907,40 +938,42 @@ fn main() {
         }
         Err(e) => {
             let error_msg = e.to_string();
-            let exit_code = if e.kind() == io::ErrorKind::PermissionDenied {
-                let mut hints = Vec::new();
-                if !allow_other_enabled {
-                    hints.push("'user_allow_other' is not set in /etc/fuse.conf");
+            let exit_code = classify_mount_error(e.kind(), probe_fuse_device);
+            match exit_code {
+                EXIT_MOUNT_PERMISSION_DENIED => {
+                    let mut hints = Vec::new();
+                    if !allow_other_enabled {
+                        hints.push("'user_allow_other' is not set in /etc/fuse.conf");
+                    }
+                    if !user_in_fuse_group() {
+                        hints.push(
+                            "user may not be in the 'fuse' group (some systems require this)",
+                        );
+                    }
+                    hints.push("running in a container or restricted environment");
+                    hints.push("SELinux/AppArmor restrictions");
+                    hints.push("/dev/fuse device permissions");
+                    error!(
+                        "Mount failed: Operation not permitted. Possible causes:\n  - {}",
+                        hints.join("\n  - ")
+                    );
                 }
-                if !user_in_fuse_group() {
-                    hints.push("user may not be in the 'fuse' group (some systems require this)");
+                EXIT_FUSE_DEVICE_UNUSABLE => {
+                    // The mount failing while /dev/fuse itself cannot be opened
+                    // means the runtime blocks the device (seccomp / device
+                    // cgroup), not the mount: classify it as "device cannot be
+                    // ensured" so supervisors see the same code as for a missing
+                    // device.
+                    error!(
+                        "Mount failed and /dev/fuse cannot be opened: {}. The container \
+                         runtime is blocking device access — pass --device /dev/fuse, \
+                         or add --security-opt seccomp=unconfined for Docker's default \
+                         seccomp profile.",
+                        error_msg
+                    );
                 }
-                hints.push("running in a container or restricted environment");
-                hints.push("SELinux/AppArmor restrictions");
-                hints.push("/dev/fuse device permissions");
-                error!(
-                    "Mount failed: Operation not permitted. Possible causes:\n  - {}",
-                    hints.join("\n  - ")
-                );
-                2
-            } else if let Some(code) = fuse_device_unusable_exit_code() {
-                // The mount failing while /dev/fuse itself cannot be opened
-                // means the runtime blocks the device (seccomp / device
-                // cgroup), not the mount: classify it as "device cannot be
-                // ensured" so supervisors see the same code as for a missing
-                // device.
-                error!(
-                    "Mount failed and /dev/fuse cannot be opened: {}. The container \
-                     runtime is blocking device access — pass --device /dev/fuse, \
-                     or add --security-opt seccomp=unconfined for Docker's default \
-                     seccomp profile.",
-                    error_msg
-                );
-                code
-            } else {
-                error!("Failed to mount filesystem: {}", error_msg);
-                1
-            };
+                _ => error!("Failed to mount filesystem: {}", error_msg),
+            }
 
             // Stop the engine before terminating: `exit` runs the C++ static
             // destructors, and OpenSSL's `OPENSSL_cleanup` frees the library
@@ -985,26 +1018,70 @@ mod tests {
     }
 
     #[test]
-    fn fuse_device_open_error_maps_only_permission_denied() {
+    fn mount_permission_denied_is_exit_2_without_probing_the_device() {
+        // Step 18 checks the mount error before the probe: a refused mount is
+        // classified from the error alone, so the probe must not run — and a
+        // blocked device must not be able to steal this branch.
+        let probed = std::cell::Cell::new(false);
+        let code = classify_mount_error(io::ErrorKind::PermissionDenied, || {
+            probed.set(true);
+            FuseProbeResult::Blocked
+        });
+        assert_eq!(code, EXIT_MOUNT_PERMISSION_DENIED);
+        assert_eq!(code, 2);
+        assert!(!probed.get(), "probe must not run for a refused mount");
+    }
+
+    #[test]
+    fn blocked_device_probe_reclassifies_a_mount_failure_as_exit_100() {
+        // The mount error alone cannot tell a blocked device from a bad
+        // mountpoint, so the probe's EACCES/EPERM verdict must reach exit 100.
+        assert_eq!(
+            classify_mount_error(io::ErrorKind::Other, || FuseProbeResult::Blocked),
+            EXIT_FUSE_DEVICE_UNUSABLE
+        );
+        assert_eq!(
+            classify_mount_error(io::ErrorKind::Other, || FuseProbeResult::Blocked),
+            100
+        );
+    }
+
+    #[test]
+    fn unblocked_device_probe_keeps_a_mount_failure_generic() {
+        // Any non-permission mount error the probe cannot attribute to the
+        // device stays on the generic branch, whose code differs from both
+        // classified branches.
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidInput,
+        ] {
+            let code = classify_mount_error(kind, || FuseProbeResult::NotBlocked);
+            assert_eq!(code, 1, "{kind:?} must stay generic");
+            assert_ne!(code, EXIT_MOUNT_PERMISSION_DENIED);
+            assert_ne!(code, EXIT_FUSE_DEVICE_UNUSABLE);
+        }
+    }
+
+    #[test]
+    fn fuse_probe_maps_only_permission_denied_to_blocked() {
         // EACCES and EPERM both surface as PermissionDenied: the runtime
         // blocks open() even though the node exists (seccomp / device
         // cgroup), which the container contract groups with a missing device.
         assert_eq!(
-            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::EACCES)),
-            Some(100)
+            FuseProbeResult::from_open_error(&io::Error::from_raw_os_error(libc::EACCES)),
+            FuseProbeResult::Blocked
         );
         assert_eq!(
-            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::EPERM)),
-            Some(100)
+            FuseProbeResult::from_open_error(&io::Error::from_raw_os_error(libc::EPERM)),
+            FuseProbeResult::Blocked
         );
         // An unusable-for-other-reasons device (e.g. module unloaded) must
         // keep the generic mount-failure classification, not claim code 100.
         assert_eq!(
-            fuse_device_open_exit_code(&io::Error::from_raw_os_error(libc::ENODEV)),
-            None
+            FuseProbeResult::from_open_error(&io::Error::from_raw_os_error(libc::ENODEV)),
+            FuseProbeResult::NotBlocked
         );
-        assert_ne!(EXIT_FUSE_DEVICE_UNUSABLE, EXIT_MOUNTPOINT_LOCKED);
-        assert_ne!(EXIT_FUSE_DEVICE_UNUSABLE, EXIT_SESSION_LOST);
     }
 
     #[test]
