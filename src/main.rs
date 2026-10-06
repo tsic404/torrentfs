@@ -907,7 +907,7 @@ fn main() {
         }
         Err(e) => {
             let error_msg = e.to_string();
-            if e.kind() == io::ErrorKind::PermissionDenied {
+            let exit_code = if e.kind() == io::ErrorKind::PermissionDenied {
                 let mut hints = Vec::new();
                 if !allow_other_enabled {
                     hints.push("'user_allow_other' is not set in /etc/fuse.conf");
@@ -922,13 +922,13 @@ fn main() {
                     "Mount failed: Operation not permitted. Possible causes:\n  - {}",
                     hints.join("\n  - ")
                 );
-                std::process::exit(2);
-            }
-            // The mount failing while /dev/fuse itself cannot be opened means
-            // the runtime blocks the device (seccomp / device cgroup), not
-            // the mount: classify it as "device cannot be ensured" so
-            // supervisors see the same code as for a missing device.
-            if let Some(code) = fuse_device_unusable_exit_code() {
+                2
+            } else if let Some(code) = fuse_device_unusable_exit_code() {
+                // The mount failing while /dev/fuse itself cannot be opened
+                // means the runtime blocks the device (seccomp / device
+                // cgroup), not the mount: classify it as "device cannot be
+                // ensured" so supervisors see the same code as for a missing
+                // device.
                 error!(
                     "Mount failed and /dev/fuse cannot be opened: {}. The container \
                      runtime is blocking device access — pass --device /dev/fuse, \
@@ -936,10 +936,23 @@ fn main() {
                      seccomp profile.",
                     error_msg
                 );
-                std::process::exit(code);
+                code
+            } else {
+                error!("Failed to mount filesystem: {}", error_msg);
+                1
+            };
+
+            // Stop the engine before terminating: `exit` runs the C++ static
+            // destructors, and OpenSSL's `OPENSSL_cleanup` frees the library
+            // globals while libtorrent's session threads (network / UPnP /
+            // DHT, started with the engine) can still be inside them — the
+            // session thread then dies on freed state instead of the process
+            // exiting with `exit_code`. Joining the engine thread first is
+            // what every other exit does (see `wait_for_shutdown`).
+            if let Some(ds) = &download_service {
+                ds.shutdown();
             }
-            error!("Failed to mount filesystem: {}", error_msg);
-            std::process::exit(1);
+            std::process::exit(exit_code);
         }
     }
 }
