@@ -942,9 +942,11 @@ impl FsService {
                 // Every close of a zero-byte `.torrent` fails with EINVAL:
                 // FUSE can't distinguish `cp` of an empty seed from `touch`,
                 // `>` redirection, or a truncate-to-zero then close. The
-                // `touch` failure is an accepted regression (a silent success
-                // would hide the invalid seed); `release` still discards the
-                // empty inode, so no ghost `data/` mirror survives.
+                // rejection lands in `flush`/`close`, so only callers that
+                // check `close(2)` (e.g. `cp`) can witness the errno; a tool
+                // that ignores it (`touch`, `>`, `dd`) reporting rc=0 is its
+                // own semantics, not an acceptance criterion. `release` still
+                // discards the empty inode, so no ghost `data/` mirror survives.
                 if data.is_empty() {
                     warn!("Zero-byte torrent file {} rejected", name);
                     return Err(FsError::InvalidArgument);
