@@ -17,7 +17,7 @@ A FUSE-based virtual filesystem for BitTorrent management: mount `.torrent` file
 
 ### Build from source
 
-Requirements: Rust toolchain (stable), `libtorrent-rasterbar` 2.1.x with pkg-config metadata, `openssl` development files, `libfuse` development files, `clang` / `libclang` (for FFI bindings), and a C++17 compiler (`gcc` or `clang`).
+Requirements: Rust toolchain (stable), `openssl` development files, `libfuse` development files, and a C++17 compiler (`gcc` or `clang`). No system `libtorrent-rasterbar`, Boost, `pkg-config`, `cmake` or `clang`/`libclang` is needed: libtorrent 2.1.1 and the Boost 1.86.0 headers are fetched from their upstream release assets by the crate's build script, verified against pinned SHA256 digests, and compiled statically into the binary. The first build needs network access (later builds reuse `$CARGO_HOME/libtorrent-sys-cache`, overridable with `LIBTORRENT_SYS_CACHE`) and takes a few minutes; set `LIBTORRENT_SRC_URL` / `BOOST_SRC_URL` to fetch through a mirror, or `BOOST_HEADERS_DIR` to point at a ready Boost header tree.
 
 ```bash
 cargo build --release       # binary at ./target/release/torrentfs
