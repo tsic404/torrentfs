@@ -5,9 +5,14 @@ edition = "2021"
 links = "torrent-rasterbar"
 
 [build-dependencies]
-bindgen = "0.69"
-pkg-config = "0.3"
-cc = "1.0"
+# libtorrent and Boost come from upstream release assets fetched at build time
+# and compiled here; the bindings are pre-generated, so bindgen and pkg-config
+# are not build dependencies (design 05-modules/libtorrent-sys.md §4 #7/#8).
+cc = { version = "1.2", features = ["parallel"] }
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [features]
 default = []

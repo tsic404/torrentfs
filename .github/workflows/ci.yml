@@ -29,19 +29,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental. Install it
-          # in its own command so `-t experimental` does not also resolve clang,
-          # libssl-dev and curl from experimental, whose clang/OpenSSL are
-          # mid-transition and unsatisfiable alongside sid.
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             curl \
             ca-certificates
@@ -55,8 +48,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
@@ -192,17 +186,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental (see the
-          # test job above for why it is installed separately from the rest).
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             fuse3 \
             curl \
@@ -220,8 +209,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-window-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-window-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
@@ -248,17 +238,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental (see the
-          # test job above for why it is installed separately from the rest).
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             fuse3 \
             curl \
@@ -276,8 +261,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-prefetch-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-prefetch-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
@@ -304,17 +290,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental (see the
-          # test job above for why it is installed separately from the rest).
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             fuse3 \
             curl \
@@ -332,8 +313,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-ladder-selfseed-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-ladder-selfseed-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-ladder-cargo-
 
@@ -366,17 +348,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental (see the
-          # test job above for why it is installed separately from the rest).
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             fuse3 \
             curl \
@@ -394,8 +371,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-multifile-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-multifile-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
@@ -422,17 +400,12 @@ jobs:
       - name: Install system dependencies
         run: |
           apt-get update
-          echo "deb http://deb.debian.org/debian experimental main" >> /etc/apt/sources.list
-          apt-get update
-          # libtorrent-rasterbar-dev is only packaged in experimental (see the
-          # test job above for why it is installed separately from the rest).
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
           apt-get install -y --no-install-recommends \
-            -t experimental libtorrent-rasterbar-dev
-          apt-get install -y --no-install-recommends \
+            g++ \
             libssl-dev \
-            pkg-config \
-            clang \
-            libclang-dev \
             libfuse-dev \
             fuse3 \
             curl \
@@ -450,8 +423,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
             target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-session-recovery-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-session-recovery-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
@@ -471,3 +445,56 @@ jobs:
 
       - name: Run session recovery e2e
         run: ./ci/tests/session_recovery_e2e.sh
+
+  bindings-drift:
+    name: Bindings Drift (regenerate + diff)
+    runs-on: ubuntu-24.04
+    # Debian 12 keeps clang 14 for the life of the release, unlike the rolling
+    # `sid` the other jobs use: libclang is part of the generator whose output is
+    # committed, and a libclang upgrade would otherwise turn this job red with the
+    # declarations unchanged (design §4 #7).
+    container: debian:bookworm-slim
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          # The build chain itself needs no bindgen and no libclang (the
+          # declarations are pre-generated); regenerating them does, which is
+          # why this runs as its own job (design §4 #7). gcc links the pinned
+          # bindgen CLI that regenerate-bindings.sh installs.
+          apt-get install -y --no-install-recommends \
+            gcc \
+            libclang-14-dev \
+            curl \
+            ca-certificates
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-bindgen-cli-${{ hashFiles('libtorrent-sys/regenerate-bindings.sh') }}
+
+      - name: Keep the committed declarations aside
+        # A container job checks the repository out as a plain archive, so there
+        # is no working tree to diff against: keep the committed bytes and
+        # compare the regenerated file with them.
+        run: cp libtorrent-sys/src/bindings.rs /tmp/bindings.committed.rs
+
+      - name: Regenerate the committed declarations
+        env:
+          # Naming the pinned libclang keeps the generator fixed instead of
+          # resolved from whatever the image ships by default.
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+        run: ./libtorrent-sys/regenerate-bindings.sh
+
+      - name: Fail on any drift from the committed declarations
+        run: |
+          if ! diff -u /tmp/bindings.committed.rs libtorrent-sys/src/bindings.rs; then
+            echo "::error::libtorrent-sys/src/bindings.rs is stale; regenerate it with libtorrent-sys/regenerate-bindings.sh"
+            exit 1
+          fi
