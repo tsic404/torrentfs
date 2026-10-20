@@ -23,16 +23,18 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM debian:sid-slim
 
 # libtorrent, its C ABI wrapper and the C++ runtime are statically linked into
-# /usr/local/bin/torrentfs, so no libtorrent / Boost package is needed here: the
-# runtime carries openssl (still a runtime dependency), FUSE and the base
-# image's own dependencies.
+# /usr/local/bin/torrentfs: the binary's DT_NEEDED carries no libstdc++ /
+# libgcc_s (ADR-002: 动态依赖面只减不增).  The base image still provides both
+# unconditionally through dependencies: apt Depends: libstdc++6, and libc6 /
+# libapt-pkg7.0 Depends: libgcc-s1 (which provides libgcc_s.so.1).  Dropping
+# their explicit install lines therefore changes no image content.  openssl
+# and FUSE remain the runtime dependencies this stage installs.
 #
 # The daemon user gets /bin/sh (not /usr/sbin/nologin) as its login shell:
 # a container has no login(1)/PAM path for nologin to guard, and operators
 # need `docker exec --user torrentfs sh` to debug the mount.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 \
-    libstdc++6 \
     libfuse2 \
     fuse3 \
     ca-certificates \
