@@ -62,6 +62,11 @@ fn main() {
     let libtorrent_src = libtorrent_source(&cache);
     let boost_headers = boost_headers(&cache);
 
+    // Emit the gcc static-archive search paths first, so the `static=stdc++`
+    // / `static=gcc_eh` link directives emitted below resolve against the
+    // archives when rustc links this crate's own rlib.
+    emit_gcc_static_archive_paths();
+
     // The wrapper archive must precede the libtorrent archive on the link line:
     // the linker resolves the libtorrent symbols the wrapper pulls in only from
     // archives that come after it.
@@ -73,6 +78,56 @@ fn main() {
     // compiler's include path, libraries by name (no pkg-config).
     println!("cargo:rustc-link-lib=ssl");
     println!("cargo:rustc-link-lib=crypto");
+
+    // The GCC unwinder runtime also links statically: rustc emits `-lgcc_s` at
+    // a fixed position after its own rlibs, so the shared lib would otherwise
+    // land in DT_NEEDED.  Pulling `libgcc_eh.a` (the exception-unwinder
+    // archive) lets the C++ exception frames resolve against the static
+    // members; `--as-needed` then drops the trailing `-lgcc_s`.  Like the C++
+    // stdlib directive, this goes out through the `links` native-lib
+    // declaration and reaches only the final binary's link.
+    println!("cargo:rustc-link-lib=static=gcc_eh");
+}
+
+/// Locates `libstdc++.a` and `libgcc_eh.a` through the C++ compiler itself and
+/// emits their directories as native search paths.  This keeps the static
+/// runtime link independent of distro-specific paths and compiler version.
+fn emit_gcc_static_archive_paths() {
+    let mut probe_build = cc::Build::new();
+    probe_build.cpp(true);
+    let compiler = probe_build.get_compiler();
+    let compiler_path = compiler.path().to_path_buf();
+    let mut dirs = std::collections::BTreeSet::new();
+    for probe in ["libstdc++.a", "libgcc_eh.a"] {
+        let flag = format!("-print-file-name={probe}");
+        let out = std::process::Command::new(&compiler_path)
+            .arg(&flag)
+            .output()
+            .unwrap_or_else(|error| {
+                fail(format!("cannot run {}: {error}", compiler_path.display()))
+            });
+        let path = String::from_utf8(out.stdout).unwrap_or_else(|_| {
+            fail(format!(
+                "{} -print-file-name output is not UTF-8",
+                compiler_path.display()
+            ))
+        });
+        let path = path.trim();
+        if path.is_empty() || path == probe {
+            fail(format!(
+                "{} could not locate {probe}",
+                compiler_path.display()
+            ));
+        }
+        if let Some(dir) = Path::new(path).parent() {
+            dirs.insert(dir.to_path_buf());
+        } else {
+            fail(format!("{path} has no parent directory"));
+        }
+    }
+    for dir in &dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
 }
 
 /// Aborts the build with an actionable message (design §8).
@@ -497,7 +552,13 @@ fn compile_wrapper(manifest_dir: &Path, libtorrent_src: &Path, boost_headers: &P
         .include(boost_headers)
         .file(manifest_dir.join("wrapper/libtorrent_wrapper.cpp"));
     apply_defines(&mut build, SHARED_DEFINES);
-    build.compile("libtorrent_wrapper");
+    // The C++ stdlib links statically into the final binary (ADR-002: 动态依赖
+    // 面只减不增). The link directive goes out through this crate's `links`
+    // native-lib declaration, so it reaches only the final link, never the
+    // intermediate crates rustc links while building the dependency graph.
+    build
+        .cpp_link_stdlib_static(true)
+        .compile("libtorrent_wrapper");
 }
 
 /// Compiles libtorrent's own translation units with the shared plus the
@@ -546,7 +607,9 @@ fn compile_libtorrent(libtorrent_src: &Path, boost_headers: &Path) {
         build.file(libtorrent_src.join("src/ed25519").join(source));
     }
     build.file(libtorrent_src.join("src/pe_crypto.cpp"));
-    build.compile("torrent-rasterbar");
+    build
+        .cpp_link_stdlib_static(true)
+        .compile("torrent-rasterbar");
 }
 
 /// Compile-only probes: the Boost header tree must be self-sufficient, and the

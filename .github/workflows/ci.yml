@@ -142,6 +142,24 @@ jobs:
       - name: Smoke test image
         run: docker run --rm torrentfs:ci --help
 
+      - name: Verify static C++ runtime linkage
+        # ADR-002's dynamic-dependency invariant: the binary must not depend on
+        # libstdc++ / libgcc_s at runtime.
+        # libtorrent-sys declares the static stdc++/gcc_eh native libs through
+        # its `links` metadata; assert the actual DT_NEEDED so a regression
+        # fails CI instead of only a manual readelf check.
+        run: |
+          docker create --name torrentfs-check torrentfs:ci
+          docker cp torrentfs-check:/usr/local/bin/torrentfs ./torrentfs-check
+          docker rm torrentfs-check
+          if readelf -d ./torrentfs-check | grep -E 'libstdc\+\+\.so\.6|libgcc_s\.so\.1'; then
+            echo "::error title=Static runtime linkage regressed::DT_NEEDED contains libstdc++.so.6 or libgcc_s.so.1"
+            exit 1
+          fi
+          echo "OK: DT_NEEDED has no libstdc++.so.6 / libgcc_s.so.1"
+          readelf -d ./torrentfs-check | grep NEEDED
+          rm -f ./torrentfs-check
+
       - name: Smoke test privilege drop
         run: |
           docker run --rm \
@@ -167,9 +185,27 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           platforms: linux/arm64
+          tags: torrentfs:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify static C++ runtime linkage
+        # arm64 is a published artifact and its runtime image no longer
+        # installs libstdc++6 either: assert the same DT_NEEDED condition as
+        # the amd64 job so an arm64-only regression cannot ship.
+        run: |
+          docker create --name torrentfs-check torrentfs:ci
+          docker cp torrentfs-check:/usr/local/bin/torrentfs ./torrentfs-check
+          docker rm torrentfs-check
+          if readelf -d ./torrentfs-check | grep -E 'libstdc\+\+\.so\.6|libgcc_s\.so\.1'; then
+            echo "::error title=Static runtime linkage regressed::DT_NEEDED contains libstdc++.so.6 or libgcc_s.so.1"
+            exit 1
+          fi
+          echo "OK: DT_NEEDED has no libstdc++.so.6 / libgcc_s.so.1"
+          readelf -d ./torrentfs-check | grep NEEDED
+          rm -f ./torrentfs-check
 
   window-boundary-e2e:
     name: Window Boundary E2E (>4 GiB sparse seed)

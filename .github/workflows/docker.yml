@@ -53,9 +53,28 @@ jobs:
         with:
           context: .
           push: true
+          load: true
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Verify static C++ runtime linkage
+        # Published artifact: assert the binary's DT_NEEDED carries no
+        # libstdc++ / libgcc_s — ADR-002's dynamic-dependency invariant.  The
+        # base image keeps its own libstdc++6 / libgcc_s.so.1, so this guards
+        # the contract rather than runtime viability.
+        run: |
+          image="$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker create --name torrentfs-check "$image"
+          docker cp torrentfs-check:/usr/local/bin/torrentfs ./torrentfs-check
+          docker rm torrentfs-check
+          if readelf -d ./torrentfs-check | grep -E 'libstdc\+\+\.so\.6|libgcc_s\.so\.1'; then
+            echo "::error title=Static runtime linkage regressed::DT_NEEDED contains libstdc++.so.6 or libgcc_s.so.1"
+            exit 1
+          fi
+          echo "OK: DT_NEEDED has no libstdc++.so.6 / libgcc_s.so.1"
+          readelf -d ./torrentfs-check | grep NEEDED
+          rm -f ./torrentfs-check
 
   build-and-push-arm64:
     name: Build and Push (arm64)
@@ -96,9 +115,28 @@ jobs:
         with:
           context: .
           push: true
+          load: true
           platforms: linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Verify static C++ runtime linkage
+        # Published artifact: assert the binary's DT_NEEDED carries no
+        # libstdc++ / libgcc_s — ADR-002's dynamic-dependency invariant.  The
+        # base image keeps its own libstdc++6 / libgcc_s.so.1, so this guards
+        # the contract rather than runtime viability.
+        run: |
+          image="$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -n1)"
+          docker create --name torrentfs-check "$image"
+          docker cp torrentfs-check:/usr/local/bin/torrentfs ./torrentfs-check
+          docker rm torrentfs-check
+          if readelf -d ./torrentfs-check | grep -E 'libstdc\+\+\.so\.6|libgcc_s\.so\.1'; then
+            echo "::error title=Static runtime linkage regressed::DT_NEEDED contains libstdc++.so.6 or libgcc_s.so.1"
+            exit 1
+          fi
+          echo "OK: DT_NEEDED has no libstdc++.so.6 / libgcc_s.so.1"
+          readelf -d ./torrentfs-check | grep NEEDED
+          rm -f ./torrentfs-check
 
   merge-manifest:
     name: Merge Multi-Arch Manifest

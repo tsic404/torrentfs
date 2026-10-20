@@ -1,6 +1,0 @@
-# libtorrent and its C ABI wrapper are linked statically, so the C++ runtime they
-# need is folded into the binary too (ADR-002: 动态依赖面只减不增). The flags
-# have to be given to the final link, which happens outside libtorrent-sys, so
-# they live here rather than in that crate's build script.
-[target.'cfg(target_os = "linux")']
-rustflags = ["-C", "link-arg=-static-libstdc++", "-C", "link-arg=-static-libgcc"]
