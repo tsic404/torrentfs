@@ -1,6 +1,6 @@
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::sync::Arc;
 use torrentfs::TorrentInfo;
 
 mod common;
@@ -68,7 +68,8 @@ fn test_read_file_range_with_local_seed() {
 
     let (torrent_data, file_content) = create_test_torrent();
 
-    let info = Arc::new(TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"));
+    let info =
+        Arc::new(TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"));
 
     println!("Torrent info:");
     println!("  Name: {}", info.name());
@@ -117,93 +118,8 @@ fn test_read_file_range_with_local_seed() {
     }
 }
 
-/// Integration test: verify that read_file_range works end-to-end with
-/// a local tracker + seeder (TestHarness). This validates the full
-/// peer-discovery-and-download flow required by acceptance scenario 4.
-///
-/// Ignored by default because it requires process-internal tracker +
-/// seeder infrastructure that may not be available in all CI environments.
-/// Run manually with: `cargo test -- --ignored`
-#[test]
-#[ignore = "requires process-internal tracker + seeder"]
-fn test_read_file_range_with_test_harness() {
-    let harness = common::TestHarness::new();
-
-    println!(
-        "Tracker: {}, announces: {}",
-        harness.tracker.announce_url(),
-        harness.tracker.announce_count()
-    );
-
-    let info_hash = hex::encode(harness.info.info_hash().expect("Failed to get info hash"));
-    println!("Info hash: {}", info_hash);
-
-    // Create a downloader session using DownloadManager with local test config
-    let config = common::local_test_config();
-    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
-
-    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadEngine");
-
-    // Re-parse torrent data (raw pointer in TorrentInfo can't be shared)
-    let dl_info = Arc::new(
-        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
-            .expect("Failed to parse torrent for downloader"),
-    );
-
-    // Brief settle — the TestHarness seeder has announced,
-    // but on slow CI the tracker's peer list may still be stale.
-    thread::sleep(Duration::from_secs(1));
-
-    println!("Downloader: attempting read_file_range...");
-
-    let dl_timeout = Duration::from_secs(60);
-    let read_start = std::time::Instant::now();
-    let mut last_error: Option<torrentfs::TorrentError> = None;
-
-    let result = loop {
-        match engine.read_file_range(dl_info.clone(), 0, 0, 16384) {
-            Ok(data) => break Ok(data),
-            Err(e) => {
-                last_error = Some(e);
-                if read_start.elapsed() > dl_timeout {
-                    break Err(last_error.take().unwrap());
-                }
-                println!(
-                    "Read attempt at {:.1}s: {:?}, retrying...",
-                    read_start.elapsed().as_secs_f64(),
-                    last_error.as_ref().unwrap()
-                );
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
-    };
-
-    match result {
-        Ok(data) => {
-            let elapsed = read_start.elapsed();
-            println!(
-                "Successfully read {} bytes in {:.1}s",
-                data.len(),
-                elapsed.as_secs_f64()
-            );
-            assert!(!data.is_empty(), "Expected non-empty data");
-            assert_eq!(
-                data.as_slice(),
-                &harness.file_content[..],
-                "Downloaded data doesn't match seed content"
-            );
-        }
-        Err(e) => {
-            panic!(
-                "read_file_range failed: {:?}. \
-                 Tracker announces: {}. \
-                 This test requires a functioning local tracker + seeder.",
-                e,
-                harness.tracker.announce_count()
-            );
-        }
-    }
-
-    println!("=== read_file_range with TestHarness passed! ===");
-}
+// `test_read_file_range_with_local_seed` above seeds the engine's cache
+// directly and exercises the cache-served read path; the former
+// `test_read_file_range_with_test_harness` (an `#[ignore]`d duplicate of the
+// full read-with-seeder flow) was migrated to
+// `tests/acceptance/test_tc_read_01.rs` and removed.
