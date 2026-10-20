@@ -1,41 +1,91 @@
-//! Regression: in a multi-file torrent, a read past one file's EOF must
-//! return 0 bytes — never residual content from a neighbouring file that
-//! shares the same piece. BitTorrent pieces span file boundaries, so a
-//! small file followed by a large all-`'a'` file is exactly the shape where
-//! a missing file-end clamp would leak the neighbour's bytes as "EOF-adjacent"
-//! content.
+//! Design acceptance case TC-read-03: reads at offset ≥ file size are a clean
+//! EOF — 0 bytes, success, no errno, no panic (`docs/03-acceptance.md` §B
+//! AC-12).
+//!
+//! Migrated from the EOF portion of
+//! `tests/read_file_test.rs::test_read_file_range_boundaries` plus the
+//! multi-file past-EOF regression (`tests/multifile_past_eof_test.rs`): a read
+//! past one file's EOF must return 0 bytes, never residual content from a
+//! neighbouring file sharing the same piece.
 
-mod common;
-
-use common::{local_test_config, MiniTracker};
+use crate::common::{local_test_config, unique_torrent, wave_slot, MiniTracker, TestHarness};
+use sha1_smol::Sha1;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-
 use torrentfs::{TorrentInfo, TorrentState};
+
+pub const TC_ID: &str = "TC-read-03";
+
+fn read_with_retry(
+    engine: &torrentfs::download::DownloadEngine,
+    info: Arc<torrentfs::TorrentInfo>,
+    offset: u64,
+    size: u32,
+) -> Vec<u8> {
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+    loop {
+        match engine.read_file_range(info.clone(), 0, offset, size) {
+            Ok(data) => return data,
+            Err(e) => {
+                if start.elapsed() > timeout {
+                    panic!(
+                        "Timed out reading offset={}, size={}: {:?}",
+                        offset, size, e
+                    );
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Single-file torrent: reads at and past EOF return empty data for any
+/// request size (1-byte and 4096-byte reads behave alike).
+#[test]
+fn tc_read_03_past_eof_returns_empty() {
+    let _slot = wave_slot();
+    let harness = TestHarness::with_torrent(unique_torrent("read-03-past-eof.txt"));
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent"),
+    );
+
+    // offset == file_size: empty regardless of requested size.
+    let data = read_with_retry(&engine, info.clone(), 16384, 4096);
+    assert!(data.is_empty(), "read at offset == file_size must be empty");
+
+    // Past EOF, 1-byte read.
+    let data = read_with_retry(&engine, info.clone(), 999_999, 1);
+    assert!(data.is_empty(), "1-byte read past EOF must be empty");
+
+    // Past EOF, large read.
+    let data = read_with_retry(&engine, info.clone(), 999_999, 4096);
+    assert!(
+        data.is_empty(),
+        "large read past EOF must be empty (bs-independent)"
+    );
+
+    engine.shutdown();
+}
 
 const PIECE_LEN: usize = 256 * 1024;
 const SMALL_LEN: usize = 1000;
 const BIG_LEN: usize = 4 * 1024 * 1024;
 
-fn bencode_bytes(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(s.len().to_string().as_bytes());
-    out.push(b':');
-    out.extend_from_slice(s);
-}
-
-fn bencode_int(out: &mut Vec<u8>, v: i64) {
-    out.push(b'i');
-    out.extend_from_slice(v.to_string().as_bytes());
-    out.push(b'e');
-}
-
-/// Build a two-file torrent: `small.txt` (1000 bytes of `x`) followed by
-/// `big.bin` (4 MiB of `a`). The two files share piece 0.
+/// Build a two-file torrent: `small.txt` (1000 bytes) followed by `big.bin`
+/// (4 MiB), sharing piece 0.  Returns `(torrent_bytes, small, big)`.
 fn build_two_file_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    use sha1_smol::Sha1;
-
     let small: Vec<u8> = vec![b'x'; SMALL_LEN];
     let big: Vec<u8> = vec![b'a'; BIG_LEN];
     let content: Vec<u8> = small.iter().chain(big.iter()).copied().collect();
@@ -43,6 +93,17 @@ fn build_two_file_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut pieces = Vec::new();
     for chunk in content.chunks(PIECE_LEN) {
         pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+    }
+
+    fn bencode_bytes(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(s.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(s);
+    }
+    fn bencode_int(out: &mut Vec<u8>, v: i64) {
+        out.push(b'i');
+        out.extend_from_slice(v.to_string().as_bytes());
+        out.push(b'e');
     }
 
     let mut t = Vec::new();
@@ -79,8 +140,7 @@ fn build_two_file_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 /// Stops and joins the seeder thread on drop (normal exit and panic unwind),
-/// then removes the seed directory. `Drop` joins before the fields drop, so
-/// the seeder's file handles are released before `_seed_dir` is removed.
+/// then removes the seed directory.
 struct SeederGuard {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -165,9 +225,11 @@ fn read_once(
     }
 }
 
+/// Multi-file torrent: a read past one file's EOF must return 0 bytes, never
+/// residual content from a neighbour sharing the same piece.
 #[test]
-fn read_past_first_file_eof_does_not_leak_neighbour_piece() {
-    let _session_guard = common::acquire_session_lock();
+fn tc_read_03_multifile_past_eof_is_empty() {
+    let _slot = wave_slot();
     let tracker = MiniTracker::start();
     let announce_url = tracker.announce_url();
     let (torrent_data, _small, _big) = build_two_file_torrent(&announce_url);
@@ -176,7 +238,7 @@ fn read_past_first_file_eof_does_not_leak_neighbour_piece() {
 
     let cache_dir = tempfile::TempDir::new().expect("cache dir");
     let mut config = local_test_config();
-    config.connections.listen_interfaces = Some("0.0.0.0:16883".to_string());
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
 
     let engine = torrentfs::DownloadEngine::new(cache_dir.path(), &config).expect("engine");
     let info = Arc::new(TorrentInfo::from_bytes(torrent_data).expect("parse torrent"));
@@ -217,4 +279,6 @@ fn read_past_first_file_eof_does_not_leak_neighbour_piece() {
         "read at big.bin EOF must be empty, got {} bytes",
         d.len()
     );
+
+    engine.shutdown();
 }

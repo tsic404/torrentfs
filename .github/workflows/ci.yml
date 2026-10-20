@@ -99,6 +99,17 @@ jobs:
           bash -n ./ci/tests/small_cache_read_e2e.sh
           bash -n ./ci/tests/small_cache_steady_state_e2e.sh
           bash -n ./ci/tests/slow_swarm_e2e.sh
+          bash -n ./tests/acceptance/lib_fuse_harness.sh
+          bash -n ./tests/acceptance/lib_seed_torrent.sh
+          bash -n ./tests/acceptance/tc_ingest_01.sh
+          bash -n ./tests/acceptance/tc_rofs_01.sh
+          bash -n ./tests/acceptance/tc_read_04.sh
+          bash -n ./tests/acceptance/tc_stats_01.sh
+          bash -n ./tests/acceptance/tc_stats_02.sh
+          bash -n ./tests/acceptance/tc_recovery_01.sh
+          bash -n ./tests/acceptance/tc_cache_02.sh
+          bash -n ./tests/acceptance/tc_container_01.sh
+          bash -n ./tests/acceptance/tc_container_02.sh
 
   deploy-rootful-test:
     name: Deploy Rootful Shell Tests
@@ -122,6 +133,9 @@ jobs:
     name: Docker Build (amd64)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    # The container cases poll a live daemon; this bounds a wedged run that
+    # would otherwise hang until the workflow's default timeout.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -169,6 +183,53 @@ jobs:
 
       - name: Smoke test torrentfs user shell
         run: ./ci/tests/user_shell_smoke.sh torrentfs:ci
+
+      - name: Setup Rust toolchain
+        # TC-container-02 needs the self-seed tracker+seeder example on the
+        # host to produce a real swarm for the host-side byte comparison.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-container-acceptance-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
+
+      - name: Build the self-seed example
+        run: cargo build --locked --release --example torrentfs-selfseed-env
+
+      - name: Prepare a shared host directory for the container cases
+        # rshared propagation only reaches the host when the bind source lives
+        # on a shared mount; the runner's /tmp is not guaranteed to be shared.
+        run: |
+          sudo mkdir -p /srv/torrentfs-acceptance
+          sudo chown "$(id -u):$(id -g)" /srv/torrentfs-acceptance
+          sudo mount --bind /srv/torrentfs-acceptance /srv/torrentfs-acceptance
+          sudo mount --make-shared /srv/torrentfs-acceptance
+
+      - name: Run acceptance container cases
+        # TC-container-01/02 exercise the production image + entrypoint's
+        # rshared mount, so they run here where the image was just built and
+        # a docker daemon is available.  The scripts self-gate: a runner
+        # without /dev/fuse + CAP_SYS_ADMIN (nested mounts unavailable) makes
+        # them SKIP (exit 2), a capable runner executes them.
+        run: |
+          set -euo pipefail
+          for tc in tc_container_01 tc_container_02; do
+            rc=0
+            ./tests/acceptance/$tc.sh torrentfs:ci /srv/torrentfs-acceptance || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::warning title=TC-container SKIP::$tc skipped — host runner cannot FUSE-mount nested containers"
+              exit 0
+            fi
+            [ "$rc" -eq 0 ] || exit "$rc"
+          done
 
   docker-build-arm64:
     name: Docker Build (arm64)
@@ -481,6 +542,62 @@ jobs:
 
       - name: Run session recovery e2e
         run: ./ci/tests/session_recovery_e2e.sh
+
+  acceptance-fuse-e2e:
+    name: Acceptance FUSE E2E (tests/acceptance P0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: debian:sid-slim
+      # FUSE mount needs the device node and CAP_SYS_ADMIN; the runner VM's
+      # /dev/fuse is passed through (same flags the Docker image documents).
+      options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
+          # the crate's build script: the build chain needs a C++17 compiler,
+          # openssl and libfuse development files, nothing else.
+          apt-get install -y --no-install-recommends \
+            g++ \
+            libssl-dev \
+            libfuse-dev \
+            fuse3 \
+            curl \
+            ca-certificates
+          # torrentfs mounts with allow_other; fuse3 gates that on this line.
+          touch /etc/fuse.conf
+          grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/libtorrent-sys-cache
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-acceptance-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
+
+      - name: Build torrentfs and the selfseed example
+        run: |
+          cargo build --locked --release
+          cargo build --locked --release --example torrentfs-selfseed-env
+
+      - name: Run acceptance FUSE cases
+        run: |
+          set -euo pipefail
+          for tc in tc_ingest_01 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02; do
+            ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc"
+          done
 
   bindings-drift:
     name: Bindings Drift (regenerate + diff)

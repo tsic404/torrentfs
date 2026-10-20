@@ -28,38 +28,6 @@ fn test_load_default_config_is_all_none() {
 }
 
 #[test]
-fn test_load_config_with_connections() {
-    let toml = r#"
-[connections]
-listen_interfaces = "0.0.0.0:6881"
-max_connections = 200
-allow_multiple_connections_per_ip = true
-"#;
-    let cfg = load_config_from_str(toml).expect("Failed to load config");
-    assert_eq!(
-        cfg.connections.listen_interfaces,
-        Some("0.0.0.0:6881".to_string())
-    );
-    assert_eq!(cfg.connections.max_connections, Some(200));
-    assert_eq!(
-        cfg.connections.allow_multiple_connections_per_ip,
-        Some(true)
-    );
-}
-
-#[test]
-fn test_load_config_with_dht_disabled() {
-    let toml = r#"
-[dht]
-enabled = false
-max_dht_items = 500
-"#;
-    let cfg = load_config_from_str(toml).expect("Failed to load config");
-    assert_eq!(cfg.dht.enabled, Some(false));
-    assert_eq!(cfg.dht.max_dht_items, Some(500));
-}
-
-#[test]
 fn test_load_config_with_rate_limits() {
     let toml = r#"
 [rate_limits]
@@ -69,32 +37,6 @@ upload_rate_limit = 524288
     let cfg = load_config_from_str(toml).expect("Failed to load config");
     assert_eq!(cfg.rate_limits.download_rate_limit, Some(1048576));
     assert_eq!(cfg.rate_limits.upload_rate_limit, Some(524288));
-}
-
-#[test]
-fn test_load_config_with_cache() {
-    let toml = r#"
-[cache]
-cache_size = 67108864
-cache_expiry = 3600
-use_read_cache = true
-"#;
-    let cfg = load_config_from_str(toml).expect("Failed to load config");
-    assert_eq!(cfg.cache.cache_size, Some(67108864));
-    assert_eq!(cfg.cache.cache_expiry, Some(3600));
-    assert_eq!(cfg.cache.use_read_cache, Some(true));
-}
-
-#[test]
-fn test_load_config_with_timeouts() {
-    let toml = r#"
-[timeouts]
-read_timeout_secs = 60
-peer_timeout = 120
-"#;
-    let cfg = load_config_from_str(toml).expect("Failed to load config");
-    assert_eq!(cfg.timeouts.read_timeout_secs, Some(60));
-    assert_eq!(cfg.timeouts.peer_timeout, Some(120));
 }
 
 #[test]
@@ -347,26 +289,6 @@ fn test_load_config_nonexistent_file_returns_error() {
     assert!(result.is_err(), "Nonexistent file should return error");
 }
 
-/// the CLI must expose `--config-check` so the container entrypoint
-/// can fail fast on an invalid --config instead of reaching the FUSE mount
-/// stage. Exit code contract: 0 = valid, non-zero = invalid/missing.
-#[test]
-fn test_config_check_flag_rejects_invalid_toml() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("bad.toml");
-    std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .args(["--config-check", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "invalid TOML must exit non-zero via --config-check"
-    );
-}
-
 #[test]
 fn test_config_check_flag_accepts_valid_toml() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -382,71 +304,6 @@ fn test_config_check_flag_accepts_valid_toml() {
         out.status.success(),
         "valid TOML must exit 0 via --config-check: {}",
         out.status
-    );
-}
-
-#[test]
-fn test_config_check_flag_requires_config_option() {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .arg("--config-check")
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "--config-check without --config must be a usage error"
-    );
-}
-
-/// `--config-check` must reject unknown keys and sections instead
-/// of silently ignoring them (rc=0 with "config is valid").
-#[test]
-fn test_config_check_flag_rejects_unknown_section() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("unknown-section.toml");
-    std::fs::write(&config_path, "[bogus_section]\nfoo = 1\n").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .args(["--config-check", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "unknown section must exit non-zero via --config-check"
-    );
-}
-
-#[test]
-fn test_config_check_flag_rejects_unknown_key() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("unknown-key.toml");
-    std::fs::write(&config_path, "[cache]\nmax_size = \"not-a-size\"\n").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .args(["--config-check", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "unknown key in known section must exit non-zero via --config-check"
-    );
-}
-
-#[test]
-fn test_config_check_flag_rejects_invalid_value_type() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("bad-value.toml");
-    std::fs::write(&config_path, "[cache]\ncache_size = \"not-a-size\"\n").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .args(["--config-check", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "invalid value type must exit non-zero via --config-check"
     );
 }
 
@@ -490,38 +347,6 @@ fn assert_accepted(out: &std::process::Output, case: &str) {
         "{} must exit 0 via --config-check: {}",
         case,
         out.status
-    );
-}
-
-/// enum fields must reject out-of-domain integers (e.g.
-/// `choking_algorithm = 999`) via `--config-check` instead of silently
-/// forwarding them to libtorrent. Exit code 1, and the error must name the
-/// offending field plus its legal value domain.
-#[test]
-fn test_config_check_flag_rejects_out_of_range_choking_algorithm() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let config_path = dir.path().join("choking-999.toml");
-    std::fs::write(&config_path, "[algorithms]\nchoking_algorithm = 999\n").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_torrentfs"))
-        .args(["--config-check", "--config"])
-        .arg(&config_path)
-        .output()
-        .expect("failed to run torrentfs");
-    assert!(
-        !out.status.success(),
-        "out-of-range enum must exit non-zero via --config-check"
-    );
-    let logs = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(logs.contains("choking_algorithm"), "logs: {}", logs);
-    assert!(
-        logs.contains("legal values are {0, 2, 3}"),
-        "logs: {}",
-        logs
     );
 }
 
