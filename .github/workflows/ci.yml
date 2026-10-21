@@ -30,12 +30,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             curl \
             ca-certificates
 
@@ -284,12 +283,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
@@ -336,12 +334,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
@@ -388,12 +385,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
@@ -446,12 +442,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
@@ -498,12 +493,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
@@ -559,12 +553,11 @@ jobs:
         run: |
           apt-get update
           # libtorrent 2.1.1 and the Boost headers are fetched and compiled by
-          # the crate's build script: the build chain needs a C++17 compiler,
-          # openssl and libfuse development files, nothing else.
+          # the crate's build script: the build chain needs a C++17 compiler and
+          # openssl, nothing else.
           apt-get install -y --no-install-recommends \
             g++ \
             libssl-dev \
-            libfuse-dev \
             fuse3 \
             curl \
             ca-certificates
