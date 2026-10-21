@@ -2,10 +2,10 @@
 FROM debian:sid-slim AS builder
 
 # Install Rust toolchain + the build chain: libtorrent and the Boost headers are
-# fetched and compiled by the crate's build script, so only a C++17 compiler,
-# openssl and libfuse development files are needed here.
+# fetched and compiled by the crate's build script, so only a C++17 compiler and
+# openssl are needed here; the FUSE layer is pure Rust and links no libfuse.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates build-essential libssl-dev libfuse-dev \
+    curl ca-certificates build-essential libssl-dev \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
@@ -28,14 +28,20 @@ FROM debian:sid-slim
 # unconditionally through dependencies: apt Depends: libstdc++6, and libc6 /
 # libapt-pkg7.0 Depends: libgcc-s1 (which provides libgcc_s.so.1).  Dropping
 # their explicit install lines therefore changes no image content.  openssl
-# and FUSE remain the runtime dependencies this stage installs.
+# remains the linked runtime dependency; torrentfs's FUSE layer links no
+# shared library of its own.
+#
+# fuser's default build talks to the kernel FUSE protocol directly and links no
+# libfuse, so the runtime stage installs no libfuse2 package; the fuse3 package
+# pulls libfuse3-4 as its dependency.  What the mount path actually needs from
+# fuse3 is the `fusermount3` helper (AutoUnmount is only supported through it)
+# and `/etc/fuse.conf` for `user_allow_other`.
 #
 # The daemon user gets /bin/sh (not /usr/sbin/nologin) as its login shell:
 # a container has no login(1)/PAM path for nologin to guard, and operators
 # need `docker exec --user torrentfs sh` to debug the mount.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 \
-    libfuse2 \
     fuse3 \
     ca-certificates \
     passwd \
