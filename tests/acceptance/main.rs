@@ -25,6 +25,7 @@
 // P0 batch.  Modules are added here as each TC's executable form lands.
 
 mod common;
+mod seed_peer;
 
 mod test_tc_cache_01;
 mod test_tc_config_01;

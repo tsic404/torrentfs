@@ -121,3 +121,94 @@ fn tc_read_01_read_after_idle_handle() {
     }
     engine.shutdown();
 }
+
+/// AC-10 against a peer that is not libtorrent: a peer which completes the
+/// handshake, unchokes and declares every piece must be used as a data source.
+///
+/// The libtorrent-seeded cases above cannot prove this on their own — both
+/// ends share one implementation, so a client that never acts on a foreign
+/// peer's bitfield still passes them.  Here the read starts only after the
+/// peer's declaration has taken effect (`.stats` reports a seed), which is the
+/// order a cold mount produces: handle added idle, peer connects and declares,
+/// read arrives afterwards.  A read that yields nothing fails the case.
+#[test]
+fn tc_read_01_read_from_protocol_peer_complete_bitfield() {
+    use crate::common::{build_multipiece_torrent_named, MiniTracker};
+    use crate::seed_peer::SeedPeer;
+
+    let _slot = wave_slot();
+    let tracker = MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    let (torrent_data, content) =
+        build_multipiece_torrent_named(&announce_url, "read-01-protocol-peer.bin");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
+    let info_hash = info.info_hash().expect("Failed to get info hash");
+    let peer = SeedPeer::start(
+        info_hash,
+        content.clone(),
+        info.piece_length() as usize,
+        &announce_url,
+    );
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+    engine
+        .ensure_handle(info.clone())
+        .expect("Failed to ensure lightweight handle");
+
+    let hex_hash = hex::encode(info_hash);
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if engine
+            .try_torrent_status(&hex_hash)
+            .is_some_and(|s| s.num_seeds >= 1)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        engine
+            .try_torrent_status(&hex_hash)
+            .is_some_and(|s| s.num_seeds >= 1),
+        "the peer declared every piece but never counted as a seed \
+         (peer listen port {})",
+        peer.port()
+    );
+
+    let full_len = content.len() as u32;
+    let start = std::time::Instant::now();
+    loop {
+        match engine.read_file_range(info.clone(), 0, 0, full_len) {
+            Ok(data) => {
+                assert_eq!(
+                    data.len(),
+                    full_len as usize,
+                    "read byte count must equal the seeded file size"
+                );
+                assert_eq!(data, content, "read bytes must match the seed content");
+                break;
+            }
+            Err(e) => {
+                assert!(
+                    start.elapsed() <= Duration::from_secs(60),
+                    "timed out reading from an unchoked, complete peer ({:?}); \
+                     pieces served: {}",
+                    e,
+                    peer.pieces_served()
+                );
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+    assert!(
+        peer.pieces_served() > 0,
+        "the read produced bytes without the peer serving a piece"
+    );
+    engine.shutdown();
+}
