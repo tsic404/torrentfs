@@ -6,6 +6,7 @@
 #include <libtorrent/span.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/add_torrent_params.hpp>
+#include <libtorrent/bitfield.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -57,6 +58,12 @@ static bool torrentfs_diag_enabled() {
 
 #define TORRENTFS_DIAG(...) \
     do { if (torrentfs_diag_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
+namespace {
+std::string sha1_to_hex(lt::sha1_hash const& h);
+lt::bitfield cached_pieces_bitfield(std::string const& dir,
+    std::string const& info_hash_hex, lt::torrent_info const& ti);
+} // namespace
 
 // ── Per-info-hash shared mutex for read/write synchronization (TSI-2262) ──
 // The C++ PieceStorage::write_piece acquires an exclusive lock before writing
@@ -438,6 +445,11 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
         // torrentfs switches to download mode explicitly on the first read).
         params.flags &= ~(lt::torrent_flags::paused | lt::torrent_flags::auto_managed);
         params.flags |= lt::torrent_flags::upload_mode;
+        // Pieces already in this cache belong to the session's resume state:
+        // report them as held so a restart onto a warm cache serves them to the
+        // swarm instead of starting with an empty bitfield.
+        params.have_pieces = cached_pieces_bitfield(params.save_path,
+            sha1_to_hex(ti->info_hashes().get_best()), *ti);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -1505,6 +1517,61 @@ std::string sha1_to_hex(lt::sha1_hash const& h) {
     return std::string(hex, 40);
 }
 
+// Piece bitmap of the pieces already complete in the disk cache.
+//
+// The cache directory is this torrent's resume state: pieces written by a
+// previous session must enter libtorrent's bitmap before the first announce,
+// otherwise the restarted torrent advertises an empty bitfield and cannot seed
+// what is already on disk.  A piece file counts only when its length equals the
+// torrent's piece size, it holds no sparse hole and no `.incomplete` marker
+// sits next to it — the write path leaves that marker on a piece it is still
+// filling, and a short or sparse file is a write that never finished.
+lt::bitfield cached_pieces_bitfield(std::string const& dir,
+    std::string const& info_hash_hex, lt::torrent_info const& ti)
+{
+    lt::bitfield have(ti.num_pieces());
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) return have;
+
+    std::string const prefix = info_hash_hex + ":piece:";
+    struct dirent* entry;
+    while ((entry = readdir(dp)) != nullptr) {
+        std::string name(entry->d_name);
+        if (name.size() <= prefix.size() || name.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        std::string const index_str = name.substr(prefix.size());
+        // The suffix must be the piece number alone; a trailing `.incomplete`
+        // marker names the same piece but is not piece data.
+        if (index_str.find_first_not_of("0123456789") != std::string::npos) continue;
+        int index = 0;
+        try {
+            index = std::stoi(index_str);
+        } catch (...) {
+            continue;
+        }
+        if (index < 0 || index >= ti.num_pieces()) continue;
+
+        std::string const path = dir + "/" + name;
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (static_cast<std::int64_t>(st.st_size)
+            != static_cast<std::int64_t>(ti.piece_size(lt::piece_index_t(index)))) {
+            continue;
+        }
+        if (st.st_size > 0
+            && static_cast<std::int64_t>(st.st_blocks) * 512
+                < static_cast<std::int64_t>(st.st_size)) {
+            continue;
+        }
+        if (::access((path + ".incomplete").c_str(), F_OK) == 0) continue;
+
+        have.set_bit(index);
+    }
+    closedir(dp);
+    return have;
+}
+
 static bool ensure_dir_recursive(const std::string& path) {
     if (path.empty()) return false;
     size_t pos = 0;
@@ -1645,6 +1712,11 @@ public:
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary);
         return file.is_open();
+    }
+
+    /// Whether the write path still has this piece in progress.
+    bool has_incomplete_marker(int piece_index) const {
+        return ::access(piece_marker_path(piece_index).c_str(), F_OK) == 0;
     }
 
     int64_t piece_size(int piece_index) {
@@ -1896,14 +1968,21 @@ public:
         int piece_idx = static_cast<int>(piece);
         int64_t sz = ps->piece_size(piece_idx);
         TORRENTFS_DIAG("[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
-        if (sz <= 0) {
-            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
-            // Zero out v2 hashes for hybrid torrents — no piece data yet
+        // An absent piece is a normal "not held" outcome, not an I/O failure:
+        // libtorrent treats a hash mismatch as that, while a storage error makes
+        // it skip the piece by *file* index — an index this per-piece storage
+        // does not have, and the skip jumps checking to the next file's first
+        // piece, abandoning pieces that are still uncounted.  Report a zero
+        // hash instead (and zero v2 hashes for hybrid torrents).
+        auto report_absent_piece = [&] {
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                h(p, lt::sha1_hash(), lt::storage_error());
             });
+        };
+        if (sz <= 0) {
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
+            report_absent_piece();
             return;
         }
 
@@ -1911,11 +1990,7 @@ public:
         auto data = ps->read_piece_data(piece_idx);
         if (data.empty()) {
             TORRENTFS_DIAG("[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
-            for (auto& h : v2) h = lt::sha256_hash();
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
-            });
+            report_absent_piece();
             return;
         }
 
@@ -1974,9 +2049,9 @@ public:
         TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
             TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
+            // Absent piece = not held (see async_hash): a zero hash, no error.
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                h(p, lt::sha256_hash(), lt::storage_error());
             });
             return;
         }
@@ -2014,7 +2089,7 @@ public:
 
     // disk_interface: async_check_files
     void async_check_files(lt::storage_index_t storage,
-        lt::add_torrent_params const* /*resume_data*/,
+        lt::add_torrent_params const* resume_data,
         lt::aux::vector<std::string, lt::file_index_t> /*links*/,
         std::function<void(lt::status_t, lt::storage_error const&)> handler) override
     {
@@ -2027,34 +2102,28 @@ public:
             return;
         }
 
-        // After FUSE remount, PieceStorageDiskIO must re-check which piece files
-        // exist on disk so that libtorrent can correctly identify cached pieces.
-        // Scan the pieces directory and report existing piece files.
-        std::string dir = ps->pieces_dir();
-        std::set<int> existing_pieces;
-
-        DIR* dp = opendir(dir.c_str());
-        if (dp) {
-            struct dirent* entry;
-            std::string prefix = ps->get_info_hash_hex() + ":piece:";
-            while ((entry = readdir(dp)) != nullptr) {
-                std::string name(entry->d_name);
-                if (name.size() > prefix.size() &&
-                    name.compare(0, prefix.size(), prefix) == 0) {
-                    std::string idx_str = name.substr(prefix.size());
-                    try {
-                        int idx = std::stoi(idx_str);
-                        existing_pieces.insert(idx);
-                    } catch (...) {
-                        // Ignore malformed filenames
-                    }
+        // The add path derived `have_pieces` from the piece files in this cache
+        // (cached_pieces_bitfield).  Verify every claim still holds before
+        // libtorrent adopts the bitmap and advertises it: a piece whose file
+        // vanished, or that the write path has since marked in progress, must
+        // not be served.  A full hash check is the honest fallback — it rebuilds
+        // the bitmap from the bytes actually on disk.
+        if (resume_data && !resume_data->have_pieces.empty()) {
+            auto const& have = resume_data->have_pieces;
+            for (int i = 0; i < have.size(); ++i) {
+                if (!have.get_bit(lt::piece_index_t(i))) continue;
+                if (!ps->has_piece(i) || ps->has_incomplete_marker(i)) {
+                    TORRENTFS_DIAG(
+                        "[DIAG] async_check_files: claimed piece %d is no longer "
+                        "on disk => full check\n", i);
+                    handler(lt::disk_status::need_full_check, lt::storage_error());
+                    return;
                 }
             }
-            closedir(dp);
         }
 
-        // Report found pieces via handler — libtorrent will then call
-        // async_hash for each piece to verify integrity.
+        // Nothing claimed from disk and nothing to verify: libtorrent starts
+        // with an empty bitmap, as it would for a brand-new torrent.
         handler(lt::status_t{}, lt::storage_error());
     }
 
