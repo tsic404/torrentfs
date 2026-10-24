@@ -3,9 +3,11 @@
 //! (`docs/03-acceptance.md` §G AC-65). Unset and non-positive resolve to 15 s
 //! and the read window is `min(read_timeout_secs, that value)`, while the
 //! `.stats` grace is that same resolved value and is not narrowed by a shorter
-//! read timeout (C-6.4.5). Config inputs load through the shipped file loader;
-//! the tests pin the resolved config, the engine value and the first-alert
-//! instant, so a 0 that stops matching "unset" fails here.
+//! read timeout (C-6.4.5). A seed that becomes usable mid-wait restores the
+//! full read timeout, so a read survives past the narrowed window. Config
+//! inputs load through the shipped file loader; the tests pin the resolved
+//! config, the engine value, the first-alert instant and the read's wait
+//! window, so a 0 that stops matching "unset" fails here.
 
 use crate::common::{base, local_test_config, wave_slot};
 use std::io::Write;
@@ -278,4 +280,132 @@ fn tc_config_06_short_read_timeout_caps_the_budget_not_the_grace() {
         alert <= Duration::from_secs(25),
         "the alert must still fire on the 15s grace, fired after {alert:?}"
     );
+}
+
+/// AC-65's fourth clause: with no seeder connected the read waits the narrowed
+/// `min(read_timeout_secs, resolved no-seeder value)` window; a seed that
+/// becomes usable inside that wait restores the full read timeout, so the read
+/// survives past the short window and completes.
+///
+/// The swarm holds a leecher from the start, which keeps the read in the piece
+/// wait instead of the empty-swarm discovery wait.  The seeded peer delays its
+/// handshake and then its PIECE reply, so the read sees a seed appear mid-wait
+/// and can only finish after the narrowed window would have ended.
+#[test]
+fn tc_config_06_seeder_joining_mid_wait_restores_the_full_read_timeout() {
+    use crate::seed_peer::{PeerDelays, SeedPeer};
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Narrowed no-seeder window.  It sits far above `HANDSHAKE_DELAY`: the
+    /// read's clock can trail the peers' connect by up to the one-second
+    /// snapshot interval (see the threshold comment below), so the seed's
+    /// delayed handshake must still land inside the window after that lag.
+    const NO_SEEDER_SECS: i64 = 7;
+    const READ_TIMEOUT_SECS: i64 = 12;
+    /// The seed's handshake lands well inside the narrowed window ...
+    const HANDSHAKE_DELAY: Duration = Duration::from_secs(5);
+    /// ... and its bytes arrive seconds after that window would have expired.
+    const REPLY_DELAY: Duration = Duration::from_secs(5);
+
+    let _slot = wave_slot();
+    let tracker = base::MiniTracker::start();
+    let announce_url = tracker.announce_url();
+    let (torrent_data, content) =
+        base::create_single_piece_torrent(&announce_url, "tc_config_06_mid_wait_seeder");
+    let info = Arc::new(TorrentInfo::from_bytes(torrent_data).expect("torrent must parse"));
+    let info_hash = info.info_hash().expect("info hash");
+    let info_hash_hex = hex::encode(info_hash);
+    let piece_len = info.piece_length() as usize;
+
+    // Both peers announce before the handle exists, so the client's first
+    // announce returns them together: the leecher connects at once, while the
+    // seed's handshake arrives only after its delay.
+    let leecher = SeedPeer::start_leecher(info_hash, content.clone(), piece_len, &announce_url);
+    let seeder = SeedPeer::start_delayed(
+        info_hash,
+        content.clone(),
+        piece_len,
+        &announce_url,
+        PeerDelays {
+            handshake: HANDSHAKE_DELAY,
+            piece: REPLY_DELAY,
+        },
+    );
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let mut config = config_with_timeouts(READ_TIMEOUT_SECS, Some(NO_SEEDER_SECS));
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("engine must start"),
+    );
+    engine.ensure_handle(info.clone()).expect("handle");
+
+    // A non-empty swarm without a seed is what routes the read into the
+    // narrowed piece wait rather than the empty-swarm discovery wait.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = engine.try_torrent_status(&info_hash_hex);
+        if status.as_ref().is_some_and(|s| s.num_peers >= 1) {
+            assert_eq!(
+                status.unwrap().num_seeds,
+                0,
+                "the seed must not be usable yet: its handshake is delayed"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the leecher never connected (peer port {})",
+            leecher.port()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let full_len = content.len() as u32;
+    let (tx, rx) = mpsc::channel();
+    let reader = {
+        let engine = Arc::clone(&engine);
+        let info = Arc::clone(&info);
+        let started = Instant::now();
+        thread::spawn(move || {
+            let result = engine.read_file_range(info, 0, 0, full_len);
+            let _ = tx.send((started.elapsed(), result));
+        })
+    };
+
+    let (elapsed, result) = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the read must finish inside the full read timeout");
+    reader.join().expect("reader thread");
+
+    let data = result.expect(
+        "a seed that becomes usable inside the narrowed wait must rescue the read",
+    );
+    assert_eq!(data, content, "the read must return the seeded bytes");
+    // `try_torrent_status` refreshes once a second, so the read can start up
+    // to one snapshot interval after the peers connected.  On the read's clock
+    // the seed's handshake therefore lands at `HANDSHAKE_DELAY` minus that lag
+    // and its first byte at `HANDSHAKE_DELAY + REPLY_DELAY` minus that lag,
+    // while an un-restored read dies at `NO_SEEDER_SECS`.  At the maximum lag
+    // the threshold keeps about two seconds to the former and four to the
+    // latter, so neither side of it is decided by the snapshot phase.
+    const MIN_ELAPSED: Duration = Duration::from_secs(5);
+    assert!(
+        elapsed >= MIN_ELAPSED,
+        "the read finished after {elapsed:?}, before the joining seed could serve a byte: \
+         the narrowed no-seeder window was not restored to the full read timeout"
+    );
+    assert!(
+        seeder.pieces_served() > 0,
+        "the late seed served nothing; the read was not driven by it"
+    );
+    assert_eq!(
+        leecher.pieces_served(),
+        0,
+        "a peer that declares no pieces must not serve data"
+    );
+
+    engine.shutdown();
 }
