@@ -243,20 +243,20 @@ To read the failure cause, grep the daemon's streams (direct run: the terminal,
 or `--log-file`):
 
 ```bash
-docker logs <container> 2>&1 | grep -E 'no seeder connected|read stalled on the on-disk cache|Failed to read'
+docker logs <container> 2>&1 | grep -E 'no seeder connected|read stalled on a slow swarm|read stalled on the on-disk cache|Failed to read'
 ```
 
-The engine writes two of the causes to its own stderr at the moment the read
-fails (the FUSE client only ever sees `ENODATA`, so this is where the reason
-exists):
+The engine writes the classified causes to its own stderr at the moment the
+read fails (the FUSE client only ever sees `ENODATA`, so this is where the
+reason exists):
 
 - `no seeder connected (Peers:<N> Seeds:<M>) within the <w>s peer-discovery window; <advice>` — the discovery window ran out with nothing that could serve the read; `<advice>` names the timeout(s) that actually cap that window (`[timeouts] read_timeout_secs` when it is the smallest term, `peer_discovery_wait_secs` when it is, the optional `peer_wait_cap_secs` when it is, or all tied terms together).
 - `no seeder connected (Peers:<N> Seeds:<M>) after the <w>s no-seeder piece wait; no seeder is present in the swarm` — peers are connected but none seeds (or the only seeder joined after the window and left). This window derives from `read_timeout_secs`, capped by `[timeouts] no_seeder_read_timeout_secs` while no seeder is connected; a larger `peer_discovery_wait_secs` cannot widen it.
+- `read stalled on a slow swarm (Peers:<N> Seeds:<M>): piece <i> did not arrive within the <w>s piece-wait window at <p>% torrent progress; raise [timeouts] read_timeout_secs and retry` — a seeder was connected but delivered no data before the piece wait expired; the window named is the one the read actually spent.
 - `read stalled on the on-disk cache (cache_size=…, read span=…, <evidence>); raise [cache] cache_size if the cache is evicting data the read needs` — the swarm is not the problem; the read outgrew the cache (`piece the read waits on is gone from cache` or `read span exceeds cache`). Size `cache_size` to at least the file being read.
 
 Otherwise the failure is logged at WARN (`Failed to read from torrent file
-…` / `Failed to read torrent file data (async): …`); the slow-seeder case
-appears only there.
+…` / `Failed to read torrent file data (async): …`).
 
 For libtorrent-level detail (piece reads, writes and hashes), restart the
 daemon with `TORRENTFS_DIAG=1` set — the gate is read once, so it must be set
