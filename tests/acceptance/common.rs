@@ -10,8 +10,8 @@
 pub mod base;
 
 pub use base::{
-    acquire_session_lock, build_multipiece_torrent_named, local_test_config, MiniTracker,
-    TestHarness,
+    acquire_session_lock, build_multipiece_torrent_named, build_multipiece_torrent_pieces,
+    local_test_config, MiniTracker, TestHarness,
 };
 
 use std::sync::atomic::{AtomicUsize, Ordering};
