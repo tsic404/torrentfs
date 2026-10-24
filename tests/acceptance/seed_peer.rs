@@ -1,12 +1,17 @@
-//! Protocol-level seed peer for the read-path acceptance cases.
+//! Protocol-level peer for the read-path acceptance cases.
 //!
 //! The design makes libtorrent the only BitTorrent implementation in the
 //! product (F5/NG2), so a libtorrent seeder cannot prove that a *foreign* peer
 //! is usable: both ends would be the same implementation.  This fixture speaks
-//! the minimum a real seed sends — handshake, complete bitfield, unchoke, and
-//! a PIECE reply per REQUEST — and records whether the client ever asked it
-//! for a byte.  A read that returns the seeded bytes therefore proves the
-//! client treated an unchoked, piece-declaring peer as a data source.
+//! the minimum a real peer sends — handshake, bitfield, unchoke, and a PIECE
+//! reply per REQUEST — and records whether the client ever asked it for a byte.
+//! A read that returns the seeded bytes therefore proves the client treated an
+//! unchoked, piece-declaring peer as a data source.
+//!
+//! The peer can also declare no pieces (a leecher, which keeps a swarm
+//! non-empty without providing a source) and can delay its handshake or its
+//! PIECE replies, so a case can make a seed become usable at a chosen point
+//! inside a read's wait.
 //!
 //! Discovery stays on the normal path: the peer announces itself to the same
 //! tracker the client uses, exactly as the libtorrent seeder it replaces does.
@@ -23,7 +28,35 @@ const BITFIELD_ID: u8 = 5;
 const REQUEST_ID: u8 = 6;
 const PIECE_ID: u8 = 7;
 
-/// A running seed peer: announces one torrent and serves its bytes.
+/// Extra latency a fixture peer applies before the client can use it.
+#[derive(Clone, Copy, Default)]
+pub struct PeerDelays {
+    /// Wait after the client's handshake before answering it.  Until the
+    /// answer lands the client counts a connecting peer, not a seed.
+    pub handshake: Duration,
+    /// Wait after each REQUEST before sending its PIECE reply.
+    pub piece: Duration,
+}
+
+/// What the peer declares about its pieces.
+#[derive(Clone, Copy)]
+enum Declared {
+    Seed,
+    Leecher,
+}
+
+impl Declared {
+    /// The `left` value this role announces to the tracker (0 = complete).
+    fn left(self, total_len: usize) -> u64 {
+        match self {
+            Self::Seed => 0,
+            Self::Leecher => total_len as u64,
+        }
+    }
+}
+
+/// A running protocol peer: announces one torrent and serves its bytes when it
+/// declares them.
 pub struct SeedPeer {
     port: u16,
     requests: Arc<AtomicUsize>,
@@ -40,15 +73,72 @@ impl SeedPeer {
         piece_len: usize,
         announce_url: &str,
     ) -> Self {
+        Self::launch(
+            info_hash,
+            content,
+            piece_len,
+            announce_url,
+            Declared::Seed,
+            PeerDelays::default(),
+        )
+    }
+
+    /// A peer that declares no pieces and announces the full size as `left`:
+    /// the client counts a connected peer, not a seed.
+    pub fn start_leecher(
+        info_hash: [u8; 20],
+        content: Vec<u8>,
+        piece_len: usize,
+        announce_url: &str,
+    ) -> Self {
+        Self::launch(
+            info_hash,
+            content,
+            piece_len,
+            announce_url,
+            Declared::Leecher,
+            PeerDelays::default(),
+        )
+    }
+
+    /// A complete seed that answers the client only after `delays.handshake`
+    /// and each REQUEST after `delays.piece`, so a case can make the seed
+    /// usable at a chosen point inside a read's wait.
+    pub fn start_delayed(
+        info_hash: [u8; 20],
+        content: Vec<u8>,
+        piece_len: usize,
+        announce_url: &str,
+        delays: PeerDelays,
+    ) -> Self {
+        Self::launch(
+            info_hash,
+            content,
+            piece_len,
+            announce_url,
+            Declared::Seed,
+            delays,
+        )
+    }
+
+    fn launch(
+        info_hash: [u8; 20],
+        content: Vec<u8>,
+        piece_len: usize,
+        announce_url: &str,
+        declared: Declared,
+        delays: PeerDelays,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("seed peer: bind failed");
         let port = listener.local_addr().expect("seed peer: no addr").port();
         listener
             .set_nonblocking(true)
             .expect("seed peer: nonblocking");
-        announce(port, &info_hash, announce_url);
+        announce(port, &info_hash, announce_url, declared.left(content.len()));
 
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
+        let peer_id = peer_id(port);
 
         // One thread per connection: the client may reconnect while the
         // torrent settles, and each connection needs its own message loop.
@@ -56,10 +146,17 @@ impl SeedPeer {
         let accept_stop = Arc::clone(&stop);
         let piece_count = content.len().div_ceil(piece_len.max(1));
         thread::spawn(move || {
-            let mut bitfield = vec![0u8; piece_count.div_ceil(8)];
-            for piece in 0..piece_count {
-                bitfield[piece / 8] |= 1 << (7 - (piece % 8));
-            }
+            let byte_len = piece_count.div_ceil(8);
+            let bitfield = match declared {
+                Declared::Seed => {
+                    let mut bitfield = vec![0u8; byte_len];
+                    for piece in 0..piece_count {
+                        bitfield[piece / 8] |= 1 << (7 - (piece % 8));
+                    }
+                    bitfield
+                }
+                Declared::Leecher => vec![0u8; byte_len],
+            };
             let bitfield = Arc::new(bitfield);
             let content = Arc::new(content);
             while !accept_stop.load(Ordering::Relaxed) {
@@ -76,6 +173,8 @@ impl SeedPeer {
                                 &bitfield,
                                 &content,
                                 piece_len,
+                                delays,
+                                &peer_id,
                                 &requests,
                                 &stop,
                             )
@@ -122,6 +221,8 @@ fn serve(
     bitfield: &[u8],
     content: &[u8],
     piece_len: usize,
+    delays: PeerDelays,
+    peer_id: &[u8; 20],
     requests: &AtomicUsize,
     stop: &AtomicBool,
 ) {
@@ -132,7 +233,10 @@ fn serve(
     if sock.read_exact(&mut peer_handshake).is_err() {
         return;
     }
-    let _ = sock.write_all(&handshake(info_hash));
+    if !delays.handshake.is_zero() {
+        thread::sleep(delays.handshake);
+    }
+    let _ = sock.write_all(&handshake(info_hash, peer_id));
     // A real seed un-chokes and declares its pieces straight after the
     // handshake; waiting for the client's extended handshake would make this
     // fixture depend on a message the product is free not to send.
@@ -173,6 +277,9 @@ fn serve(
                 payload.extend_from_slice(&(index as u32).to_be_bytes());
                 payload.extend_from_slice(&(begin as u32).to_be_bytes());
                 payload.extend_from_slice(&content[start..end]);
+                if !delays.piece.is_zero() {
+                    thread::sleep(delays.piece);
+                }
                 if sock.write_all(&frame(PIECE_ID, &payload)).is_err() {
                     return;
                 }
@@ -192,7 +299,16 @@ fn frame(id: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn handshake(info_hash: &[u8; 20]) -> Vec<u8> {
+/// A peer id unique to this peer's listen port, so two fixture peers in one
+/// swarm are not rejected as a duplicate connection.
+fn peer_id(port: u16) -> [u8; 20] {
+    let text = format!("-SP0001-{port:012}");
+    let mut id = [0u8; 20];
+    id.copy_from_slice(text.as_bytes());
+    id
+}
+
+fn handshake(info_hash: &[u8; 20], peer_id: &[u8; 20]) -> Vec<u8> {
     let mut hs = vec![19u8];
     hs.extend_from_slice(b"BitTorrent protocol");
     let mut reserved = [0u8; 8];
@@ -202,12 +318,13 @@ fn handshake(info_hash: &[u8; 20]) -> Vec<u8> {
     reserved[5] |= 0x10;
     hs.extend_from_slice(&reserved);
     hs.extend_from_slice(info_hash);
-    hs.extend_from_slice(b"-SP0001-012345678901");
+    hs.extend_from_slice(peer_id);
     hs
 }
 
-/// Register this peer with the tracker as a complete seed (`left=0`).
-fn announce(port: u16, info_hash: &[u8; 20], announce_url: &str) {
+/// Register this peer with the tracker, announcing `left` bytes remaining
+/// (0 = complete seed).
+fn announce(port: u16, info_hash: &[u8; 20], announce_url: &str, left: u64) {
     let mut escaped = String::new();
     for byte in info_hash {
         escaped.push_str(&format!("%{byte:02x}"));
@@ -217,7 +334,7 @@ fn announce(port: u16, info_hash: &[u8; 20], announce_url: &str) {
         .split('/')
         .next()
         .expect("seed peer: announce url has no host");
-    let path = format!("/announce?info_hash={escaped}&port={port}&left=0&compact=1");
+    let path = format!("/announce?info_hash={escaped}&port={port}&left={left}&compact=1");
     match TcpStream::connect(host) {
         Ok(mut stream) => {
             let _ = stream.write_all(
