@@ -1151,6 +1151,28 @@ pub(crate) fn cache_stall_stderr_hint(
     )
 }
 
+/// Format the stderr hint for a read stalled on a healthy-but-slow swarm,
+/// mirroring [`no_seeder_stderr_hint`] and [`cache_stall_stderr_hint`] so the
+/// operator can grep the three causes apart.  The prefix must not read as "no
+/// seeder" — a seeder was connected when the piece-wait window elapsed — and
+/// the window it names is the one the read actually ran out of, so the advice
+/// points at the knob that widens that window.  Pure so the exact message is
+/// unit-testable without a running engine.
+pub(crate) fn slow_swarm_stderr_hint(
+    num_peers: i32,
+    num_seeds: i32,
+    piece_idx: i32,
+    piece_wait_secs: u64,
+    progress_percent: f64,
+) -> String {
+    format!(
+        "read stalled on a slow swarm (Peers:{num_peers} Seeds:{num_seeds}): \
+         piece {piece_idx} did not arrive within the {piece_wait_secs}s \
+         piece-wait window at {progress_percent:.2}% torrent progress; raise \
+         [timeouts] read_timeout_secs and retry"
+    )
+}
+
 /// Format the `Timeout` error for a read stalled on the on-disk cache rather
 /// than on the swarm.  It states the evidence without claiming *why* the data
 /// left the cache (eviction, a failed check, or removal outside the cache are
@@ -2139,18 +2161,22 @@ impl EngineState {
         if self.sourceless.contains_key(&read.info_hash) {
             // Only a live status read can tell whether the verdict still speaks
             // for the swarm: the read may have sat in the settle/recheck phases
-            // while a peer or seed connected, which spends the verdict.
-            if let Some(status) = self
+            // while a peer or seed connected, which spends the verdict.  The
+            // verdict is applied only on that fresh snapshot — a read that
+            // cannot take one runs the normal discovery instead of inheriting
+            // from last-known counts.
+            let snapshot = self
                 .handles
                 .get(&read.info_hash)
-                .and_then(|h| h.status().ok())
-            {
-                read.status = status;
+                .and_then(|h| h.status().ok());
+            if let Some(status) = &snapshot {
+                read.status = status.clone();
             }
             let now = Instant::now();
             let inherited = match self.sourceless.get_mut(&read.info_hash) {
                 Some(verdict)
-                    if swarm_is_empty(read.status.num_peers, read.status.num_seeds)
+                    if snapshot.is_some()
+                        && swarm_is_empty(read.status.num_peers, read.status.num_seeds)
                         && verdict.is_live(now) =>
                 {
                     Some((verdict.elapsed, verdict.take_reannounce(now)))
@@ -2192,7 +2218,17 @@ impl EngineState {
                 }
                 read.is_peer_wait_exhausted = true;
                 read.peer_wait_elapsed = elapsed;
-                return Some(self.read_timed_out(read, read.current_piece, Duration::ZERO));
+                // Settle from the same snapshot the verdict was applied on
+                // (C-4.3.3/C-4.3.7): a second live read could already report a
+                // seed that connected in between and classify the read as a
+                // slow swarm that never spent a window — the family whose
+                // advice does not name the discovery window's binding cap.
+                return Some(self.read_timed_out(
+                    read,
+                    read.current_piece,
+                    Duration::ZERO,
+                    snapshot.as_ref(),
+                ));
             }
             // Spent — a peer or seed is present, or the verdict aged out — so
             // this read runs its own discovery or download from here.  The
@@ -2698,7 +2734,7 @@ impl EngineState {
                 self.no_seeder_read_timeout_secs,
             ));
             if read.piece_wait_start.elapsed() >= window {
-                return Some(self.read_timed_out(read, piece_idx, window));
+                return Some(self.read_timed_out(read, piece_idx, window, None));
             }
             return None;
         }
@@ -2713,6 +2749,7 @@ impl EngineState {
         read: &PendingRead,
         piece_idx: i32,
         window: Duration,
+        snapshot: Option<&TorrentStatus>,
     ) -> TorrentResult<Vec<u8>> {
         // libtorrent's custom storage may have already written partial piece
         // data to disk for the requested range.  Record it as incomplete
@@ -2747,24 +2784,30 @@ impl EngineState {
 
         // Tell the three stalls apart: no seeder (`NoPeers`), a read the
         // on-disk cache window cannot cover (`Timeout` naming the cache), and
-        // a slow-but-healthy swarm (`Timeout`).  If status is unavailable
+        // a slow-but-healthy swarm (`Timeout`).  The inherited settlement
+        // hands in the snapshot its verdict was applied on, so the family it
+        // classifies as cannot disagree with that decision; the piece wait
+        // passes `None` and gets a live read.  If status is unavailable
         // (handle gone, `status()` failed), fall back to `Timeout` — don't
         // fabricate a zero-seeder swarm and mislead the user into checking
         // tracker health for a stale handle.
-        let (progress, num_peers, num_seeds) = match self
-            .handles
-            .get(&read.info_hash)
-            .and_then(|h| h.status().ok())
-        {
+        let (progress, num_peers, num_seeds) = match snapshot {
             Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
-            None => {
-                return Err(TorrentError::Timeout(format!(
-                    "Timed out waiting for piece {} after {:.0}s \
+            None => match self
+                .handles
+                .get(&read.info_hash)
+                .and_then(|h| h.status().ok())
+            {
+                Some(s) => (s.progress * 100.0, s.num_peers, s.num_seeds),
+                None => {
+                    return Err(TorrentError::Timeout(format!(
+                        "Timed out waiting for piece {} after {:.0}s \
                          (status unavailable)",
-                    piece_idx,
-                    window.as_secs(),
-                )));
-            }
+                        piece_idx,
+                        window.as_secs(),
+                    )));
+                }
+            },
         };
         let read_span_bytes = read.end_offset.saturating_sub(read.absolute_offset);
         // An unreadable capacity must not read as "the cache is too small":
@@ -2830,13 +2873,26 @@ impl EngineState {
                     num_seeds,
                 )))
             }
-            ReadStallCause::SlowSwarm => Err(TorrentError::Timeout(format!(
-                "Timed out waiting for piece {} after {:.0}s. \
-                 Torrent progress: {:.2}%",
-                piece_idx,
-                window.as_secs(),
-                progress,
-            ))),
+            ReadStallCause::SlowSwarm => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{}",
+                    slow_swarm_stderr_hint(
+                        num_peers,
+                        num_seeds,
+                        piece_idx,
+                        window.as_secs(),
+                        f64::from(progress)
+                    )
+                );
+                Err(TorrentError::Timeout(format!(
+                    "Timed out waiting for piece {} after {:.0}s. \
+                     Torrent progress: {:.2}%",
+                    piece_idx,
+                    window.as_secs(),
+                    progress,
+                )))
+            }
         }
     }
 
@@ -3325,7 +3381,8 @@ mod tests {
         cache_stall_message, cache_stall_stderr_hint, classify_read_stall, discovery_window_advice,
         no_peers_message, no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds,
         peer_discovery_window_secs, piece_wait_window_secs, read_wait_budget_secs,
-        reader_demand_is_live, should_publish_after_command, swarm_is_empty, ColdFlight,
+        reader_demand_is_live, should_publish_after_command, slow_swarm_stderr_hint,
+        swarm_is_empty, ColdFlight,
         DiscoveryWindowAdvice, NoSeederWait, ReadStallCause, SourcelessSwarm, WaitingReads,
         NO_SEEDER_FAST_FAIL_SECS, READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
     };
@@ -3807,6 +3864,23 @@ mod tests {
              raise [cache] cache_size if the cache is evicting data the read \
              needs"
         );
+    }
+
+    /// The slow-swarm hint is the third registered prefix: it must carry the
+    /// live counts, the blocking piece, the window the read actually spent and
+    /// the progress, and its wording must not suggest a sourceless swarm —
+    /// a seeder was connected when the window elapsed.
+    #[test]
+    fn slow_swarm_hint_names_piece_window_and_progress() {
+        let hint = slow_swarm_stderr_hint(2, 1, 7, 60, 12.5);
+        assert_eq!(
+            hint,
+            "read stalled on a slow swarm (Peers:2 Seeds:1): piece 7 did not \
+             arrive within the 60s piece-wait window at 12.50% torrent \
+             progress; raise [timeouts] read_timeout_secs and retry"
+        );
+        assert!(!hint.contains("no seeder"));
+        assert!(!hint.starts_with("read stalled on the on-disk cache"));
     }
 
     /// the read budget must cover all five synchronous phases —

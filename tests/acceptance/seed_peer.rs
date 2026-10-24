@@ -9,9 +9,10 @@
 //! unchoked, piece-declaring peer as a data source.
 //!
 //! The peer can also declare no pieces (a leecher, which keeps a swarm
-//! non-empty without providing a source) and can delay its handshake or its
+//! non-empty without providing a source), can delay its handshake or its
 //! PIECE replies, so a case can make a seed become usable at a chosen point
-//! inside a read's wait.
+//! inside a read's wait, and can stall its PIECE replies outright, so a case
+//! can hold a read on a swarm whose connected seeder never delivers.
 //!
 //! Discovery stays on the normal path: the peer announces itself to the same
 //! tracker the client uses, exactly as the libtorrent seeder it replaces does.
@@ -80,6 +81,7 @@ impl SeedPeer {
             announce_url,
             Declared::Seed,
             PeerDelays::default(),
+            false,
         )
     }
 
@@ -98,6 +100,7 @@ impl SeedPeer {
             announce_url,
             Declared::Leecher,
             PeerDelays::default(),
+            false,
         )
     }
 
@@ -118,6 +121,28 @@ impl SeedPeer {
             announce_url,
             Declared::Seed,
             delays,
+            false,
+        )
+    }
+
+    /// A complete seed that declares every piece and unchokes but never
+    /// answers a REQUEST, so the client counts a connected seeder while a read
+    /// cannot make progress (the slow-swarm stall the third frozen prefix
+    /// diagnoses).
+    pub fn start_stalled(
+        info_hash: [u8; 20],
+        content: Vec<u8>,
+        piece_len: usize,
+        announce_url: &str,
+    ) -> Self {
+        Self::launch(
+            info_hash,
+            content,
+            piece_len,
+            announce_url,
+            Declared::Seed,
+            PeerDelays::default(),
+            true,
         )
     }
 
@@ -128,6 +153,7 @@ impl SeedPeer {
         announce_url: &str,
         declared: Declared,
         delays: PeerDelays,
+        stalled: bool,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("seed peer: bind failed");
         let port = listener.local_addr().expect("seed peer: no addr").port();
@@ -174,6 +200,7 @@ impl SeedPeer {
                                 &content,
                                 piece_len,
                                 delays,
+                                stalled,
                                 &peer_id,
                                 &requests,
                                 &stop,
@@ -222,6 +249,7 @@ fn serve(
     content: &[u8],
     piece_len: usize,
     delays: PeerDelays,
+    stalled: bool,
     peer_id: &[u8; 20],
     requests: &AtomicUsize,
     stop: &AtomicBool,
@@ -261,7 +289,7 @@ fn serve(
             return;
         }
         match msg[0] {
-            REQUEST_ID if len >= 13 => {
+            REQUEST_ID if len >= 13 && !stalled => {
                 let index =
                     u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]) as usize;
                 let begin =
