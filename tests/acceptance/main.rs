@@ -1,11 +1,12 @@
 //! Executable acceptance suite — registry and runner.
 //!
-//! `tsic/torrentfs-design@4bc1833` `docs/03-acceptance.md` fixes the TC
-//! identifiers ("编号冻结，不得重排") and declares that the executable form
-//! lives in this repo under `tests/acceptance/<TC-id>`.  This crate root
-//! carries the registry: every design TC id, which ids have an executable
-//! module here, and validation tests that keep the registry honest (an id
-//! without a module is a missing-test-evidence finding for QA; a module
+//! The design repo's `docs/03-acceptance.md` fixes the TC identifiers
+//! ("编号冻结，不得重排") and declares that the executable form lives in this
+//! repo under `tests/acceptance/<TC-id>`.  The batch's design anchor is kept in
+//! the pipeline record, never here — a sha frozen in this comment goes stale.
+//! This crate root carries the registry: every design TC id, which ids have an
+//! executable module here, and validation tests that keep the registry honest
+//! (an id without a module is a missing-test-evidence finding for QA; a module
 //! without an id is drift).
 //!
 //! One module per landed TC (`test_tc_<id lowercased, `-` → `_`>.rs`), each
@@ -50,8 +51,8 @@ mod test_tc_seeding_01;
 mod test_tc_seeding_02;
 mod test_tc_seeding_03;
 
-/// The full id set fixed by `docs/03-acceptance.md` (60 ids, design anchor
-/// 4bc1833).  Sorted; the validation test below pins it exactly.
+/// The full id set fixed by `docs/03-acceptance.md` (60 ids).  Sorted; the
+/// validation test below pins it exactly.
 pub const TC_IDS: &[&str] = &[
     "TC-cache-01",
     "TC-cache-02",
