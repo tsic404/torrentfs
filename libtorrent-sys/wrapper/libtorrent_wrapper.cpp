@@ -121,7 +121,113 @@ struct lt_torrent_metadata {
 struct lt_session_wrapper {
     lt::session* session;
     std::mutex mutex;
+    // `disable_hash_checks` as baked into this session's settings.  With it
+    // on, a full check cannot reject a missing piece (the comparison is
+    // skipped), so the cached set has to be declared from the piece files.
+    bool disable_hash_checks = false;
+    // Piece-cache root of a custom-storage session; empty for the plain
+    // session, which keeps libtorrent's own storage.
+    std::string piece_cache_dir;
 };
+
+namespace {
+
+std::string sha1_to_hex(lt::sha1_hash const& h) {
+    char hex[41];
+    for (int i = 0; i < 20; i++) {
+        snprintf(hex + i * 2, 3, "%02x", static_cast<unsigned char>(h.data()[i]));
+    }
+    return std::string(hex, 40);
+}
+
+// Piece files live at <pieces>/<info_hash_hex>/<info_hash_hex>:piece:<index>.
+// Only a name whose suffix is all digits is a piece file: a leftover
+// `<index>.incomplete` marker (a write that never finished) is not.
+static bool parse_piece_file_name(char const* name, std::string const& prefix,
+    int& index)
+{
+    std::string s(name);
+    if (s.size() <= prefix.size() || s.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    for (size_t i = prefix.size(); i < s.size(); ++i) {
+        if (s[i] < '0' || s[i] > '9') return false;
+    }
+    try {
+        index = std::stoi(s.substr(prefix.size()));
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+// Whether any piece file of this torrent exists on disk — the trigger for a
+// full check (which needs a cache to check; an empty one would hash nothing).
+static bool has_cached_piece_file(std::string const& dir,
+    std::string const& info_hash_hex)
+{
+    std::string prefix = info_hash_hex + ":piece:";
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) return false;
+    bool found = false;
+    while (struct dirent* entry = readdir(dp)) {
+        int index = 0;
+        if (parse_piece_file_name(entry->d_name, prefix, index)) {
+            found = true;
+            break;
+        }
+    }
+    closedir(dp);
+    return found;
+}
+
+// Declare the cached pieces in `params.have_pieces`.  Only used when hash
+// checks are disabled: a full check then marks every piece as passed, so a
+// partial cache would be broadcast as complete.  A piece counts only when its
+// file is exactly one piece long and no `.incomplete` marker is left — the
+// bitmap cannot detect a file of the right length holding wrong bytes, which
+// is why the checked path keeps the full check instead.
+static void declare_cached_pieces(lt::add_torrent_params& params,
+    lt::torrent_info const& ti, std::string const& piece_cache_dir,
+    std::string const& info_hash_hex)
+{
+    std::string dir = piece_cache_dir + "/" + info_hash_hex;
+    std::string prefix = info_hash_hex + ":piece:";
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) return;
+    bool sized = false;
+    while (struct dirent* entry = readdir(dp)) {
+        int index = 0;
+        if (!parse_piece_file_name(entry->d_name, prefix, index)) continue;
+        if (index < 0 || index >= ti.num_pieces()) continue;
+        std::string path = dir + "/" + entry->d_name;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) continue;
+        if (st.st_size != ti.piece_size(lt::piece_index_t(index))) continue;
+        if (access((path + ".incomplete").c_str(), F_OK) == 0) continue;
+        // Only a non-empty bitmap is resume data; an empty cache must not look
+        // like a declaration (libtorrent then treats the torrent as new).
+        if (!sized) {
+            params.have_pieces.resize(ti.num_pieces(), false);
+            sized = true;
+        }
+        params.have_pieces.set_bit(lt::piece_index_t(index));
+    }
+    closedir(dp);
+}
+
+// Declare the cached set on a freshly built add_torrent_params when the
+// session has hash checks off and keeps pieces in the custom cache.
+static void declare_cached_pieces_if_needed(lt_session_wrapper const& wrapper,
+    lt::add_torrent_params& params)
+{
+    if (!wrapper.disable_hash_checks || wrapper.piece_cache_dir.empty()) return;
+    if (!params.ti) return;
+    declare_cached_pieces(params, *params.ti, wrapper.piece_cache_dir,
+        sha1_to_hex(params.ti->info_hashes().get_best()));
+}
+
+} // namespace
 
 lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error) {
     try {
@@ -351,6 +457,13 @@ lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) 
         // the unconditional false is correct — user config is applied later
         // via lt_session_apply_settings.
         settings.set_bool(lt::settings_pack::close_redundant_connections, false);
+        // A seeder must serve peers that share one public address — peers
+        // behind the same NAT, or a foreign client on the same host as the
+        // seeder it is downloading from.  With upstream's default (false)
+        // libtorrent keeps a single peer connection per address: peers that
+        // share an address compete for that one slot, and the side that is
+        // not kept receives no piece.
+        settings.set_bool(lt::settings_pack::allow_multiple_connections_per_ip, true);
         wrapper->session->apply_settings(settings);
 
         return static_cast<lt_session_t>(wrapper);
@@ -397,6 +510,7 @@ lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info
         // tracker announces and peer connections. Torrent download is
         // triggered on-demand via set_piece_deadline.
         params.flags &= ~lt::torrent_flags::paused;
+        declare_cached_pieces_if_needed(*wrapper, params);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -438,6 +552,7 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
         // torrentfs switches to download mode explicitly on the first read).
         params.flags &= ~(lt::torrent_flags::paused | lt::torrent_flags::auto_managed);
         params.flags |= lt::torrent_flags::upload_mode;
+        declare_cached_pieces_if_needed(*wrapper, params);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -1497,14 +1612,6 @@ void lt_alert_list_destroy(lt_alert_list_t* list) {
 
 namespace {
 
-std::string sha1_to_hex(lt::sha1_hash const& h) {
-    char hex[41];
-    for (int i = 0; i < 20; i++) {
-        snprintf(hex + i * 2, 3, "%02x", static_cast<unsigned char>(h.data()[i]));
-    }
-    return std::string(hex, 40);
-}
-
 static bool ensure_dir_recursive(const std::string& path) {
     if (path.empty()) return false;
     size_t pos = 0;
@@ -1733,8 +1840,10 @@ private:
 
 class PieceStorageDiskIO : public lt::disk_interface, public lt::buffer_allocator_interface {
 public:
-    PieceStorageDiskIO(lt::io_context& ios, const std::string& piece_cache_dir)
-        : m_ios(ios), m_piece_cache_dir(piece_cache_dir)
+    PieceStorageDiskIO(lt::io_context& ios, const std::string& piece_cache_dir,
+        bool disable_hash_checks)
+        : m_ios(ios), m_piece_cache_dir(piece_cache_dir),
+          m_disable_hash_checks(disable_hash_checks)
     {
         if (piece_cache_dir.empty()) {
             throw std::runtime_error("PieceStorageDiskIO: piece_cache_dir is empty");
@@ -1898,11 +2007,13 @@ public:
         TORRENTFS_DIAG("[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
             TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
-            // Zero out v2 hashes for hybrid torrents — no piece data yet
+            // A missing piece is a mismatch to this storage, not a file error:
+            // a `no_such_file_or_directory` here makes libtorrent skip every
+            // remaining piece of that file, which for piece-level storage is
+            // the rest of the torrent, hiding a partially cached torrent.
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                h(p, lt::sha1_hash(), lt::storage_error());
             });
             return;
         }
@@ -1913,8 +2024,7 @@ public:
             TORRENTFS_DIAG("[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                h(p, lt::sha1_hash(), lt::storage_error());
             });
             return;
         }
@@ -2029,32 +2139,28 @@ public:
 
         // After FUSE remount, PieceStorageDiskIO must re-check which piece files
         // exist on disk so that libtorrent can correctly identify cached pieces.
-        // Scan the pieces directory and report existing piece files.
-        std::string dir = ps->pieces_dir();
-        std::set<int> existing_pieces;
-
-        DIR* dp = opendir(dir.c_str());
-        if (dp) {
-            struct dirent* entry;
-            std::string prefix = ps->get_info_hash_hex() + ":piece:";
-            while ((entry = readdir(dp)) != nullptr) {
-                std::string name(entry->d_name);
-                if (name.size() > prefix.size() &&
-                    name.compare(0, prefix.size(), prefix) == 0) {
-                    std::string idx_str = name.substr(prefix.size());
-                    try {
-                        int idx = std::stoi(idx_str);
-                        existing_pieces.insert(idx);
-                    } catch (...) {
-                        // Ignore malformed filenames
-                    }
-                }
-            }
-            closedir(dp);
+        // With hash checks off a full check cannot tell a missing piece from a
+        // present one (the comparison is skipped and every piece passes), so it
+        // would broadcast a partial cache as complete; the cached set is
+        // declared in `have_pieces` when the torrent is added instead.
+        if (m_disable_hash_checks) {
+            TORRENTFS_DIAG("[DIAG] async_check_files: hash checks disabled, "
+                           "keeping the declared bitmap\n");
+            handler(lt::status_t{}, lt::storage_error());
+            return;
         }
 
-        // Report found pieces via handler — libtorrent will then call
-        // async_hash for each piece to verify integrity.
+        // Cached piece files exist but carry no resume data (every torrent is
+        // re-added on start), so `no_error` would tell libtorrent the storage
+        // is empty: the session then advertises an empty bitfield and serves
+        // nothing.  `need_full_check` makes it hash the cache through
+        // async_hash and rebuild the bitfield from the pieces on disk.
+        if (has_cached_piece_file(ps->pieces_dir(), ps->get_info_hash_hex())) {
+            TORRENTFS_DIAG("[DIAG] async_check_files: cached pieces => need_full_check\n");
+            handler(lt::disk_status::need_full_check, lt::storage_error());
+            return;
+        }
+
         handler(lt::status_t{}, lt::storage_error());
     }
 
@@ -2138,6 +2244,10 @@ private:
 
     lt::io_context& m_ios;
     std::string m_piece_cache_dir;
+    // Session setting snapshotted at construction: with it on, a full check
+    // marks every piece as passed, so the cached set must come from the
+    // declared bitmap instead.
+    bool m_disable_hash_checks;
     std::mutex m_mutex;
     std::map<lt::storage_index_t, std::unique_ptr<PieceStorage>> m_storages;
     lt::storage_index_t m_next_index{0};
@@ -2220,11 +2330,31 @@ lt_session_t lt_session_create_with_custom_storage(
             params.settings.set_bool(
                 lt::settings_pack::close_redundant_connections, false);
         }
+        // Same reasoning as close_redundant_connections above, and as the plain
+        // session path: this session is the seeder, so it must accept a peer
+        // whose address it already holds a connection to (peers behind one
+        // NAT, or a foreign client on the seeder's own host).  Upstream's
+        // address-only match would drop that peer as a duplicate before it
+        // receives a block.  An explicit user value still wins.
+        bool user_set_multiple_connections = settings_json
+            && strstr(settings_json, "\"allow_multiple_connections_per_ip\"") != nullptr;
+        if (!user_set_multiple_connections) {
+            params.settings.set_bool(
+                lt::settings_pack::allow_multiple_connections_per_ip, true);
+        }
 
         std::string cache_dir(piece_cache_dir);
-        params.disk_io_constructor = [cache_dir](lt::io_context& ios,
+        // Snapshot the setting the piece accounting depends on: with hash
+        // checks off, the cached set has to be declared from the piece files
+        // (see async_check_files), so both the add path and the disk_io need
+        // the same value.
+        wrapper->disable_hash_checks =
+            params.settings.get_bool(lt::settings_pack::disable_hash_checks);
+        wrapper->piece_cache_dir = cache_dir;
+        const bool disable_hash_checks = wrapper->disable_hash_checks;
+        params.disk_io_constructor = [cache_dir, disable_hash_checks](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
-            return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
+            return std::make_unique<PieceStorageDiskIO>(ios, cache_dir, disable_hash_checks);
         };
         wrapper->session = new lt::session(std::move(params));
 
@@ -2272,6 +2402,7 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
         // Clear paused: default_flags includes paused, preventing tracker
         // announces. Download is triggered on-demand via set_piece_deadline.
         atp.flags &= ~lt::torrent_flags::paused;
+        declare_cached_pieces_if_needed(*wrapper, atp);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(atp);
@@ -2313,6 +2444,7 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
         // Clear paused so tracker announces and peer connections work.
         atp.flags &= ~lt::torrent_flags::paused;
         atp.flags |= lt::torrent_flags::upload_mode;
+        declare_cached_pieces_if_needed(*wrapper, atp);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(atp);

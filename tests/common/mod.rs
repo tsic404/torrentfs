@@ -427,17 +427,28 @@ pub fn build_multipiece_torrent(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
 /// pairs two same-host sessions serving the same info hash) passes a name
 /// unique to itself.  Content and piece hashes are unchanged.
 pub fn build_multipiece_torrent_named(announce_url: &str, name: &str) -> (Vec<u8>, Vec<u8>) {
+    build_multipiece_torrent_pieces(announce_url, name, 4)
+}
+
+/// [`build_multipiece_torrent_named`] with an explicit piece count (256 KiB
+/// pieces). A test that must observe a cache holding only part of the torrent
+/// picks the count it wants to fill.
+pub fn build_multipiece_torrent_pieces(
+    announce_url: &str,
+    name: &str,
+    num_pieces: usize,
+) -> (Vec<u8>, Vec<u8>) {
     const PIECE_LEN: usize = 256 * 1024;
-    const NUM_PIECES: usize = 4;
-    let total = PIECE_LEN * NUM_PIECES;
+    let num_pieces = num_pieces.max(1);
+    let total = PIECE_LEN * num_pieces;
 
     let mut content = Vec::with_capacity(total);
     for i in 0..total {
         content.push((i as u8).wrapping_mul(31).wrapping_add(7));
     }
 
-    let mut hashes = Vec::with_capacity(20 * NUM_PIECES);
-    for p in 0..NUM_PIECES {
+    let mut hashes = Vec::with_capacity(20 * num_pieces);
+    for p in 0..num_pieces {
         use sha1_smol::Sha1;
         let mut hasher = Sha1::new();
         hasher.update(&content[p * PIECE_LEN..(p + 1) * PIECE_LEN]);

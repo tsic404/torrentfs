@@ -196,6 +196,41 @@ fn close_redundant_connections_user_override_respected() {
     });
 }
 
+/// The seeding session has to accept a peer whose address it already holds a
+/// connection to: upstream's default (false) matches peers by address alone,
+/// so a foreign peer on the seeder's own host — or behind the same NAT — is
+/// dropped as a duplicate before it can fetch a block.
+#[test]
+fn allow_multiple_connections_default_on() {
+    let config = TorrentfsConfig::default_config();
+    let session = Session::new(&config).unwrap();
+    assert_setting(&session, "allow_multiple_connections_per_ip", true);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    with_large_stack(move || {
+        let config = TorrentfsConfig::default_config();
+        let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
+        assert_setting(&session, "allow_multiple_connections_per_ip", true);
+    });
+}
+
+/// An explicit user value still wins over the injected default.
+#[test]
+fn allow_multiple_connections_user_override_respected() {
+    let mut config = TorrentfsConfig::default_config();
+    config.connections.allow_multiple_connections_per_ip = Some(false);
+    let session = Session::new(&config).unwrap();
+    assert_setting(&session, "allow_multiple_connections_per_ip", false);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    with_large_stack(move || {
+        let mut config = TorrentfsConfig::default_config();
+        config.connections.allow_multiple_connections_per_ip = Some(false);
+        let session = Session::new_with_custom_storage(&config, dir.path()).unwrap();
+        assert_setting(&session, "allow_multiple_connections_per_ip", false);
+    });
+}
+
 /// a configured `proxy_type` string must survive the C wrapper's
 /// `apply_str_setting` mapping and land in the live session as the matching
 /// `proxy_type_t` value — not be silently dropped as an unknown string key.
