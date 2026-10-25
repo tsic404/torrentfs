@@ -115,10 +115,20 @@ pub fn rig() -> Rig {
 /// create → write → flush → release path, then wait for the DB row to land so
 /// `data/` resolves the projection.
 pub fn ingest(svc: &mut FsService, filename: &str, torrent_bytes: &[u8]) -> TorrentInfo {
+    ingest_into(svc, METADATA_INO, "", filename, torrent_bytes)
+}
+
+/// `ingest`, into the metadata directory at `parent` — which projects as
+/// `source_path` under `data/`.
+pub fn ingest_into(
+    svc: &mut FsService,
+    parent: u64,
+    source_path: &str,
+    filename: &str,
+    torrent_bytes: &[u8],
+) -> TorrentInfo {
     let info = TorrentInfo::from_bytes(torrent_bytes.to_vec()).expect("parse fixture torrent");
-    let created = svc
-        .create(METADATA_INO, filename)
-        .expect("create metadata entry");
+    let created = svc.create(parent, filename).expect("create metadata entry");
     svc.write(created.attr.ino, 0, torrent_bytes)
         .expect("write torrent bytes");
     svc.flush(created.attr.ino).expect("flush valid torrent");
@@ -132,7 +142,7 @@ pub fn ingest(svc: &mut FsService, filename: &str, torrent_bytes: &[u8]) -> Torr
             .expect("service must own the database")
             .lock()
             .expect("lock db")
-            .get_torrent_by_filename_and_source_path(filename, "")
+            .get_torrent_by_filename_and_source_path(filename, source_path)
             .expect("query torrent row")
             .is_some();
         let is_idle = svc
@@ -145,7 +155,7 @@ pub fn ingest(svc: &mut FsService, filename: &str, torrent_bytes: &[u8]) -> Torr
         }
         assert!(
             Instant::now() < deadline,
-            "{filename}: the DB row must land within {INGEST_TIMEOUT:?}"
+            "{source_path}/{filename}: the DB row must land within {INGEST_TIMEOUT:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

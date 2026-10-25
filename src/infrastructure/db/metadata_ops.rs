@@ -69,7 +69,8 @@ impl Database {
         Ok(())
     }
 
-    /// Rename a metadata directory and update all descendant paths and torrent source_paths.
+    /// Rename a metadata directory: its own name, path and parent link, the
+    /// descendant paths, and the torrent source paths.
     pub fn rename_metadata_directory(
         &mut self,
         old_path: &str,
@@ -78,10 +79,22 @@ impl Database {
     ) -> Result<(), DbError> {
         let tx = self.conn.transaction()?;
 
-        // 1. Update the directory itself
+        // 1. Update the directory itself, including its parent link: `data/`
+        // lists children by `parent_id`, so a stale link kept the moved
+        // subtree under its old location however often it was re-read.
+        let new_parent_id: Option<i64> = match new_path.rsplit_once('/') {
+            Some((parent_path, _)) => tx
+                .query_row(
+                    "SELECT id FROM metadata_directories WHERE path = ?",
+                    params![parent_path],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
         tx.execute(
-            "UPDATE metadata_directories SET name = ?, path = ? WHERE path = ?",
-            params![new_name, new_path, old_path],
+            "UPDATE metadata_directories SET name = ?, path = ?, parent_id = ? WHERE path = ?",
+            params![new_name, new_path, new_parent_id, old_path],
         )?;
 
         // 2. Update all child directories' paths (replace old_path prefix with new_path).

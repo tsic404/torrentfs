@@ -1503,6 +1503,77 @@ fn test_rename_metadata_directory_underscore_in_name() {
     assert_eq!(t2.source_path, "aXb/d");
 }
 
+/// A move across parents must repoint the directory's `parent_id`: the
+/// `data/` projection enumerates a directory's children by that column, so a
+/// stale link leaves the moved subtree listed under its old location (and
+/// restores it there on remount).  Persisted, so the reading side is checked
+/// on a reopened database.
+#[test]
+fn test_rename_metadata_directory_across_parents_reparents() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        db.ensure_metadata_directories("a/tree/sub").unwrap();
+        db.ensure_metadata_directories("b").unwrap();
+        // Direct child: matched by the exact-path update.
+        db.insert_torrent("a/tree", "T1", "T1.torrent", 100, "h1", 1)
+            .unwrap();
+        // Subtree: matched by the prefix update.
+        db.insert_torrent("a/tree/sub", "T2", "T2.torrent", 200, "h2", 1)
+            .unwrap();
+
+        // The old parent owns the moved directory before the move.
+        assert_eq!(db.get_source_path_prefixes("a").unwrap(), vec!["tree"]);
+
+        db.rename_metadata_directory("a/tree", "tree", "b/tree")
+            .unwrap();
+
+        // Both parents reflect the move immediately, and the directory's own
+        // listing is unchanged (C-3.3.6).
+        assert!(
+            db.get_source_path_prefixes("a").unwrap().is_empty(),
+            "the old parent must no longer list the moved directory"
+        );
+        assert_eq!(db.get_source_path_prefixes("b").unwrap(), vec!["tree"]);
+        assert_eq!(
+            db.get_source_path_prefixes("b/tree").unwrap(),
+            vec!["sub"],
+            "the moved directory must keep its own children"
+        );
+
+        // Moving back to the root clears the parent link again.  The emptied
+        // parents keep their own rows — only `rmdir` deletes a directory.
+        db.rename_metadata_directory("b/tree", "tree", "tree")
+            .unwrap();
+        assert!(db.get_source_path_prefixes("b").unwrap().is_empty());
+        assert_eq!(
+            db.get_source_path_prefixes("").unwrap(),
+            vec!["a", "b", "tree"]
+        );
+    }
+
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_source_path_prefixes("").unwrap(),
+        vec!["a", "b", "tree"],
+        "the parent link must survive a reopen"
+    );
+    assert_eq!(db.get_source_path_prefixes("tree").unwrap(), vec!["sub"]);
+    assert_eq!(
+        db.get_torrent_by_source_path("tree").unwrap().unwrap().name,
+        "T1"
+    );
+    assert_eq!(
+        db.get_torrent_by_source_path("tree/sub")
+            .unwrap()
+            .unwrap()
+            .name,
+        "T2"
+    );
+}
+
 #[test]
 fn test_migrate_v5_preserves_child_data() {
     let temp_dir = TempDir::new().unwrap();
