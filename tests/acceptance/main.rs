@@ -26,6 +26,7 @@
 
 mod common;
 mod seed_peer;
+mod stats_support;
 
 mod test_tc_cache_01;
 mod test_tc_config_01;
@@ -45,6 +46,12 @@ mod test_tc_rofs_03;
 mod test_tc_seeding_01;
 mod test_tc_seeding_02;
 mod test_tc_seeding_03;
+mod test_tc_stats_03;
+mod test_tc_stats_04;
+mod test_tc_stats_05;
+mod test_tc_stats_06;
+mod test_tc_stats_07;
+mod test_tc_stats_08;
 
 /// The full id set fixed by `docs/03-acceptance.md` (60 ids, design anchor
 /// 4bc1833).  Sorted; the validation test below pins it exactly.
@@ -137,6 +144,12 @@ pub const LANDED: &[&str] = &[
     test_tc_seeding_01::TC_ID,
     test_tc_seeding_02::TC_ID,
     test_tc_seeding_03::TC_ID,
+    test_tc_stats_03::TC_ID,
+    test_tc_stats_04::TC_ID,
+    test_tc_stats_05::TC_ID,
+    test_tc_stats_06::TC_ID,
+    test_tc_stats_07::TC_ID,
+    test_tc_stats_08::TC_ID,
 ];
 
 /// Ids whose executable form is a FUSE/container-level shell script in this
