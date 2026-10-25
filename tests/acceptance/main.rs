@@ -1,13 +1,14 @@
 //! Executable acceptance suite — registry and runner.
 //!
 //! The design repo's `docs/03-acceptance.md` fixes the TC identifiers
-//! ("编号冻结，不得重排") and declares that the executable form lives in this
-//! repo under `tests/acceptance/<TC-id>`.  The batch's design anchor is kept in
-//! the pipeline record, never here — a sha frozen in this comment goes stale.
-//! This crate root carries the registry: every design TC id, which ids have an
-//! executable module here, and validation tests that keep the registry honest
-//! (an id without a module is a missing-test-evidence finding for QA; a module
-//! without an id is drift).
+//! ("编号冻结，不得重排") and the rule naming each TC's executable carrier in
+//! this directory: the id lowercased with `-` replaced by `_`, `test_` + `.rs`
+//! for a Rust module and `.sh` for a shell script.  The batch's design anchor
+//! is kept in the pipeline record, never here — a sha frozen in this comment
+//! goes stale.  This crate root carries the registry: every design TC id,
+//! which ids have an executable module here, and validation tests that keep
+//! the registry honest (an id without a module is a missing-test-evidence
+//! finding for QA; a module without an id is drift).
 //!
 //! One module per landed TC (`test_tc_<id lowercased, `-` → `_`>.rs`), each
 //! declaring `pub const TC_ID: &str`.  Run everything:
