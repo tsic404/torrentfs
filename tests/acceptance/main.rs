@@ -40,6 +40,8 @@ mod test_tc_read_02;
 mod test_tc_read_03;
 mod test_tc_read_05;
 mod test_tc_read_06;
+mod test_tc_rofs_02;
+mod test_tc_rofs_03;
 mod test_tc_seeding_01;
 
 /// The full id set fixed by `docs/03-acceptance.md` (60 ids, design anchor
@@ -128,6 +130,8 @@ pub const LANDED: &[&str] = &[
     test_tc_read_03::TC_ID,
     test_tc_read_05::TC_ID,
     test_tc_read_06::TC_ID,
+    test_tc_rofs_02::TC_ID,
+    test_tc_rofs_03::TC_ID,
     test_tc_seeding_01::TC_ID,
 ];
 
