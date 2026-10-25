@@ -40,7 +40,12 @@ mod test_tc_config_04;
 mod test_tc_config_05;
 mod test_tc_config_06;
 mod test_tc_config_07;
+mod test_tc_ingest_02;
+mod test_tc_ingest_03;
 mod test_tc_ingest_04;
+mod test_tc_ingest_05;
+mod test_tc_ingest_06;
+mod test_tc_ingest_07;
 mod test_tc_negative_01;
 mod test_tc_negative_02;
 mod test_tc_negative_03;
@@ -150,7 +155,12 @@ pub const LANDED: &[&str] = &[
     test_tc_config_05::TC_ID,
     test_tc_config_06::TC_ID,
     test_tc_config_07::TC_ID,
+    test_tc_ingest_02::TC_ID,
+    test_tc_ingest_03::TC_ID,
     test_tc_ingest_04::TC_ID,
+    test_tc_ingest_05::TC_ID,
+    test_tc_ingest_06::TC_ID,
+    test_tc_ingest_07::TC_ID,
     test_tc_negative_01::TC_ID,
     test_tc_negative_02::TC_ID,
     test_tc_negative_03::TC_ID,
@@ -177,10 +187,11 @@ pub const LANDED: &[&str] = &[
     test_tc_stats_08::TC_ID,
 ];
 
-/// Ids whose executable form is a FUSE/container-level shell script in this
-/// directory (TC-ingest-01 → `tc_ingest_01.sh`).  The script declares its TC
-/// id in its header comment; `script_form_modules_have_their_script` checks
-/// the file exists and carries the id.
+/// Ids that also carry a FUSE/container-level shell script in this directory
+/// (TC-ingest-01 → `tc_ingest_01.sh`); TC-ingest-03/06 keep their rust module
+/// and add a mount-form carrier.  The script declares its TC id in its header
+/// comment; `script_form_tcs_have_their_script` checks the file exists and
+/// carries the id.
 pub const SCRIPT_FORM: &[&str] = &[
     "TC-cache-02",
     "TC-container-01",
@@ -192,6 +203,8 @@ pub const SCRIPT_FORM: &[&str] = &[
     "TC-container-07",
     "TC-container-08",
     "TC-ingest-01",
+    "TC-ingest-03",
+    "TC-ingest-06",
     "TC-read-04",
     "TC-recovery-01",
     "TC-rofs-01",

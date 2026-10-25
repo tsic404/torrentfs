@@ -101,6 +101,8 @@ jobs:
           bash -n ./tests/acceptance/lib_fuse_harness.sh
           bash -n ./tests/acceptance/lib_seed_torrent.sh
           bash -n ./tests/acceptance/tc_ingest_01.sh
+          bash -n ./tests/acceptance/tc_ingest_03.sh
+          bash -n ./tests/acceptance/tc_ingest_06.sh
           bash -n ./tests/acceptance/tc_rofs_01.sh
           bash -n ./tests/acceptance/tc_read_04.sh
           bash -n ./tests/acceptance/tc_stats_01.sh
@@ -597,10 +599,22 @@ jobs:
           cargo build --locked --release --example torrentfs-selfseed-env
 
       - name: Run acceptance FUSE cases
+        # Case exit codes: 0 = PASS, 1 = FAIL, 2 = SKIP (the case self-gated:
+        # no /dev/fuse or no fusermount3).  A bare `set -e` loop would turn a
+        # SKIP into a failure, so each case is run with `|| rc=$?` and rc=2 is
+        # reported as a warning; rc=1 still fails the job.  This job installs
+        # fuse3 and runs as root with /dev/fuse, so the passing path is real.
         run: |
           set -euo pipefail
-          for tc in tc_ingest_01 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02; do
-            ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc"
+          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02; do
+            rc=0
+            ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc" || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::warning::$tc SKIP (no /dev/fuse or fusermount3 on this runner)"
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error::$tc FAIL (rc=$rc)"
+              exit "$rc"
+            fi
           done
 
       # TC-negative-03's mount-dependent half (forbidden state paths inside
