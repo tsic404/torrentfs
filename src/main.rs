@@ -932,7 +932,7 @@ fn main() {
             // wire the kernel cache invalidation channel so
             // `unlink`/`rmdir`/`rename` can immediately purge stale
             // `data/` dentries instead of waiting for the 1s TTL.
-            notifier.set(Some(bg.notifier())).ok();
+            notifier.set(Some(Arc::new(bg.notifier()))).ok();
             info!("torrentfs mounted");
             wait_for_shutdown(worker_pool, download_service, bg, &mountpoint);
         }
