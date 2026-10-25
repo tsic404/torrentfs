@@ -43,6 +43,8 @@ mod test_tc_read_06;
 mod test_tc_rofs_02;
 mod test_tc_rofs_03;
 mod test_tc_seeding_01;
+mod test_tc_seeding_02;
+mod test_tc_seeding_03;
 
 /// The full id set fixed by `docs/03-acceptance.md` (60 ids, design anchor
 /// 4bc1833).  Sorted; the validation test below pins it exactly.
@@ -133,6 +135,8 @@ pub const LANDED: &[&str] = &[
     test_tc_rofs_02::TC_ID,
     test_tc_rofs_03::TC_ID,
     test_tc_seeding_01::TC_ID,
+    test_tc_seeding_02::TC_ID,
+    test_tc_seeding_03::TC_ID,
 ];
 
 /// Ids whose executable form is a FUSE/container-level shell script in this
