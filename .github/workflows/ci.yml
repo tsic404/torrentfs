@@ -109,6 +109,12 @@ jobs:
           bash -n ./tests/acceptance/tc_cache_02.sh
           bash -n ./tests/acceptance/tc_container_01.sh
           bash -n ./tests/acceptance/tc_container_02.sh
+          bash -n ./tests/acceptance/tc_container_03.sh
+          bash -n ./tests/acceptance/tc_container_04.sh
+          bash -n ./tests/acceptance/tc_container_05.sh
+          bash -n ./tests/acceptance/tc_container_06.sh
+          bash -n ./tests/acceptance/tc_container_07.sh
+          bash -n ./tests/acceptance/tc_container_08.sh
 
   deploy-rootful-test:
     name: Deploy Rootful Shell Tests
@@ -213,19 +219,24 @@ jobs:
           sudo mount --make-shared /srv/torrentfs-acceptance
 
       - name: Run acceptance container cases
-        # TC-container-01/02 exercise the production image + entrypoint's
-        # rshared mount, so they run here where the image was just built and
-        # a docker daemon is available.  The scripts self-gate: a runner
-        # without /dev/fuse + CAP_SYS_ADMIN (nested mounts unavailable) makes
-        # them SKIP (exit 2), a capable runner executes them.
+        # TC-container-01..08 exercise the production image and entrypoint:
+        # rshared host visibility, state persistence across a restart,
+        # argument passthrough and exit codes, same-host-directory conflict,
+        # config-source precedence, SIGKILL residue recovery and non-TTY
+        # diagnostic capture.  They run here where the image was just built
+        # and a docker daemon is available.  Each script self-gates: an
+        # environment that cannot provide the required capability (no
+        # /dev/fuse, no CAP_SYS_ADMIN, no shared host directory) exits 2,
+        # which the loop records as a SKIP warning and then continues with
+        # the remaining cases; any other non-zero exit fails the job.
         run: |
           set -euo pipefail
-          for tc in tc_container_01 tc_container_02; do
+          for tc in tc_container_01 tc_container_02 tc_container_03 tc_container_04 tc_container_05 tc_container_06 tc_container_07 tc_container_08; do
             rc=0
             ./tests/acceptance/$tc.sh torrentfs:ci /srv/torrentfs-acceptance || rc=$?
             if [ "$rc" -eq 2 ]; then
-              echo "::warning title=TC-container SKIP::$tc skipped — host runner cannot FUSE-mount nested containers"
-              exit 0
+              echo "::warning title=TC-container SKIP::$tc skipped — host runner cannot provide the required container/FUSE capability"
+              continue
             fi
             [ "$rc" -eq 0 ] || exit "$rc"
           done
