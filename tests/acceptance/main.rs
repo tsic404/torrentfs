@@ -31,6 +31,8 @@ mod test_tc_cache_01;
 mod test_tc_config_01;
 mod test_tc_config_02;
 mod test_tc_config_03;
+mod test_tc_config_04;
+mod test_tc_config_05;
 mod test_tc_config_06;
 mod test_tc_config_07;
 mod test_tc_read_01;
@@ -117,6 +119,8 @@ pub const LANDED: &[&str] = &[
     test_tc_config_01::TC_ID,
     test_tc_config_02::TC_ID,
     test_tc_config_03::TC_ID,
+    test_tc_config_04::TC_ID,
+    test_tc_config_05::TC_ID,
     test_tc_config_06::TC_ID,
     test_tc_config_07::TC_ID,
     test_tc_read_01::TC_ID,
