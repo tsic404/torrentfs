@@ -10,13 +10,12 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
-
-use fuser::Notifier;
 
 use tracing::{debug, error, info, warn};
 
@@ -101,6 +100,16 @@ fn entries_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
         .collect()
 }
 
+/// Sink for kernel dentry invalidation.
+///
+/// Production wires `fuser::Notifier` (via `TorrentFs::notifier_handle`); the
+/// trait exists so tests can record which `data/` entries a daemon-side
+/// removal drops, instead of the concrete type being uninjectable.
+pub trait EntryInvalidator: Send + Sync {
+    /// Drop the kernel's cached dentry for `name` under `parent`.
+    fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()>;
+}
+
 pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -124,28 +133,28 @@ pub struct FsService {
     /// kernel cache invalidation handle.  Set once after
     /// `fuser::spawn_mount2` returns (main wires `bg.notifier()` into
     /// here).  When set, `unlink`/`rmdir`/`rename` call
-    /// `Notifier::inval_entry` to immediately purge the kernel dentry
+    /// [`EntryInvalidator::inval_entry`] to immediately purge the kernel dentry
     /// cache for removed `data/` entries, so the stale mirror vanishes
     /// at once instead of lingering for the 1s FUSE TTL.
-    pub notifier: Arc<OnceLock<Option<Notifier>>>,
+    pub notifier: Arc<OnceLock<Option<Arc<dyn EntryInvalidator>>>>,
     /// most recent `data/` listing, so the kernel's per-page `readdir` calls do
     /// not each rebuild it. See [`DataReaddirCache`].
     data_readdir_cache: Option<DataReaddirCache>,
 }
 
 // ── Kernel cache invalidation ─────────────────────────────────
-// `Notifier::inval_entry` sends `FUSE_NOTIFY_INVAL_ENTRY`, purging the kernel's
-// cached dentry immediately — otherwise the kernel serves a stale `data/` entry
-// for the full 1s TTL after `rm metadata/foo.torrent`. The `Notifier` is
-// extracted from `BackgroundSession` before `TorrentFs` is moved into the
-// session and set once it is live; all calls are best-effort (a failure is
-// swallowed by `Notifier::send_inval`).
+// `EntryInvalidator::inval_entry` sends `FUSE_NOTIFY_INVAL_ENTRY`, purging the
+// kernel's cached dentry immediately — otherwise the kernel serves a stale
+// `data/` entry for the full 1s TTL after `rm metadata/foo.torrent`. The
+// production sink is the `fuser::Notifier` extracted from `BackgroundSession`
+// before `TorrentFs` is moved into the session and set once it is live; all
+// calls are best-effort (a failure is swallowed by `Notifier::send_inval`).
 impl FsService {
     /// Invalidate the kernel's cached dentry for `name` under `parent` in the
-    /// `data/` subtree.  No-op when the notifier isn't wired (tests).
+    /// `data/` subtree.  No-op when no sink is wired.
     fn inval_data_entry(&self, parent: u64, name: &str) {
         if let Some(Some(notifier)) = self.notifier.get() {
-            if let Err(e) = notifier.inval_entry(parent, &OsStr::new(name)) {
+            if let Err(e) = notifier.inval_entry(parent, OsStr::new(name)) {
                 warn!(
                     "inval_entry(parent={}, name={}) failed: {}",
                     parent, name, e
@@ -1607,6 +1616,12 @@ impl FsService {
                     name, newname
                 );
             }
+
+            // purge the kernel dentry cache for the renamed directory's old
+            // `data/` projection so the stale mirror name vanishes at once
+            // instead of lingering for the 1s FUSE TTL.
+            let (dir_parent, dir_name) = Self::split_data_dir_parent(&old_source_path);
+            self.inval_data_entry(dir_parent, &dir_name);
 
             Ok(())
         } else {
@@ -5824,5 +5839,97 @@ mod tests {
         let svc = bare_service();
         // No notifier set — this must be a silent no-op.
         svc.inval_data_entry(DATA_INO, "foo.torrent");
+    }
+
+    /// Records every kernel dentry invalidation the service issues, so tests
+    /// can assert which `data/` entry a daemon-side removal drops.
+    #[derive(Default)]
+    struct RecordingInvalidator {
+        calls: Mutex<Vec<(u64, String)>>,
+    }
+
+    impl RecordingInvalidator {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn calls(&self) -> Vec<(u64, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl EntryInvalidator for RecordingInvalidator {
+        fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((parent, name.to_string_lossy().into_owned()));
+            Ok(())
+        }
+    }
+
+    /// A directory rename must invalidate the OLD projection entry under the
+    /// old parent, so `data/<old>` stops resolving at once.  Renaming to a
+    /// different parent must still target that old parent, and the destination
+    /// name must never be the invalidation target.
+    #[test]
+    fn rename_dir_invalidates_the_old_projection_entry() {
+        let mut svc = bare_service();
+        let recorder = RecordingInvalidator::new();
+        svc.notifier.set(Some(recorder.clone())).ok();
+
+        let a = svc.mkdir(METADATA_INO, "a").expect("mkdir a").ino;
+        svc.mkdir(a, "tree").expect("mkdir a/tree");
+        let b = svc.mkdir(METADATA_INO, "b").expect("mkdir b").ino;
+
+        // Cross-parent rename: `a/tree` -> `b/sub`.
+        svc.rename(a, "tree", b, "sub")
+            .expect("rename a/tree -> b/sub");
+        assert_eq!(
+            recorder.calls(),
+            vec![(
+                InodeManager::make_source_path_dir_ino("a"),
+                "tree".to_string()
+            )],
+            "the old parent's `tree` entry must be the invalidation target"
+        );
+
+        // Root-level rename: `b/sub` -> `moved`.
+        svc.rename(b, "sub", METADATA_INO, "moved")
+            .expect("rename b/sub -> moved");
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                (
+                    InodeManager::make_source_path_dir_ino("a"),
+                    "tree".to_string()
+                ),
+                (
+                    InodeManager::make_source_path_dir_ino("b"),
+                    "sub".to_string()
+                ),
+            ],
+            "moving a nested directory to the root invalidates it under its old parent"
+        );
+
+        // A directory already at the root is invalidated under `data/`.
+        svc.mkdir(METADATA_INO, "top").expect("mkdir top");
+        svc.rename(METADATA_INO, "top", METADATA_INO, "top2")
+            .expect("rename top -> top2");
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                (
+                    InodeManager::make_source_path_dir_ino("a"),
+                    "tree".to_string()
+                ),
+                (
+                    InodeManager::make_source_path_dir_ino("b"),
+                    "sub".to_string()
+                ),
+                (DATA_INO, "top".to_string()),
+            ],
+            "a root-level rename must invalidate the old name under data/"
+        );
     }
 }

@@ -41,6 +41,13 @@ use crate::domain::fs_error::FsError;
 use crate::infrastructure::metrics::Metrics;
 use crate::services::download::DownloadService;
 
+/// `fuser::Notifier` is the production kernel-cache invalidation sink.
+impl fs_service::EntryInvalidator for fuser::Notifier {
+    fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()> {
+        fuser::Notifier::inval_entry(self, parent, name)
+    }
+}
+
 // ── Pending reply table ────────────────────────────────────────────────────
 
 /// Maximum number of concurrent pending (deferred) read replies.
@@ -484,11 +491,13 @@ impl TorrentFs {
         self.worker_pool.clone()
     }
 
-    /// clone the `Arc<OnceLock<Option<Notifier>>>` handle before
+    /// clone the [`fs_service::EntryInvalidator`] handle before
     /// `spawn_mount2` moves `self`.  After the session is live, `main`
-    /// calls `notifier.set(Some(bg.notifier()))` on this handle to wire
-    /// the kernel invalidation channel.
-    pub fn notifier_handle(&self) -> Arc<std::sync::OnceLock<Option<fuser::Notifier>>> {
+    /// calls `notifier.set(Some(Arc::new(bg.notifier())))` on this handle to
+    /// wire the kernel invalidation channel.
+    pub fn notifier_handle(
+        &self,
+    ) -> Arc<std::sync::OnceLock<Option<Arc<dyn fs_service::EntryInvalidator>>>> {
         self.service.notifier.clone()
     }
 
