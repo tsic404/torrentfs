@@ -28,6 +28,9 @@ mod common;
 mod seed_peer;
 
 mod test_tc_cache_01;
+mod test_tc_cache_03;
+mod test_tc_cache_04;
+mod test_tc_cache_05;
 mod test_tc_config_01;
 mod test_tc_config_02;
 mod test_tc_config_03;
@@ -114,6 +117,9 @@ pub const TC_IDS: &[&str] = &[
 /// at compile time).
 pub const LANDED: &[&str] = &[
     test_tc_cache_01::TC_ID,
+    test_tc_cache_03::TC_ID,
+    test_tc_cache_04::TC_ID,
+    test_tc_cache_05::TC_ID,
     test_tc_config_01::TC_ID,
     test_tc_config_02::TC_ID,
     test_tc_config_03::TC_ID,
