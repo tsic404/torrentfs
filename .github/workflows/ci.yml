@@ -108,6 +108,7 @@ jobs:
           bash -n ./tests/acceptance/tc_stats_01.sh
           bash -n ./tests/acceptance/tc_stats_02.sh
           bash -n ./tests/acceptance/tc_recovery_01.sh
+          bash -n ./tests/acceptance/tc_recovery_05.sh
           bash -n ./tests/acceptance/tc_cache_02.sh
           bash -n ./tests/acceptance/tc_container_01.sh
           bash -n ./tests/acceptance/tc_container_02.sh
@@ -598,6 +599,15 @@ jobs:
           cargo build --locked --release
           cargo build --locked --release --example torrentfs-selfseed-env
 
+      - name: Create the daemon user
+        # tc_recovery_05 drives the rootful entrypoint, which drops torrentfs
+        # to TORRENTFS_UID (1000); fusermount3 resolves that uid through NSS,
+        # and debian:sid-slim has no uid-1000 user, so the mount would fail
+        # with "could not determine username".
+        run: |
+          groupadd --gid 1000 torrentfs
+          useradd --uid 1000 --gid 1000 --home-dir /home/torrentfs --create-home --shell /bin/sh torrentfs
+
       - name: Run acceptance FUSE cases
         # Case exit codes: 0 = PASS, 1 = FAIL, 2 = SKIP (the case self-gated:
         # no /dev/fuse or no fusermount3).  A bare `set -e` loop would turn a
@@ -606,7 +616,7 @@ jobs:
         # fuse3 and runs as root with /dev/fuse, so the passing path is real.
         run: |
           set -euo pipefail
-          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02; do
+          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_recovery_05; do
             rc=0
             ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc" || rc=$?
             if [ "$rc" -eq 2 ]; then
@@ -623,6 +633,12 @@ jobs:
       # carrier's full scenario runs here.
       - name: Run negative acceptance carrier (FUSE-dependent half)
         run: cargo test --locked --release --test acceptance -- tc_negative_03 --nocapture
+
+      - name: Run acceptance recovery cases (FUSE)
+        # The Rust carriers skip themselves without /dev/fuse, so the plain
+        # `cargo test` job (no device) never executes them; this is the job
+        # that has the device and the capability to mount.
+        run: cargo test --locked --release --test acceptance -- tc_recovery_0
 
   bindings-drift:
     name: Bindings Drift (regenerate + diff)

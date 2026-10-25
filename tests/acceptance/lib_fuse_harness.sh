@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Shared FUSE harness for the acceptance scripts.
 #
-# Mounts torrentfs on a fresh mountpoint with a fresh state/cache, waits for
-# the mount, and tears it down on exit.  Source this file from an acceptance
-# script after setting:
+# The helpers at the top are the one implementation of "is there a FUSE mount
+# here, and wait for one": cases that drive their own daemons or the container
+# entrypoint source this file with TORRENTFS_FUSE_HARNESS_LIB_ONLY=1 and use
+# them without the single-daemon harness below.
+#
+# Sourcing it plainly mounts torrentfs on a fresh mountpoint with a fresh
+# state/cache, waits for the mount, and tears it down on exit.  Source this
+# file from an acceptance script after setting:
 #
 #   ROOT_DIR (repo root), BIN (torrentfs binary), MNT (mountpoint)
 #
@@ -19,6 +24,40 @@
 #   # shellcheck source=/dev/null
 #   source "$ROOT_DIR/tests/acceptance/lib_fuse_harness.sh"
 set -euo pipefail
+
+# Print the FUSE connection minor of the mount at $1 (the id under
+# /sys/fs/fuse/connections), empty when the path carries no FUSE mount.
+fuse_minor_at() {
+    awk -v mp="$1" '
+        $5 == mp {
+            for (i = 7; i < NF; i++) {
+                if ($i == "-" && $(i + 1) ~ /^fuse/) {
+                    split($3, a, ":")
+                    print a[2]
+                    exit
+                }
+            }
+        }
+    ' /proc/self/mountinfo
+}
+
+# Wait for a FUSE mount at $1, bounded by $2 seconds (default 30).
+wait_for_fuse() {
+    local target="$1" timeout="${2:-30}"
+    local deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        [ -n "$(fuse_minor_at "$target")" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# A case that manages its own daemons (or the entrypoint) wants the helpers
+# above and owns its own state and EXIT trap: it sources this file with
+# TORRENTFS_FUSE_HARNESS_LIB_ONLY=1, which stops before the harness mounts.
+if [ "${TORRENTFS_FUSE_HARNESS_LIB_ONLY:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 LOG_FILE="$(mktemp)"
 CACHE_DIR="$(mktemp -d)"

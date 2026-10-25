@@ -60,6 +60,9 @@ mod test_tc_read_07;
 mod test_tc_read_08;
 mod test_tc_read_09;
 mod test_tc_read_10;
+mod test_tc_recovery_02;
+mod test_tc_recovery_03;
+mod test_tc_recovery_04;
 mod test_tc_rofs_02;
 mod test_tc_rofs_03;
 mod test_tc_seeding_01;
@@ -175,6 +178,9 @@ pub const LANDED: &[&str] = &[
     test_tc_read_08::TC_ID,
     test_tc_read_09::TC_ID,
     test_tc_read_10::TC_ID,
+    test_tc_recovery_02::TC_ID,
+    test_tc_recovery_03::TC_ID,
+    test_tc_recovery_04::TC_ID,
     test_tc_rofs_02::TC_ID,
     test_tc_rofs_03::TC_ID,
     test_tc_seeding_01::TC_ID,
@@ -208,6 +214,7 @@ pub const SCRIPT_FORM: &[&str] = &[
     "TC-ingest-06",
     "TC-read-04",
     "TC-recovery-01",
+    "TC-recovery-05",
     "TC-rofs-01",
     "TC-stats-01",
     "TC-stats-02",

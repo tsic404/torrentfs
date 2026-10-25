@@ -107,30 +107,11 @@ fail() {
     exit 1
 }
 
-# Print the FUSE connection minor (the /sys/fs/fuse/connections id) of the FUSE
-# mount at $1, or nothing when the path carries no FUSE mount.
-fuse_minor() {
-    awk -v mp="$1" '
-        $5 == mp {
-            for (i = 7; i < NF; i++) {
-                if ($i == "-" && $(i + 1) ~ /^fuse/) {
-                    split($3, a, ":")
-                    print a[2]
-                    exit
-                }
-            }
-        }
-    ' /proc/self/mountinfo
-}
-
-wait_for_fuse_mount() {
-    local target="$1" deadline=$((SECONDS + 30))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        [ -n "$(fuse_minor "$target")" ] && return 0
-        sleep 0.5
-    done
-    return 1
-}
+# The FUSE mount probe (mountinfo minor + bounded wait) is shared with the
+# acceptance cases, so there is one parser for the kernel's mount table.
+TORRENTFS_FUSE_HARNESS_LIB_ONLY=1
+# shellcheck source=/dev/null
+source "$ROOT_DIR/tests/acceptance/lib_fuse_harness.sh"
 
 wait_for_data_file() {
     local deadline=$((SECONDS + 60)) found=""
@@ -165,7 +146,7 @@ PATH="$WORK/bin:$PATH" "$ROOT_DIR/entrypoint.sh" "$MNT" \
     --cache "$WORK/cache" --db "$WORK/db/metadata.db" >"$LOG" 2>&1 &
 ENTRYPOINT_PID=$!
 
-wait_for_fuse_mount "$MNT" || fail "FUSE mount at $MNT did not appear"
+wait_for_fuse "$MNT" 30 || fail "FUSE mount at $MNT did not appear"
 cp "$SELFSEED_OUT/selfseed.torrent" "$MNT/metadata/"
 DATA_FILE="$(wait_for_data_file)" || fail "data file did not appear under $MNT/data"
 
@@ -186,7 +167,7 @@ if umount "$MNT" 2>/dev/null; then
     fail "reader did not hold $MNT busy (a plain umount succeeded) — detach policy untested"
 fi
 
-MINOR="$(fuse_minor "$INTERNAL_MNT")"
+MINOR="$(fuse_minor_at "$INTERNAL_MNT")"
 [ -n "$MINOR" ] || fail "no FUSE connection found at $INTERNAL_MNT"
 ABORT_FILE="/sys/fs/fuse/connections/$MINOR/abort"
 echo "[session_recovery_e2e] severing the FUSE connection (minor=$MINOR)…"

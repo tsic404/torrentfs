@@ -15,6 +15,9 @@ pub use base::{
 };
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -672,4 +675,360 @@ fn join_path(prefix: &str, name: &str) -> String {
     } else {
         format!("{}/{}", prefix, name)
     }
+}
+
+// ── daemon-level helpers ─────────────────────────────────────────────────────
+//
+// The lifecycle cases need the real binary: a signal, an exit status and the
+// kernel mount table are invisible to the in-process engine harness.  One
+// `Daemon` owns a private mountpoint, cache, state database and log, and
+// tears all of it down on drop, so an assertion panic never leaves a mount
+// behind for the next test.
+
+/// How long one daemon-side operation may take before the case fails instead
+/// of hanging.  Waiting forever would make a wedged mount look like CI
+/// slowness rather than a broken contract.
+pub const DAEMON_MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The fusermount helper on `PATH` (`fusermount3` first, then `fusermount`).
+fn fusermount_binary() -> Option<&'static str> {
+    ["fusermount3", "fusermount"].into_iter().find(|name| {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+            .unwrap_or(false)
+    })
+}
+
+/// Why this environment cannot mount FUSE at all, or `None` when it can.
+///
+/// The recovery cases are FUSE-level by design; an environment without the
+/// device or the mount helper cannot execute them.  The case reports that as
+/// a skip with the reason instead of a false pass.
+pub fn fuse_mount_blocker() -> Option<String> {
+    if !Path::new("/dev/fuse").exists() {
+        return Some("/dev/fuse is absent".to_string());
+    }
+    if fusermount_binary().is_none() {
+        return Some("neither fusermount3 nor fusermount is on PATH".to_string());
+    }
+    None
+}
+
+/// Escape a path the way `/proc/self/mountinfo` does.
+fn mountinfo_escape(path: &str) -> String {
+    path.replace('\\', "\\\\")
+        .replace(' ', "\\040")
+        .replace('\t', "\\011")
+        .replace('\n', "\\012")
+}
+
+/// Number of FUSE mounts whose mountpoint is exactly `path`.
+pub fn mountinfo_fuse_count(path: &Path) -> usize {
+    let escaped = mountinfo_escape(&path.to_string_lossy());
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return 0;
+    };
+    mountinfo
+        .lines()
+        .filter(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            if fields.len() < 5 || fields[4] != escaped {
+                return false;
+            }
+            match fields.iter().position(|field| *field == "-") {
+                Some(sep) => fields
+                    .get(sep + 1)
+                    .is_some_and(|kind| kind.starts_with("fuse")),
+                None => false,
+            }
+        })
+        .count()
+}
+
+/// Outcome of waiting for the daemon's mount.
+pub enum MountGate {
+    Mounted,
+    /// This environment refused the mount; the case cannot execute here.
+    Environment(String),
+    /// The daemon failed for a reason that is not environmental.
+    Failed(String),
+}
+
+/// A torrentfs daemon process with its own FUSE mountpoint and state.
+pub struct Daemon {
+    child: Option<Child>,
+    work: tempfile::TempDir,
+    log_path: PathBuf,
+    stderr_path: PathBuf,
+}
+
+impl Daemon {
+    /// Start `target/debug/torrentfs` on a private mountpoint.
+    ///
+    /// `config_toml` is written into the work directory and passed as
+    /// `--config`; `log_level` feeds `--log-level`.  The daemon's own stderr
+    /// is captured separately file so the frozen read-failure diagnostics are
+    /// readable, while tracing output goes to `--log-file`.
+    pub fn start(config_toml: Option<&str>, log_level: &str) -> Self {
+        let base = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let work = tempfile::TempDir::new_in(&base).expect("create daemon work dir");
+        let mountpoint = work.path().join("mnt");
+        fs::create_dir_all(&mountpoint).expect("create mountpoint");
+        let cache = work.path().join("cache");
+        fs::create_dir_all(&cache).expect("create cache dir");
+        let db_dir = work.path().join("db");
+        fs::create_dir_all(&db_dir).expect("create db dir");
+
+        let log_path = work.path().join("daemon.log");
+        let stderr_path = work.path().join("daemon.stderr");
+        let stderr = fs::File::create(&stderr_path).expect("create daemon stderr file");
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentfs"));
+        cmd.arg(&mountpoint)
+            .arg("--cache")
+            .arg(&cache)
+            .arg("--db")
+            .arg(db_dir.join("metadata.db"))
+            .arg("--log-level")
+            .arg(log_level)
+            .arg("--log-file")
+            .arg(&log_path);
+        if let Some(toml) = config_toml {
+            let config_path = work.path().join("config.toml");
+            fs::write(&config_path, toml).expect("write daemon config");
+            cmd.arg("--config").arg(&config_path);
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::from(stderr));
+
+        let child = cmd.spawn().expect("spawn torrentfs daemon");
+        Daemon {
+            child: Some(child),
+            work,
+            log_path,
+            stderr_path,
+        }
+    }
+
+    pub fn mountpoint(&self) -> PathBuf {
+        self.work.path().join("mnt")
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        self.work.path().join("cache")
+    }
+
+    pub fn log_path(&self) -> PathBuf {
+        self.log_path.clone()
+    }
+
+    /// Everything the daemon wrote to its log file and its stderr, for a
+    /// failure message.
+    pub fn output(&self) -> String {
+        let log = fs::read_to_string(&self.log_path).unwrap_or_default();
+        let err = fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        format!("--- daemon log ---\n{log}\n--- daemon stderr ---\n{err}")
+    }
+
+    fn poll_exit(&mut self) -> Option<ExitStatus> {
+        let child = self.child.as_mut()?;
+        match child.try_wait().expect("poll daemon") {
+            Some(status) => {
+                self.child = None;
+                Some(status)
+            }
+            None => None,
+        }
+    }
+
+    /// Wait for the FUSE mount, classifying an early exit.
+    pub fn wait_for_mount(&mut self, timeout: Duration) -> MountGate {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if mountinfo_fuse_count(&self.mountpoint()) > 0 {
+                return MountGate::Mounted;
+            }
+            if let Some(status) = self.poll_exit() {
+                let output = self.output();
+                // A refused mount, not any startup failure.  The exit status
+                // says the daemon reached the mount (2 = refused, 3 = /dev/fuse
+                // vanished, 100 = the device could not be opened, C-1.2.3..5)
+                // and the line must name a refusal only a mount attempt
+                // writes.  The `user_allow_other` warning is printed before
+                // every mount, so on its own it would turn a state-database,
+                // engine-init or instance-lock failure into a skip.
+                let mount_refused = [
+                    "Mount failed: Operation not permitted",
+                    "Mount failed and /dev/fuse cannot be opened",
+                    "mountpoint is not empty",
+                    "fusermount:",
+                    "/dev/fuse not found",
+                ]
+                .iter()
+                .any(|marker| output.contains(marker));
+                let mount_stage_exit = matches!(status.code(), Some(2) | Some(3) | Some(100));
+                return if mount_refused && mount_stage_exit {
+                    MountGate::Environment(output)
+                } else {
+                    MountGate::Failed(format!(
+                        "daemon exited with {status} before mounting\n{output}"
+                    ))
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                return MountGate::Failed(format!(
+                    "FUSE mount did not appear within {timeout:?}\n{}",
+                    self.output()
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Deliver a signal to the daemon.  Returns false when it already exited.
+    pub fn signal(&self, signal: libc::c_int) -> bool {
+        match self.child.as_ref() {
+            Some(child) => unsafe { libc::kill(child.id() as libc::pid_t, signal) == 0 },
+            None => false,
+        }
+    }
+
+    /// Wait for the daemon to exit, polling until `timeout`.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.poll_exit() {
+                return Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // A killed daemon leaves its mount attached; lazy-detach so the work
+        // directory can be removed and no later test sees a stale mount.
+        if mountinfo_fuse_count(&self.mountpoint()) > 0 {
+            if let Some(bin) = fusermount_binary() {
+                let _ = Command::new(bin)
+                    .arg("-u")
+                    .arg("-z")
+                    .arg("--")
+                    .arg(self.mountpoint())
+                    .status();
+            }
+        }
+    }
+}
+
+/// The config the lifecycle cases use: ephemeral listen port (several test
+/// daemons run in parallel), no DHT, tracker discovery kept on, and the three
+/// read windows set by the caller.
+pub fn daemon_config(read_timeout_secs: u64, no_seeder_secs: u64, discovery_secs: u64) -> String {
+    format!(
+        r#"
+[connections]
+listen_interfaces = "127.0.0.1:0"
+allow_multiple_connections_per_ip = true
+peer_connect_timeout = 5
+
+[dht]
+enabled = false
+
+[local_discovery]
+lsd_enabled = true
+upnp_enabled = false
+natpmp_enabled = false
+
+[tracker]
+announce_to_all_trackers = true
+announce_to_all_tiers = true
+min_announce_interval = 5
+
+[timeouts]
+read_timeout_secs = {read_timeout_secs}
+no_seeder_read_timeout_secs = {no_seeder_secs}
+peer_discovery_wait_secs = {discovery_secs}
+"#
+    )
+}
+
+/// Write a `.torrent` into the mount's `metadata/` namespace.
+pub fn ingest_torrent_through_mount(mountpoint: &Path, filename: &str, torrent_data: &[u8]) {
+    fs::write(mountpoint.join("metadata").join(filename), torrent_data)
+        .unwrap_or_else(|e| panic!("write metadata/{filename}: {e}"));
+}
+
+/// Read a file through the mount with a wall-clock ceiling, so a wedged
+/// request fails the case instead of stalling the suite.
+pub fn read_with_deadline(path: &Path, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let read_path = path.to_path_buf();
+    thread::spawn(move || {
+        let _ = sender.send(fs::read(&read_path));
+    });
+    receiver.recv_timeout(timeout).unwrap_or_else(|_| {
+        panic!(
+            "read of {} did not return within {timeout:?} (the mount is hanging)",
+            path.display()
+        )
+    })
+}
+
+/// Read a file that was just ingested, retrying while the torrent is still in
+/// the delivery window.
+///
+/// C-2.5.3 keeps a freshly closed `.torrent` listed as a temporary projection
+/// until the background persist finishes; that projection has no download
+/// handle yet, so its first reads answer `ENOENT`.  Retrying `ENOENT` for up
+/// to `timeout` waits out that window, and every other error is returned at
+/// once.
+pub fn read_when_ready(path: &Path, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match read_with_deadline(path, timeout) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Wait for the projection of `filename` to appear under `data/`.
+pub fn wait_for_projection(mountpoint: &Path, filename: &str, timeout: Duration) -> bool {
+    let path = mountpoint.join("data").join(filename);
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.is_dir() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Wait for `path` to exist (a projected file appears after its directory).
+pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
