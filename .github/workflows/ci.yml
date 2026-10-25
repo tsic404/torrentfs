@@ -592,6 +592,13 @@ jobs:
             ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc"
           done
 
+      # TC-negative-03's mount-dependent half (forbidden state paths inside
+      # the mountpoint and the remount comparison) needs a live FUSE mount.
+      # The regular Cargo Test jobs have no /dev/fuse; this job does, so the
+      # carrier's full scenario runs here.
+      - name: Run negative acceptance carrier (FUSE-dependent half)
+        run: cargo test --locked --release --test acceptance -- tc_negative_03 --nocapture
+
   bindings-drift:
     name: Bindings Drift (regenerate + diff)
     runs-on: ubuntu-24.04

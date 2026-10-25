@@ -187,3 +187,142 @@ pub fn root_stats_without_uptime(svc: &FsService) -> Vec<u8> {
     }
     masked
 }
+
+/// A config that touches no network discovery: DHT, LSD, UPnP and NAT-PMP are
+/// off and the engine listens on an ephemeral port.  State-service tests only
+/// need the engine present (or absent); a quiet engine keeps parallel modules
+/// from pairing through a same-host swarm and from colliding on a fixed port.
+pub fn quiet_config() -> torrentfs::TorrentfsConfig {
+    let mut config = local_test_config();
+    config.dht.enabled = Some(false);
+    config.local_discovery.lsd_enabled = Some(false);
+    config.local_discovery.upnp_enabled = Some(false);
+    config.local_discovery.natpmp_enabled = Some(false);
+    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+    config
+}
+
+/// An `FsService` backed by an in-memory database and a fresh cache dir.
+///
+/// The service owns its state; keep the returned `TempDir` alive for the
+/// service's lifetime (it backs the piece cache).  Callers hold a
+/// [`wave_slot`]: constructing the service starts a libtorrent session.
+pub fn service_with_state() -> (torrentfs::fuse::FsService, tempfile::TempDir) {
+    service_with_config(&quiet_config())
+}
+
+/// [`service_with_state`] with an explicit engine config.
+pub fn service_with_config(
+    config: &torrentfs::TorrentfsConfig,
+) -> (torrentfs::fuse::FsService, tempfile::TempDir) {
+    let cache = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let db = torrentfs::infrastructure::db::Database::open_in_memory()
+        .expect("Failed to open in-memory database");
+    let service = torrentfs::fuse::FsService::new_with_db_and_cache(
+        db,
+        cache.path().to_path_buf(),
+        config,
+    );
+    (service, cache)
+}
+
+/// Ingest `torrent_bytes` through the service's real `metadata/` write path
+/// (`create` → `write` → `flush` → `release`) and wait until the detached
+/// persistence settles, so `data/` carries the projection.
+pub fn ingest_torrent(
+    service: &mut torrentfs::fuse::FsService,
+    parent: u64,
+    filename: &str,
+    torrent_bytes: &[u8],
+) {
+    let created = service
+        .create(parent, filename)
+        .unwrap_or_else(|e| panic!("create {filename}: {e:?}"));
+    let written = service
+        .write(created.attr.ino, 0, torrent_bytes)
+        .unwrap_or_else(|e| panic!("write {filename}: {e:?}"));
+    assert_eq!(
+        written as usize,
+        torrent_bytes.len(),
+        "{filename}: the write must accept the whole torrent"
+    );
+    service
+        .flush(created.attr.ino)
+        .unwrap_or_else(|e| panic!("flush {filename}: {e:?}"));
+    service
+        .release(created.fh)
+        .unwrap_or_else(|e| panic!("release {filename}: {e:?}"));
+
+    // `release` persists and registers the handle on a detached thread; the
+    // dedup key is dropped only once both have settled.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if service
+            .processing_torrents
+            .lock()
+            .map(|pending| pending.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("{filename}: persistence did not settle within 20s");
+}
+
+/// Build a multi-file `.torrent` from `(relative/path, size)` entries.
+///
+/// The fixture never seeds, so the piece hashes are placeholder zeroes of the
+/// right width; only the file tree and sizes matter to the projection and
+/// `.stats` surfaces these tests exercise.
+pub fn build_multi_file_torrent(
+    announce_url: &str,
+    name: &str,
+    files: &[(&str, usize)],
+) -> Vec<u8> {
+    const PIECE_LEN: usize = 16 * 1024;
+
+    fn bencode_str(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(value.as_bytes().len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    let total: usize = files.iter().map(|(_, size)| *size).sum();
+    let piece_count = total.div_ceil(PIECE_LEN).max(1);
+
+    let mut torrent = Vec::new();
+    torrent.push(b'd');
+    bencode_str(&mut torrent, "announce");
+    bencode_str(&mut torrent, announce_url);
+    bencode_str(&mut torrent, "info");
+    torrent.push(b'd');
+    bencode_str(&mut torrent, "files");
+    torrent.push(b'l');
+    for (path, size) in files {
+        torrent.push(b'd');
+        torrent.extend_from_slice(b"6:lengthi");
+        torrent.extend_from_slice(size.to_string().as_bytes());
+        torrent.push(b'e');
+        bencode_str(&mut torrent, "path");
+        torrent.push(b'l');
+        for component in path.split('/') {
+            bencode_str(&mut torrent, component);
+        }
+        torrent.push(b'e');
+        torrent.push(b'e');
+    }
+    torrent.push(b'e');
+    bencode_str(&mut torrent, "name");
+    bencode_str(&mut torrent, name);
+    torrent.extend_from_slice(b"12:piece lengthi");
+    torrent.extend_from_slice(PIECE_LEN.to_string().as_bytes());
+    torrent.push(b'e');
+    bencode_str(&mut torrent, "pieces");
+    torrent.extend_from_slice((piece_count * 20).to_string().as_bytes());
+    torrent.push(b':');
+    torrent.extend_from_slice(&vec![0u8; piece_count * 20]);
+    torrent.push(b'e');
+    torrent.push(b'e');
+    torrent
+}
