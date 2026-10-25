@@ -839,24 +839,16 @@ fn main() {
         }
     };
 
-    let cache_path = args.cache.clone().unwrap_or_else(|| {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("torrentfs/cache")
-    });
+    let (default_db_path, default_cache_path) =
+        torrentfs::infrastructure::config::default_state_paths();
+    let cache_path = args.cache.clone().unwrap_or(default_cache_path);
     if !cache_path.exists() {
         if let Err(e) = std::fs::create_dir_all(&cache_path) {
             warn!("Failed to create cache directory {:?}: {:?}", cache_path, e);
         }
     }
 
-    let db_path = if let Some(db_path) = &args.db {
-        db_path.clone()
-    } else {
-        dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("torrentfs/db/metadata.db")
-    };
+    let db_path = args.db.clone().unwrap_or(default_db_path);
 
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {

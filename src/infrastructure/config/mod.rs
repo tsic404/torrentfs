@@ -1,8 +1,25 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::config::enums::EnumValidator;
+
+/// Default on-disk state locations when `--db` / `--cache` are not given.
+///
+/// Both live under the XDG data directory (`$XDG_DATA_HOME`, else
+/// `~/.local/share`), never under a FUSE mountpoint: a path inside the
+/// mountpoint is resolved in the mounted namespace instead of reaching the
+/// underlying disk — under `<mount>/data/` it hits the read-only projection
+/// (`EROFS`), elsewhere it resolves inside the synthetic FUSE root
+/// (`EACCES`/`ENOENT`) — so the state can never be persisted there (C-12,
+/// C-2.2.4).
+pub fn default_state_paths() -> (PathBuf, PathBuf) {
+    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    (
+        base.join("torrentfs/db/metadata.db"),
+        base.join("torrentfs/cache"),
+    )
+}
 
 // ---- config sub-modules ----
 pub mod active_limits;
