@@ -18,7 +18,9 @@ use torrentfs::fuse::inodes::{DATA_INO, METADATA_INO};
 use torrentfs::fuse::FsService;
 use torrentfs::FsError;
 
-use crate::common::{build_multi_file_torrent, ingest_torrent, service_with_state, wave_slot};
+use crate::common::{
+    build_multi_file_torrent, ingest_torrent, readdir_from, service_with_state, wave_slot,
+};
 
 pub const TC_ID: &str = "TC-negative-01";
 
@@ -79,9 +81,7 @@ struct ProjectionRow {
 /// excluded: `.stats` is explicitly outside AC-90's "no trace" rule).
 fn snapshot(service: &mut FsService, root: u64) -> Vec<ProjectionRow> {
     fn walk(service: &mut FsService, ino: u64, prefix: &str, out: &mut Vec<ProjectionRow>) {
-        let mut entries = service
-            .readdir(ino, 0)
-            .unwrap_or_else(|e| panic!("list inode {ino}: {e:?}"));
+        let mut entries = readdir_from(service, ino, -1);
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         for entry in entries {
             if entry.name == "." || entry.name == ".." || entry.name == ".stats" {

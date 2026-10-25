@@ -90,14 +90,24 @@ struct DataReaddirCache {
     entries: Vec<DirEntry>,
 }
 
-/// Entries the kernel has not seen yet: it passes back the offset of the last
-/// entry it accepted, and every returned offset must be strictly greater.
-fn entries_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
-    entries
-        .iter()
-        .filter(|entry| entry.offset > offset)
-        .cloned()
-        .collect()
+/// Most entries one `readdir` call returns.
+///
+/// A kernel readdir reply holds roughly a hundred entries, so a page this size
+/// never forces an extra round trip.  The cap is what keeps one call's cost
+/// independent of the directory size: returning the whole remainder made a
+/// walk at one-entry granularity quadratic — every call filtered the listing
+/// and cloned its tail.
+const READDIR_PAGE_ENTRIES: usize = 128;
+
+/// At most one page of the entries after `offset`, the last one the kernel
+/// accepted.
+///
+/// `entries` carry strictly increasing offsets, so the resume point is found by
+/// binary search and only the returned page is cloned.
+fn page_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
+    let start = entries.partition_point(|entry| entry.offset <= offset);
+    let end = start.saturating_add(READDIR_PAGE_ENTRIES).min(entries.len());
+    entries[start..end].to_vec()
 }
 
 /// Sink for kernel dentry invalidation.
@@ -610,7 +620,7 @@ impl FsService {
                 let state = DataResolver::current_state(db, &self.processing_torrents);
                 if let Some(cache) = &self.data_readdir_cache {
                     if cache.ino == ino && cache.state == state {
-                        return Ok(entries_after_offset(&cache.entries, offset));
+                        return Ok(page_after_offset(&cache.entries, offset));
                     }
                 }
                 // The listing carries the state it was built from, so the cache
@@ -631,7 +641,7 @@ impl FsService {
                             name,
                         })
                         .collect();
-                    let page = entries_after_offset(&entries, offset);
+                    let page = page_after_offset(&entries, offset);
                     self.data_readdir_cache = Some(DataReaddirCache {
                         ino,
                         state: listing.state,
@@ -685,7 +695,7 @@ impl FsService {
 
             let mut offset_counter = entries.len() as i64 + 1;
             // Collect entries first to avoid borrowing issues.
-            let children: Vec<(u64, FileKind, String)> = self
+            let mut children: Vec<(u64, FileKind, String)> = self
                 .inode_mgr
                 .inodes
                 .iter()
@@ -706,6 +716,9 @@ impl FsService {
                     _ => None,
                 })
                 .collect();
+            // Paged listing: an entry must keep its offset between calls, so
+            // the order cannot come from the inode map's iteration order.
+            children.sort_unstable_by_key(|(child_ino, ..)| *child_ino);
 
             for (child_ino, kind, name) in children {
                 entries.push(DirEntry {
@@ -720,7 +733,7 @@ impl FsService {
             return Err(FsError::NotDirectory);
         }
 
-        Ok(entries.into_iter().filter(|e| e.offset > offset).collect())
+        Ok(page_after_offset(&entries, offset))
     }
 
     /// Open a file, returning the file handle and open-mode hints.
