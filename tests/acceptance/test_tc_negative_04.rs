@@ -4,12 +4,8 @@
 //! and the section/title assertions in `tests/acceptance/tc_stats_0{1,2}.sh`
 //! all still hold against freshly rendered output
 //! (`docs/03-acceptance.md` §J AC-93; `docs/02-contracts.md` §C-6.1..§C-6.3).
-//!
-//! The renderers are driven against real database + engine state, then the
-//! output is checked with the same parsers the external consumers use: exact
-//! section names, the `Cache:`/`info_hash:`/`tier 0` field forms, the wait
-//! fields, and the strict four-state piece marker grammar.  A format change
-//! that any existing consumer would trip on fails here.
+//! The wait fields are pinned in both forms - a parked read and no parked read -
+//! so a field rename fails here rather than only in the consumer test.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,7 +15,7 @@ use torrentfs::fuse::stats::{
 };
 use torrentfs::infrastructure::db::Database;
 use torrentfs::services::download::DownloadService;
-use torrentfs::{InsertTorrentResult, TorrentInfo};
+use torrentfs::{InsertTorrentResult, TorrentError, TorrentInfo};
 
 use crate::common::{base, quiet_config, wave_slot};
 
@@ -29,7 +25,8 @@ const TRACKER_URL: &str = "http://127.0.0.1:6977/announce";
 const SOURCE_PATH: &str = "collection";
 
 /// The consumer-parsed `Waited:` seconds, copied from
-/// `tests/torrent_stats_waiting_test.rs`: absent when no read is parked.
+/// `tests/torrent_stats_waiting_test.rs`: `None` when the published line is
+/// absent or no longer parses.
 fn waited_secs(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("  Waited: "))
@@ -143,6 +140,7 @@ fn tc_negative_04_published_stats_format_satisfies_existing_consumers() {
     let mut database = Database::open_in_memory().expect("in-memory database");
     let (alpha, alpha_info) = insert(&mut database, "negative-04-alpha", "alpha.torrent");
     let (beta, beta_info) = insert(&mut database, "negative-04-beta", "beta.torrent");
+    let alpha_info = Arc::new(alpha_info);
     let db = Some(Arc::new(Mutex::new(database)));
 
     let cache = tempfile::TempDir::new().expect("cache dir");
@@ -150,7 +148,7 @@ fn tc_negative_04_published_stats_format_satisfies_existing_consumers() {
         DownloadService::new(cache.path(), &quiet_config()).expect("create download service"),
     );
     service
-        .ensure_handle_lightweight(Arc::new(alpha_info))
+        .ensure_handle_lightweight(Arc::clone(&alpha_info))
         .expect("register alpha handle");
     service
         .ensure_handle_lightweight(Arc::new(beta_info))
@@ -301,6 +299,49 @@ fn tc_negative_04_published_stats_format_satisfies_existing_consumers() {
     ))
     .into_owned();
     require(&empty_directory, "  No torrents found under this path.\n");
+
+    // The positive form of the same field: a parked read must render
+    // `Waiting: yes` with a `Waited: Ns` line the consumer parser accepts.
+    // Pinning only the absent form leaves a renamed field undetected here.
+    let reader_service = Arc::clone(&service);
+    let reader_info = Arc::clone(&alpha_info);
+    let reader =
+        std::thread::spawn(move || reader_service.read_file_range(reader_info, 0, 0, 4096));
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
+    let mut parked = None;
+    while Instant::now() < wait_deadline {
+        let text = render_torrent(&alpha);
+        if text.contains("  Waiting: yes\n") {
+            if let Some(waited) = waited_secs(&text) {
+                parked = Some((text, waited));
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (parked_stats, waited) = parked.expect(
+        "a parked read must surface `Waiting: yes` with a consumer-parsable `Waited: Ns` line",
+    );
+    require(&parked_stats, &format!("  Waited: {waited}s\n"));
+    require(&parked_stats, "  Active readers: 1\n");
+
+    // Join before shutdown: shutdown aborts the read and would mask whether an
+    // empty swarm fails on its own.
+    let failure = reader
+        .join()
+        .expect("reader thread")
+        .expect_err("a read with no seeder must fail, not return data");
+    let message = match failure {
+        TorrentError::NoPeers(message) => message,
+        other => panic!("a read on an empty swarm must fail with NoPeers, got {other:?}"),
+    };
+    assert!(
+        message.starts_with(&format!(
+            "No seeder connected for info_hash {}",
+            alpha.info_hash
+        )),
+        "the failure must name the empty swarm, got: {message}"
+    );
 
     service.shutdown();
 }
