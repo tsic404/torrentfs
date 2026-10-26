@@ -11,16 +11,17 @@ pub mod base;
 
 pub use base::{
     acquire_session_lock, build_multipiece_torrent_named, build_multipiece_torrent_pieces,
-    local_test_config, MiniTracker, TestHarness,
+    create_single_piece_torrent, local_test_config, MiniTracker, TestHarness,
 };
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use torrentfs::fuse::fs_types::{FileKind, StatsKind};
-use torrentfs::fuse::inodes::METADATA_INO;
-use torrentfs::{Database, FsError, FsService, TorrentInfo};
+use torrentfs::fuse::fs_types::{DirEntry, FileKind, ReadOutcome, StatsKind};
+use torrentfs::fuse::inodes::{DATA_INO, METADATA_INO};
+use torrentfs::{Database, FsError, FsService, Torrent, TorrentInfo};
 
 /// How many tests in this binary may run at once.
 ///
@@ -96,18 +97,37 @@ pub struct Rig {
 /// the FUSE adapter forwards to them unchanged and maps their `FsError`
 /// through `src/fuse/errno.rs`, so the errno assertions match the kernel.
 pub fn rig() -> Rig {
-    let cache = tempfile::TempDir::new().expect("create cache dir");
-    let mut config = local_test_config();
-    // Ephemeral port: acceptance tests run in parallel and a fixed one collides.
-    config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
-    let svc = FsService::new_with_db_and_cache(
-        Database::open_in_memory().expect("create in-memory db"),
-        cache.path().to_path_buf(),
-        &config,
-    );
-    Rig {
-        svc,
-        _cache: cache,
+    Rig::with_database(Database::open_in_memory().expect("create in-memory db"))
+}
+
+impl Rig {
+    /// Wire `db` to a fresh cache directory and the test config — the one
+    /// construction path behind [`rig`] and the remount-capable harness.
+    fn with_database(db: Database) -> Self {
+        let cache = tempfile::TempDir::new().expect("create cache dir");
+        let mut config = local_test_config();
+        // Ephemeral port: acceptance tests run in parallel and a fixed one collides.
+        config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+        Rig {
+            svc: FsService::new_with_db_and_cache(db, cache.path().to_path_buf(), &config),
+            _cache: cache,
+        }
+    }
+
+    /// Rebuild the service from `db_path`, keeping the cache directory alive.
+    fn reopen(self, db_path: &std::path::Path) -> Self {
+        let Rig { svc, _cache } = self;
+        drop(svc);
+        let mut config = local_test_config();
+        config.connections.listen_interfaces = Some("0.0.0.0:0".to_string());
+        Rig {
+            svc: FsService::new_with_db_and_cache(
+                Database::open(db_path).expect("open database"),
+                _cache.path().to_path_buf(),
+                &config,
+            ),
+            _cache,
+        }
     }
 }
 
@@ -335,4 +355,321 @@ pub fn build_multi_file_torrent(
     torrent.push(b'e');
     torrent.push(b'e');
     torrent
+}
+
+// ── Ingest harness (metadata/ → data/ projection) ───────────────────────────
+
+/// One entry the `data/` projection exposes, relative to the mount root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedEntry {
+    pub path: String,
+    pub kind: FileKind,
+    pub perm: u16,
+    pub size: u64,
+}
+
+/// A FUSE-facing service driving the ingest path without a kernel mount.
+///
+/// Every ingest effect crosses `FsService` through the same calls the adapter
+/// makes: `create` / `write` / `flush` / `release` for a copy, `lookup` /
+/// `readdir` / `getattr` for observation, `rename` / `unlink` / `rmdir` for
+/// mutation.  Only the kernel dentry cache sits above this boundary; its
+/// invalidation is adapter-side, so the mount-form scripts
+/// (`tc_ingest_03.sh`, `tc_ingest_06.sh`) cover it instead.
+pub struct IngestHarness {
+    rig: Rig,
+    db_dir: Option<tempfile::TempDir>,
+}
+
+impl IngestHarness {
+    /// The [`rig`] wiring over an in-memory database (cases without a remount).
+    pub fn new() -> Self {
+        Self {
+            rig: rig(),
+            db_dir: None,
+        }
+    }
+
+    /// The [`rig`] wiring over a file-backed database, so [`Self::remount`]
+    /// can reopen it and prove the projection survived the restart.
+    pub fn with_file_db() -> Self {
+        let db_dir = tempfile::TempDir::new().expect("db dir");
+        let rig = Rig::with_database(
+            Database::open(&db_dir.path().join("ingest.db")).expect("open database"),
+        );
+        Self {
+            rig,
+            db_dir: Some(db_dir),
+        }
+    }
+
+    /// One unmount/mount cycle: drop the service, then rebuild [`Rig`] from
+    /// the same database file and cache directory.
+    pub fn remount(self) -> Self {
+        let Self { rig, db_dir } = self;
+        let db_dir = db_dir.expect("remount requires a file-backed database");
+        let rig = rig.reopen(&db_dir.path().join("ingest.db"));
+        Self {
+            rig,
+            db_dir: Some(db_dir),
+        }
+    }
+
+    pub fn service(&mut self) -> &mut FsService {
+        &mut self.rig.svc
+    }
+
+    /// Create `metadata/<parts…>` top-down like `mkdir -p`, returning the
+    /// deepest inode.  Existing levels are reused, not re-created.
+    pub fn mkdir(&mut self, parts: &[&str]) -> u64 {
+        let mut parent = METADATA_INO;
+        for part in parts {
+            parent = match self.rig.svc.lookup(parent, part) {
+                Ok(Some(entry)) => entry.ino,
+                Ok(None) => {
+                    self.rig.svc
+                        .mkdir(parent, part)
+                        .unwrap_or_else(|e| {
+                            panic!("mkdir metadata/{} failed: {:?}", parts.join("/"), e)
+                        })
+                        .ino
+                }
+                Err(e) => panic!("lookup metadata/{} failed: {:?}", parts.join("/"), e),
+            };
+        }
+        parent
+    }
+
+    /// Copy `.torrent` bytes into `metadata/` exactly as `cp` does, then wait
+    /// for the detached persistence to settle.
+    pub fn copy_torrent(&mut self, parent: u64, filename: &str, bytes: &[u8]) {
+        if let Err(e) = self.try_copy_torrent(parent, filename, bytes) {
+            let rendered = format!("{:?}", e);
+            let errno = libc::c_int::from(e);
+            panic!(
+                "copy of {} must be accepted, got {} (errno {})",
+                filename, rendered, errno
+            );
+        }
+        self.wait_persisted();
+    }
+
+    /// The `cp` sequence, returning the close-time verdict instead of
+    /// unwrapping it.  A `create` failure is returned too: a stale inode left
+    /// behind by an earlier rejected write would surface as `EEXIST` here.
+    pub fn try_copy_torrent(
+        &mut self,
+        parent: u64,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<(), FsError> {
+        let created = self.rig.svc.create(parent, filename)?;
+        let close = match self.rig.svc.write(created.attr.ino, 0, bytes) {
+            Ok(_) => self.rig.svc.flush(created.attr.ino),
+            Err(e) => Err(e),
+        };
+        let released = self.rig.svc.release(created.fh);
+        match close {
+            Err(e) => Err(e),
+            Ok(()) => released,
+        }
+    }
+
+    /// Block until every background persist spawned by `release` settled and
+    /// assert none failed.  `release` spawns the database write detached, so
+    /// a projection assertion made too early would race it.
+    pub fn wait_persisted(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let pending = self
+                .rig
+                .svc
+                .processing_torrents
+                .lock()
+                .map(|g| g.len())
+                .unwrap_or(0);
+            if pending == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background persist did not settle within 20s ({} pending)",
+                pending
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        if let Ok(errors) = self.rig.svc.persist_errors.lock() {
+            assert!(
+                errors.is_empty(),
+                "persist failures recorded: {:?}",
+                *errors
+            );
+        }
+    }
+
+    /// Directory entries the service returns, without `.` / `..`.
+    pub fn children(&mut self, ino: u64) -> Vec<DirEntry> {
+        self.rig.svc
+            .readdir(ino, 0)
+            .unwrap_or_else(|e| panic!("readdir(ino={}) failed: {:?}", ino, e))
+            .into_iter()
+            .filter(|entry| entry.name != "." && entry.name != "..")
+            .collect()
+    }
+
+    /// Every directory the projection exposes, relative to `data/`, sorted.
+    /// `.stats` is the design's virtual observability file, not a projection
+    /// of a metadata entry, so it is excluded.
+    pub fn data_dirs(&mut self) -> Vec<String> {
+        let mut dirs = Vec::new();
+        let mut pending = vec![(DATA_INO, String::new())];
+        while let Some((ino, prefix)) = pending.pop() {
+            let mut children = self.children(ino);
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            for child in children {
+                if child.name == ".stats" || child.kind != FileKind::Directory {
+                    continue;
+                }
+                let path = join_path(&prefix, &child.name);
+                pending.push((child.ino, path.clone()));
+                dirs.push(path);
+            }
+        }
+        dirs.sort();
+        dirs
+    }
+
+    /// Every entry under `metadata/`: directories and `.torrent` files,
+    /// relative to the mount root.  The `data/` projection mirrors each one as
+    /// a directory of the same relative path.
+    pub fn metadata_projection_paths(&mut self) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut pending = vec![(METADATA_INO, String::new())];
+        while let Some((ino, prefix)) = pending.pop() {
+            let mut children = self.children(ino);
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            for child in children {
+                let path = join_path(&prefix, &child.name);
+                if child.kind == FileKind::Directory {
+                    pending.push((child.ino, path.clone()));
+                }
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    /// Full `data/` projection snapshot — path, kind, permission bits, size —
+    /// excluding the virtual `.stats` entries and sorted by path.
+    pub fn data_snapshot(&mut self) -> Vec<ProjectedEntry> {
+        let mut out = Vec::new();
+        let mut pending = vec![(DATA_INO, String::new())];
+        while let Some((ino, prefix)) = pending.pop() {
+            let mut children = self.children(ino);
+            children.sort_by(|a, b| a.name.cmp(&b.name));
+            for child in children {
+                if child.name == ".stats" {
+                    continue;
+                }
+                let path = join_path(&prefix, &child.name);
+                let attr = self
+                    .rig
+                    .svc
+                    .getattr(child.ino)
+                    .unwrap_or_else(|e| panic!("getattr data/{} failed: {:?}", path, e));
+                out.push(ProjectedEntry {
+                    path: path.clone(),
+                    kind: attr.kind,
+                    perm: attr.perm,
+                    size: attr.size,
+                });
+                if child.kind == FileKind::Directory {
+                    pending.push((child.ino, path));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Resolve a path below `data/` through the service `lookup`.  A name the
+    /// daemon no longer projects must not resolve.
+    pub fn data_lookup(&mut self, parts: &[&str]) -> Option<u64> {
+        let mut ino = DATA_INO;
+        for part in parts {
+            match self.rig.svc.lookup(ino, part) {
+                Ok(Some(entry)) => ino = entry.ino,
+                Ok(None) => return None,
+                Err(e) => panic!("lookup data/{} failed: {:?}", parts.join("/"), e),
+            }
+        }
+        Some(ino)
+    }
+
+    /// `.stats` content of a `data/` directory or torrent root.
+    pub fn stats_text(&mut self, dir_ino: u64) -> String {
+        let entry = self
+            .rig
+            .svc
+            .lookup(dir_ino, ".stats")
+            .unwrap_or_else(|e| panic!("lookup .stats failed: {:?}", e))
+            .expect("a data/ directory must expose .stats");
+        match self.rig.svc.read(entry.ino, 0, 8 * 1024 * 1024) {
+            Ok(ReadOutcome::Ready(bytes)) => String::from_utf8(bytes).expect(".stats is UTF-8"),
+            Ok(ReadOutcome::Pending { .. }) => panic!(".stats must be served synchronously"),
+            Err(e) => panic!("read .stats failed: {:?}", e),
+        }
+    }
+
+    /// Every source row in the database, each carrying its content id.
+    pub fn torrents(&self) -> Vec<Torrent> {
+        let db = self.rig.svc.db.as_ref().expect("harness always has a database");
+        db.lock()
+            .expect("database lock")
+            .get_all_torrents()
+            .expect("list torrents")
+    }
+
+    /// Distinct content-record ids (`torrents.id`) behind `info_hash`.
+    pub fn content_ids(&self, info_hash: &str) -> BTreeSet<i64> {
+        self.torrents()
+            .into_iter()
+            .filter(|t| t.info_hash == info_hash)
+            .map(|t| t.torrent_id)
+            .collect()
+    }
+
+    /// Number of content rows (`torrents`) carrying `info_hash`, read straight
+    /// from the SQLite file.
+    ///
+    /// [`Self::torrents`] joins `torrent_sources`, so a content row whose last
+    /// source was deleted is invisible there — an orphaned content row would
+    /// pass any source-level assertion.  Only the content table can prove the
+    /// row was deleted, hence the direct read.  Requires a file-backed
+    /// database ([`Self::with_file_db`]).
+    pub fn content_rows(&self, info_hash: &str) -> i64 {
+        let dir = self
+            .db_dir
+            .as_ref()
+            .expect("content_rows needs a file-backed database");
+        let conn = rusqlite::Connection::open(dir.path().join("ingest.db"))
+            .expect("open the ingest database");
+        conn.busy_timeout(Duration::from_secs(5))
+            .expect("set busy timeout");
+        conn.query_row(
+            "SELECT COUNT(*) FROM torrents WHERE info_hash = ?1",
+            [info_hash],
+            |row| row.get(0),
+        )
+        .expect("count content rows")
+    }
+}
+
+fn join_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", prefix, name)
+    }
 }

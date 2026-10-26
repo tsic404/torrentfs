@@ -2,16 +2,27 @@
 //! both `data/` projections correct — the old location stops listing it, the
 //! new one starts (`docs/03-acceptance.md` §A AC-04, C-3.3.6).
 //!
+//! The seed-move faces of the same AC: a torrent moved across `metadata/`
+//! directories updates both projections; a move whose destination parent does
+//! not exist fails non-zero (`ENOENT`) and leaves the projection untouched; an
+//! overwrite move replaces an existing destination's content record
+//! atomically (C-3.3.2 / C-3.3.5).  The overwrite case builds a real
+//! destination first and asserts the post-state carries exactly one source
+//! row — no half commit.
+//!
 //! Driving `FsService` directly is the shipped path: the FUSE adapter
 //! forwards `rename` to it and maps the domain error through
 //! `src/fuse/errno.rs`, so the assertions below are the entries the kernel
 //! sees, read back immediately — the fix must not depend on the 1s entry TTL
 //! expiring.
 
-use crate::common::{base, errno, ingest_into, listing, rig, wave_slot, UNUSED_ANNOUNCE_URL};
+use crate::common::{
+    base, create_single_piece_torrent, errno, ingest_into, listing, rig, wave_slot, IngestHarness,
+    UNUSED_ANNOUNCE_URL,
+};
 use torrentfs::fuse::fs_types::FileKind;
 use torrentfs::fuse::inodes::{DATA_INO, METADATA_INO};
-use torrentfs::FsService;
+use torrentfs::{FsService, TorrentInfo};
 
 pub const TC_ID: &str = "TC-ingest-04";
 
@@ -137,4 +148,223 @@ fn tc_ingest_04_cross_parent_move_swaps_both_projections() {
             .is_some(),
         "the moved torrent's contents stay reachable under the new path"
     );
+}
+
+/// A successful cross-directory move: old projection gone, new one present.
+#[test]
+fn tc_ingest_04_cross_directory_move_updates_both_sides() {
+    let _slot = wave_slot();
+    let mut ingest = IngestHarness::new();
+    let announce = "http://127.0.0.1:9/announce";
+    let (seed, _) = create_single_piece_torrent(announce, "ingest-04.bin");
+
+    let src = ingest.mkdir(&["src"]);
+    let dst = ingest.mkdir(&["dst"]);
+    ingest.copy_torrent(src, "seed.torrent", &seed);
+    assert!(
+        ingest
+            .data_lookup(&["src", "seed.torrent", "ingest-04.bin"])
+            .is_some(),
+        "the seed must project under its source directory first"
+    );
+
+    ingest
+        .service()
+        .rename(src, "seed.torrent", dst, "seed.torrent")
+        .expect("a cross-directory move must succeed");
+
+    assert!(
+        ingest.data_lookup(&["src", "seed.torrent"]).is_none(),
+        "the old position must disappear"
+    );
+    assert!(
+        ingest
+            .data_lookup(&["dst", "seed.torrent", "ingest-04.bin"])
+            .is_some(),
+        "the new position must appear with its entries"
+    );
+    assert!(
+        ingest
+            .service()
+            .lookup(src, "seed.torrent")
+            .unwrap()
+            .is_none(),
+        "metadata/ must not keep the source name"
+    );
+    assert!(
+        ingest
+            .service()
+            .lookup(dst, "seed.torrent")
+            .unwrap()
+            .is_some(),
+        "metadata/ must show the destination name"
+    );
+}
+
+/// Moving into a directory that no longer exists — the kernel can forward a
+/// stale parent inode — fails with `ENOENT` and changes nothing.
+#[test]
+fn tc_ingest_04_move_into_missing_parent_fails_without_projection_change() {
+    let _slot = wave_slot();
+    let mut ingest = IngestHarness::new();
+    let announce = "http://127.0.0.1:9/announce";
+    let (seed, _) = create_single_piece_torrent(announce, "ingest-04-missing.bin");
+
+    let src = ingest.mkdir(&["src"]);
+    let dst = ingest.mkdir(&["dst"]);
+    ingest.copy_torrent(src, "seed.torrent", &seed);
+
+    // Create then remove the destination directory so its inode is one the
+    // daemon knows about but that no longer exists.
+    let gone = ingest.mkdir(&["gone"]);
+    ingest
+        .service()
+        .rmdir(METADATA_INO, "gone")
+        .expect("removing the empty directory must succeed");
+
+    let before = ingest.data_snapshot();
+    let err = ingest
+        .service()
+        .rename(src, "seed.torrent", gone, "seed.torrent")
+        .expect_err("a move into a missing parent must fail");
+    assert_eq!(
+        libc::c_int::from(err),
+        libc::ENOENT,
+        "a missing destination parent must report ENOENT"
+    );
+
+    assert_eq!(
+        ingest.data_snapshot(),
+        before,
+        "a failed move must not change the projection"
+    );
+    assert!(
+        ingest
+            .service()
+            .lookup(src, "seed.torrent")
+            .expect("lookup source")
+            .is_some(),
+        "the source name must be retained"
+    );
+    assert!(
+        ingest
+            .service()
+            .lookup(dst, "seed.torrent")
+            .expect("lookup destination")
+            .is_none(),
+        "the destination must not gain the name"
+    );
+}
+
+/// Overwriting an existing destination seed: the destination projection is
+/// replaced by the source's content, its old content row is gone from the
+/// content table, and the move committed exactly once (one row at the
+/// destination, none at the source).
+#[test]
+fn tc_ingest_04_overwrite_move_replaces_the_destination_atomically() {
+    let _slot = wave_slot();
+    // File-backed so the content layer (`torrents`) can be queried directly.
+    let mut ingest = IngestHarness::with_file_db();
+    let announce = "http://127.0.0.1:9/announce";
+    let (source_bytes, _) = create_single_piece_torrent(announce, "ingest-04-source.bin");
+    let (target_bytes, _) = create_single_piece_torrent(announce, "ingest-04-target.bin");
+    let source_hash = info_hash(&source_bytes);
+    let target_hash = info_hash(&target_bytes);
+
+    let src = ingest.mkdir(&["a"]);
+    let dst = ingest.mkdir(&["b"]);
+    ingest.copy_torrent(src, "x.torrent", &source_bytes);
+    ingest.copy_torrent(dst, "x.torrent", &target_bytes);
+    assert!(
+        ingest
+            .data_lookup(&["b", "x.torrent", "ingest-04-target.bin"])
+            .is_some(),
+        "the destination must project its own content before the overwrite"
+    );
+
+    ingest
+        .service()
+        .rename(src, "x.torrent", dst, "x.torrent")
+        .expect("an overwrite rename over an existing destination must succeed");
+
+    // Source name is gone on both sides.
+    assert!(
+        ingest.data_lookup(&["a", "x.torrent"]).is_none(),
+        "the source position must disappear"
+    );
+    assert!(
+        ingest.service().lookup(src, "x.torrent").unwrap().is_none(),
+        "metadata/ must not keep the source name"
+    );
+    // The destination now projects the source content, and the replaced
+    // content's entries are gone.
+    let root = ingest
+        .data_lookup(&["b", "x.torrent"])
+        .expect("the destination must keep projecting at its own name");
+    assert!(
+        ingest
+            .data_lookup(&["b", "x.torrent", "ingest-04-source.bin"])
+            .is_some(),
+        "the destination projection must carry the source's file"
+    );
+    assert!(
+        ingest
+            .data_lookup(&["b", "x.torrent", "ingest-04-target.bin"])
+            .is_none(),
+        "the replaced destination content must be cleaned from the projection"
+    );
+    let stats = ingest.stats_text(root);
+    assert!(
+        stats.contains("torrent: ingest-04-source.bin"),
+        "the destination root must report the source content: {stats}"
+    );
+
+    // No half commit: exactly one source row for this name, at the
+    // destination, and the replaced content record is gone with no orphan.
+    let rows: Vec<_> = ingest
+        .torrents()
+        .into_iter()
+        .filter(|torrent| torrent.filename == "x.torrent")
+        .collect();
+    assert_eq!(rows.len(), 1, "the move must commit exactly one row");
+    assert_eq!(
+        rows[0].source_path, "b",
+        "the surviving row must sit at the destination"
+    );
+    let source_content = ingest.content_ids(&source_hash);
+    assert_eq!(
+        source_content.len(),
+        1,
+        "the source's content record must survive the move"
+    );
+    assert_eq!(
+        rows[0].torrent_id,
+        *source_content.iter().next().expect("source content id"),
+        "the surviving row must carry the source's content"
+    );
+    assert!(
+        ingest.content_ids(&target_hash).is_empty(),
+        "no source row may keep referencing the replaced content"
+    );
+    // Content layer: the source row's deletion alone would leave the
+    // replaced content row orphaned and still pass the join above.
+    assert_eq!(
+        ingest.content_rows(&target_hash),
+        0,
+        "the replaced content row must be deleted from the content table"
+    );
+    assert_eq!(
+        ingest.content_rows(&source_hash),
+        1,
+        "the moved source content row must remain in the content table"
+    );
+}
+
+fn info_hash(bytes: &[u8]) -> String {
+    hex::encode(
+        TorrentInfo::from_bytes(bytes.to_vec())
+            .expect("parse fixture torrent")
+            .info_hash()
+            .expect("info hash"),
+    )
 }
