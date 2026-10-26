@@ -382,6 +382,80 @@ pub fn build_multi_file_torrent(
     torrent
 }
 
+/// Build a multi-file `.torrent` from `(relative/path, content)` entries with
+/// real piece hashes over the concatenated content.
+///
+/// BEP 3 lays a multi-file torrent's byte stream out by the `files` list, so
+/// pieces are computed over the file contents back to back and a file may
+/// start or end inside a piece.  Returns `(torrent_bytes, flat_stream)`: the
+/// flat stream is what a peer serves for those pieces, and what a correct
+/// client must slice back into the declared files.
+pub fn build_multi_file_torrent_with_content(
+    announce_url: &str,
+    name: &str,
+    files: &[(&str, &[u8])],
+    piece_len: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    assert!(!files.is_empty(), "a multi-file torrent needs at least one file");
+    assert!(piece_len > 0, "piece length must be positive");
+
+    fn bencode_str(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(value.as_bytes().len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value.as_bytes());
+    }
+
+    let flat: Vec<u8> = files
+        .iter()
+        .flat_map(|(_, content)| content.iter().copied())
+        .collect();
+    let piece_count = flat.len().div_ceil(piece_len).max(1);
+
+    let mut hashes = Vec::with_capacity(piece_count * 20);
+    for index in 0..piece_count {
+        let start = index * piece_len;
+        let end = (start + piece_len).min(flat.len());
+        let mut hasher = sha1_smol::Sha1::new();
+        hasher.update(&flat[start..end]);
+        hashes.extend_from_slice(&hasher.digest().bytes());
+    }
+
+    let mut torrent = Vec::new();
+    torrent.push(b'd');
+    bencode_str(&mut torrent, "announce");
+    bencode_str(&mut torrent, announce_url);
+    bencode_str(&mut torrent, "info");
+    torrent.push(b'd');
+    bencode_str(&mut torrent, "files");
+    torrent.push(b'l');
+    for (path, content) in files {
+        torrent.push(b'd');
+        torrent.extend_from_slice(b"6:lengthi");
+        torrent.extend_from_slice(content.len().to_string().as_bytes());
+        torrent.push(b'e');
+        bencode_str(&mut torrent, "path");
+        torrent.push(b'l');
+        for component in path.split('/') {
+            bencode_str(&mut torrent, component);
+        }
+        torrent.push(b'e');
+        torrent.push(b'e');
+    }
+    torrent.push(b'e');
+    bencode_str(&mut torrent, "name");
+    bencode_str(&mut torrent, name);
+    torrent.extend_from_slice(b"12:piece lengthi");
+    torrent.extend_from_slice(piece_len.to_string().as_bytes());
+    torrent.push(b'e');
+    bencode_str(&mut torrent, "pieces");
+    torrent.extend_from_slice(hashes.len().to_string().as_bytes());
+    torrent.push(b':');
+    torrent.extend_from_slice(&hashes);
+    torrent.push(b'e');
+    torrent.push(b'e');
+    (torrent, flat)
+}
+
 // ── Ingest harness (metadata/ → data/ projection) ───────────────────────────
 
 /// One entry the `data/` projection exposes, relative to the mount root.
@@ -688,6 +762,49 @@ impl IngestHarness {
             |row| row.get(0),
         )
         .expect("count content rows")
+    }
+}
+
+/// Read a projected torrent file end to end through the service.
+///
+/// `FsService::read` is the entry point the FUSE adapter calls; while the
+/// pieces are missing it answers `Pending`, exactly as a real read does.  The
+/// adapter resolves that pending read on a worker with the blocking engine
+/// read, so this repeats the same step and then re-enters `read`, which serves
+/// the bytes through the projection's cache path.  `len` is the file size from
+/// `getattr`: the read is the full-file read AC-10 pins.
+pub fn read_projection_file(ingest: &mut IngestHarness, file_ino: u64, len: u32) -> Vec<u8> {
+    const READ_BUDGET: Duration = Duration::from_secs(60);
+    let started = Instant::now();
+    loop {
+        match ingest.service().read(file_ino, 0, len) {
+            Ok(ReadOutcome::Ready(data)) => return data,
+            Ok(ReadOutcome::Pending {
+                info,
+                file_index,
+                offset,
+                size,
+                ..
+            }) => {
+                let download = ingest
+                    .service()
+                    .download_service
+                    .clone()
+                    .expect("the service must hold a download engine");
+                if let Err(e) = download.read_file_range_blocking(info, file_index, offset, size) {
+                    assert!(
+                        started.elapsed() < READ_BUDGET,
+                        "timed out reading through the projection: {:?}",
+                        e
+                    );
+                }
+            }
+            Err(e) => panic!("read through the projection failed: {:?}", e),
+        }
+        assert!(
+            started.elapsed() < READ_BUDGET,
+            "timed out waiting for the projection read to complete"
+        );
     }
 }
 
