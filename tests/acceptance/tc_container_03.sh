@@ -10,9 +10,13 @@
 # inside it, so the SQLite DB and the piece cache survive the stop/start.  The
 # swarm is the local self-seed environment; the seeder is stopped before the
 # restart, so a byte-exact read that finishes fast can only come from the
-# cache.  The root `.stats` cache hit/miss counters confirm the hit: hits must
-# grow and misses must not.  Self-gating: SKIP (exit 2) when docker, /dev/fuse
-# or a successful image build is unavailable.
+# cache.  On restart the daemon's own cache-verification summary must report
+# all 16 pieces verified from disk, and the second read must stay inside the
+# cache-hit time bound with no no-seeder fallback.  The global cache counters
+# are printed as non-gating evidence only: they are a non-blocking snapshot and
+# may render as zero while another reader holds the cache lock (C-6.5.1).
+# Self-gating: SKIP (exit 2) when docker, /dev/fuse or a successful image build
+# is unavailable.
 #
 # Usage: ./tests/acceptance/tc_container_03.sh [image]
 # Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
@@ -234,27 +238,41 @@ EXPECTED_SIZE="$(stat -c '%s' "$SEED_OUT/payload.txt")"
 [ "$SIZE" = "$EXPECTED_SIZE" ] \
     || fail "projection size after restart is $SIZE, expected $EXPECTED_SIZE"
 
-# The FUSE layer re-verifies on-disk pieces asynchronously on startup: wait
-# until every piece is marked cached before reading.
+# Readiness only: the FUSE layer re-verifies on-disk pieces asynchronously on
+# startup.  Wait (bounded) for the markers to settle, then judge on the listed
+# observables; a timeout here is not itself a verdict.
 DEADLINE=$((SECONDS + 90))
-PIECES_OK=0
 STATS=""
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
     STATS="$(timeout 10 docker exec "$CONTAINER" cat /mnt/data/selfseed.torrent/.stats 2>/dev/null || true)"
     if all_pieces_cached "$STATS"; then
-        PIECES_OK=1
         break
     fi
     sleep 1
 done
-if [ "$PIECES_OK" -ne 1 ]; then
-    fail "cached pieces were not re-verified after the restart: $(grep -m1 '^  Pieces: ' <<<"$STATS" || echo 'no Pieces line')"
+
+# AC-72 / C-5.3.1: the retained pieces are re-verified from disk on restart.
+# The daemon's own verification summary is the observable that all 16 cached
+# pieces (4 MiB payload / 256 KiB pieces) survived instead of being re-fetched.
+VERIFIED=0
+DEADLINE=$((SECONDS + 60))
+RESTART_LOGS=""
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+    RESTART_LOGS="$(timeout 10 docker logs "$CONTAINER" 2>&1 | tail -n +$((LOG_OFFSET + 1)) || true)"
+    if grep -q "Cache piece verification complete: 16 verified" <<<"$RESTART_LOGS"; then
+        VERIFIED=1
+        break
+    fi
+    sleep 1
+done
+if [ "$VERIFIED" -ne 1 ]; then
+    fail "the restart did not verify the 16 cached pieces from disk: $(grep -m1 'Cache piece verification' <<<"$RESTART_LOGS" || echo 'no verification line')"
 fi
 
+# Evidence only, never a verdict: the global cache counters are a non-blocking
+# snapshot and may render as zero while a reader holds the cache lock
+# (C-6.5.1), so they cannot carry AC-72.
 BEFORE="$(cache_counts "$CONTAINER")"
-[ -n "$BEFORE" ] || fail "the root .stats carries no cache hit/miss counters"
-HITS_BEFORE="${BEFORE%% *}"
-MISSES_BEFORE="${BEFORE##* }"
 
 echo "$CASE: second read — must be served from the cache…"
 START_NS="$(date +%s%N)"
@@ -270,17 +288,10 @@ ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
     || fail "the second read took ${ELAPSED_MS}ms; a cache miss would stall on the no-seeder window"
 
 AFTER="$(cache_counts "$CONTAINER")"
-[ -n "$AFTER" ] || fail "the root .stats lost its cache hit/miss counters"
-HITS_AFTER="${AFTER%% *}"
-MISSES_AFTER="${AFTER##* }"
-[ "$HITS_AFTER" -gt "$HITS_BEFORE" ] \
-    || fail "cache hits did not grow on the second read (before=$HITS_BEFORE after=$HITS_AFTER)"
-[ "$MISSES_AFTER" -eq "$MISSES_BEFORE" ] \
-    || fail "the second read recorded cache misses (before=$MISSES_BEFORE after=$MISSES_AFTER)"
 NEW_LOGS="$(timeout 10 docker logs "$CONTAINER" 2>&1 | tail -n +$((LOG_OFFSET + 1)) || true)"
 if grep -q "no seeder connected" <<<"$NEW_LOGS"; then
     fail "the second read fell back to the swarm (a no-seeder cause was logged after the restart)"
 fi
 
 stop_gracefully "$CONTAINER"
-echo "$CASE: PASS (torrent and cache survived stop/start; second read ${ELAPSED_MS}ms from cache, hits ${HITS_BEFORE}→${HITS_AFTER}, misses ${MISSES_BEFORE})"
+echo "$CASE: PASS (torrent and cache survived stop/start; 16 pieces verified from disk; second read ${ELAPSED_MS}ms from cache; cache counters evidence only: before=${BEFORE:-unavailable} after=${AFTER:-unavailable})"
