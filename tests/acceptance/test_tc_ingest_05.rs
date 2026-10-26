@@ -4,10 +4,11 @@
 //! independent (`docs/03-acceptance.md` §A AC-05, contracts C-3.2.2 /
 //! C-3.2.3 / C-3.2.5).
 
-use crate::common::{create_single_piece_torrent, wave_slot, IngestHarness, TestHarness};
+use crate::common::{
+    create_single_piece_torrent, read_projection_file, wave_slot, IngestHarness, TestHarness,
+};
 use std::thread;
 use std::time::{Duration, Instant};
-use torrentfs::fuse::fs_types::ReadOutcome;
 
 pub const TC_ID: &str = "TC-ingest-05";
 
@@ -31,48 +32,6 @@ fn progress_percent(stats: &str) -> Option<f64> {
     let rest = &line[start..];
     let end = rest.find('%')?;
     rest[..end].parse().ok()
-}
-
-/// Read the whole file through one projection's file inode.
-///
-/// `FsService::read` is the entry point the FUSE adapter calls; the first
-/// attempt returns `Pending` while the pieces are missing, exactly as a real
-/// read does.  The adapter resolves that pending read on a worker with the
-/// blocking engine read, so this repeats the same step and then re-enters
-/// `read`, which now serves the bytes through the projection's cache path.
-fn read_through_projection(ingest: &mut IngestHarness, file_ino: u64, len: u32) -> Vec<u8> {
-    let started = Instant::now();
-    loop {
-        match ingest.service().read(file_ino, 0, len) {
-            Ok(ReadOutcome::Ready(data)) => return data,
-            Ok(ReadOutcome::Pending {
-                info,
-                file_index,
-                offset,
-                size,
-                ..
-            }) => {
-                let download = ingest
-                    .service()
-                    .download_service
-                    .clone()
-                    .expect("the ingest service must hold a download engine");
-                match download.read_file_range_blocking(info, file_index, offset, size) {
-                    Ok(_) => {}
-                    Err(e) => assert!(
-                        started.elapsed() < Duration::from_secs(60),
-                        "timed out reading through the projection: {:?}",
-                        e
-                    ),
-                }
-            }
-            Err(e) => panic!("read through the projection failed: {:?}", e),
-        }
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "timed out waiting for the projection read to complete"
-        );
-    }
 }
 
 /// Identical bytes at two source paths: both projections list the content,
@@ -128,7 +87,7 @@ fn tc_ingest_05_identical_bytes_share_one_content_record() {
     let file_ino = ingest
         .data_lookup(&["a", "dup.torrent", "ingest-05-shared.bin"])
         .expect("the first projection must resolve its file inode");
-    let read = read_through_projection(&mut ingest, file_ino, harness.file_content.len() as u32);
+    let read = read_projection_file(&mut ingest, file_ino, harness.file_content.len() as u32);
     assert_eq!(
         read, harness.file_content,
         "the read must return the seeded bytes"
