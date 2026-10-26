@@ -26,7 +26,8 @@ use torrentfs::fuse::FsService;
 use torrentfs::TorrentInfo;
 
 use crate::common::{
-    build_multi_file_torrent, ingest_torrent, quiet_config, service_with_config, wave_slot,
+    build_multi_file_torrent, ingest_torrent, quiet_config, readdir_from, service_with_config,
+    wave_slot,
 };
 
 pub const TC_ID: &str = "TC-negative-02";
@@ -69,14 +70,13 @@ fn entry_key(entry: &DirEntry) -> EntryKey {
 
 /// List a directory and assert the C-2.5.6 page invariants the kernel relies
 /// on: every returned offset is strictly greater than the previous one; a
-/// continuation from a middle offset returns exactly the remaining entries
-/// (that is how the kernel pages, and a materialise-per-call implementation
-/// that ignores the offset repeats rows here); and the page after the last
-/// offset is empty.
+/// continuation from a middle offset starts exactly at the following entry and
+/// paging on from there reaches the end with nothing repeated or skipped (that
+/// is how the kernel pages, and a materialise-per-call implementation that
+/// ignores the offset repeats rows here); and the page after the last offset is
+/// empty.
 fn list_page(service: &mut FsService, ino: u64) -> Vec<DirEntry> {
-    let entries = service
-        .readdir(ino, 0)
-        .unwrap_or_else(|e| panic!("list inode {ino}: {e:?}"));
+    let entries = readdir_from(service, ino, -1);
     let mut previous = 0;
     for entry in &entries {
         assert!(
@@ -99,12 +99,23 @@ fn list_page(service: &mut FsService, ino: u64) -> Vec<DirEntry> {
         || service.readdir(ino, resume_from),
     )
     .unwrap_or_else(|e| panic!("continue listing inode {ino} after {resume_from}: {e:?}"));
+    if pivot + 1 < entries.len() {
+        assert_eq!(
+            resumed.first().map(entry_key),
+            Some(entry_key(&entries[pivot + 1])),
+            "a listing continued from a middle offset must start at the next \
+             entry — no repetition, nothing skipped"
+        );
+    }
+    let remainder: Vec<EntryKey> = readdir_from(service, ino, resume_from)
+        .iter()
+        .map(entry_key)
+        .collect();
     let expected: Vec<EntryKey> = entries[pivot + 1..].iter().map(entry_key).collect();
-    let actual: Vec<EntryKey> = resumed.iter().map(entry_key).collect();
     assert_eq!(
-        actual, expected,
-        "a listing continued from a middle offset must return exactly the \
-         remaining entries — no repetition, nothing skipped"
+        remainder, expected,
+        "paging on from a middle offset must cover exactly the remaining \
+         entries — no repetition, nothing skipped"
     );
 
     let next = service

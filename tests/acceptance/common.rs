@@ -187,11 +187,33 @@ pub fn errno(err: FsError) -> libc::c_int {
     err.into()
 }
 
+/// Every entry a directory has after `offset`, paging the way the kernel does.
+///
+/// One `readdir` returns at most one page; the next starts after the offset of
+/// the last entry its predecessor accepted.  A caller that wants the whole
+/// remaining listing — the assertion helpers below do — has to page, or it
+/// silently compares the first page only.
+pub fn readdir_from(svc: &mut FsService, ino: u64, offset: i64) -> Vec<DirEntry> {
+    let mut entries = Vec::new();
+    let mut cursor = offset;
+    loop {
+        let page = svc
+            .readdir(ino, cursor)
+            .unwrap_or_else(|e| panic!("readdir({ino}, {cursor}) failed: {e:?}"));
+        let Some(last) = page.last() else { break };
+        assert!(
+            last.offset > cursor,
+            "readdir({ino}, {cursor}) must continue past the requested offset, got {page:?}"
+        );
+        cursor = last.offset;
+        entries.extend(page);
+    }
+    entries
+}
+
 /// One directory's complete entry set, order-independent.
 pub fn listing(svc: &mut FsService, ino: u64) -> Vec<(String, FileKind)> {
-    let mut entries: Vec<(String, FileKind)> = svc
-        .readdir(ino, -1)
-        .unwrap_or_else(|e| panic!("readdir({ino}) failed: {e:?}"))
+    let mut entries: Vec<(String, FileKind)> = readdir_from(svc, ino, -1)
         .into_iter()
         .map(|entry| (entry.name, entry.kind))
         .collect();

@@ -51,6 +51,7 @@ mod test_tc_negative_01;
 mod test_tc_negative_02;
 mod test_tc_negative_03;
 mod test_tc_negative_04;
+mod test_tc_negative_05;
 mod test_tc_read_01;
 mod test_tc_read_02;
 mod test_tc_read_03;
@@ -72,7 +73,7 @@ mod test_tc_stats_06;
 mod test_tc_stats_07;
 mod test_tc_stats_08;
 
-/// The full id set fixed by `docs/03-acceptance.md` (60 ids).  Sorted; the
+/// The full id set fixed by `docs/03-acceptance.md` (61 ids).  Sorted; the
 /// validation test below pins it exactly.
 pub const TC_IDS: &[&str] = &[
     "TC-cache-01",
@@ -106,6 +107,7 @@ pub const TC_IDS: &[&str] = &[
     "TC-negative-02",
     "TC-negative-03",
     "TC-negative-04",
+    "TC-negative-05",
     "TC-read-01",
     "TC-read-02",
     "TC-read-03",
@@ -166,6 +168,7 @@ pub const LANDED: &[&str] = &[
     test_tc_negative_02::TC_ID,
     test_tc_negative_03::TC_ID,
     test_tc_negative_04::TC_ID,
+    test_tc_negative_05::TC_ID,
     test_tc_read_01::TC_ID,
     test_tc_read_02::TC_ID,
     test_tc_read_03::TC_ID,
@@ -228,7 +231,7 @@ pub fn module_name(tc_id: &str) -> String {
 mod registry_tests {
     use super::{module_name, script_name, LANDED, SCRIPT_FORM, TC_IDS};
 
-    /// The registry must carry exactly the 60 ids the design fixes, in the
+    /// The registry must carry exactly the 61 ids the design fixes, in the
     /// frozen order-independent sense (set equality; order here is just the
     /// sorted listing).  A missing id means the suite silently dropped a
     /// design TC — exactly what QA reports as missing-test-evidence.
@@ -242,7 +245,7 @@ mod registry_tests {
             TC_IDS.len(),
             "TC_IDS must not contain duplicates"
         );
-        assert_eq!(ids.len(), 60, "design docs/03-acceptance.md fixes 60 TCs");
+        assert_eq!(ids.len(), 61, "design docs/03-acceptance.md fixes 61 TCs");
         assert!(
             ids.iter().all(|id| id.starts_with("TC-")),
             "every id must carry the TC- prefix"
