@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn, Level};
@@ -433,6 +433,82 @@ const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(1);
 /// session ended.  The check is a cheap `JoinHandle::is_finished` poll.
 const SESSION_END_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// `docker stop`'s default grace window: the runtime sends SIGTERM, waits this
+/// long, then SIGKILLs the container.  A SIGKILL leaves the FUSE tree severed
+/// and the entrypoint never gets to detach it, and that residue is what makes
+/// the next `docker start` fail — so the whole graceful teardown has to finish
+/// well inside this window.
+const CONTAINER_STOP_WINDOW: Duration = Duration::from_secs(10);
+
+/// Bound on waiting for the download engine thread to stop.
+///
+/// A cooperative engine stops in milliseconds (the stop flag aborts every
+/// parked read on its next poll).  The bound only matters when the engine is
+/// parked inside a libtorrent FFI call that cannot observe the flag: the
+/// teardown then abandons it and the process exit ends it, instead of waiting
+/// for the container runtime to kill the whole container.
+const ENGINE_STOP_BUDGET: Duration = Duration::from_secs(2);
+
+/// How long the shutdown flush waits for the cache lock before giving up.
+///
+/// The flush normally takes the lock immediately: the engine has already
+/// stopped, and the FUSE workers only hold it for short metadata lookups.  A
+/// bounded wait keeps one wedged holder from eating the rest of the teardown;
+/// the metadata is flushed periodically anyway, so a skipped final flush costs
+/// at most one interval of staleness.
+const CACHE_FLUSH_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bound on waiting for the download worker pool to drain.
+///
+/// A worker can be parked inside a download read that outlives the engine's
+/// own stop signal; the pool reports the timeout and the process exit ends the
+/// thread.
+const WORKER_DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// The teardown slices must leave the runtime room to unmount and exit: their
+/// sum stays within half of [`CONTAINER_STOP_WINDOW`], and the unmount retries
+/// (bounded, ~0.6s) plus the helper calls fit in the rest.  A slice that grows
+/// past this fails the build instead of turning into a container SIGKILL.
+const _: () = assert!(
+    ENGINE_STOP_BUDGET.as_millis()
+        + CACHE_FLUSH_LOCK_TIMEOUT.as_millis()
+        + WORKER_DRAIN_BUDGET.as_millis()
+        + SESSION_DRAIN_GRACE.as_millis()
+        <= CONTAINER_STOP_WINDOW.as_millis() / 2
+);
+
+/// Why [`lock_within`] could not take the lock.
+#[derive(Debug, PartialEq, Eq)]
+enum LockWithinError {
+    /// A holder kept the lock past the deadline.
+    Held,
+    /// A previous holder panicked; the guard is poisoned.
+    Poisoned,
+}
+
+/// Take `mutex` within `timeout` instead of blocking indefinitely.
+///
+/// Both failure cases mean "do not touch the guarded state during teardown",
+/// but they call for different diagnostics — a held lock points at a running
+/// holder, a poisoned one at an earlier panic.
+fn lock_within<'a, T>(
+    mutex: &'a Mutex<T>,
+    timeout: Duration,
+) -> Result<MutexGuard<'a, T>, LockWithinError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => return Err(LockWithinError::Poisoned),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(LockWithinError::Held);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Outcome of waiting for the FUSE session thread to exit during shutdown.
 #[derive(Debug, PartialEq, Eq)]
 enum JoinOutcome {
@@ -461,6 +537,29 @@ where
         }
         std::thread::sleep(poll_interval);
     }
+}
+
+/// Terminate the process with `code`, skipping static destructors when the
+/// engine thread was abandoned mid-shutdown.
+///
+/// A wedged engine thread still owns its libtorrent session (and through it the
+/// OpenSSL globals).  Letting normal exit run the C++ static destructors while
+/// that thread is inside them is the crash class the mount-failure path avoids
+/// by joining the engine first; once the teardown hit its bound the exit code
+/// is fixed, so `_exit` is both safe and sufficient (the cache metadata and the
+/// state database were already written; only the destructor-time backstops —
+/// `CacheManager::drop`'s dirty flush and the C++ static destructors — are
+/// skipped, and the caller records that trade-off).
+///
+/// The normal path never calls this: it returns so the runtime drops the
+/// daemon's remaining state, `CacheManager::drop` included.
+fn exit_process(code: i32, engine_abandoned: bool) -> ! {
+    if engine_abandoned {
+        // SAFETY: `_exit` is async-signal-safe, closes the file descriptors and
+        // never returns; no destructor runs after it.
+        unsafe { libc::_exit(code) }
+    }
+    std::process::exit(code)
 }
 
 /// Park the main thread until SIGINT/SIGTERM, then run graceful shutdown:
@@ -501,8 +600,17 @@ fn wait_for_shutdown(
     };
 
     info!("shutdown requested — stopping download engine");
+    let mut engine_abandoned = false;
     if let Some(ds) = &download_service {
-        ds.shutdown();
+        if !ds.shutdown_within(ENGINE_STOP_BUDGET) {
+            engine_abandoned = true;
+            warn!(
+                "download engine thread still running {:?} after the stop request; \
+                 abandoning it so the teardown can finish (parked reads are \
+                 answered by the engine's own abort on stop)",
+                ENGINE_STOP_BUDGET
+            );
+        }
     }
     // flush the cache metadata to disk (with fsync) before
     // unmounting.  The download engine has already stopped, so no new
@@ -510,9 +618,11 @@ fn wait_for_shutdown(
     // container restart can leave cache_metadata.txt stale, causing
     // scan_pieces_subdirectory to register pieces at wrong sizes and
     // the verifier to purge them ("cache piece cleaned" after restart).
+    // The lock wait is bounded: the engine was just abandoned if it did not
+    // stop, and it may still be holding the cache lock.
     if let Some(ds) = &download_service {
         if let Some(cache) = ds.get_cache_manager() {
-            match cache.lock() {
+            match lock_within(&cache, CACHE_FLUSH_LOCK_TIMEOUT) {
                 Ok(mut cm) => {
                     if let Err(e) = cm.flush() {
                         warn!("Failed to flush cache metadata on shutdown: {:?}", e);
@@ -520,12 +630,26 @@ fn wait_for_shutdown(
                         info!("cache metadata flushed to disk");
                     }
                 }
-                Err(_) => warn!("Cache lock poisoned on shutdown — metadata not flushed"),
+                Err(LockWithinError::Held) => warn!(
+                    "cache lock still held {:?} after the shutdown flush started — \
+                     metadata not flushed (the periodic flush bounds the loss)",
+                    CACHE_FLUSH_LOCK_TIMEOUT
+                ),
+                Err(LockWithinError::Poisoned) => warn!(
+                    "cache lock poisoned (a holder panicked) — metadata not flushed \
+                     on shutdown"
+                ),
             }
         }
     }
     info!("draining download worker queue");
-    worker_pool.shutdown();
+    if !worker_pool.shutdown_within(WORKER_DRAIN_BUDGET) {
+        warn!(
+            "download worker pool still has running workers {:?} after the drain request; \
+             abandoning them so the teardown can finish",
+            WORKER_DRAIN_BUDGET
+        );
+    }
 
     if session_lost {
         // The session thread ended without a shutdown signal.  The kernel
@@ -559,13 +683,13 @@ fn wait_for_shutdown(
                 exit_code
             );
         }
-        std::process::exit(exit_code);
+        exit_process(exit_code, engine_abandoned);
     }
 
     info!("unmounting FUSE filesystem");
     if !unmount_fuse(mountpoint) {
         error!("FUSE unmount failed; the mountpoint is left in an inconsistent state");
-        std::process::exit(1);
+        exit_process(1, engine_abandoned);
     }
     info!("joining FUSE session");
     // Normal path: the unmount aborts the connection and the session thread
@@ -589,6 +713,13 @@ fn wait_for_shutdown(
                 "FUSE session thread still blocked after unmount (external bind mount keeping the superblock alive); exiting and letting the entrypoint release it"
             );
         }
+    }
+    // Normal path: return so the runtime drops the daemon's state and
+    // `CacheManager::drop` still gets its dirty-flush backstop.  Only an
+    // abandoned engine thread has to skip the destructors (see
+    // [`exit_process`]).
+    if engine_abandoned {
+        exit_process(0, true);
     }
 }
 
@@ -1179,6 +1310,42 @@ mod tests {
                 Duration::from_millis(1)
             ),
             JoinOutcome::TimedOut
+        );
+    }
+
+    #[test]
+    fn lock_within_gives_up_on_a_held_lock() {
+        let mutex = Mutex::new(0u32);
+        let guard = mutex.lock().unwrap();
+        let start = Instant::now();
+        assert_eq!(
+            lock_within(&mutex, Duration::from_millis(30)).unwrap_err(),
+            LockWithinError::Held,
+            "a held lock must not be waited for past the window"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(30));
+        drop(guard);
+        assert!(
+            lock_within(&mutex, Duration::from_millis(30)).is_ok(),
+            "a released lock must be acquired"
+        );
+    }
+
+    /// A poisoned lock is a different diagnosis from a held one: the holder is
+    /// gone (it panicked), so the warning must not send the reader looking for
+    /// a live holder.
+    #[test]
+    fn lock_within_reports_a_poisoned_lock_distinctly() {
+        let mutex = Mutex::new(0u32);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("holder panicked");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            lock_within(&mutex, Duration::from_millis(30)).unwrap_err(),
+            LockWithinError::Poisoned,
+            "a poisoned lock must not be reported as merely held"
         );
     }
 

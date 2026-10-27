@@ -920,38 +920,66 @@ impl Daemon {
         let db_dir = work.path().join("db");
         fs::create_dir_all(&db_dir).expect("create db dir");
 
-        let log_path = work.path().join("daemon.log");
-        let stderr_path = work.path().join("daemon.stderr");
-        let stderr = fs::File::create(&stderr_path).expect("create daemon stderr file");
+        let mut daemon = Daemon {
+            child: None,
+            log_path: work.path().join("daemon.log"),
+            stderr_path: work.path().join("daemon.stderr"),
+            work,
+        };
+        daemon.restart(config_toml, log_level);
+        daemon
+    }
+
+    /// Start a new daemon process on this daemon's mountpoint, cache and state
+    /// database — the remount half of a recovery case (`TC-recovery-01`).
+    ///
+    /// The previous instance must have exited (`child` is `None` after
+    /// [`Daemon::wait_for_exit`]); the state tree is left exactly as it was, so
+    /// the new instance opens the same database and sees the same cache.  Both
+    /// runs append to the same log/stderr files, so [`Daemon::output`] carries
+    /// the whole history of the case.
+    pub fn restart(&mut self, config_toml: Option<&str>, log_level: &str) {
+        assert!(
+            self.child.is_none(),
+            "restart requires the previous daemon instance to have exited"
+        );
+        let mountpoint = self.mountpoint();
+        let cache = self.cache_dir();
+        let db_path = self.work.path().join("db").join("metadata.db");
+        let stderr = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stderr_path)
+            .expect("open daemon stderr file");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentfs"));
         cmd.arg(&mountpoint)
             .arg("--cache")
             .arg(&cache)
             .arg("--db")
-            .arg(db_dir.join("metadata.db"))
+            .arg(&db_path)
             .arg("--log-level")
             .arg(log_level)
             .arg("--log-file")
-            .arg(&log_path);
+            .arg(&self.log_path);
         if let Some(toml) = config_toml {
-            let config_path = work.path().join("config.toml");
+            let config_path = self.work.path().join("config.toml");
             fs::write(&config_path, toml).expect("write daemon config");
             cmd.arg("--config").arg(&config_path);
         }
         cmd.stdout(Stdio::null()).stderr(Stdio::from(stderr));
 
-        let child = cmd.spawn().expect("spawn torrentfs daemon");
-        Daemon {
-            child: Some(child),
-            work,
-            log_path,
-            stderr_path,
-        }
+        self.child = Some(cmd.spawn().expect("spawn torrentfs daemon"));
     }
 
     pub fn mountpoint(&self) -> PathBuf {
         self.work.path().join("mnt")
+    }
+
+    /// The running daemon's process id, for cases that have to reach into its
+    /// threads (`/proc/<pid>/task`).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|child| child.id())
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -964,10 +992,21 @@ impl Daemon {
 
     /// Everything the daemon wrote to its log file and its stderr, for a
     /// failure message.
+    ///
+    /// Decoded lossily: a poller can read the log while the daemon appends to
+    /// it, and a read that lands mid-character must not turn the whole
+    /// diagnostic into an empty string.
     pub fn output(&self) -> String {
-        let log = fs::read_to_string(&self.log_path).unwrap_or_default();
-        let err = fs::read_to_string(&self.stderr_path).unwrap_or_default();
-        format!("--- daemon log ---\n{log}\n--- daemon stderr ---\n{err}")
+        let read = |path: &Path| {
+            fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        };
+        format!(
+            "--- daemon log ---\n{}\n--- daemon stderr ---\n{}",
+            read(&self.log_path),
+            read(&self.stderr_path)
+        )
     }
 
     fn poll_exit(&mut self) -> Option<ExitStatus> {

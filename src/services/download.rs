@@ -192,4 +192,13 @@ impl DownloadService {
     pub fn shutdown(&self) {
         self.engine.shutdown();
     }
+
+    /// Stop the download engine, waiting at most `grace` for its thread.
+    ///
+    /// Returns `false` when the engine thread did not exit in time and was
+    /// abandoned — the process teardown must finish even if a libtorrent call
+    /// is not interruptible.
+    pub fn shutdown_within(&self, grace: std::time::Duration) -> bool {
+        self.engine.shutdown_within(grace)
+    }
 }

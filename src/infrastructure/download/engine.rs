@@ -223,6 +223,48 @@ struct EngineState {
     slow_swarm_since: HashMap<String, Instant>,
 }
 
+/// Join the thread behind `join`, either unconditionally (`None`) or bounded by
+/// `grace` (`Some`), and report whether it exited.
+///
+/// The handle lives behind a mutex because two shutdown paths may race (the
+/// main thread's bounded stop and a `Drop` from whichever thread releases the
+/// last `Arc`); taking it out under the same lock keeps exactly one joiner.
+/// A bounded wait polls `JoinHandle::is_finished` and, at the deadline, takes
+/// the handle without joining: the thread detaches, so neither a later
+/// `shutdown()` nor `Drop` can block on it again.  Blocking is the one thing a
+/// teardown must not do, so a poisoned lock also reports "no one to wait for".
+fn join_thread_within(join: &Mutex<Option<JoinHandle<()>>>, grace: Option<Duration>) -> bool {
+    let Some(grace) = grace else {
+        if let Some(handle) = join.lock().ok().and_then(|mut g| g.take()) {
+            let _ = handle.join();
+        }
+        return true;
+    };
+    let deadline = Instant::now() + grace;
+    loop {
+        let finished = match join.lock() {
+            Ok(guard) => match guard.as_ref() {
+                None => return true,
+                Some(handle) => handle.is_finished(),
+            },
+            Err(_) => return true,
+        };
+        if finished {
+            if let Some(handle) = join.lock().ok().and_then(|mut g| g.take()) {
+                let _ = handle.join();
+            }
+            return true;
+        }
+        if Instant::now() >= deadline {
+            if let Ok(mut guard) = join.lock() {
+                let _ = guard.take();
+            }
+            return false;
+        }
+        std::thread::sleep(ENGINE_SHUTDOWN_POLL_INTERVAL);
+    }
+}
+
 impl DownloadEngine {
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
         Self::new_with_metrics(cache_dir, config, Arc::new(Metrics::new()))
@@ -278,6 +320,11 @@ impl DownloadEngine {
 
         let thread_shared_stats = shared_stats.clone();
         let handle = std::thread::Builder::new()
+            // Named so a wedged engine is identifiable from outside the process
+            // (`ps -L`, `/proc/<pid>/task/*/comm`): the stop path abandons this
+            // thread at its bound, and a teardown diagnosis has to tell it apart
+            // from the FUSE session and worker threads.
+            .name(ENGINE_THREAD_NAME.to_string())
             .spawn(move || {
                 let shared_stats = thread_shared_stats;
                 let session = match Session::new_with_custom_storage(&config, &pieces_dir) {
@@ -616,11 +663,35 @@ impl DownloadEngine {
     /// Stop the engine: abort in-flight reads and join the thread.
     /// Idempotent.
     pub fn shutdown(&self) {
+        self.request_stop();
+        self.join_engine(None);
+    }
+
+    /// Stop the engine, waiting at most `grace` for its thread to exit.
+    ///
+    /// Returns `true` when the thread exited and was joined, `false` when it
+    /// was still running at the deadline.  A teardown must never hang on the
+    /// engine thread: it can be parked inside a libtorrent FFI call that does
+    /// not observe the stop flag, and the process is about to exit anyway.
+    /// The join handle is taken either way, so a later `Drop` cannot block on
+    /// the abandoned thread either.
+    ///
+    /// Idempotent: a second call finds no handle and reports `true`.
+    pub fn shutdown_within(&self, grace: Duration) -> bool {
+        self.request_stop();
+        self.join_engine(Some(grace))
+    }
+
+    /// Flag the stop and queue the shutdown command (idempotent).
+    fn request_stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Command::Shutdown);
-        if let Some(handle) = self.join.lock().ok().and_then(|mut g| g.take()) {
-            let _ = handle.join();
-        }
+    }
+
+    /// Poll the engine thread until it exits, or abandon it at the deadline.
+    /// See [`join_thread_within`].
+    fn join_engine(&self, grace: Option<Duration>) -> bool {
+        join_thread_within(&self.join, grace)
     }
 
     fn disconnected() -> TorrentError {
@@ -1270,6 +1341,22 @@ const READER_DEMAND_TTL: Duration = Duration::from_secs(2);
 /// while it held the engine thread.
 const PENDING_READ_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Poll cadence for the bounded engine join ([`DownloadEngine::shutdown_within`]).
+/// Short enough that a normally-stopping engine is joined almost immediately,
+/// long enough that the poll itself costs nothing during teardown.
+const ENGINE_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Name of the engine thread.
+///
+/// The stop path can abandon this thread at its bound, so an outside observer
+/// (`ps -L`, `/proc/<pid>/task/*/comm`) has to be able to tell it apart from
+/// the FUSE session and worker threads when a teardown is diagnosed.
+pub const ENGINE_THREAD_NAME: &str = "torrent-engine";
+
+// `comm` holds TASK_COMM_LEN - 1 bytes; the kernel truncates anything longer,
+// so a name past the limit would make the thread unfindable by name.
+const _: () = assert!(ENGINE_THREAD_NAME.len() <= 15);
+
 /// Phase of a parked read's wait machine.  Each engine-loop iteration advances
 /// every parked read by one step, so no phase ever sleeps on the engine
 /// thread.
@@ -1574,6 +1661,16 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Ok(cmd) => {
                 let is_read = matches!(cmd, Command::ReadFileRange { .. });
                 let stop = state.handle_command(cmd);
+                // Shutdown must not carry the loop's periodic work: a snapshot
+                // publish runs per-torrent libtorrent sync calls and an
+                // O(num_pieces) cache walk, which on a large torrent can hold
+                // the join for far longer than a container's stop window.  The
+                // parked reads are resolved by `abort_pending_reads` and the
+                // cache metadata is flushed after the loop, so nothing the
+                // skip would have done is needed for a clean stop.
+                if stop {
+                    break;
+                }
                 state.drain_piece_finished();
                 state.poll_pending_reads();
                 let has_parked_read = !state.pending_reads.is_empty();
@@ -1597,9 +1694,6 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                 if last_housekeeping.elapsed() >= SNAPSHOT_INTERVAL {
                     state.flush_cache_metadata();
                     last_housekeeping = Instant::now();
-                }
-                if stop {
-                    break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -1932,6 +2026,17 @@ impl EngineState {
         size: u32,
         reply: SyncSender<TorrentResult<Vec<u8>>>,
     ) {
+        // A read that arrives after the stop request must not run the setup
+        // path: `prepare_read` can call into libtorrent (handle creation scans
+        // the piece cache) and the engine thread is being joined — the caller
+        // is answered with the shutdown abort instead of paying that cost
+        // ahead of the exit.
+        if self.stopping.load(Ordering::Relaxed) {
+            let _ = reply.send(Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            )));
+            return;
+        }
         let prepared = match self.prepare_read(info, file_index, offset, size) {
             Ok(Some(prepared)) => prepared,
             // An empty range (offset past EOF, or a zero-span slice) is a
@@ -3379,17 +3484,20 @@ mod tests {
     use super::{
         advance_condition_since, advance_reader_demand, aggregate_waiting_reads,
         cache_stall_message, cache_stall_stderr_hint, classify_read_stall, discovery_window_advice,
-        no_peers_message, no_seeder_stderr_hint, no_seeder_wait, partial_read_bounds,
-        peer_discovery_window_secs, piece_wait_window_secs, read_wait_budget_secs,
-        reader_demand_is_live, should_publish_after_command, slow_swarm_stderr_hint,
-        swarm_is_empty, ColdFlight,
-        DiscoveryWindowAdvice, NoSeederWait, ReadStallCause, SourcelessSwarm, WaitingReads,
-        NO_SEEDER_FAST_FAIL_SECS, READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
+        join_thread_within, no_peers_message, no_seeder_stderr_hint, no_seeder_wait,
+        partial_read_bounds, peer_discovery_window_secs, piece_wait_window_secs,
+        read_wait_budget_secs, reader_demand_is_live, should_publish_after_command,
+        slow_swarm_stderr_hint, swarm_is_empty, ColdFlight, DiscoveryWindowAdvice, DownloadEngine,
+        NoSeederWait, ReadStallCause, SourcelessSwarm, WaitingReads, NO_SEEDER_FAST_FAIL_SECS,
+        READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
     };
     use crate::infrastructure::config::{
-        DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
+        TorrentfsConfig, DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
         DEFAULT_READ_TIMEOUT_SECS,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant};
 
     /// The advice the mapping hands the formatters for the shipped defaults
@@ -4217,5 +4325,99 @@ mod tests {
         ));
         assert!(!should_publish_after_command(true, true, early));
         assert!(should_publish_after_command(true, true, SNAPSHOT_INTERVAL));
+    }
+
+    #[test]
+    fn join_thread_within_joins_a_finished_thread() {
+        let join = Mutex::new(Some(thread::spawn(|| {})));
+        assert!(join_thread_within(&join, Some(Duration::from_secs(5))));
+        // The handle was taken, so nothing is left to join.
+        assert!(join.lock().unwrap().is_none());
+    }
+
+    /// The abandonment branch: a thread that does not observe the stop flag must
+    /// be given up on at the deadline, and the handle taken so a later
+    /// `shutdown()`/`Drop` cannot block on it a second time.  This is the branch
+    /// the daemon relies on to finish a container stop instead of being
+    /// SIGKILLed.
+    #[test]
+    fn join_thread_within_abandons_a_wedged_thread() {
+        let release = Arc::new(AtomicBool::new(false));
+        let release_thread = Arc::clone(&release);
+        let join = Mutex::new(Some(thread::spawn(move || {
+            while !release_thread.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+        })));
+
+        let start = Instant::now();
+        assert!(
+            !join_thread_within(&join, Some(Duration::from_millis(50))),
+            "a thread that never exits must be reported, not joined"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the bounded join took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            join.lock().unwrap().is_none(),
+            "the abandoned thread's handle must be taken"
+        );
+        // A second call finds no handle and must not block either.
+        assert!(join_thread_within(&join, Some(Duration::from_millis(50))));
+        // Release the abandoned thread so the test leaves no thread behind.
+        release.store(true, Ordering::Relaxed);
+    }
+
+    /// `shutdown_within` on a live engine must stop the engine *thread*, not
+    /// merely report success: the stop flag aborts parked work on the next
+    /// poll, so the thread joins well inside the grace.
+    ///
+    /// Two observations prove the thread is gone, because a `true` return
+    /// alone is satisfied by a stub: the join handle was consumed out of its
+    /// slot, and the command channel has no consumer left — a request sent
+    /// after the stop never gets an answer.  A daemon that kept the thread
+    /// alive while this reported `true` would unmount FUSE under a live
+    /// engine, which is the defect the bound exists to prevent.
+    #[test]
+    fn shutdown_within_stops_an_idle_engine() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let mut config = TorrentfsConfig::default_config();
+        config.dht.enabled = Some(false);
+        config.local_discovery.lsd_enabled = Some(false);
+        config.connections.listen_interfaces = Some("127.0.0.1:0".to_string());
+        let engine = DownloadEngine::new(cache_dir.path(), &config).expect("engine");
+
+        // The engine is alive first, so the reply-less path below can only be
+        // explained by the stop.
+        assert!(
+            engine.get_pieces_status("idle-engine", 0).is_ok(),
+            "the engine thread must answer a command before the stop"
+        );
+
+        let start = Instant::now();
+        assert!(
+            engine.shutdown_within(Duration::from_secs(5)),
+            "an idle engine must stop inside the grace"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "shutdown_within took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            engine.join.lock().unwrap().is_none(),
+            "a successful stop must consume the engine thread's join handle"
+        );
+        assert!(
+            engine.get_pieces_status("idle-engine", 0).is_err(),
+            "the engine thread still answered a command after shutdown_within \
+             reported success, so it never exited"
+        );
+        assert!(
+            engine.shutdown_within(Duration::from_millis(1)),
+            "a stopped engine reports success immediately"
+        );
     }
 }
