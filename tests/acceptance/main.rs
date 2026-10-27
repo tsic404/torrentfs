@@ -53,6 +53,7 @@ mod test_tc_negative_02;
 mod test_tc_negative_03;
 mod test_tc_negative_04;
 mod test_tc_negative_05;
+mod test_tc_negative_06;
 mod test_tc_read_01;
 mod test_tc_read_02;
 mod test_tc_read_03;
@@ -79,9 +80,9 @@ mod test_tc_stats_06;
 mod test_tc_stats_07;
 mod test_tc_stats_08;
 
-/// The TC ids this suite carries: every id `docs/03-acceptance.md` fixes
-/// except TC-negative-06, whose carrier is owed by its own batch.  Sorted; the
-/// validation test below pins the count so a design id cannot vanish silently.
+/// The TC ids this suite carries: every id `docs/03-acceptance.md` fixes.
+/// Sorted; the validation test below pins the count so a design id cannot
+/// vanish silently.
 pub const TC_IDS: &[&str] = &[
     "TC-cache-01",
     "TC-cache-02",
@@ -116,6 +117,7 @@ pub const TC_IDS: &[&str] = &[
     "TC-negative-03",
     "TC-negative-04",
     "TC-negative-05",
+    "TC-negative-06",
     "TC-read-01",
     "TC-read-02",
     "TC-read-03",
@@ -179,6 +181,7 @@ pub const LANDED: &[&str] = &[
     test_tc_negative_03::TC_ID,
     test_tc_negative_04::TC_ID,
     test_tc_negative_05::TC_ID,
+    test_tc_negative_06::TC_ID,
     test_tc_read_01::TC_ID,
     test_tc_read_02::TC_ID,
     test_tc_read_03::TC_ID,
@@ -252,9 +255,9 @@ mod registry_tests {
     /// sorted listing).  A missing id means the suite silently dropped a
     /// design TC — exactly what QA reports as missing-test-evidence.
     ///
-    /// `docs/03-acceptance.md` fixes 64 ids; 63 are carried here, and
-    /// TC-negative-06 is still owed by its own carrier batch.  The count is
-    /// pinned so a design TC cannot disappear without a deliberate edit.
+    /// `docs/03-acceptance.md` fixes 64 ids and all of them are carried here.
+    /// The count is pinned so a design TC cannot disappear without a
+    /// deliberate edit.
     #[test]
     fn registry_pins_the_design_id_set() {
         let mut ids = TC_IDS.to_vec();
@@ -265,7 +268,7 @@ mod registry_tests {
             TC_IDS.len(),
             "TC_IDS must not contain duplicates"
         );
-        assert_eq!(ids.len(), 63, "the suite must carry its 63 design TC ids");
+        assert_eq!(ids.len(), 64, "the suite must carry its 64 design TC ids");
         assert!(
             ids.iter().all(|id| id.starts_with("TC-")),
             "every id must carry the TC- prefix"
