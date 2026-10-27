@@ -7,6 +7,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::error::{TorrentError, TorrentResult};
 
 const CACHE_METADATA_FILE: &str = "cache_metadata.txt";
+/// Scratch name for the atomic metadata rewrite.  It lives next to the
+/// authoritative file so the rename stays inside one filesystem, and the piece
+/// scan skips it exactly like the metadata file itself: a crash can leave one
+/// behind, and it must never be registered as a piece.
+const CACHE_METADATA_SCRATCH_FILE: &str = "cache_metadata.txt.tmp";
 const INCOMPLETE_SUFFIX: &str = ".incomplete";
 
 #[derive(Debug, Clone)]
@@ -245,7 +250,7 @@ impl CacheManager {
 
             let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-            if filename == CACHE_METADATA_FILE {
+            if filename == CACHE_METADATA_FILE || filename == CACHE_METADATA_SCRATCH_FILE {
                 continue;
             }
 
@@ -295,7 +300,7 @@ impl CacheManager {
             } else if path.is_file() {
                 let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                if filename == CACHE_METADATA_FILE {
+                if filename == CACHE_METADATA_FILE || filename == CACHE_METADATA_SCRATCH_FILE {
                     continue;
                 }
 
@@ -349,10 +354,47 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Persist the metadata file atomically: write a scratch file beside it,
+    /// fsync the contents, then `rename(2)` it over the authoritative name.
+    ///
+    /// An in-place truncating write is observable from outside the lock: an
+    /// interrupted shutdown (an abandoned engine thread still flushing, a
+    /// process exit between truncate and fsync) or a crash leaves
+    /// `cache_metadata.txt` empty or cut mid-line, and the next start registers
+    /// pieces at wrong sizes and the verifier purges them — the failure mode
+    /// the old fsync comment already guarded against, one step weaker.  The
+    /// rename is atomic within the directory, so a reader sees either the old
+    /// file or the new one; fsyncing the directory makes the rename itself
+    /// durable.
     fn save_metadata_file(&self) -> TorrentResult<()> {
         let metadata_path = self.cache_dir.join(CACHE_METADATA_FILE);
-        let file = File::create(&metadata_path)
-            .map_err(|e| TorrentError::IoError(format!("Failed to create metadata file: {}", e)))?;
+        let scratch_path = self.cache_dir.join(CACHE_METADATA_SCRATCH_FILE);
+
+        if let Err(error) = self.write_metadata_scratch(&scratch_path) {
+            // The scratch is worthless once the rewrite failed; do not leave a
+            // stray file for the piece scan to find.
+            let _ = fs::remove_file(&scratch_path);
+            return Err(error);
+        }
+        if let Err(e) = fs::rename(&scratch_path, &metadata_path) {
+            let _ = fs::remove_file(&scratch_path);
+            return Err(TorrentError::IoError(format!(
+                "Failed to replace metadata file: {}",
+                e
+            )));
+        }
+        // The rename has to survive a crash as well, not only the contents.
+        if let Ok(dir) = File::open(&self.cache_dir) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Write the whole metadata map into `scratch_path` and fsync its contents.
+    fn write_metadata_scratch(&self, scratch_path: &Path) -> TorrentResult<()> {
+        let file = File::create(scratch_path).map_err(|e| {
+            TorrentError::IoError(format!("Failed to create metadata scratch file: {}", e))
+        })?;
         let mut writer = BufWriter::new(file);
 
         for (piece_key, meta) in &self.metadata {
@@ -364,12 +406,8 @@ impl CacheManager {
             .map_err(|e| TorrentError::IoError(format!("Failed to write metadata: {}", e)))?;
         }
 
-        // flush the BufWriter into the OS page cache, then
-        // fsync the underlying file descriptor so the metadata reaches
-        // disk.  BufWriter::flush only pushes bytes to the OS buffer;
-        // without fsync a container restart can leave cache_metadata.txt
-        // empty or stale, causing scan_pieces_subdirectory to register
-        // pieces at wrong sizes and the verifier to purge them.
+        // Flush the BufWriter into the OS page cache, then fsync the descriptor
+        // so the contents reach disk before the rename publishes them.
         writer
             .flush()
             .map_err(|e| TorrentError::IoError(format!("Failed to flush metadata file: {}", e)))?;
@@ -379,7 +417,6 @@ impl CacheManager {
         inner
             .sync_all()
             .map_err(|e| TorrentError::IoError(format!("Failed to fsync metadata file: {}", e)))?;
-
         Ok(())
     }
 
@@ -954,6 +991,7 @@ pub struct InfohashCacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use tempfile::TempDir;
 
     #[test]
@@ -971,6 +1009,79 @@ mod tests {
         assert!(cache.has_piece(test_key));
         assert_eq!(cache.piece_count(), 1);
 
+        Ok(())
+    }
+
+    /// The metadata file must never be observable half-written: the save writes
+    /// a scratch file and renames it over the authoritative name, so a reader
+    /// (or a restart after an interrupted shutdown) sees a complete map.
+    ///
+    /// Atomicity is asserted three ways, because "the scratch is gone" alone is
+    /// also true of an in-place truncating write: the published file is a new
+    /// inode after a rewrite (a rename, not a truncate), a save whose scratch
+    /// cannot be written leaves the previously published map byte-identical
+    /// (the target is not touched until the scratch is complete), and a
+    /// crash-leftover scratch is never registered as a piece.
+    #[test]
+    fn metadata_save_is_atomic_and_leaves_no_scratch() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        let metadata_path = temp_dir.path().join(CACHE_METADATA_FILE);
+        let scratch_path = temp_dir.path().join(CACHE_METADATA_SCRATCH_FILE);
+        let piece_key = "hash1:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0u8; 100])?;
+        cache.add_piece(piece_key, 100)?;
+        cache.flush()?;
+
+        let saved = std::fs::read_to_string(&metadata_path).unwrap();
+        assert!(
+            saved.lines().any(|line| line.starts_with(piece_key)),
+            "the flushed metadata does not carry the registered piece:\n{saved}"
+        );
+        assert!(
+            !scratch_path.exists(),
+            "the rename must consume the scratch file"
+        );
+
+        // A rewrite publishes a *new* file.  Reusing the published inode means
+        // the save truncated it in place, which is exactly the half-written
+        // window the rename exists to remove.
+        let published = fs::metadata(&metadata_path).unwrap();
+        cache.add_piece("hash1:piece:1", 200)?;
+        cache.flush()?;
+        let replaced = fs::metadata(&metadata_path).unwrap();
+        assert_ne!(
+            published.ino(),
+            replaced.ino(),
+            "the metadata rewrite reused the published file's inode: the save \
+             wrote the target in place instead of renaming a scratch over it"
+        );
+
+        // A save that cannot finish its scratch must not touch the published
+        // file at all; a direct write would leave a truncated target behind.
+        let before_failure = fs::read_to_string(&metadata_path).unwrap();
+        fs::create_dir(&scratch_path).unwrap();
+        cache.add_piece("hash1:piece:2", 300)?;
+        assert!(
+            cache.flush().is_err(),
+            "a save whose scratch cannot be written must report the failure"
+        );
+        assert_eq!(
+            fs::read_to_string(&metadata_path).unwrap(),
+            before_failure,
+            "a failed save changed the published metadata file"
+        );
+        fs::remove_dir(&scratch_path).unwrap();
+
+        // A crash-leftover scratch is skipped by the piece scan on restart.
+        std::fs::write(&scratch_path, "half-written").unwrap();
+        let reopened = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(
+            !reopened.metadata.contains_key(CACHE_METADATA_SCRATCH_FILE),
+            "the scratch file was registered as a piece"
+        );
+        assert!(reopened.has_piece(piece_key));
         Ok(())
     }
 

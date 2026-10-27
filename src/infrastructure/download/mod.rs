@@ -13,7 +13,9 @@ mod piece_store;
 mod session;
 mod types;
 
-pub use engine::{Command as DownloadCommand, DownloadEngine, DownloadSnapshot, WaitingReads};
+pub use engine::{
+    Command as DownloadCommand, DownloadEngine, DownloadSnapshot, WaitingReads, ENGINE_THREAD_NAME,
+};
 pub use piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
 pub use piece_store::PieceStore;
 pub use session::{Session, TorrentHandle};

@@ -63,6 +63,7 @@ mod test_tc_read_08;
 mod test_tc_read_09;
 mod test_tc_read_10;
 mod test_tc_read_11;
+mod test_tc_recovery_01;
 mod test_tc_recovery_02;
 mod test_tc_recovery_03;
 mod test_tc_recovery_04;
@@ -188,6 +189,7 @@ pub const LANDED: &[&str] = &[
     test_tc_read_09::TC_ID,
     test_tc_read_10::TC_ID,
     test_tc_read_11::TC_ID,
+    test_tc_recovery_01::TC_ID,
     test_tc_recovery_02::TC_ID,
     test_tc_recovery_03::TC_ID,
     test_tc_recovery_04::TC_ID,

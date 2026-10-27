@@ -11,9 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SendError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 /// A unit of work dispatched to the download worker pool.
 pub type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Poll cadence for the bounded worker join ([`WorkerPool::shutdown_within`]).
+const WORKER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Bounded pool of download worker threads.
 ///
@@ -133,6 +137,28 @@ impl WorkerPool {
     ///
     /// Idempotent — subsequent calls are no-ops.
     pub fn shutdown(&self) {
+        self.stop_accepting();
+        self.join_workers(None);
+    }
+
+    /// Graceful shutdown bounded by `grace`.
+    ///
+    /// Returns `true` when every worker exited within the window, `false` when
+    /// at least one was still running at the deadline.  A worker can be parked
+    /// inside a download read that outlives the engine's own stop signal (the
+    /// read waits on a blocking call into libtorrent), and a process teardown
+    /// must not hang on it — the callers exit the process, which ends the
+    /// thread.  The handles are taken either way, so a later `shutdown()` is a
+    /// no-op rather than a second, unbounded join.
+    ///
+    /// Idempotent.
+    pub fn shutdown_within(&self, grace: Duration) -> bool {
+        self.stop_accepting();
+        self.join_workers(Some(grace))
+    }
+
+    /// Reject new submissions and drop the sender so workers drain and exit.
+    fn stop_accepting(&self) {
         // 1. Reject new submissions.
         self.stopping.store(true, Ordering::SeqCst);
         // 2. Drop the single sender: workers consume the remaining queued jobs
@@ -140,16 +166,36 @@ impl WorkerPool {
         if let Ok(mut guard) = self.tx.lock() {
             drop(guard.take());
         }
-        // 3. Join every worker.
+    }
+
+    /// Join the workers, either unconditionally (`None`) or within `grace`.
+    fn join_workers(&self, grace: Option<Duration>) -> bool {
         let handles = {
             let mut guard = match self.handles.lock() {
                 Ok(guard) => guard,
-                Err(_) => return,
+                Err(_) => return true,
             };
             std::mem::take(&mut *guard)
         };
-        for handle in handles {
-            let _ = handle.join();
+        let Some(grace) = grace else {
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return true;
+        };
+        let deadline = Instant::now() + grace;
+        let mut pending = handles;
+        loop {
+            pending.retain(|handle| !handle.is_finished());
+            if pending.is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                // Abandon: the handles detach on drop, so the still-running
+                // workers cannot block the caller a second time.
+                return false;
+            }
+            thread::sleep(WORKER_SHUTDOWN_POLL_INTERVAL);
         }
     }
 }
@@ -323,6 +369,56 @@ mod tests {
         assert!(pool.try_submit(Box::new(|| {})).is_err());
         // Idempotent.
         pool.shutdown();
+    }
+
+    #[test]
+    fn shutdown_within_joins_idle_workers() {
+        let pool = WorkerPool::new(2, 2);
+        let start = Instant::now();
+        assert!(
+            pool.shutdown_within(Duration::from_secs(2)),
+            "an idle pool must drain inside the window"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(pool.try_submit(Box::new(|| {})).is_err());
+    }
+
+    /// The defect this guards: a teardown must not hang on a worker parked in
+    /// a download read.  Before the bounded variant, `shutdown` joined such a
+    /// worker unconditionally and the daemon was SIGKILLed by the container
+    /// runtime; now it reports the timeout and the process can exit.
+    #[test]
+    fn shutdown_within_abandons_a_wedged_worker() {
+        let pool = WorkerPool::new(1, 1);
+        let release = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let release_job = Arc::clone(&release);
+
+        assert!(pool
+            .try_submit(Box::new(move || {
+                let _ = started_tx.send(());
+                while !release_job.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }))
+            .is_ok());
+        started_rx.recv().unwrap();
+
+        let start = Instant::now();
+        assert!(
+            !pool.shutdown_within(Duration::from_millis(50)),
+            "a wedged worker must be reported, not silently joined"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the bounded shutdown took {:?}",
+            start.elapsed()
+        );
+
+        // The handle was taken, so a second call cannot block either.
+        assert!(pool.shutdown_within(Duration::from_millis(50)));
+        // Release the abandoned worker so the test leaves no thread behind.
+        release.store(true, Ordering::Relaxed);
     }
 
     #[test]
