@@ -184,9 +184,11 @@ done
 [ -f "$LOG_HOST/torrentfs.log" ] || fail "--log-file was not created on the host mount"
 grep -q "torrentfs mounted" "$LOG_HOST/torrentfs.log" \
     || fail "--log-file did not receive the daemon's structured log"
-log_text "$LOG_HOST/torrentfs.log" | grep -q " INFO " \
+# Here-string, not a pipe: `grep -q` closing the pipe early would SIGPIPE sed
+# and `pipefail` would report 141 for a log that does carry the line.
+grep -q " INFO " <<<"$(log_text "$LOG_HOST/torrentfs.log")" \
     || fail "the log file carries no INFO line at --log-level debug"
-if timeout 10 docker logs "$NAME_A" 2>&1 | grep -q "torrentfs mounted"; then
+if grep -q "torrentfs mounted" <<<"$(timeout 10 docker logs "$NAME_A" 2>&1)"; then
     fail "--log-file did not redirect the structured log away from the container streams"
 fi
 stop_container "$NAME_A"
@@ -209,7 +211,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
     sleep 1
 done
 [ -f "$LOG_HOST/warn.log" ] || fail "--log-file was not created for the warn run"
-if log_text "$LOG_HOST/warn.log" | grep -q " INFO "; then
+if grep -q " INFO " <<<"$(log_text "$LOG_HOST/warn.log")"; then
     fail "--log-level warn did not suppress the INFO lines in the log file"
 fi
 stop_container "$NAME_B"
@@ -229,7 +231,7 @@ timeout 10 docker exec "$NAME_C" test -f /home/torrentfs/.local/share/torrentfs/
     || fail "the default state DB path was not used"
 timeout 10 docker exec "$NAME_C" test -f /home/torrentfs/.local/share/torrentfs/cache/cache_metadata.txt \
     || fail "the default cache path was not used"
-if ! timeout 10 docker logs "$NAME_C" 2>&1 | grep -q "torrentfs mounted"; then
+if ! grep -q "torrentfs mounted" <<<"$(timeout 10 docker logs "$NAME_C" 2>&1)"; then
     fail "the default run does not log to the container streams"
 fi
 stop_container "$NAME_C"
