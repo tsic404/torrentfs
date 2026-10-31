@@ -15,6 +15,10 @@
 # recording that the residue was reproducible — the step itself is a host root
 # operation, not a product behaviour.
 #
+# The connection-cut state is judged by the numeric errno (107), not by the
+# `strerror` text, which depends on the host libc; the probe needs python3 or
+# perl and the case SKIPs when neither is available.
+#
 # Usage: ./tests/acceptance/tc_container_07.sh [image] [host-dir]
 # Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
 #
@@ -27,6 +31,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${1:-torrentfs:acceptance-ci}"
 WORK="$(mktemp -d)"
 HOST_IO_TIMEOUT=5
+ENOTCONN_ERRNO=107
 CONTAINER="tc-container-07-$$"
 OWN_HOST_DIR=0
 HOST_DIR_SHARED=0
@@ -90,6 +95,8 @@ trap cleanup EXIT
 
 command -v docker >/dev/null 2>&1 || skip "no docker"
 [ -e /dev/fuse ] || skip "no /dev/fuse"
+command -v python3 >/dev/null 2>&1 || command -v perl >/dev/null 2>&1 \
+    || skip "no python3 or perl on the host to read the mount errno"
 
 timeout 10 mkdir -p "$MOUNT_HOST"
 # Only a script-owned temp directory is shared: the container bind is
@@ -126,13 +133,28 @@ host_residue_present() {
     grep -q " $MOUNT_HOST " /proc/self/mountinfo 2>/dev/null
 }
 
+# `stat` renders the failure through the host libc, so the text differs across
+# libcs (glibc: "Transport endpoint is not connected", musl: "Socket not
+# connected"); read the numeric errno instead.
+host_errno() {
+    local path="$1"
+    if command -v python3 >/dev/null 2>&1; then
+        timeout -k 2 "$HOST_IO_TIMEOUT" python3 -c '
+import os, sys
+try:
+    os.stat(sys.argv[1])
+except OSError as exc:
+    print(exc.errno)
+' "$path" 2>/dev/null || true
+    elif command -v perl >/dev/null 2>&1; then
+        timeout -k 2 "$HOST_IO_TIMEOUT" perl -e '
+stat($ARGV[0]) or print 0 + $!;
+' "$path" 2>/dev/null || true
+    fi
+}
+
 host_residue_enotconn() {
-    local err
-    err="$(timeout -k 2 "$HOST_IO_TIMEOUT" stat -c '%f' "$MOUNT_HOST" 2>&1 >/dev/null || true)"
-    case "$err" in
-        *'Transport endpoint is not connected'*) return 0 ;;
-    esac
-    return 1
+    [ "$(host_errno "$MOUNT_HOST")" = "$ENOTCONN_ERRNO" ]
 }
 
 wait_for_internal_mount() {
