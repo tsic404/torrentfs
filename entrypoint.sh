@@ -1038,11 +1038,27 @@ start_torrentfs_rootless() {
     echo "[entrypoint] starting torrentfs directly on $mountpoint" >&2
 
     local torrentfs_pid=""
+    # Status the cleanup trap reaped from the daemon.  A trapped signal wakes
+    # `wait` with 128+signo before the trap runs, so the trap's own status is
+    # the only place the daemon's real exit code survives for the exit path.
+    local daemon_rc=""
     cleanup() {
+        # A repeated stop signal must not re-enter this handler: the recursive
+        # call's interrupted `wait` would overwrite daemon_rc with 128+signo.
+        trap '' INT TERM
         echo "[entrypoint] shutting down" >&2
         if [ -n "${torrentfs_pid:-}" ]; then
             kill "$torrentfs_pid" 2>/dev/null || true
-            wait "$torrentfs_pid" 2>/dev/null || true
+            # A pid the loop already reaped is no longer a child and answers
+            # `wait` with 127; only a live (or zombie) daemon has a status.
+            if kill -0 "$torrentfs_pid" 2>/dev/null; then
+                if wait "$torrentfs_pid" 2>/dev/null; then
+                    daemon_rc=0
+                else
+                    daemon_rc=$?
+                fi
+            fi
+            torrentfs_pid=""
         fi
         umount "${mountpoint:-}" 2>/dev/null || true
         force_unmount_fuse "${mountpoint:-}" || true
@@ -1066,8 +1082,20 @@ start_torrentfs_rootless() {
         echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
 
         rc=0
-        wait "$torrentfs_pid" || rc=$?
-        torrentfs_pid=""
+        # The trap may already have reaped the daemon (a stop signal that
+        # arrived before this `wait`); `daemon_rc` then carries its status.
+        if [ -n "$torrentfs_pid" ]; then
+            wait "$torrentfs_pid" || rc=$?
+            torrentfs_pid=""
+        fi
+        # A stop signal wakes `wait` with 128+signo, but the trap reaped the
+        # daemon: its status is the shutdown result the container must report
+        # (0 = clean), and a stop request must not become a recovery restart.
+        if [ -n "$daemon_rc" ]; then
+            rc="$daemon_rc"
+            daemon_rc=""
+            break
+        fi
 
         if ! should_recover_session "$rc" "$recoveries"; then
             break
@@ -1111,11 +1139,27 @@ start_torrentfs_rootful() {
     echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
 
     local torrentfs_pid=""
+    # Status the cleanup trap reaped from the daemon.  A trapped signal wakes
+    # `wait` with 128+signo before the trap runs, so the trap's own status is
+    # the only place the daemon's real exit code survives for the exit path.
+    local daemon_rc=""
     cleanup() {
+        # A repeated stop signal must not re-enter this handler: the recursive
+        # call's interrupted `wait` would overwrite daemon_rc with 128+signo.
+        trap '' INT TERM
         echo "[entrypoint] shutting down" >&2
         if [ -n "${torrentfs_pid:-}" ]; then
             kill "$torrentfs_pid" 2>/dev/null || true
-            wait "$torrentfs_pid" 2>/dev/null || true
+            # A pid the loop already reaped is no longer a child and answers
+            # `wait` with 127; only a live (or zombie) daemon has a status.
+            if kill -0 "$torrentfs_pid" 2>/dev/null; then
+                if wait "$torrentfs_pid" 2>/dev/null; then
+                    daemon_rc=0
+                else
+                    daemon_rc=$?
+                fi
+            fi
+            torrentfs_pid=""
         fi
         # Detach the FUSE mount first (the daemon unmounts $internal_mnt itself,
         # but a killed daemon may have skipped it), then release the bind mount
@@ -1146,8 +1190,20 @@ start_torrentfs_rootful() {
         echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
 
         rc=0
-        wait "$torrentfs_pid" || rc=$?
-        torrentfs_pid=""
+        # The trap may already have reaped the daemon (a stop signal that
+        # arrived before this `wait`); `daemon_rc` then carries its status.
+        if [ -n "$torrentfs_pid" ]; then
+            wait "$torrentfs_pid" || rc=$?
+            torrentfs_pid=""
+        fi
+        # A stop signal wakes `wait` with 128+signo, but the trap reaped the
+        # daemon: its status is the shutdown result the container must report
+        # (0 = clean), and a stop request must not become a recovery restart.
+        if [ -n "$daemon_rc" ]; then
+            rc="$daemon_rc"
+            daemon_rc=""
+            break
+        fi
 
         if ! should_recover_session "$rc" "$recoveries"; then
             break

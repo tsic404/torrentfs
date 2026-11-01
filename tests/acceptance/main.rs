@@ -229,6 +229,7 @@ pub const SCRIPT_FORM: &[&str] = &[
     "TC-ingest-06",
     "TC-read-04",
     "TC-recovery-01",
+    "TC-recovery-03",
     "TC-recovery-05",
     "TC-rofs-01",
     "TC-stats-01",
