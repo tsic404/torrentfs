@@ -180,7 +180,11 @@ fn read_blocked_on_a_piece_removed_from_the_cache() {
 
     let cache = engine.cache_manager();
     let piece_key = format!("{info_hash}:piece:0");
-    let piece_path = cache.lock().expect("cache lock").piece_path(&piece_key);
+    let piece_path = cache
+        .lock()
+        .expect("cache lock")
+        .piece_path(&piece_key)
+        .expect("piece key must resolve to a path");
     assert!(piece_path.is_file(), "precondition: piece 0 must be on disk");
     std::fs::remove_file(&piece_path).expect("remove piece 0 from the cache");
 

@@ -3438,13 +3438,28 @@ impl EngineState {
     /// periodically persist dirty cache metadata so the on-disk
     /// state does not lag too far behind the in-memory state.  Mutating
     /// cache methods (`record_access`, `add_piece`, `remove_piece`, …)
-    /// only flag `metadata_dirty` instead of fsyncing on every call; this
+    /// only flag `metadata_dirty` instead of writing on every call; this
     /// is the single flush point that hits disk.  The `main.rs` shutdown
     /// path still calls `flush()` for the final fsync.
+    ///
+    /// The snapshot is taken under the cache lock and the serialization +
+    /// fsync run outside it: at the engine's periodic cadence a rewrite of the
+    /// whole map under the lock would stall every reader (`.stats`, the read
+    /// path) for the duration of two fsyncs (C-5.2.1).
     fn flush_cache_metadata(&self) {
-        if let Ok(mut cm) = self.store.cache_manager().lock() {
-            if let Err(e) = cm.flush_metadata_if_dirty() {
-                tracing::warn!("Failed to flush cache metadata: {:?}", e);
+        let prepared = match self.store.cache_manager().lock() {
+            Ok(mut cm) => cm.take_dirty_snapshot(),
+            Err(_) => None,
+        };
+        let Some(snapshot) = prepared else {
+            return;
+        };
+        if let Err(e) = snapshot.write() {
+            tracing::warn!("Failed to flush cache metadata: {:?}", e);
+            // The change is still only in memory; keep the map dirty so the
+            // next tick retries instead of losing it.
+            if let Ok(mut cm) = self.store.cache_manager().lock() {
+                cm.mark_metadata_dirty();
             }
         }
     }

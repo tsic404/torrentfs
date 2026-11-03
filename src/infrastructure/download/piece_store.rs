@@ -103,7 +103,9 @@ impl PieceStore {
     pub fn read_piece(&self, piece_key: &str) -> TorrentResult<Vec<u8>> {
         let path = {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
-            cache.piece_path(piece_key)
+            cache.piece_path(piece_key).ok_or_else(|| {
+                TorrentError::IoError(format!("Invalid cache piece key: {}", piece_key))
+            })?
         };
         // Extract info_hash from the piece_key ("{info_hash}:piece:{index}")
         // to acquire the per-info-hash shared read lock.
@@ -171,6 +173,9 @@ impl PieceStore {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
             cache.piece_path(&key)
         };
+        let Some(path) = path else {
+            return Ok(false);
+        };
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
             Err(_) => return Ok(false),
@@ -198,6 +203,9 @@ impl PieceStore {
         let path = {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
             cache.piece_path(&key)
+        };
+        let Some(path) = path else {
+            return Ok(false);
         };
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
@@ -353,8 +361,8 @@ impl PieceStore {
 /// RAII guard for the C++ per-info-hash shared read lock: acquires on
 /// construction, releases on drop, so `PieceStorage::write_piece` (exclusive
 /// lock) can't write blocks while the Rust side reads. The lock is a no-op
-/// when `info_hash_hex` is empty (unit tests with synthetic piece keys, or a
-/// malformed piece key).
+/// when `info_hash_hex` is empty, which a caller with a key outside the cache
+/// key space can produce.
 struct PieceReadLockGuard {
     info_hash_hex: String,
     locked: bool,
@@ -409,7 +417,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "abc123";
+        let info_hash = "6367c48dd193d56ea7b0baad25b19455e529f5ee";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let piece_content = vec![0xAAu8; 16_384];
@@ -460,7 +468,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "ghi789";
+        let info_hash = "ffcb2deee9131e6cda4faa78bb40423c9b847ff0";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let expected = 16_384u64;
@@ -508,7 +516,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "truncate_stale";
+        let info_hash = "c4f6cc809764938998ceae7a3fc30681097fef58";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let expected = 16_384u64;
@@ -544,7 +552,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "def456";
+        let info_hash = "0b3d8b29493059afd7f9912106279c4643ac4939";
         let piece_idx = 1;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let piece_content = vec![0xBBu8; 16_384];
@@ -590,7 +598,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "tsi3130range";
+        let info_hash = "d2d4b24080d54b14614e9d2b0eb78bc0cbfc6c78";
         let verified_idx = 0;
         let partial_idx = 1;
 
@@ -649,7 +657,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "extdel";
+        let info_hash = "297168d955a8e9a843d21ebbc75fa773c260a530";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let piece_length = 16_384u64;
@@ -714,7 +722,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "exttrunc";
+        let info_hash = "649ebee0031dea6bd3cb9bb80631aecb858f65c8";
         let piece_idx = 0;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let piece_length = 16_384u64;
