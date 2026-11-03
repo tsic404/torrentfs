@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{TorrentError, TorrentResult};
@@ -14,11 +15,134 @@ use crate::infrastructure::config::enums::EnumValidator;
 /// (`EACCES`/`ENOENT`) — so the state can never be persisted there (C-12,
 /// C-2.2.4).
 pub fn default_state_paths() -> (PathBuf, PathBuf) {
-    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = state_base_dir();
     (
         base.join("torrentfs/db/metadata.db"),
         base.join("torrentfs/cache"),
     )
+}
+
+/// Shared base the state falls back to when the XDG data directory is
+/// unavailable.  Single source for both `default_state_paths` and the
+/// ownership check below, so the two cannot drift apart.
+const TMP_STATE_BASE: &str = "/tmp";
+
+fn state_base_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(TMP_STATE_BASE))
+}
+
+/// `<base>/torrentfs`, the root the default state lives under.
+fn tmp_state_root() -> PathBuf {
+    Path::new(TMP_STATE_BASE).join("torrentfs")
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // `geteuid` has no failure mode and needs no allocation.
+    unsafe { libc::geteuid() }
+}
+
+/// Refuse a fallback root in the shared `/tmp` that the current user does not
+/// own, and refuse one that is a symbolic link: following a link would adopt
+/// the directory behind it and let its owner redirect (or watch) every write
+/// the daemon makes.
+fn check_tmp_fallback_root(root: &Path) -> TorrentResult<()> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(TorrentError::IoError(format!(
+                "Failed to inspect state directory {}: {}",
+                root.display(),
+                e
+            )))
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(TorrentError::IoError(format!(
+            "Refusing to use state directory {}: it is a symbolic link",
+            root.display()
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = metadata.uid();
+        if owner != current_euid() {
+            return Err(TorrentError::IoError(format!(
+                "Refusing to use state directory {}: owned by uid {}, running as uid {}",
+                root.display(),
+                owner,
+                current_euid()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Create `dir`, and every missing ancestor up to the first existing one, with
+/// owner-only permissions (`0700`).
+///
+/// The state tree holds the piece cache and the SQLite metadata: a
+/// world-readable root lets another local user read `cache_metadata.txt`,
+/// which is the file path resolution has to defend against (C-5.4.6).  Only
+/// directories this call creates are tightened, so an existing parent the user
+/// prepared (a mounted volume, `~/.local/share`) keeps its mode.
+///
+/// When the XDG data directory is unavailable the state root falls back to
+/// `/tmp/torrentfs`; a root that already exists there must belong to the
+/// current user and must not be a symbolic link (see
+/// [`check_tmp_fallback_root`]).
+pub fn create_state_dir(dir: &Path) -> TorrentResult<()> {
+    // `Path::parent` of a bare file name is `""`; there is nothing to create
+    // for the current directory and no way to chmod it.
+    if dir.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let fallback_root = tmp_state_root();
+    if dir.starts_with(&fallback_root) {
+        check_tmp_fallback_root(&fallback_root)?;
+    }
+
+    let mut missing = Vec::new();
+    let mut candidate = dir;
+    while !candidate.exists() {
+        missing.push(candidate.to_path_buf());
+        match candidate.parent() {
+            // `""` is the current directory, not a parent to create: a bare
+            // relative path (`--cache cache-data`) stops here.
+            Some(parent) if !parent.as_os_str().is_empty() => candidate = parent,
+            _ => break,
+        }
+    }
+
+    fs::create_dir_all(dir).map_err(|e| {
+        TorrentError::IoError(format!(
+            "Failed to create state directory {}: {}",
+            dir.display(),
+            e
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for created in &missing {
+            fs::set_permissions(created, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                TorrentError::IoError(format!(
+                    "Failed to restrict permissions on state directory {}: {}",
+                    created.display(),
+                    e
+                ))
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 // ---- config sub-modules ----
@@ -567,5 +691,101 @@ backward_priority = 1
         // Unspecified fields remain None (so they fall back to defaults).
         assert_eq!(config.piece_priority.current_priority, None);
         assert_eq!(config.piece_priority.window_edge_priority, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tmp_fallback_root_rejects_a_symlink() {
+        let root = tempfile::TempDir::new().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(
+            check_tmp_fallback_root(&link).is_err(),
+            "a symlinked state root would let its owner redirect every write"
+        );
+        assert!(
+            check_tmp_fallback_root(&target).is_ok(),
+            "a real directory owned by the current user is accepted"
+        );
+        assert!(
+            check_tmp_fallback_root(&root.path().join("missing")).is_ok(),
+            "an absent root is created later and needs no check"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_state_dir_accepts_a_relative_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        // `--cache cache-data` resolves against the process working directory.
+        // Its parent is `""`, the current directory, which must not be pushed
+        // as a directory to create or chmod (that used to fail with ENOENT
+        // after the directory had already been created).
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = tempfile::TempDir::new().unwrap();
+        let _restore = RestoreCwd(std::env::current_dir().unwrap());
+        std::env::set_current_dir(root.path()).unwrap();
+
+        for relative in ["cache-data", "nested/child"] {
+            create_state_dir(Path::new(relative)).expect("create relative state dir");
+            let created = root.path().join(relative);
+            assert!(created.is_dir(), "{relative} was not created");
+            let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{relative} has mode {mode:o}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_state_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let nested = root.path().join("torrentfs/db");
+        create_state_dir(&nested).expect("create nested state dir");
+
+        // Every directory this call created is owner-only: the tree holds the
+        // cache metadata and the SQLite state.
+        for path in [
+            root.path().join("torrentfs"),
+            root.path().join("torrentfs/db"),
+        ] {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{} has mode {:o}", path.display(), mode);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_state_dir_leaves_existing_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let existing = root.path().join("share");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+
+        create_state_dir(&existing).expect("adopt existing dir");
+
+        // A directory the caller prepared keeps its mode; only newly created
+        // levels are tightened.
+        let mode = fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

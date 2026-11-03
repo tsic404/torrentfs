@@ -2378,6 +2378,11 @@ fn spawn_cache_verification(
                         return;
                     }
                 };
+                let Some(path) = path else {
+                    warn!("Skipping piece verification for invalid cache key {piece_key}");
+                    skipped += 1;
+                    continue;
+                };
 
                 let outcome = verify_single_piece(&path, piece_index, info, &piece_key);
 

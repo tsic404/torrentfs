@@ -464,7 +464,9 @@ fn test_truncated_piece_reheals_via_recheck_and_redownload() {
     let piece_path = {
         let cm = engine.cache_manager();
         let guard = cm.lock().unwrap();
-        guard.piece_path(&piece_key)
+        guard
+            .piece_path(&piece_key)
+            .expect("piece key must resolve to a path")
     };
     assert!(
         std::fs::metadata(&piece_path).unwrap().len() >= PIECE_LEN as u64,

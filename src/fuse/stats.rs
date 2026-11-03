@@ -1516,8 +1516,8 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mut cache = CacheManager::new(temp_dir.path(), 64 * 1024).unwrap();
 
-        let first = "aaaa1111:piece:0";
-        let second = "bbbb2222:piece:0";
+        let first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:piece:0";
+        let second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:piece:0";
 
         let first_path = cache.ensure_piece_dir(first).unwrap();
         std::fs::write(&first_path, vec![0u8; 40_000]).unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
 
-        let piece_key = "aaaa1111:piece:0";
+        let piece_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:piece:0";
         let piece_path = cache.ensure_piece_dir(piece_key).unwrap();
         std::fs::write(&piece_path, vec![0u8; 2 * 1024 * 1024]).unwrap();
         cache
@@ -1599,17 +1599,11 @@ mod tests {
         // against the actual config byte-for-byte, rather than re-deriving it
         // from a rounded human-readable form.
         use crate::db::InsertTorrentResult;
+        let info_hash = "1234567890abcdef1234567890abcdef12345678";
 
         let mut db = Database::open_in_memory().unwrap();
         let InsertTorrentResult::Inserted(source_id) = db
-            .insert_torrent(
-                "data",
-                "ubuntu",
-                "ubuntu.torrent",
-                1024,
-                "hash-cache-max",
-                1,
-            )
+            .insert_torrent("data", "ubuntu", "ubuntu.torrent", 1024, info_hash, 1)
             .unwrap()
         else {
             panic!("expected a fresh insert");
@@ -1619,15 +1613,15 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let max_bytes = 32 * 1024 * 1024;
         let mut cache = CacheManager::new(temp_dir.path(), max_bytes).unwrap();
-        let piece_key = "hash-cache-max:piece:0";
-        let piece_path = cache.ensure_piece_dir(piece_key).unwrap();
+        let piece_key = format!("{info_hash}:piece:0");
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
         std::fs::write(&piece_path, vec![0u8; 4 * 1024 * 1024]).unwrap();
         cache
-            .register_incomplete_piece(piece_key, 4 * 1024 * 1024)
+            .register_incomplete_piece(&piece_key, 4 * 1024 * 1024)
             .unwrap();
         let cm = Arc::new(Mutex::new(cache));
 
-        let stats = generate_torrent_stats(source_id, "hash-cache-max", &db, &None, {
+        let stats = generate_torrent_stats(source_id, info_hash, &db, &None, {
             let cm = cm.clone();
             move || Some(cm.clone())
         });

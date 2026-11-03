@@ -973,19 +973,17 @@ fn main() {
     let (default_db_path, default_cache_path) =
         torrentfs::infrastructure::config::default_state_paths();
     let cache_path = args.cache.clone().unwrap_or(default_cache_path);
-    if !cache_path.exists() {
-        if let Err(e) = std::fs::create_dir_all(&cache_path) {
-            warn!("Failed to create cache directory {:?}: {:?}", cache_path, e);
-        }
+    if let Err(e) = torrentfs::infrastructure::config::create_state_dir(&cache_path) {
+        error!("Failed to create cache directory {:?}: {}", cache_path, e);
+        std::process::exit(1);
     }
 
     let db_path = args.db.clone().unwrap_or(default_db_path);
 
     if let Some(parent) = db_path.parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                warn!("Failed to create database directory: {:?}", e);
-            }
+        if let Err(e) = torrentfs::infrastructure::config::create_state_dir(parent) {
+            error!("Failed to create database directory {:?}: {}", parent, e);
+            std::process::exit(1);
         }
     }
 
