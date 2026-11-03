@@ -886,13 +886,14 @@ mod tests {
     /// Test rig: a scheduler holding one torrent (4 pieces) plus a cache whose
     /// piece 1 file exists on disk without a cache metadata entry — the state
     /// libtorrent's custom storage leaves behind between the first block write
-    /// and the piece's registration.
-    fn in_flight_piece_rig() -> (TempDir, PieceStore, TorrentHandle) {
+    /// and the piece's registration. `info_hash` must have the 40 (or 64)
+    /// lowercase hex digit shape the cache accepts in a piece key.
+    fn in_flight_piece_rig(info_hash: &str) -> (TempDir, PieceStore, TorrentHandle) {
         let dir = tempfile::TempDir::new().unwrap();
         let store = PieceStore::new(Arc::new(Mutex::new(
             CacheManager::new(dir.path(), 1024 * 1024).unwrap(),
         )));
-        let piece_key = PieceStore::piece_key("hash", 1);
+        let piece_key = PieceStore::piece_key(info_hash, 1);
         let path = {
             let cache = store.cache_manager();
             let cache = cache.lock().unwrap();
@@ -901,7 +902,7 @@ mod tests {
         std::fs::write(&path, vec![0xAB; 16]).unwrap();
         let handle = TorrentHandle {
             inner: std::ptr::null_mut(),
-            info_hash: "hash".to_string(),
+            info_hash: info_hash.to_string(),
             session: std::ptr::null_mut(),
         };
         (dir, store, handle)
@@ -912,28 +913,29 @@ mod tests {
     /// libtorrent's wanted set and stall the read that wants it.
     #[test]
     fn recompute_keeps_in_flight_piece_wanted() {
-        let (_dir, store, handle) = in_flight_piece_rig();
-        store.register_piece("hash", 0, 16).unwrap();
+        let info_hash = "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b";
+        let (_dir, store, handle) = in_flight_piece_rig(info_hash);
+        store.register_piece(info_hash, 0, 16).unwrap();
 
         let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
-        s.init_torrent("hash", 4, 256 * 1024).unwrap();
+        s.init_torrent(info_hash, 4, 256 * 1024).unwrap();
         s.readers.insert(
-            "hash".to_string(),
+            info_hash.to_string(),
             vec![ReadRange {
                 id: ReadId(1),
                 gradient: vec![7, 6, 0, 0],
             }],
         );
 
-        s.recompute(&handle, "hash", &store);
+        s.recompute(&handle, info_hash, &store);
 
         assert_eq!(
-            s.get_piece_priority("hash", 0),
+            s.get_piece_priority(info_hash, 0),
             0,
             "a registered complete piece is a cache hit"
         );
         assert_eq!(
-            s.get_piece_priority("hash", 1),
+            s.get_piece_priority(info_hash, 1),
             6,
             "an in-flight piece must keep its gradient priority"
         );
@@ -944,29 +946,30 @@ mod tests {
     /// come back because `recompute` skips cached pieces.
     #[test]
     fn reader_release_retains_in_flight_piece_in_prefetch() {
-        let (_dir, store, handle) = in_flight_piece_rig();
-        store.register_piece("hash", 0, 16).unwrap();
+        let info_hash = "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c";
+        let (_dir, store, handle) = in_flight_piece_rig(info_hash);
+        store.register_piece(info_hash, 0, 16).unwrap();
 
         let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
-        s.init_torrent("hash", 4, 256 * 1024).unwrap();
+        s.init_torrent(info_hash, 4, 256 * 1024).unwrap();
         s.readers.insert(
-            "hash".to_string(),
+            info_hash.to_string(),
             vec![ReadRange {
                 id: ReadId(1),
                 gradient: vec![7, 6, 0, 0],
             }],
         );
 
-        s.reader_released(&handle, "hash", ReadId(1), &store);
+        s.reader_released(&handle, info_hash, ReadId(1), &store);
 
-        let retained = s.prefetch.get("hash").expect("gradient retained");
+        let retained = s.prefetch.get(info_hash).expect("gradient retained");
         assert_eq!(retained[0], 0, "the cached piece is dropped from the window");
         assert_eq!(
             retained[1], 6,
             "the in-flight piece stays in the retained prefetch window"
         );
         assert_eq!(
-            s.get_piece_priority("hash", 1),
+            s.get_piece_priority(info_hash, 1),
             6,
             "its priority survives the recompute that follows the release"
         );
