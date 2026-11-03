@@ -232,14 +232,13 @@ impl PieceScheduler {
             // libtorrent continues the read-ahead prefetch and `.stats` shows
             // `[6][5][4][3]` for the queued pieces instead of resetting to `[]`.
             if let Some(mut gradient) = last_gradient {
-                // Drop pieces already available locally from the retained
-                // window. `recompute` skips them, so they would never trigger
-                // `piece_ready` again and their entries would keep the gradient
-                // non-zero forever, blocking the all-zero cleanup that clears
-                // `prefetch`.
+                // Drop cached pieces from the retained window: `recompute`
+                // skips them, so they would never trigger `piece_ready` again
+                // and the gradient would never reach all-zero.  Only
+                // registered-complete counts — a piece still downloading must
+                // keep the priority that drives its own download.
                 for (p, prio) in gradient.iter_mut().enumerate() {
-                    let piece_key = PieceStore::piece_key(info_hash, p as i32);
-                    if store.has_piece(info_hash, p as i32) || store.has_piece_on_disk(&piece_key) {
+                    if store.is_piece_complete(info_hash, p as i32) {
                         *prio = 0;
                     }
                 }
@@ -359,8 +358,9 @@ impl PieceScheduler {
     /// Recompute the priority gradient as the element-wise maximum over all
     /// active readers' gradients (falling back to the retained prefetch
     /// gradient once the last reader releases), then apply it to the handle
-    /// (skipping already-cached pieces).  Infallible: it only mutates
-    /// in-memory state and issues best-effort piece-priority FFI calls.
+    /// (skipping pieces the cache holds as registered-complete).  Infallible:
+    /// it only mutates in-memory state and issues best-effort piece-priority
+    /// FFI calls.
     pub fn recompute(&mut self, handle: &TorrentHandle, info_hash: &str, store: &PieceStore) {
         let num_pieces = self
             .elevated
@@ -402,9 +402,11 @@ impl PieceScheduler {
         };
 
         for (p, &prio) in target.iter().enumerate() {
-            let piece_key = PieceStore::piece_key(info_hash, p as i32);
-            let cached =
-                store.has_piece(info_hash, p as i32) || store.has_piece_on_disk(&piece_key);
+            // Zero only pieces the cache holds as registered-complete.  A
+            // piece file that merely exists belongs to a piece still being
+            // written; zeroing it would remove it from libtorrent's wanted
+            // set and stall the very read that wants it.
+            let cached = store.is_piece_complete(info_hash, p as i32);
             let new_prio = if cached { 0 } else { prio };
             // Skip unchanged pieces on the ordinary path (O(changed)); the
             // in-memory cache is authoritative except after a recheck, whose
@@ -591,6 +593,10 @@ fn decide_priority(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::infrastructure::cache::CacheManager;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
 
     #[test]
     fn default_priority_is_zero() {
@@ -851,9 +857,6 @@ mod tests {
     /// released) is a no-op: it must not remove an unrelated live reader.
     #[test]
     fn release_of_unknown_id_leaves_other_readers_alone() {
-        use crate::infrastructure::cache::CacheManager;
-        use std::sync::{Arc, Mutex};
-
         let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
         s.init_torrent("hash", 4, 256).unwrap();
         s.readers.insert(
@@ -878,5 +881,94 @@ mod tests {
         assert_eq!(s.readers.get("hash").map(|r| r.len()), Some(1));
         assert_eq!(s.elevated_pieces("hash"), vec![2, 3]);
         assert!(s.prefetch.get("hash").is_none());
+    }
+
+    /// Test rig: a scheduler holding one torrent (4 pieces) plus a cache whose
+    /// piece 1 file exists on disk without a cache metadata entry — the state
+    /// libtorrent's custom storage leaves behind between the first block write
+    /// and the piece's registration.
+    fn in_flight_piece_rig() -> (TempDir, PieceStore, TorrentHandle) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PieceStore::new(Arc::new(Mutex::new(
+            CacheManager::new(dir.path(), 1024 * 1024).unwrap(),
+        )));
+        let piece_key = PieceStore::piece_key("hash", 1);
+        let path = {
+            let cache = store.cache_manager();
+            let cache = cache.lock().unwrap();
+            cache.ensure_piece_dir(&piece_key).unwrap()
+        };
+        std::fs::write(&path, vec![0xAB; 16]).unwrap();
+        let handle = TorrentHandle {
+            inner: std::ptr::null_mut(),
+            info_hash: "hash".to_string(),
+            session: std::ptr::null_mut(),
+        };
+        (dir, store, handle)
+    }
+
+    /// A piece that is still downloading must keep its priority: its file
+    /// exists from the first block write, but zeroing it would drop it from
+    /// libtorrent's wanted set and stall the read that wants it.
+    #[test]
+    fn recompute_keeps_in_flight_piece_wanted() {
+        let (_dir, store, handle) = in_flight_piece_rig();
+        store.register_piece("hash", 0, 16).unwrap();
+
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
+        s.init_torrent("hash", 4, 256 * 1024).unwrap();
+        s.readers.insert(
+            "hash".to_string(),
+            vec![ReadRange {
+                id: ReadId(1),
+                gradient: vec![7, 6, 0, 0],
+            }],
+        );
+
+        s.recompute(&handle, "hash", &store);
+
+        assert_eq!(
+            s.get_piece_priority("hash", 0),
+            0,
+            "a registered complete piece is a cache hit"
+        );
+        assert_eq!(
+            s.get_piece_priority("hash", 1),
+            6,
+            "an in-flight piece must keep its gradient priority"
+        );
+    }
+
+    /// The retained prefetch window must keep an in-flight piece: dropping it
+    /// removes the priority that drives its own download, and it would never
+    /// come back because `recompute` skips cached pieces.
+    #[test]
+    fn reader_release_retains_in_flight_piece_in_prefetch() {
+        let (_dir, store, handle) = in_flight_piece_rig();
+        store.register_piece("hash", 0, 16).unwrap();
+
+        let mut s = PieceScheduler::new(PiecePriorityConfig::default(), 1024 * 1024 * 1024);
+        s.init_torrent("hash", 4, 256 * 1024).unwrap();
+        s.readers.insert(
+            "hash".to_string(),
+            vec![ReadRange {
+                id: ReadId(1),
+                gradient: vec![7, 6, 0, 0],
+            }],
+        );
+
+        s.reader_released(&handle, "hash", ReadId(1), &store);
+
+        let retained = s.prefetch.get("hash").expect("gradient retained");
+        assert_eq!(retained[0], 0, "the cached piece is dropped from the window");
+        assert_eq!(
+            retained[1], 6,
+            "the in-flight piece stays in the retained prefetch window"
+        );
+        assert_eq!(
+            s.get_piece_priority("hash", 1),
+            6,
+            "its priority survives the recompute that follows the release"
+        );
     }
 }

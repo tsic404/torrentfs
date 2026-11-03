@@ -779,6 +779,13 @@ impl CacheManager {
         self.verified_piece_keys.contains(piece_key)
     }
 
+    /// Whether the piece is tagged incomplete — the C++ write path is still
+    /// filling its file.  Its metadata entry records download progress for
+    /// `.stats`; it is not a usable cache hit and must stay wanted.
+    pub fn is_piece_incomplete(&self, piece_key: &str) -> bool {
+        self.incomplete_piece_keys.contains(piece_key)
+    }
+
     /// All piece keys present in cache metadata but not yet marked verified.
     /// These are candidates for background SHA-1 verification after a restart
     /// pieces discovered by `scan_pieces_subdirectory` that may be
