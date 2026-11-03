@@ -432,7 +432,9 @@ mod tests {
         let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
         let store = PieceStore::new(cache);
 
-        let info_hash = "complete_only";
+        // The cache accepts only `{40|64 lowercase hex}:piece:{index}` keys, so
+        // the fixture carries a real-shaped hash instead of a descriptive label.
+        let info_hash = "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d";
         let piece_idx = 4;
         let piece_key = PieceStore::piece_key(info_hash, piece_idx);
         let path = {
