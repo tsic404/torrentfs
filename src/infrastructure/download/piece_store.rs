@@ -53,6 +53,21 @@ impl PieceStore {
             .unwrap_or(false)
     }
 
+    /// Whether the piece is registered in the cache as a completed download:
+    /// its metadata entry exists and it is not tagged incomplete.
+    ///
+    /// This is the only valid "already cached" test for scheduling: on-disk
+    /// existence is not evidence — the custom storage creates the piece file
+    /// at the first 16 KiB block write, while the metadata entry appears only
+    /// once the piece completes.
+    pub fn is_piece_complete(&self, info_hash: &str, piece_index: i32) -> bool {
+        let key = Self::piece_key(info_hash, piece_index);
+        self.cache
+            .lock()
+            .map(|c| c.has_piece(&key) && !c.is_piece_incomplete(&key))
+            .unwrap_or(false)
+    }
+
     /// Whether the piece file exists on disk with a real length reaching
     /// `expected` — a truncated file passes `Path::exists` but is not usable.
     pub fn has_piece_on_disk_at_least(&self, piece_key: &str, expected: u64) -> bool {
@@ -406,6 +421,42 @@ impl Drop for PieceReadLockGuard {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The piece scheduler's "already cached" test must not be satisfied by a
+    /// piece file that merely exists: the custom storage creates the file at
+    /// the first 16 KiB block write, so an in-flight (or timed-out partial)
+    /// piece would otherwise be forced to priority 0 and never finish.
+    #[test]
+    fn is_piece_complete_requires_registration_not_file_existence() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "complete_only";
+        let piece_idx = 4;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+
+        // Mid-download: the file exists (first block written) but nothing is
+        // registered — not a cache hit.
+        std::fs::write(&path, vec![0xDDu8; 16_384])?;
+        assert!(!store.is_piece_complete(info_hash, piece_idx));
+
+        // A read timed out and the partial piece was registered incomplete:
+        // still not a cache hit, its download must continue.
+        store.register_incomplete_piece(info_hash, piece_idx)?;
+        assert!(!store.is_piece_complete(info_hash, piece_idx));
+
+        // The piece finished: registered and verified → a cache hit.
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+        assert!(store.is_piece_complete(info_hash, piece_idx));
+
+        Ok(())
+    }
 
     /// after `delete_piece` purges a piece (file + metadata), the
     /// `has_piece_on_disk` check must return `false` — this is the signal the

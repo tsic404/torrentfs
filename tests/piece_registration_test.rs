@@ -221,19 +221,19 @@ fn test_background_prefetch_registers_via_piece_finished_alert() {
     // The wanted-set half of the verdict must attribute the priority drop to
     // the piece_finished alert, so every priority-zeroing source has to be
     // ruled out: (a) the init baseline at handle creation, (b) `recompute`
-    // forcing cached/on-disk pieces to 0 on reader events — and
-    // `has_piece_on_disk` checks mere file existence, so a piece only has to
-    // start downloading to qualify, (c) `recompute`'s idle bulk reset when
-    // nothing is wanted any more, and (d) `piece_ready`. The partial seeder
-    // keeps pieces 1..=3 off disk until after `reader_released` — the last
-    // reader event in this test — so (a) precedes the baseline the sampler
-    // records while the read is parked, (b) finds nothing on disk for them at
-    // the one remaining reader event and never runs again (no more reads, no
-    // recheck without a read, and the 1 GiB default cache cannot evict four
-    // pieces), (c) cannot fire because the released reader's gradient is
-    // retained as the prefetch window, and only (d) remains. An absolute
-    // `priority == 0` check cannot make this distinction: 0 is also the idle
-    // baseline, and on a fast host (b) reaches it without any alert.
+    // forcing registered-complete pieces to 0 on reader events — a piece only
+    // qualifies once its downloaded bytes are registered, which the alert path
+    // and the read path do, (c) `recompute`'s idle bulk reset when nothing is
+    // wanted any more, and (d) `piece_ready`. The partial seeder keeps pieces
+    // 1..=3 off disk until after `reader_released` — the last reader event in
+    // this test — so (a) precedes the baseline the sampler records while the
+    // read is parked, (b) finds nothing registered for them at the one
+    // remaining reader event and never runs again (no more reads, no recheck
+    // without a read, and the 1 GiB default cache cannot evict four pieces),
+    // (c) cannot fire because the released reader's gradient is retained as
+    // the prefetch window, and only (d) remains. An absolute `priority == 0`
+    // check cannot make this distinction: 0 is also the idle baseline, and on
+    // a fast host (b) reaches it without any alert.
     const BASELINE_ALLOWANCE_SECS: u64 = 30;
     const FIRST_READ_ALLOWANCE_SECS: u64 = 120;
     let (data, baseline) = thread::scope(|scope| {
