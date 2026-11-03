@@ -25,6 +25,7 @@ pub use domain::{
 };
 
 // other re-exports
+pub use domain::deadline_after;
 pub use domain::fs_error::{FsError, FsResult};
 pub use error::{is_transient_read_error, TorrentError, TorrentResult};
 pub use fuse::{FsService, TorrentFs};

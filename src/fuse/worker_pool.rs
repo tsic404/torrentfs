@@ -183,7 +183,7 @@ impl WorkerPool {
             }
             return true;
         };
-        let deadline = Instant::now() + grace;
+        let deadline = crate::domain::time::deadline_after(grace);
         let mut pending = handles;
         loop {
             pending.retain(|handle| !handle.is_finished());

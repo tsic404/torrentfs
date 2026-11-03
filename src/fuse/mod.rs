@@ -671,8 +671,9 @@ impl Filesystem for TorrentFs {
                     .as_ref()
                     .map(|ds| ds.read_wait_budget_secs())
                     .unwrap_or(self.read_timeout_secs);
-                let deadline = Instant::now()
-                    + Duration::from_secs(budget_secs.saturating_add(READ_DEADLINE_MARGIN_SECS));
+                let deadline = crate::domain::time::deadline_after(Duration::from_secs(
+                    budget_secs.saturating_add(READ_DEADLINE_MARGIN_SECS),
+                ));
 
                 // Coalesce concurrent readers of the same range onto one engine
                 // download; `insert` blocks the FUSE dispatch thread while the
