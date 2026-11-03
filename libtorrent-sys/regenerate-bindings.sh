@@ -29,3 +29,8 @@ cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked --root "$tools"
 
 # bindgen writes no trailing newline; the committed file ends like any source file.
 printf '\n' >> "$here/src/bindings.rs"
+
+# Digest of the header the bindings were generated from. `build.rs` compares it
+# against the checked-out header, so an edit to a signature or a struct layout
+# that was not regenerated fails the build instead of drifting silently.
+sha256sum "$here/wrapper/libtorrent_wrapper.h" | cut -d' ' -f1 > "$here/src/header.sha256"

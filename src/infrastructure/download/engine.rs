@@ -1880,7 +1880,12 @@ impl EngineState {
     /// and its handle/scheduler entries do not leak across add/remove cycles.
     fn remove_handle(&mut self, info_hash: &str) -> TorrentResult<()> {
         if let Some(handle) = self.handles.remove(info_hash) {
-            self.session.remove_torrent(handle, false);
+            // Detaching keeps the handle object alive; dropping it here runs
+            // `lt_torrent_handle_destroy`. `remove_files` stays false: C-3.2.8
+            // gives cache deletion to `TorrentService::remove_torrent`, which
+            // releases this handle first and purges `<pieces>/<info_hash>` only
+            // when no other row shares the info_hash.
+            drop(self.session.remove_torrent(handle, false));
         }
         self.scheduler.remove_torrent(info_hash);
         self.private_torrents.remove(info_hash);
@@ -2097,12 +2102,25 @@ impl EngineState {
             let status = handle.status()?;
             let piece_info = handle.get_file_piece_info(file_index)?;
             let (piece_length, num_pieces) = handle.get_torrent_info()?;
-            let file_start_offset = piece_info.file_offset as u64;
-            let file_size = info
-                .files()
+            let file_start_offset = u64::try_from(piece_info.file_offset).map_err(|_| {
+                TorrentError::InvalidFile(format!(
+                    "file index {file_index} reported a negative offset {}",
+                    piece_info.file_offset
+                ))
+            })?;
+            let files = info.files().map_err(|error| {
+                TorrentError::InvalidFile(format!("torrent file table unavailable: {error}"))
+            })?;
+            let file_size = usize::try_from(file_index)
                 .ok()
-                .and_then(|fs| fs.get(file_index as usize).map(|f| f.size))
-                .unwrap_or(u64::MAX);
+                .and_then(|index| files.get(index))
+                .map(|file| file.size)
+                .ok_or_else(|| {
+                    TorrentError::InvalidFile(format!(
+                        "file index {file_index} is outside the torrent's {} file(s)",
+                        files.len()
+                    ))
+                })?;
             (
                 piece_length as u64,
                 num_pieces as i32,
@@ -2120,8 +2138,12 @@ impl EngineState {
             )));
         }
 
-        let absolute_offset = file_start_offset + offset;
-        let file_end = file_start_offset + file_size;
+        let absolute_offset = file_start_offset.checked_add(offset).ok_or_else(|| {
+            TorrentError::InvalidFile("read offset overflows the torrent layout".to_string())
+        })?;
+        let file_end = file_start_offset.checked_add(file_size).ok_or_else(|| {
+            TorrentError::InvalidFile("file end overflows the torrent layout".to_string())
+        })?;
         let size = if absolute_offset < file_end {
             (std::cmp::min(size as u64, file_end - absolute_offset) as u32).max(1)
         } else {
@@ -2129,7 +2151,9 @@ impl EngineState {
         };
 
         let start_piece = (absolute_offset / piece_length) as i32;
-        let end_offset = absolute_offset + size as u64;
+        let end_offset = absolute_offset.checked_add(size as u64).ok_or_else(|| {
+            TorrentError::InvalidFile("read end overflows the torrent layout".to_string())
+        })?;
         let end_piece = if size > 0 {
             std::cmp::min(((end_offset - 1) / piece_length) as i32, num_pieces - 1)
         } else {

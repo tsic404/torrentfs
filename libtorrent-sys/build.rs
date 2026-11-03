@@ -42,6 +42,7 @@ fn main() {
         "probe/boost_probe.cpp",
         "probe/build_config_probe.cpp",
         "src/bindings.rs",
+        "src/header.sha256",
         "src/defines.rs",
     ] {
         println!("cargo:rerun-if-changed={watched}");
@@ -714,6 +715,30 @@ fn check_bindings(manifest_dir: &Path) {
             bindings_path.display(),
             missing.len(),
             missing.join(", ")
+        ));
+    }
+
+    // The name check above catches an added or removed declaration, not a
+    // changed signature or struct layout. The digest of the header the
+    // bindings were generated from is recorded next to them, so any header
+    // edit without regeneration fails the build; CI's regenerate-and-diff run
+    // catches a digest that was refreshed without regenerating.
+    let digest_path = manifest_dir.join("src/header.sha256");
+    let recorded = fs::read_to_string(&digest_path).unwrap_or_else(|error| {
+        fail(format!(
+            "cannot read {}: {error}; regenerate it with libtorrent-sys/regenerate-bindings.sh",
+            digest_path.display()
+        ))
+    });
+    let actual = sha256_of(&header_path);
+    if recorded.trim() != actual {
+        fail(format!(
+            "{} is stale: it records header digest {} but {} hashes to {}; \
+             regenerate the bindings with libtorrent-sys/regenerate-bindings.sh",
+            digest_path.display(),
+            recorded.trim(),
+            header_path.display(),
+            actual
         ));
     }
 }

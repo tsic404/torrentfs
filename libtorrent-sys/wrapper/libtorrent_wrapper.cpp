@@ -58,6 +58,64 @@ static bool torrentfs_diag_enabled() {
 #define TORRENTFS_DIAG(...) \
     do { if (torrentfs_diag_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
 
+// ── FFI exception fence ────────────────────────────────────────────────────
+// ADR-002: no C++ exception may cross the C ABI. Every exported function runs
+// its libtorrent-touching body inside this fence; the catch arms turn the
+// exception into the documented error channel — the error struct when the
+// signature carries one, the function's failure value otherwise — instead of
+// letting it reach std::terminate.
+// Outside the fence: only `free`/`delete` of objects whose destructors are
+// implicitly noexcept (a throwing member destructor would call std::terminate
+// before any catch arm could see it) and the compile-time constant
+// `lt_torrent_i2p_enabled`.
+
+// The single translation point from a C++ failure to `lt_error_t`: noexcept,
+// and allocation-free when the message itself cannot be stored. Callers that
+// carry a specific code write it back afterwards.
+static void lt_ffi_error_set(lt_error_t* error, const char* message) noexcept {
+    if (!error) return;
+    static thread_local std::string err_msg;
+    error->code = -1;
+    try {
+        err_msg = message ? message : "";
+        error->message = err_msg.c_str();
+    } catch (...) {
+        // Recording the failure must not allocate: a second bad_alloc would
+        // escape this noexcept function and call std::terminate — the outcome
+        // the fence exists to prevent. A string literal needs no allocation.
+        error->message = "out of memory while recording the error message";
+    }
+}
+
+#define LT_FFI_BEGIN try {
+#define LT_FFI_END(error, failure)                                          \
+    } catch (const std::exception& e) {                                     \
+        lt_ffi_error_set((error), e.what());                                \
+        fprintf(stderr, "[wrapper] C++ exception in %s: %s\n", __func__, e.what()); \
+        return failure;                                                     \
+    } catch (...) {                                                         \
+        lt_ffi_error_set((error), "unknown C++ exception");                  \
+        fprintf(stderr, "[wrapper] unknown C++ exception in %s\n", __func__); \
+        return failure;                                                     \
+    }
+#define LT_FFI_END_VOID(error)                                              \
+    } catch (const std::exception& e) {                                     \
+        lt_ffi_error_set((error), e.what());                                \
+        fprintf(stderr, "[wrapper] C++ exception in %s: %s\n", __func__, e.what()); \
+    } catch (...) {                                                         \
+        lt_ffi_error_set((error), "unknown C++ exception");                  \
+        fprintf(stderr, "[wrapper] unknown C++ exception in %s\n", __func__); \
+    }
+// Appended to a function that keeps its own typed catch arms (one that maps a
+// libtorrent error code, for instance): the generic arm still has to exist, or
+// a non-std exception would escape.
+#define LT_FFI_TAIL(error, failure)                                         \
+    catch (...) {                                                           \
+        lt_ffi_error_set((error), "unknown C++ exception");                  \
+        fprintf(stderr, "[wrapper] unknown C++ exception in %s\n", __func__); \
+        return failure;                                                     \
+    }
+
 // ── Per-info-hash shared mutex for read/write synchronization (TSI-2262) ──
 // The C++ PieceStorage::write_piece acquires an exclusive lock before writing
 // blocks to a piece file. The Rust PieceStore::read_piece acquires a shared
@@ -128,6 +186,17 @@ struct lt_session_wrapper {
     // Piece-cache root of a custom-storage session; empty for the plain
     // session, which keeps libtorrent's own storage.
     std::string piece_cache_dir;
+    // Rate sampling for the session-stats snapshot (C-6.2.2): libtorrent 2.1
+    // reports cumulative byte counters only, so the rates are the deltas
+    // between two samples over the elapsed time. Only the single alert-consumer
+    // thread (C-11.9) touches these.
+    int64_t stats_last_recv_bytes = -1;
+    int64_t stats_last_sent_bytes = -1;
+    std::chrono::steady_clock::time_point stats_last_sample{};
+    // Last computed one-second rates; a sample posted before the next full
+    // interval reuses them (see the session-stats branch).
+    int64_t stats_last_download_rate = 0;
+    int64_t stats_last_upload_rate = 0;
 };
 
 namespace {
@@ -234,22 +303,19 @@ lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error
         auto ti = new lt::torrent_info(std::string(filepath));
         return static_cast<lt_torrent_info_t>(ti);
     } catch (const lt::system_error& e) {
-        if (error) {
-            error->code = e.code().value();
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
+        // Never record the message by hand here: an allocation failing inside
+        // a handler is not caught by the later handlers of the same try, so it
+        // would leave the C ABI. `lt_ffi_error_set` is noexcept and falls back
+        // to a literal; the code is restored after it.
+        int code = e.code().value();
+        lt_ffi_error_set(error, e.what());
+        if (error) error->code = code;
         return nullptr;
     } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
+        lt_ffi_error_set(error, e.what());
         return nullptr;
     }
+    LT_FFI_TAIL(error, nullptr)
 }
 
 lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t size, lt_error_t* error) {
@@ -262,42 +328,29 @@ lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t
         lt::bdecode(reinterpret_cast<const char*>(data),
                     reinterpret_cast<const char*>(data) + size, node, ec);
         if (ec) {
-            if (error) {
-                error->code = ec.value();
-                static thread_local std::string err_msg;
-                err_msg = ec.message();
-                error->message = err_msg.c_str();
-            }
+            int code = ec.value();
+            lt_ffi_error_set(error, ec.message().c_str());
+            if (error) error->code = code;
             return nullptr;
         }
         lt::torrent_info ti(node, ec);
         if (ec) {
-            if (error) {
-                error->code = ec.value();
-                static thread_local std::string err_msg;
-                err_msg = ec.message();
-                error->message = err_msg.c_str();
-            }
+            int code = ec.value();
+            lt_ffi_error_set(error, ec.message().c_str());
+            if (error) error->code = code;
             return nullptr;
         }
         return static_cast<lt_torrent_info_t>(new lt::torrent_info(std::move(ti)));
     } catch (const lt::system_error& e) {
-        if (error) {
-            error->code = e.code().value();
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
+        int code = e.code().value();
+        lt_ffi_error_set(error, e.what());
+        if (error) error->code = code;
         return nullptr;
     } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
+        lt_ffi_error_set(error, e.what());
         return nullptr;
     }
+    LT_FFI_TAIL(error, nullptr)
 }
 
 void lt_torrent_info_destroy(lt_torrent_info_t info) {
@@ -309,39 +362,50 @@ void lt_torrent_info_destroy(lt_torrent_info_t info) {
 
 const char* lt_torrent_info_name(lt_torrent_info_t info) {
     if (!info) return nullptr;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     static thread_local std::string name;
     name = ti->name();
     return name.c_str();
+    LT_FFI_END(nullptr, nullptr)
 }
 
 uint64_t lt_torrent_info_total_size(lt_torrent_info_t info) {
     if (!info) return 0;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     return ti->total_size();
+    LT_FFI_END(nullptr, 0)
 }
 
 uint32_t lt_torrent_info_piece_length(lt_torrent_info_t info) {
     if (!info) return 0;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     return static_cast<uint32_t>(ti->piece_length());
+    LT_FFI_END(nullptr, 0)
 }
 
 uint32_t lt_torrent_info_num_pieces(lt_torrent_info_t info) {
     if (!info) return 0;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     return static_cast<uint32_t>(ti->num_pieces());
+    LT_FFI_END(nullptr, 0)
 }
 
 uint32_t lt_torrent_info_num_files(lt_torrent_info_t info) {
     if (!info) return 0;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     return static_cast<uint32_t>(ti->num_files());
+    LT_FFI_END(nullptr, 0)
 }
 
 int lt_torrent_info_get_files(lt_torrent_info_t info, lt_file_entry_t** files, uint32_t* count) {
     if (!info || !files || !count) return -1;
 
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     const lt::file_storage& fs = ti->files();
     auto n = static_cast<uint32_t>(fs.num_files());
@@ -363,6 +427,7 @@ int lt_torrent_info_get_files(lt_torrent_info_t info, lt_file_entry_t** files, u
     *files = out;
     *count = n;
     return 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 void lt_files_free(lt_file_entry_t* files) {
@@ -371,25 +436,25 @@ void lt_files_free(lt_file_entry_t* files) {
 
 int lt_torrent_info_get_info_hash(lt_torrent_info_t info, uint8_t* hash_out) {
     if (!info || !hash_out) return -1;
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     auto h = ti->info_hashes();
     auto sha1 = h.get_best();
     std::memcpy(hash_out, sha1.data(), 20);
     return 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint8_t* hash_out) {
     if (!info || !hash_out || piece_index < 0) return -1;
-    try {
-        auto ti = static_cast<lt::torrent_info*>(info);
-        if (piece_index >= ti->num_pieces()) return -1;
-        auto h = ti->hash_for_piece(lt::piece_index_t(piece_index));
-        if (h.is_all_zeros()) return -1;
-        std::memcpy(hash_out, h.data(), 20);
-        return 0;
-    } catch (const std::exception&) {
-        return -1;
-    }
+    LT_FFI_BEGIN
+    auto ti = static_cast<lt::torrent_info*>(info);
+    if (piece_index >= ti->num_pieces()) return -1;
+    auto h = ti->hash_for_piece(lt::piece_index_t(piece_index));
+    if (h.is_all_zeros()) return -1;
+    std::memcpy(hash_out, h.data(), 20);
+    return 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 // TSI-2277: Extract the private flag from the torrent info dict.
@@ -398,17 +463,16 @@ int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint
 // Returns 1 if private, 0 if not, -1 on error (null handle).
 int lt_torrent_info_is_private(lt_torrent_info_t info) {
     if (!info) return -1;
-    try {
-        auto ti = static_cast<lt::torrent_info*>(info);
-        return ti->priv() ? 1 : 0;
-    } catch (const std::exception&) {
-        return -1;
-    }
+    LT_FFI_BEGIN
+    auto ti = static_cast<lt::torrent_info*>(info);
+    return ti->priv() ? 1 : 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 lt_torrent_metadata_t* lt_torrent_info_get_metadata(lt_torrent_info_t info) {
     if (!info) return nullptr;
 
+    LT_FFI_BEGIN
     auto ti = static_cast<lt::torrent_info*>(info);
     auto* meta = new lt_torrent_metadata();
 
@@ -427,6 +491,7 @@ lt_torrent_metadata_t* lt_torrent_info_get_metadata(lt_torrent_info_t info) {
     meta->info_hash = h;
 
     return reinterpret_cast<lt_torrent_metadata_t*>(meta);
+    LT_FFI_END(nullptr, nullptr)
 }
 
 void lt_torrent_metadata_destroy(lt_torrent_metadata_t* metadata) {
@@ -437,7 +502,7 @@ void lt_torrent_metadata_destroy(lt_torrent_metadata_t* metadata) {
 }
 
 lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) {
-    try {
+    LT_FFI_BEGIN
         auto wrapper = new lt_session_wrapper();
         wrapper->session = new lt::session();
 
@@ -467,15 +532,7 @@ lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) 
         wrapper->session->apply_settings(settings);
 
         return static_cast<lt_session_t>(wrapper);
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 void lt_session_destroy(lt_session_t session) {
@@ -488,14 +545,11 @@ void lt_session_destroy(lt_session_t session) {
 
 lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error) {
     if (!session || !info) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid session or torrent info";
-        }
+        lt_ffi_error_set(error, "Invalid session or torrent info");
         return nullptr;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
@@ -515,27 +569,16 @@ lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error) {
     if (!session || !info) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid session or torrent info";
-        }
+        lt_ffi_error_set(error, "Invalid session or torrent info");
         return nullptr;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
@@ -557,26 +600,22 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 void lt_session_remove_torrent(lt_session_t session, lt_torrent_handle_t handle, int remove_files) {
-    if (session && handle) {
-        auto wrapper = static_cast<lt_session_wrapper*>(session);
-        auto h = static_cast<lt::torrent_handle*>(handle);
-        lt::remove_flags_t flags = remove_files ? lt::session::delete_files : lt::remove_flags_t{};
-        std::lock_guard<std::mutex> lock(wrapper->mutex);
-        wrapper->session->remove_torrent(*h, flags);
-        delete h;
-    }
+    if (!session || !handle) return;
+    LT_FFI_BEGIN
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    lt::remove_flags_t flags = remove_files ? lt::session::delete_files : lt::remove_flags_t{};
+    std::lock_guard<std::mutex> lock(wrapper->mutex);
+    wrapper->session->remove_torrent(*h, flags);
+    // The handle object is the caller's: destroying it here would turn every
+    // later call on the same pointer into a use-after-free instead of the
+    // `invalid_torrent_handle` error the fence reports. The Rust owner drops it
+    // through `lt_torrent_handle_destroy` right after this call.
+    LT_FFI_END_VOID(nullptr)
 }
 
 void lt_torrent_handle_destroy(lt_torrent_handle_t handle) {
@@ -588,18 +627,23 @@ void lt_torrent_handle_destroy(lt_torrent_handle_t handle) {
 
 int lt_torrent_handle_is_valid(lt_torrent_handle_t handle) {
     if (!handle) return 0;
+    LT_FFI_BEGIN
     auto h = static_cast<lt::torrent_handle*>(handle);
     return h->is_valid() ? 1 : 0;
+    LT_FFI_END(nullptr, 0)
 }
 
 int lt_torrent_handle_status(lt_torrent_handle_t handle, int* state, float* progress, uint64_t* total_done, uint64_t* total,
     int64_t* dl_rate, int64_t* ul_rate, int64_t* total_dl, int64_t* total_ul,
     int32_t* peers, int32_t* seeds) {
     if (!handle || !state || !progress || !total_done || !total) return -1;
-    
+
+    LT_FFI_BEGIN
     auto h = static_cast<lt::torrent_handle*>(handle);
-    if (!h->is_valid()) return -1;
-    
+    // No is_valid() pre-check: a torrent removed between the check and the
+    // call makes status() throw `invalid_torrent_handle`, and the fence turns
+    // that into this function's documented -1. A pre-check would only narrow
+    // the window, not close it.
     auto status = h->status();
     *state = static_cast<int>(status.state);
     *progress = status.progress;
@@ -612,43 +656,7 @@ int lt_torrent_handle_status(lt_torrent_handle_t handle, int* state, float* prog
     if (peers) *peers = status.num_peers;
     if (seeds) *seeds = status.num_seeds;
     return 0;
-}
-
-int lt_torrent_handle_read_piece(lt_session_t session, lt_torrent_handle_t handle, int piece_index, uint8_t** data_out, size_t* size_out, lt_error_t* error) {
-    (void)session; // session is no longer used for inline pop_alerts
-    if (!handle || !data_out || !size_out) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid arguments";
-        }
-        return -1;
-    }
-
-    auto h = static_cast<lt::torrent_handle*>(handle);
-    if (!h->is_valid()) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid torrent handle";
-        }
-        return -1;
-    }
-
-    try {
-        // Enqueue the read request — the actual data will arrive via
-        // read_piece_alert, consumed by the background AlertConsumer thread.
-        h->read_piece(lt::piece_index_t(piece_index));
-        *data_out = nullptr;
-        *size_out = 0;
-        return 0;
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return -1;
-    }
+    LT_FFI_END(nullptr, -1)
 }
 
 void lt_piece_data_free(uint8_t* data) {
@@ -659,20 +667,27 @@ void lt_piece_data_free(uint8_t* data) {
 
 int lt_torrent_handle_get_piece_info(lt_torrent_handle_t handle, int file_index, int64_t* first_piece, int64_t* num_pieces, int64_t* file_offset) {
     if (!handle || !first_piece || !num_pieces || !file_offset) return -1;
-    
+
+    LT_FFI_BEGIN
     auto h = static_cast<lt::torrent_handle*>(handle);
     if (!h->is_valid()) return -1;
-    
+
     auto t = h->torrent_file();
     if (!t) return -1;
-    
+
     const auto& fs = t->files();
-    
+
+    // `file_index` is an int at the ABI edge: a negative value compared as
+    // `lt::file_index_t` never satisfies `>= end_file()`, so it has to be
+    // rejected before the conversion, and the upper bound is checked against
+    // the torrent's own file count.
+    if (file_index < 0) return -1;
     lt::file_index_t fi(file_index);
     if (fi >= fs.end_file()) return -1;
-    
+
     auto file_size = fs.file_size(fi);
     auto piece_length = t->piece_length();
+    if (piece_length <= 0) return -1;
     auto file_offset_val = fs.file_offset(fi);
     
     int64_t start_piece = file_offset_val / piece_length;
@@ -684,33 +699,44 @@ int lt_torrent_handle_get_piece_info(lt_torrent_handle_t handle, int file_index,
     *file_offset = file_offset_val;
     
     return 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 int lt_torrent_handle_get_torrent_info(lt_torrent_handle_t handle, int64_t* piece_length, int64_t* num_pieces) {
     if (!handle || !piece_length || !num_pieces) return -1;
-    
+
+    LT_FFI_BEGIN
     auto h = static_cast<lt::torrent_handle*>(handle);
     if (!h->is_valid()) return -1;
-    
+
     auto t = h->torrent_file();
     if (!t) return -1;
-    
+
     *piece_length = t->piece_length();
     *num_pieces = t->num_pieces();
-    
+
     return 0;
+    LT_FFI_END(nullptr, -1)
 }
 
 int lt_torrent_handle_have_piece(lt_torrent_handle_t handle, int piece_index) {
-    if (!handle) return 0;
-    
+    // A negative index used to reach `status.pieces[-1]` — an out-of-range
+    // read. Anything outside the torrent's piece range is "not have".
+    if (!handle || piece_index < 0) return 0;
+
+    LT_FFI_BEGIN
     auto h = static_cast<lt::torrent_handle*>(handle);
     if (!h->is_valid()) return 0;
-    
-    auto status = h->status();
-    if (static_cast<int>(status.pieces.size()) <= piece_index) return 0;
-    
-    return status.pieces[lt::piece_index_t(piece_index)] ? 1 : 0;
+
+    auto t = h->torrent_file();
+    if (!t) return 0;
+    if (piece_index >= t->num_pieces()) return 0;
+
+    // `have_piece()` reads the piece-picker bit directly. The old
+    // `h->status()` built a whole torrent_status — including the complete
+    // piece bitfield — on every poll of every piece.
+    return h->have_piece(lt::piece_index_t(piece_index)) ? 1 : 0;
+    LT_FFI_END(nullptr, 0)
 }
 
 int lt_torrent_handle_set_piece_deadline(lt_torrent_handle_t handle, int piece_index, int deadline_ms) {
@@ -725,6 +751,7 @@ int lt_torrent_handle_set_piece_deadline(lt_torrent_handle_t handle, int piece_i
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 int lt_torrent_handle_set_piece_priority(lt_torrent_handle_t handle, int piece_index, int priority) {
@@ -741,6 +768,7 @@ int lt_torrent_handle_set_piece_priority(lt_torrent_handle_t handle, int piece_i
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int priority) {
@@ -764,6 +792,7 @@ int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int p
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 int lt_torrent_handle_unset_flags(lt_torrent_handle_t handle, uint64_t flags) {
@@ -778,6 +807,7 @@ int lt_torrent_handle_unset_flags(lt_torrent_handle_t handle, uint64_t flags) {
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags) {
@@ -792,6 +822,7 @@ int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags) {
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle) {
@@ -806,6 +837,7 @@ int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle) {
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 // Minimal JSON parser for flat settings objects
@@ -1236,10 +1268,12 @@ static lt::settings_pack build_settings_pack(const char* settings_json) {
 void lt_session_apply_settings(lt_session_t session, const char* settings_json) {
     if (!session) return;
 
+    LT_FFI_BEGIN
     auto pack = build_settings_pack(settings_json);
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
     wrapper->session->apply_settings(pack);
+    LT_FFI_END_VOID(nullptr)
 }
 
 static bool get_session_bool_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
@@ -1299,15 +1333,17 @@ static bool get_session_int_setting_impl(lt::settings_pack const& settings, cons
 
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out) {
     if (!session || !key || !out) return -1;
+    LT_FFI_BEGIN
+    // The lock lives inside the fence with the settings copy: `lock()` itself
+    // throws `std::system_error`, which was the exception still escaping.
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
-    try {
-        auto settings = wrapper->session->get_settings();
-        if (get_session_bool_setting_impl(settings, std::string(key), out)) {
-            return 0;
-        }
-    } catch (const std::exception&) {}
+    auto settings = wrapper->session->get_settings();
+    if (get_session_bool_setting_impl(settings, std::string(key), out)) {
+        return 0;
+    }
     return -1;
+    LT_FFI_END(nullptr, -1)
 }
 
 static bool get_session_str_setting_impl(lt::settings_pack const& settings, const std::string& key, std::string& out) {
@@ -1346,30 +1382,30 @@ static bool get_session_str_setting_impl(lt::settings_pack const& settings, cons
 
 int lt_session_get_str_setting(lt_session_t session, const char* key, char** out) {
     if (!session || !key || !out) return -1;
+    LT_FFI_BEGIN
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
-    try {
-        auto settings = wrapper->session->get_settings();
-        std::string val;
-        if (get_session_str_setting_impl(settings, std::string(key), val)) {
-            *out = strdup(val.c_str());
-            return *out ? 0 : -1;
-        }
-    } catch (const std::exception&) {}
+    auto settings = wrapper->session->get_settings();
+    std::string val;
+    if (get_session_str_setting_impl(settings, std::string(key), val)) {
+        *out = strdup(val.c_str());
+        return *out ? 0 : -1;
+    }
     return -1;
+    LT_FFI_END(nullptr, -1)
 }
 
 int lt_session_get_int_setting(lt_session_t session, const char* key, int* out) {
     if (!session || !key || !out) return -1;
+    LT_FFI_BEGIN
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
-    try {
-        auto settings = wrapper->session->get_settings();
-        if (get_session_int_setting_impl(settings, std::string(key), out)) {
-            return 0;
-        }
-    } catch (const std::exception&) {}
+    auto settings = wrapper->session->get_settings();
+    if (get_session_int_setting_impl(settings, std::string(key), out)) {
+        return 0;
+    }
     return -1;
+    LT_FFI_END(nullptr, -1)
 }
 
 // TSI-2547: report whether I2P support is compiled into this libtorrent build.
@@ -1400,6 +1436,8 @@ void lt_session_post_session_stats(lt_session_t session) {
     } catch (const std::exception&) {
         // Fire-and-forget: a failed stats request is not an error the
         // caller can act on; the next tick retries.
+    } catch (...) {
+        fprintf(stderr, "[wrapper] unknown C++ exception in %s\n", __func__);
     }
 }
 
@@ -1416,6 +1454,8 @@ void lt_session_post_torrent_updates(lt_session_t session) {
         wrapper->session->post_torrent_updates();
     } catch (const std::exception&) {
         // Fire-and-forget
+    } catch (...) {
+        fprintf(stderr, "[wrapper] unknown C++ exception in %s\n", __func__);
     }
 }
 // ── Helper: convert sha1_hash to hex string ──
@@ -1465,6 +1505,7 @@ static int alert_torrent_finished_is_complete(const lt::torrent_handle& h) {
 
 void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* user_data), void* user_data) {
     if (!session) return;
+    LT_FFI_BEGIN
     auto wrapper = static_cast<lt_session_wrapper*>(session);
 
     if (!callback) {
@@ -1480,6 +1521,7 @@ void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* us
     wrapper->session->set_alert_notify([callback, user_data]() {
         callback(user_data);
     });
+    LT_FFI_END_VOID(nullptr)
 }
 
 lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
@@ -1487,6 +1529,7 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
 
     auto wrapper = static_cast<lt_session_wrapper*>(session);
 
+    LT_FFI_BEGIN
     std::vector<lt::alert*> alerts;
     {
         std::lock_guard<std::mutex> lock(wrapper->mutex);
@@ -1539,19 +1582,60 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
                 // static data, so capture it once.
                 static std::vector<lt::stats_metric> const metrics =
                     lt::session_stats_metrics();
+                int64_t recv_bytes = -1;
+                int64_t sent_bytes = -1;
                 for (auto const& m : metrics) {
                     int idx = m.value_index;
                     if (idx < 0 || idx >= static_cast<int>(counters.size())) continue;
                     const char* name = m.name;
                     if (!name) continue;
                     std::string namestr(name);
-                    if (namestr == "net.recv_rate") out.download_rate = counters[idx];
-                    else if (namestr == "net.sent_rate") out.upload_rate = counters[idx];
-                    else if (namestr == "net.recv_bytes") out.total_downloaded = counters[idx];
-                    else if (namestr == "net.sent_bytes") out.total_uploaded = counters[idx];
+                    if (namestr == "net.recv_bytes") recv_bytes = counters[idx];
+                    else if (namestr == "net.sent_bytes") sent_bytes = counters[idx];
                     else if (namestr == "dht.dht_nodes") out.dht_nodes = static_cast<int32_t>(counters[idx]);
                     else if (namestr == "peer.num_peers_connected") out.peers_connected = static_cast<int32_t>(counters[idx]);
                     else if (namestr == "peer.num_peers_half_open") out.half_open_connections = static_cast<int32_t>(counters[idx]);
+                }
+                // libtorrent 2.1 publishes cumulative byte counters only —
+                // `net.recv_rate` / `net.sent_rate` do not exist, which is why
+                // the rate rows used to read 0 forever. The rate is the delta
+                // between two samples over the elapsed time.
+                //
+                // The rate is a one-second rate: a sample posted closer than
+                // that to the previous one reuses the last value instead of
+                // dividing a near-zero delta by a near-zero interval. Without
+                // that floor a second alert carrying the same counters (the
+                // engine posts per loop iteration while a read is parked)
+                // overwrote a valid rate with 0 in the same batch.
+                constexpr double RATE_SAMPLE_SECONDS = 1.0;
+                out.total_downloaded = recv_bytes > 0 ? recv_bytes : 0;
+                out.total_uploaded = sent_bytes > 0 ? sent_bytes : 0;
+                if (recv_bytes >= 0 && sent_bytes >= 0) {
+                    auto const now = std::chrono::steady_clock::now();
+                    bool const have_baseline =
+                        wrapper->stats_last_recv_bytes >= 0 && wrapper->stats_last_sent_bytes >= 0;
+                    double const seconds = have_baseline
+                        ? std::chrono::duration<double>(now - wrapper->stats_last_sample).count()
+                        : 0.0;
+                    if (have_baseline && seconds >= RATE_SAMPLE_SECONDS) {
+                        int64_t const recv_delta = recv_bytes - wrapper->stats_last_recv_bytes;
+                        int64_t const sent_delta = sent_bytes - wrapper->stats_last_sent_bytes;
+                        // A negative delta means the counters restarted with a
+                        // new session; report 0 rather than a bogus rate.
+                        wrapper->stats_last_download_rate =
+                            recv_delta >= 0 ? static_cast<int64_t>(recv_delta / seconds) : 0;
+                        wrapper->stats_last_upload_rate =
+                            sent_delta >= 0 ? static_cast<int64_t>(sent_delta / seconds) : 0;
+                        wrapper->stats_last_recv_bytes = recv_bytes;
+                        wrapper->stats_last_sent_bytes = sent_bytes;
+                        wrapper->stats_last_sample = now;
+                    } else if (!have_baseline) {
+                        wrapper->stats_last_recv_bytes = recv_bytes;
+                        wrapper->stats_last_sent_bytes = sent_bytes;
+                        wrapper->stats_last_sample = now;
+                    }
+                    out.download_rate = wrapper->stats_last_download_rate;
+                    out.upload_rate = wrapper->stats_last_upload_rate;
                 }
             }
             // ── torrent_finished_alert ──
@@ -1589,6 +1673,7 @@ lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
     }
 
     return list;
+    LT_FFI_END(nullptr, nullptr)
 }
 
 void lt_alert_list_destroy(lt_alert_list_t* list) {
@@ -1632,8 +1717,9 @@ static bool ensure_dir_recursive(const std::string& path) {
 
 class PieceStorage {
 public:
-    PieceStorage(const std::string& base_path, const std::string& info_hash_hex)
-        : m_base_path(base_path), m_info_hash_hex(info_hash_hex)
+    PieceStorage(const std::string& base_path, const std::string& info_hash_hex,
+        lt::file_storage const* files)
+        : m_base_path(base_path), m_info_hash_hex(info_hash_hex), m_files(files)
     {
         std::string full_path = m_base_path + "/" + m_info_hash_hex;
         if (!ensure_dir_recursive(full_path)) {
@@ -1641,6 +1727,16 @@ public:
                     full_path.c_str());
             throw std::runtime_error("Failed to create piece storage directory: " + full_path);
         }
+    }
+
+    // v2 piece length in bytes, i.e. excluding the v1 tail padding (BEP 52).
+    // The torrent's file layout owns the value; the storage only mirrors it.
+    int piece_size2(int piece_index) const {
+        if (!m_files || piece_index < 0
+            || lt::piece_index_t(piece_index) >= m_files->end_piece()) {
+            return -1;
+        }
+        return m_files->piece_size2(lt::piece_index_t(piece_index));
     }
 
     std::string get_info_hash_hex() const { return m_info_hash_hex; }
@@ -1782,24 +1878,22 @@ public:
         return h.final();
     }
 
-    lt::sha256_hash hash_piece_sha256(int piece_index, int piece_size) {
+    // SHA-256 of one v2 block: `size` bytes read from `offset` inside the
+    // piece file. A short read (piece truncated on disk) yields the zero hash,
+    // which never matches the torrent's expected block hash.
+    lt::sha256_hash hash_block_sha256(int piece_index, int offset, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) return lt::sha256_hash();
+        if (!file.is_open() || offset < 0 || size <= 0) return lt::sha256_hash();
+        file.seekg(offset);
+        std::vector<char> buf(static_cast<size_t>(size));
+        file.read(buf.data(), size);
+        if (file.gcount() != size) return lt::sha256_hash();
 
         SHA256_CTX ctx;
         SHA256_Init(&ctx);
-        std::vector<char> buf(16 * 1024);
-        int remaining = piece_size;
-        while (remaining > 0) {
-            int to_read = std::min(remaining, static_cast<int>(buf.size()));
-            file.read(buf.data(), to_read);
-            int actual = static_cast<int>(file.gcount());
-            if (actual == 0) break;
-            SHA256_Update(&ctx, buf.data(), actual);
-            remaining -= actual;
-        }
+        SHA256_Update(&ctx, buf.data(), buf.size());
         lt::sha256_hash result;
         SHA256_Final(reinterpret_cast<unsigned char*>(result.data()), &ctx);
         return result;
@@ -1822,15 +1916,30 @@ public:
         return data;
     }
 
+    // Drop the torrent's piece directory: every piece file and `.incomplete`
+    // marker first, then the directory itself. A plain rmdir() on a directory
+    // that still holds piece files always failed, so the cache of a deleted
+    // torrent was never reclaimed.
     void delete_piece_files() {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string dir = m_base_path + "/" + m_info_hash_hex;
+        DIR* dp = opendir(dir.c_str());
+        if (!dp) return;
+        while (struct dirent* entry = readdir(dp)) {
+            std::string name(entry->d_name);
+            if (name == "." || name == "..") continue;
+            ::unlink((dir + "/" + name).c_str());
+        }
+        closedir(dp);
         rmdir(dir.c_str());
     }
 
 private:
     std::string m_base_path;
     std::string m_info_hash_hex;
+    // Torrent layout, owned by the torrent_info of the torrent this storage
+    // belongs to. Only read for v2 piece geometry.
+    lt::file_storage const* m_files;
     mutable std::mutex m_mutex;
 };
 
@@ -1890,7 +1999,10 @@ public:
         std::string info_hash_hex = sha1_to_hex(p.info_hash);
         TORRENTFS_DIAG("[DIAG] new_torrent info_hash=%s\n",
                 info_hash_hex.c_str());
-        auto storage = std::make_unique<PieceStorage>(m_piece_cache_dir, info_hash_hex);
+        // The layout (and with it the v2 piece geometry) is owned by the
+        // torrent's torrent_info, which outlives this storage.
+        auto storage = std::make_unique<PieceStorage>(
+            m_piece_cache_dir, info_hash_hex, &p.files);
         lt::storage_index_t idx = m_next_index;
         ++m_next_index;
         m_storages[idx] = std::move(storage);
@@ -2035,22 +2147,36 @@ public:
         lt::sha1_hash hash = hasher.final();
 
         // Compute SHA256 for each v2 block in hybrid torrents.
-        // Each v2 block is a contiguous sub-range of the piece data.
-        // The v2 span has one entry per v2 block that overlaps this v1 piece.
+        // BEP 52 hashes the piece in fixed 16 KiB blocks; only the final block
+        // is short, and the range stops at `piece_size2` (the v2 piece length,
+        // which excludes v1 tail padding). Slicing the piece evenly
+        // (`data.size() / v2.size()`) instead folded padding bytes into the
+        // last block, so every padded piece failed v2 verification.
         if (!v2.empty()) {
-            size_t total = data.size();
-            size_t n = v2.size();
-            size_t block_sz = total / n;   // regular block size
-            for (size_t j = 0; j < n; ++j) {
-                size_t start = j * block_sz;
-                size_t end = (j == n - 1) ? total : (j + 1) * block_sz;
-                SHA256_CTX ctx;
-                SHA256_Init(&ctx);
-                SHA256_Update(&ctx, data.data() + start, end - start);
-                SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
+            int const piece_size2 = ps->piece_size2(piece_idx);
+            if (piece_size2 < 0 || static_cast<size_t>(piece_size2) > data.size()) {
+                TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%d => zero hashes\n",
+                        piece_idx, v2.size(), piece_size2);
+                for (auto& h : v2) h = lt::sha256_hash();
+            } else {
+                size_t const blocks = v2.size();
+                size_t const block_size = static_cast<size_t>(lt::default_block_size);
+                size_t const v2_size = static_cast<size_t>(piece_size2);
+                for (size_t j = 0; j < blocks; ++j) {
+                    size_t const start = j * block_size;
+                    if (start >= v2_size) {
+                        v2[j] = lt::sha256_hash();
+                        continue;
+                    }
+                    size_t const len = std::min(block_size, v2_size - start);
+                    SHA256_CTX ctx;
+                    SHA256_Init(&ctx);
+                    SHA256_Update(&ctx, data.data() + start, len);
+                    SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
+                }
+                TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%zu => populated\n",
+                        piece_idx, blocks, v2_size);
             }
-            TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu block_sz=%zu => populated\n",
-                    piece_idx, n, block_sz);
         }
 
         TORRENTFS_DIAG("[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
@@ -2062,13 +2188,15 @@ public:
         });
     }
 
-    // disk_interface: async_hash2
+    // disk_interface: async_hash2 — SHA-256 of the single v2 block at `offset`
+    // inside the piece. The offset is part of the contract: hashing the whole
+    // piece (the previous behaviour) returned a hash no block can match.
     void async_hash2(lt::storage_index_t storage, lt::piece_index_t piece,
-        int /*offset*/, lt::disk_job_flags_t /*flags*/,
+        int offset, lt::disk_job_flags_t /*flags*/,
         std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> handler) override
     {
-        TORRENTFS_DIAG("[DIAG] async_hash2 CALLED piece=%d\n",
-                static_cast<int>(piece));
+        TORRENTFS_DIAG("[DIAG] async_hash2 CALLED piece=%d offset=%d\n",
+                static_cast<int>(piece), offset);
         auto* ps = get_storage(storage);
         if (!ps) {
             TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => no storage\n", static_cast<int>(piece));
@@ -2079,9 +2207,11 @@ public:
             return;
         }
 
-        int piece_idx = static_cast<int>(piece);
-        int64_t sz = ps->piece_size(piece_idx);
-        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld\n", piece_idx, (long)sz);
+        int const piece_idx = static_cast<int>(piece);
+        int const piece_size2 = ps->piece_size2(piece_idx);
+        int64_t const sz = ps->piece_size(piece_idx);
+        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld offset=%d piece_size2=%d\n",
+                piece_idx, (long)sz, offset, piece_size2);
         if (sz <= 0) {
             TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
@@ -2091,9 +2221,20 @@ public:
             return;
         }
 
-        lt::sha256_hash hash = ps->hash_piece_sha256(piece_idx, static_cast<int>(sz));
-        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
-                piece_idx, static_cast<int>(sz),
+        if (piece_size2 <= 0 || offset < 0 || offset >= piece_size2) {
+            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d outside piece_size2=%d\n",
+                    piece_idx, offset, piece_size2);
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::invalid_argument, boost::system::generic_category())));
+            });
+            return;
+        }
+
+        int const block_len = std::min<int>(lt::default_block_size, piece_size2 - offset);
+        lt::sha256_hash hash = ps->hash_block_sha256(piece_idx, offset, block_len);
+        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d len=%d hash=%02x%02x%02x%02x... => posted\n",
+                piece_idx, offset, block_len,
                 (unsigned char)hash[0], (unsigned char)hash[1],
                 (unsigned char)hash[2], (unsigned char)hash[3]);
         boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
@@ -2268,14 +2409,11 @@ lt_session_t lt_session_create_with_custom_storage(
     const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
 {
     if (!piece_cache_dir || !*piece_cache_dir) {
-        if (error) {
-            error->code = -1;
-            error->message = "piece_cache_dir is required";
-        }
+        lt_ffi_error_set(error, "piece_cache_dir is required");
         return nullptr;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto wrapper = new lt_session_wrapper();
 
         // TSI-2068: Always pass a non-empty JSON to build_settings_pack so
@@ -2359,15 +2497,7 @@ lt_session_t lt_session_create_with_custom_storage(
         wrapper->session = new lt::session(std::move(params));
 
         return static_cast<lt_session_t>(wrapper);
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 // ============================================================================
@@ -2381,14 +2511,11 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
     const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
 {
     if (!session || !info) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid session or torrent info";
-        }
+        lt_ffi_error_set(error, "Invalid session or torrent info");
         return nullptr;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
@@ -2407,15 +2534,7 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
@@ -2423,14 +2542,11 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
     const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
 {
     if (!session || !info) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid session or torrent info";
-        }
+        lt_ffi_error_set(error, "Invalid session or torrent info");
         return nullptr;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
@@ -2449,15 +2565,7 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return nullptr;
-    }
+    LT_FFI_END(error, nullptr)
 }
 
 // ============================================================================
@@ -2475,10 +2583,12 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
 // the piece file via Rust's std::fs::read.
 void lt_lock_piece_read(const char* info_hash_hex) {
     if (!info_hash_hex || !*info_hash_hex) return;
+    LT_FFI_BEGIN
     // get_piece_lock returns a shared_ptr copy, so the mutex outlives
     // the map entry even if a concurrent remove_torrent happens.
     auto lock = get_piece_lock(std::string(info_hash_hex));
     lock->lock_shared();
+    LT_FFI_END_VOID(nullptr)
 }
 
 // Release a previously-acquired shared (read) lock.
@@ -2489,10 +2599,12 @@ void lt_lock_piece_read(const char* info_hash_hex) {
 // unlocking a mutex that was never locked.
 void lt_unlock_piece_read(const char* info_hash_hex) {
     if (!info_hash_hex || !*info_hash_hex) return;
+    LT_FFI_BEGIN
     auto lock = find_piece_lock(std::string(info_hash_hex));
     if (lock) {
         lock->unlock_shared();
     }
+    LT_FFI_END_VOID(nullptr)
 }
 
 // ============================================================================
@@ -2538,14 +2650,11 @@ static std::string trackers_to_json(const std::vector<std::pair<int, std::string
 
 int lt_torrent_info_trackers(lt_torrent_info_t info, char** out_json, lt_error_t* error) {
     if (!info || !out_json) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid arguments";
-        }
+        lt_ffi_error_set(error, "Invalid arguments");
         return -1;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto ti = static_cast<lt::torrent_info*>(info);
 
         // torrent_info::trackers() returns the merged list from both
@@ -2558,22 +2667,11 @@ int lt_torrent_info_trackers(lt_torrent_info_t info, char** out_json, lt_error_t
         std::string json = trackers_to_json(trackers);
         *out_json = strdup(json.c_str());
         if (!*out_json) {
-            if (error) {
-                error->code = -1;
-                error->message = "strdup failed";
-            }
+            lt_ffi_error_set(error, "strdup failed");
             return -1;
         }
         return 0;
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return -1;
-    }
+    LT_FFI_END(error, -1)
 }
 
 // Minimal JSON array parser for tracker replacement.
@@ -2644,42 +2742,25 @@ static int parse_trackers_json(const char* json, std::vector<lt::announce_entry>
 
 int lt_torrent_handle_replace_trackers(lt_torrent_handle_t handle, const char* trackers_json, lt_error_t* error) {
     if (!handle || !trackers_json) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid arguments";
-        }
+        lt_ffi_error_set(error, "Invalid arguments");
         return -1;
     }
 
     auto h = static_cast<lt::torrent_handle*>(handle);
     if (!h->is_valid()) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid torrent handle";
-        }
+        lt_ffi_error_set(error, "Invalid torrent handle");
         return -1;
     }
 
-    try {
+    LT_FFI_BEGIN
         std::vector<lt::announce_entry> trackers;
         if (parse_trackers_json(trackers_json, trackers) != 0) {
-            if (error) {
-                error->code = -1;
-                error->message = "Failed to parse trackers JSON";
-            }
+            lt_ffi_error_set(error, "Failed to parse trackers JSON");
             return -1;
         }
         h->replace_trackers(trackers);
         return 0;
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return -1;
-    }
+    LT_FFI_END(error, -1)
 }
 
 int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle) {
@@ -2694,6 +2775,7 @@ int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle) {
     } catch (const std::exception&) {
         return -1;
     }
+    LT_FFI_TAIL(nullptr, -1)
 }
 
 // TSI-2277: Extract the current tracker list from a torrent_handle.
@@ -2702,20 +2784,14 @@ int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle) {
 // tracker merge logic to get the existing handle's trackers for dedup.
 int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char** out_json, lt_error_t* error) {
     if (!handle || !out_json) {
-        if (error) {
-            error->code = -1;
-            error->message = "Invalid arguments";
-        }
+        lt_ffi_error_set(error, "Invalid arguments");
         return -1;
     }
 
-    try {
+    LT_FFI_BEGIN
         auto h = static_cast<lt::torrent_handle*>(handle);
         if (!h->is_valid()) {
-            if (error) {
-                error->code = -1;
-                error->message = "Invalid torrent handle";
-            }
+            lt_ffi_error_set(error, "Invalid torrent handle");
             return -1;
         }
 
@@ -2729,22 +2805,11 @@ int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char** out_json, lt_e
         std::string json = trackers_to_json(trackers);
         *out_json = strdup(json.c_str());
         if (!*out_json) {
-            if (error) {
-                error->code = -1;
-                error->message = "strdup failed";
-            }
+            lt_ffi_error_set(error, "strdup failed");
             return -1;
         }
         return 0;
-    } catch (const std::exception& e) {
-        if (error) {
-            error->code = -1;
-            static thread_local std::string err_msg;
-            err_msg = e.what();
-            error->message = err_msg.c_str();
-        }
-        return -1;
-    }
+    LT_FFI_END(error, -1)
 }
 
 void lt_string_free(char* str) {
