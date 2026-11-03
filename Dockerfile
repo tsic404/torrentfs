@@ -1,13 +1,19 @@
 # Stage 1: Build
-FROM debian:sid-slim AS builder
+# The base image is pinned by digest: `sid-slim` is a rolling tag, so an
+# unpinned build can compile against a tree CI never tested. The digest is the
+# multi-arch index, so the amd64 and arm64 builds resolve the same content.
+FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae AS builder
 
 # Install Rust toolchain + the build chain: libtorrent and the Boost headers are
 # fetched and compiled by the crate's build script, so only a C++17 compiler and
 # openssl are needed here; the FUSE layer is pure Rust and links no libfuse.
+# The toolchain is pinned to one release for the same reason as the base image —
+# CI installs the identical version (see .github/workflows/ci.yml).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates build-essential libssl-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain 1.99.1
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -15,12 +21,14 @@ WORKDIR /build
 
 COPY . .
 
+# `--locked` fails the build when Cargo.lock would have to change, so the image
+# carries exactly the dependency graph CI resolved and tested.
 RUN --mount=type=cache,target=/root/.cargo/registry \
-    cargo build --release && \
+    cargo build --release --locked && \
     cp target/release/torrentfs /torrentfs
 
 # Stage 2: Runtime
-FROM debian:sid-slim
+FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae
 
 # libtorrent, its C ABI wrapper and the C++ runtime are statically linked into
 # /usr/local/bin/torrentfs: the binary's DT_NEEDED carries no libstdc++ /
@@ -59,6 +67,14 @@ RUN touch /etc/fuse.conf \
 
 COPY --from=builder /torrentfs /usr/local/bin/torrentfs
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# Up until now the image reported "running" for a container whose daemon had
+# died: the entrypoint stays alive only while the daemon runs, and a wedged
+# FUSE session answers nothing. The probe stays dependency-free (no procps in
+# the runtime stage) and only asserts that the daemon process exists; the
+# mount itself is judged by the entrypoint's own readiness and recovery paths.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD grep -qs '^torrentfs$' /proc/[0-9]*/comm || exit 1
 
 # stop_timeout must be raised at the runtime layer (see README Container
 # Deployment): the image cannot override podman/docker's default 10s

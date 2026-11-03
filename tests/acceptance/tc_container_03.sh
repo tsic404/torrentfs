@@ -10,19 +10,19 @@
 # inside it, so the SQLite DB and the piece cache survive the stop/start.  The
 # swarm is synthesized inside that container from the shipped fixtures
 # (`lib_container_swarm.sh`, `lib_swarm.pl`), so the host needs docker only —
-# no build step on the host and no seeder binary to build.  A container stop kills the
-# tracker and the seeder with the daemon, so the second read has no peer at
-# all: a byte-exact read that finishes fast can only come from the cache.  On
-# restart the daemon's own cache-verification summary must report every cached
-# piece verified from disk, and the second read must stay inside the cache-hit
-# time bound with no no-seeder fallback.  The global cache counters are printed
-# as non-gating evidence only: they are a non-blocking snapshot and may render
-# as zero while another reader holds the cache lock (C-6.5.1).
-# Self-gating: SKIP (exit 2) when docker, /dev/fuse or a successful image build
-# is unavailable.
+# no build step on the host and no seeder binary to build.  A container stop
+# kills the tracker and the seeder with the daemon, so the second read has no
+# peer at all: a byte-exact read that finishes fast can only come from the
+# cache.  On restart the daemon's own cache-verification summary must report
+# all 16 pieces verified from disk, and the second read must stay inside the
+# cache-hit time bound with no no-seeder fallback.  The global cache counters
+# are printed as non-gating evidence only: they are a non-blocking snapshot and
+# may render as zero while another reader holds the cache lock (C-6.5.1).
+# Self-gating: SKIP (exit 2) when docker or /dev/fuse is unavailable; a failed
+# image build is a real failure (exit 1).
 #
 # Usage: ./tests/acceptance/tc_container_03.sh [image]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).
 #
 # Every external call is bounded (docker subcommands, the swarm startup, the
 # in-container reads).  A hung call fails the case with a diagnostic instead
@@ -85,7 +85,7 @@ if [ -z "$IMAGE_ID" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
         fail "docker build hung (rc=$rc)"
     fi
-    [ "$rc" -eq 0 ] || skip "docker build failed (rc=$rc)"
+    [ "$rc" -eq 0 ] || fail "docker build failed (rc=$rc)"
 fi
 
 container_running() {

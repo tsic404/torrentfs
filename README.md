@@ -101,6 +101,23 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 A `--user <uid>:<gid>` run cannot chown: there the daemon user must already be
 able to write the paths it is given.
 
+The `--cache` directory and the `--db` file must be absolute and may not be a
+system directory (`/var/lib`, `/usr/bin`, …): either is rejected with exit 2
+before the daemon starts.
+
+`--log-file` must be absolute, and its parent directory may not be `/`: a
+relative path, or `/torrentfs.log`, exits 1 and the reason goes to stderr.
+
+The parent directory is not checked against the state-path list: `/var/lib` is
+accepted as a `--log-file` parent, and the entrypoint then creates it if
+missing and hands *that directory* to the daemon user — it is the leaf of the
+operation, not a path below it. Use a dedicated directory
+(`/var/log/torrentfs/torrentfs.log`), never `/var/lib` itself.
+
+Both checks run whichever identity starts the container, before torrentfs
+itself, so a `--user <uid>:<gid>` run is rejected the same way; only the chown
+and the directory creation that follow them are root-only.
+
 ### Shutdown, restart, and stale mounts
 
 `docker stop` / `podman stop` send SIGTERM first: torrentfs drains the download
@@ -131,9 +148,14 @@ Two defenses live inside the image:
 - **Exit-side detach.** On shutdown the entrypoint detaches any FUSE mount the
   daemon failed to unmount itself (`fusermount3 -u` / `fusermount -u`, then
   `umount -l`), so a daemon that exits without a clean unmount does not leave a
-  stale host mount behind. If the detach itself fails after a clean daemon exit
+  stale host mount behind. The bind mount that publishes the filesystem to the
+  host goes through the same chain: a reader still holding the dead mount makes
+  a plain `umount` fail `EBUSY`, so it falls back to `umount -l` and verifies
+  the entry is gone. If the detach itself fails after a clean daemon exit
   (status 0), the entrypoint exits `103` so the cleanup failure is not mistaken
-  for a clean shutdown.
+  for a clean shutdown. A stop signal is honoured in every window — during the
+  readiness wait and during the recovery backoff as well — so a `docker stop`
+  that lands mid-restart still ends in a clean unmount instead of a `SIGKILL`.
 - **Startup probe.** For container-only mounts (rootless podman / non-root
   `--user`, where the stale mount lives inside the container and the engine can
   still start it), the entrypoint probes the mountpoint for `ENOTCONN` at
@@ -142,8 +164,10 @@ Two defenses live inside the image:
   underneath a *live* mount (kernel abort, forced unmount): every in-flight
   request fails with `ECONNABORTED`, every later one with `ENOTCONN`, and the
   mount is dead while the daemon still runs. The daemon reports that loss with
-  status `104` — distinct from `102`, which stays reserved for an external
-  `fusermount -u` — and the entrypoint restarts it (bounded to 3 attempts),
+  status `104` — distinct from `102`, which covers an external `fusermount -u`
+  **and** the entrypoint's own refusal to start the `:shared` bind recipe under
+  rootless podman (the flag is silently ignored there, so the host could never
+  see the mount) — and the entrypoint restarts it (bounded to 3 attempts),
   re-mounting and re-publishing the bind mount, so the container recovers
   without a `docker restart`. An intentional unmount still stops the container.
 

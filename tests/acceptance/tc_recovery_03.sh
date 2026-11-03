@@ -26,9 +26,9 @@
 # state SIGTERM contract this case is about.
 #
 # Usage: ./tests/acceptance/tc_recovery_03.sh [image]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.  A scenario
-# the environment refuses (no usable FUSE device) counts as 2 as well: a case
-# that asserted nothing must never read as passed.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).  A
+# scenario the environment refuses (no usable FUSE device) counts as 2 as well:
+# a case that asserted nothing must never read as passed.
 #
 # Every external call is bounded (docker subcommands, the readiness poll); a
 # hung call fails the case with a diagnostic instead of stalling the job.
@@ -84,7 +84,7 @@ if [ -z "$IMAGE_ID" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
         fail "docker build hung (rc=$rc)"
     fi
-    [ "$rc" -eq 0 ] || skip "docker build failed (rc=$rc)"
+    [ "$rc" -eq 0 ] || fail "docker build failed (rc=$rc)"
 fi
 
 # Container log (stdout+stderr), bounded like every other external call.

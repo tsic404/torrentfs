@@ -14,8 +14,8 @@
 # image only — no build step on the host, no host-side Perl.
 #
 # Requires: docker + /dev/fuse + a host directory on a shared mount.  Self-
-# gating: SKIP (exit 2) when the environment cannot provide docker + /dev/fuse
-# + a successful image build.
+# gating: SKIP (exit 2) when the environment cannot provide docker + /dev/fuse;
+# a failed image build is a real failure (exit 1).
 #
 # The host directory must live on a shared mount for the FUSE mount to
 # propagate to the host (see README "bind-propagation=rshared"); when the
@@ -25,7 +25,7 @@
 # modified.
 #
 # Usage: ./tests/acceptance/tc_container_02.sh [image] [host-dir]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).
 #
 # Every external call is bounded (docker subcommands, host-side reads/writes
 # through the propagated FUSE mount, mount/umount helpers).  A hung call fails
@@ -62,8 +62,8 @@ if [ -z "$IMAGE_ID" ]; then
         exit 1
     fi
     [ "$rc" -eq 0 ] || {
-        echo "TC-container-02: SKIP — docker build failed (rc=$rc)" >&2
-        exit 2
+        echo "TC-container-02: FAIL — docker build failed (rc=$rc)" >&2
+        exit 1
     }
 fi
 

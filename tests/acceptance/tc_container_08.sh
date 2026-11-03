@@ -18,7 +18,7 @@
 # stdout stream — a merge in either direction fails the case.
 #
 # Usage: ./tests/acceptance/tc_container_08.sh [image]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).
 #
 # Every external call is bounded; a hung read or docker subcommand fails the
 # case instead of stalling the job.
@@ -93,7 +93,7 @@ if [ -z "$IMAGE_ID" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
         fail "docker build hung (rc=$rc)"
     fi
-    [ "$rc" -eq 0 ] || skip "docker build failed (rc=$rc)"
+    [ "$rc" -eq 0 ] || fail "docker build failed (rc=$rc)"
 fi
 
 # ── positive control: the non-TTY collection channel itself ─────────────────
