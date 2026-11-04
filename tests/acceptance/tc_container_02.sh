@@ -5,15 +5,17 @@
 # a read-only errno (`docs/03-acceptance.md` §H AC-71).
 #
 # Container-level executable form.  Runs the production image (entrypoint +
-# rshared mount) in a rootful FUSE-capable container with host networking, so
-# the local tracker/seeder started here is reachable at loopback.  The
+# rshared mount) in a rootful FUSE-capable container with host networking.  The
 # container mountpoint is `/mnt` — the container-side path of the rshared bind
 # — while `$HOST_DIR` is the host source directory.
 #
-# Requires: docker + /dev/fuse, the release binary and the self-seed example
-# (`cargo build --release --example torrentfs-selfseed-env`).  Self-gating:
-# SKIP (exit 2) when the environment cannot provide docker + /dev/fuse + a
-# successful image build.
+# The swarm is synthesized inside that container from the shipped fixtures
+# (`lib_container_swarm.sh`, `lib_swarm.pl`): the host needs docker and the
+# image only — no build step on the host, no host-side Perl.
+#
+# Requires: docker + /dev/fuse + a host directory on a shared mount.  Self-
+# gating: SKIP (exit 2) when the environment cannot provide docker + /dev/fuse
+# + a successful image build.
 #
 # The host directory must live on a shared mount for the FUSE mount to
 # propagate to the host (see README "bind-propagation=rshared"); when the
@@ -74,9 +76,11 @@ else
 fi
 HOST_DIR_SHARED=0
 SEED_OUT="$(mktemp -d)"
+# shellcheck source=/dev/null
+SWARM_HOST_DIR="$SEED_OUT"
+source "$ROOT_DIR/tests/acceptance/lib_container_swarm.sh"
 
 CONTAINER="tc-container-02-$$"
-SEEDER_PID=""
 RUN_DIR="$HOST_DIR/run.$$.${RANDOM}"
 MOUNT_HOST="$RUN_DIR/mnt"
 PROBE_OUT="$RUN_DIR/probe.out"
@@ -99,12 +103,6 @@ cleanup() {
         timeout 30 docker stop -t 20 "$CONTAINER" >/dev/null 2>&1 || true
     fi
     timeout 20 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-    if [ -n "$SEEDER_PID" ]; then
-        for child in $(pgrep -P "$SEEDER_PID" 2>/dev/null || true); do
-            kill "$child" 2>/dev/null || true
-        done
-        kill "$SEEDER_PID" 2>/dev/null || true
-    fi
     for _ in $(seq 1 10); do
         # mountinfo lists stale (ENOTCONN) mounts too, unlike `mountpoint`.
         grep -q " $MOUNT_HOST " /proc/self/mountinfo 2>/dev/null || break
@@ -180,29 +178,11 @@ probe() {
 
 trap cleanup EXIT
 
-# Local tracker + seeder (loopback); the container joins the host network so
-# the announce URL resolves inside it.
-"$ROOT_DIR/ci/run_self_seed_env.sh" \
-    --tracker-bind 127.0.0.1 --announce-host 127.0.0.1 \
-    --output-dir "$SEED_OUT" >/dev/null 2>&1 &
-SEEDER_PID=$!
-DEADLINE=$((SECONDS + 180))
-while [ "$SECONDS" -lt "$DEADLINE" ]; do
-    [ -f "$SEED_OUT/selfseed.torrent" ] && break
-    kill -0 "$SEEDER_PID" 2>/dev/null || {
-        echo "TC-container-02: FAIL — self-seed environment exited before producing a torrent" >&2
-        exit 1
-    }
-    sleep 1
-done
-[ -f "$SEED_OUT/selfseed.torrent" ] || {
-    echo "TC-container-02: FAIL — self-seed environment did not produce a torrent within 180s" >&2
-    exit 1
-}
-
 timeout 120 docker run -d --name "$CONTAINER" \
     --device /dev/fuse --cap-add SYS_ADMIN --network host \
     --security-opt apparmor=unconfined \
+    -v "$SEED_OUT:/seed" \
+    -v "$ROOT_DIR/tests/acceptance:/fixtures:ro" \
     --mount "type=bind,source=$MOUNT_HOST,target=/mnt,bind-propagation=rshared" \
     "$IMAGE" /mnt >/dev/null || {
     echo "TC-container-02: FAIL — docker run failed or did not return within 120s" >&2
@@ -219,6 +199,15 @@ container_running || {
     { timeout 10 docker logs "$CONTAINER" 2>&1 | tail -20 >&2; } || true
     exit 1
 }
+
+# The swarm lives inside the container under test (its own Perl + the shipped
+# fixtures); the host side below only drives the shared mount.
+echo "TC-container-02: starting the local swarm inside the container…"
+swarm_start "$CONTAINER" || {
+    echo "TC-container-02: FAIL — the in-container swarm fixtures did not start" >&2
+    exit 1
+}
+echo "  swarm: tracker=$SWARM_TRACKER_URL pieces=$SWARM_PIECE_COUNT"
 
 # Wait until the entrypoint published the FUSE mount on both the container
 # path (/mnt) and the host-side shared directory before writing the torrent
@@ -242,18 +231,42 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
     sleep 1
 done
 [ "$READY" -eq 1 ] || {
-    echo "TC-container-02: FAIL — mount not visible on both sides within the 120s deadline" >&2
+    # The SKIP below is only for a host whose directory cannot propagate: it
+    # requires the container side to have published data/ and metadata/ by
+    # itself.  A container that never published is a real failure of the mount
+    # this case exists to catch, and must not hide behind the host's mount
+    # propagation setting (tc_container_01.sh takes the same unconditional
+    # FAIL when either side is missing).
+    INNER="$(timeout 5 docker exec "$CONTAINER" ls /mnt 2>/dev/null || true)"
     echo "  container /mnt: [$INNER]" >&2
     echo "  host metadata dir exists: $(timeout -k 2 "$HOST_IO_TIMEOUT" test -d "$MOUNT_HOST/metadata" && echo yes || echo no)" >&2
-    echo "  (host visibility needs the host directory on a shared mount:" >&2
-    echo "   mount --bind <dir> <dir> && mount --make-shared <dir>)" >&2
+    if ! grep -qx "data" <<<"$INNER" || ! grep -qx "metadata" <<<"$INNER"; then
+        echo "TC-container-02: FAIL — the container never published data/ and metadata/ on /mnt within the 120s deadline" >&2
+        { timeout 10 docker logs "$CONTAINER" 2>&1 | tail -20 >&2; } || true
+        exit 1
+    fi
+    HOST_PROPAGATION="$(timeout 5 findmnt -no PROPAGATION --target "$HOST_DIR" 2>/dev/null || true)"
+    if [ "$HOST_DIR_SHARED" -eq 1 ] || [[ "$HOST_PROPAGATION" == *shared* ]]; then
+        echo "TC-container-02: FAIL — the container published the mount but the host side does not show it within the 120s deadline" >&2
+        { timeout 10 docker logs "$CONTAINER" 2>&1 | tail -20 >&2; } || true
+        exit 1
+    fi
+    if [ -n "$HOST_PROPAGATION" ]; then
+        # Container side proven ready, and the only gap is the host directory
+        # being on a private mount: the container's rshared bind can never
+        # publish the FUSE mount back to the host, whatever the carrier does.
+        # That is the environment (the contract's exit 2), not a mount defect.
+        echo "TC-container-02: SKIP — container /mnt lists data/ and metadata/, but host directory $HOST_DIR is on a '$HOST_PROPAGATION' mount; rshared propagation needs a shared host mount (mount --bind <dir> <dir> && mount --make-shared <dir>), or pass a shared directory as the second argument" >&2
+        exit 2
+    fi
+    echo "TC-container-02: FAIL — mount not visible on both sides within the 120s deadline" >&2
     { timeout 10 docker logs "$CONTAINER" 2>&1 | tail -20 >&2; } || true
     exit 1
 }
 
 # Host-side write: copy the torrent into the host-visible metadata/.
 host_run 60 "cp $MOUNT_HOST/metadata/selfseed.torrent" \
-    cp "$SEED_OUT/selfseed.torrent" "$MOUNT_HOST/metadata/selfseed.torrent"
+    cp "$SWARM_TORRENT" "$MOUNT_HOST/metadata/selfseed.torrent"
 
 # The data/ projection must appear through the host side in real time.
 PROJECTION="$MOUNT_HOST/data/selfseed.torrent/selfseed"
@@ -270,7 +283,7 @@ host_test -e "$PROJECTION" || {
 
 # Host-side read: bytes must equal the authoritative payload, and the stat
 # size must match it.
-AUTHORITATIVE_SIZE="$(stat -c '%s' "$SEED_OUT/payload.txt")"
+AUTHORITATIVE_SIZE="$(stat -c '%s' "$SWARM_PAYLOAD")"
 rc=0
 probe "$HOST_IO_TIMEOUT" "stat $PROJECTION" "$PROBE_OUT" stat -c '%s' "$PROJECTION" || rc=$?
 [ "$rc" -eq 0 ] || host_io_failed "stat $PROJECTION" "$rc"
@@ -280,7 +293,7 @@ SIZE="$(<"$PROBE_OUT")"
     exit 1
 }
 rc=0
-timeout -k 5 120 cmp -s "$SEED_OUT/payload.txt" "$PROJECTION" || rc=$?
+timeout -k 5 120 cmp -s "$SWARM_PAYLOAD" "$PROJECTION" || rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
     host_io_failed "cmp $PROJECTION" "$rc"
 fi
