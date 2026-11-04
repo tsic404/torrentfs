@@ -1881,7 +1881,7 @@ impl FsService {
         timeout: Duration,
         op: &str,
     ) -> FsResult<()> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = crate::domain::time::deadline_after(timeout);
         let mut guard = self
             .processing_torrents
             .lock()

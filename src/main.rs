@@ -495,7 +495,7 @@ fn lock_within<'a, T>(
     mutex: &'a Mutex<T>,
     timeout: Duration,
 ) -> Result<MutexGuard<'a, T>, LockWithinError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = torrentfs::deadline_after(timeout);
     loop {
         match mutex.try_lock() {
             Ok(guard) => return Ok(guard),
@@ -527,7 +527,7 @@ fn wait_bounded<F>(is_finished: F, timeout: Duration, poll_interval: Duration) -
 where
     F: Fn() -> bool,
 {
-    let deadline = Instant::now() + timeout;
+    let deadline = torrentfs::deadline_after(timeout);
     loop {
         if is_finished() {
             return JoinOutcome::Finished;
@@ -756,6 +756,39 @@ const EXIT_FUSE_DEVICE_UNUSABLE: i32 = 100;
 /// (see `main-entry.md` step 18).
 const EXIT_MOUNT_PERMISSION_DENIED: i32 = 2;
 
+/// Exit status used when the mount cannot even be attempted because the
+/// mountpoint directory could not be created — a generic mount-setup failure.
+///
+/// Distinct from the lock-held status on purpose: an unwinding `expect` used
+/// to exit 101 here, the same code as [`EXIT_MOUNTPOINT_LOCKED`], so a
+/// supervisor could not tell a lost lock from a broken mountpoint.
+const EXIT_MOUNT_FAILED: i32 = 1;
+
+/// Exit status for a mountpoint that cannot be created, or `None` when the
+/// directory already exists.
+///
+/// The branch's status is produced here rather than written at the exit call
+/// so the unit tests pin the value the process actually exits with — a literal
+/// at the call site was invisible to them. The value must never be the
+/// lock-contention status: a supervisor reads that one as "another instance is
+/// running", and an unwinding `expect` used to report exactly that here.
+fn mountpoint_setup_status(mountpoint: &Path) -> Option<i32> {
+    if mountpoint.exists() {
+        return None;
+    }
+    match std::fs::create_dir_all(mountpoint) {
+        Ok(()) => None,
+        Err(e) => {
+            error!(
+                "Failed to create mountpoint {:?}: {}. Mounting requires an \
+                 existing or creatable mountpoint directory.",
+                mountpoint, e
+            );
+            Some(EXIT_MOUNT_FAILED)
+        }
+    }
+}
+
 /// Outcome of the `/dev/fuse` probe run after a non-permission mount failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FuseProbeResult {
@@ -942,8 +975,8 @@ fn main() {
         .mountpoint
         .unwrap_or_else(|| unreachable!("clap: mountpoint required without --config-check"));
 
-    if !mountpoint.exists() {
-        std::fs::create_dir_all(&mountpoint).expect("Failed to create mountpoint");
+    if let Some(status) = mountpoint_setup_status(&mountpoint) {
+        std::process::exit(status);
     }
 
     // Serialize mount ownership: two daemons (or two containers sharing one
@@ -1120,6 +1153,34 @@ mod tests {
         assert!(should_attempt_direct_unmount(0));
         assert!(!should_attempt_direct_unmount(1000));
         assert!(!should_attempt_direct_unmount(u32::MAX));
+    }
+
+    /// An existing mountpoint needs no setup status at all — the branch is
+    /// skipped and the process continues to the lock.
+    #[test]
+    fn existing_mountpoint_yields_no_setup_status() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(mountpoint_setup_status(dir.path()), None);
+    }
+
+    /// An uncreatable mountpoint maps to a generic mount failure. The status
+    /// must stay distinct from the lock-contention one: an unwinding `expect`
+    /// used to exit with that very status, leaving a supervisor unable to
+    /// separate "another instance holds the lock" from a broken mountpoint.
+    #[test]
+    fn uncreatable_mountpoint_maps_to_the_generic_failure_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let status = mountpoint_setup_status(&blocker.join("mnt"))
+            .expect("creating a mountpoint below a regular file must fail");
+
+        assert_eq!(status, 1, "generic mount failure is exit 1");
+        assert_ne!(
+            status, EXIT_MOUNTPOINT_LOCKED,
+            "mountpoint setup must not reuse the lock-contention status"
+        );
     }
 
     #[test]

@@ -240,7 +240,7 @@ fn join_thread_within(join: &Mutex<Option<JoinHandle<()>>>, grace: Option<Durati
         }
         return true;
     };
-    let deadline = Instant::now() + grace;
+    let deadline = crate::domain::time::deadline_after(grace);
     loop {
         let finished = match join.lock() {
             Ok(guard) => match guard.as_ref() {
@@ -1396,7 +1396,7 @@ impl ColdFlight {
     fn new(now: Instant, window: Duration) -> Self {
         Self {
             started: now,
-            deadline: now + window,
+            deadline: crate::domain::time::deadline_from(now, window),
             reannounced: false,
         }
     }
@@ -3508,7 +3508,7 @@ mod tests {
     };
     use crate::infrastructure::config::{
         TorrentfsConfig, DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
-        DEFAULT_READ_TIMEOUT_SECS,
+        DEFAULT_READ_TIMEOUT_SECS, MAX_LOCAL_TIMEOUT_SECS,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -4057,6 +4057,26 @@ mod tests {
         assert_eq!(read_wait_budget_secs(4, 30, None, 15), 4 + 4 + 4 + 4 + 4);
         // Timeout below every cap.
         assert_eq!(read_wait_budget_secs(2, 30, None, 15), 2 + 2 + 2 + 2 + 2);
+    }
+
+    /// The largest configuration the loader admits must still convert into a
+    /// deadline without overflowing the clock — the panic this budget used to
+    /// cause when a timeout key carried a near-`u64::MAX` value.
+    #[test]
+    fn maximal_configured_budget_yields_a_representable_deadline() {
+        let budget = read_wait_budget_secs(
+            MAX_LOCAL_TIMEOUT_SECS,
+            MAX_LOCAL_TIMEOUT_SECS,
+            Some(MAX_LOCAL_TIMEOUT_SECS),
+            MAX_LOCAL_TIMEOUT_SECS,
+        );
+        let before = Instant::now();
+        let deadline = crate::domain::time::deadline_after(Duration::from_secs(budget));
+        assert!(deadline > before);
+        assert!(
+            deadline <= before + Duration::from_secs(budget + 1),
+            "the deadline must stay inside the configured budget"
+        );
     }
 
     #[test]

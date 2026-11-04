@@ -33,6 +33,15 @@ pub const DEFAULT_PEER_DISCOVERY_WAIT_SECS: u64 = 30;
 /// longer than 15s to connect; lower it to fail faster.
 pub const DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS: u64 = 15;
 
+/// Upper bound (seconds) on every torrentfs-level timeout key: one day.
+///
+/// These windows feed deadline arithmetic that converts seconds into an
+/// `Instant` offset, and the per-read budget sums several of them. One day is
+/// far beyond any real read or discovery window while keeping that budget
+/// finite; an out-of-range value is rejected at load time instead of aborting
+/// the FUSE dispatch thread on the first cold read.
+pub const MAX_LOCAL_TIMEOUT_SECS: u64 = 86_400;
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutsConfig {
@@ -72,6 +81,35 @@ pub struct TimeoutsConfig {
 }
 
 impl TimeoutsConfig {
+    /// Reject local timeout keys above [`MAX_LOCAL_TIMEOUT_SECS`].
+    ///
+    /// Non-positive values keep their documented meaning — they fall back to
+    /// the shipped default (C-8.2.1 through C-8.2.4) — so only the upper bound
+    /// is enforced here. The libtorrent-backed keys in this section are still
+    /// left to upstream clamp semantics.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let keys = [
+            ("read_timeout_secs", self.read_timeout_secs),
+            ("peer_discovery_wait_secs", self.peer_discovery_wait_secs),
+            ("peer_wait_cap_secs", self.peer_wait_cap_secs),
+            (
+                "no_seeder_read_timeout_secs",
+                self.no_seeder_read_timeout_secs,
+            ),
+        ];
+        for (name, value) in keys {
+            if let Some(v) = value {
+                if v > MAX_LOCAL_TIMEOUT_SECS as i64 {
+                    return Err(format!(
+                        "[timeouts] {} must be <= {} seconds (one day), got {}",
+                        name, MAX_LOCAL_TIMEOUT_SECS, v
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Resolved read timeout: the configured value when positive, otherwise
     /// [`DEFAULT_READ_TIMEOUT_SECS`].
     pub fn resolved_read_timeout_secs(&self) -> u64 {

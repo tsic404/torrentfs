@@ -173,7 +173,7 @@ pub use alert::AlertConfig;
 pub use algorithms::AlgorithmsConfig;
 pub use auto_manage::AutoManageConfig;
 pub use cache_config::CacheConfig;
-pub use concurrency::ConcurrencyConfig;
+pub use concurrency::{ConcurrencyConfig, MAX_DOWNLOAD_QUEUE_DEPTH, MAX_DOWNLOAD_WORKERS};
 pub use connections::ConnectionsConfig;
 pub use dht::DhtConfig;
 pub use disk_io::DiskIoConfig;
@@ -187,7 +187,7 @@ pub use proxy::ProxyConfig;
 pub use rate_limits::RateLimitsConfig;
 pub use timeouts::{
     TimeoutsConfig, DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
-    DEFAULT_READ_TIMEOUT_SECS,
+    DEFAULT_READ_TIMEOUT_SECS, MAX_LOCAL_TIMEOUT_SECS,
 };
 pub use tracker::TrackerConfig;
 pub use user_agent::UserAgentConfig;
@@ -258,22 +258,27 @@ pub struct TorrentfsConfig {
 }
 
 impl TorrentfsConfig {
-    /// Validate numeric value ranges for the small set of fields where a
-    /// value is unambiguously invalid — negative counts, negative rate limits,
-    /// and values that would be truncated at the i32 FFI boundary. All other
-    /// numeric fields are intentionally left to libtorrent clamp/default
-    /// semantics (see each section's `validate` doc for rationale).
+    /// Validate numeric value ranges for the fields whose domain is bounded:
+    /// negative counts, negative rate limits, values truncated at the i32 FFI
+    /// boundary, the torrentfs-level timeouts, and the concurrency limits.
+    /// All other numeric fields are intentionally left to libtorrent
+    /// clamp/default semantics (see each section's `validate` doc for
+    /// rationale).
     fn validate(&self) -> TorrentResult<()> {
-        self.connections
-            .validate()
-            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
-        self.rate_limits
-            .validate()
-            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
-        self.proxy
-            .validate()
-            .map_err(|msg| TorrentError::ParseError(format!("Invalid config value: {}", msg)))?;
-        Ok(())
+        let checks = [
+            self.connections.validate(),
+            self.rate_limits.validate(),
+            self.timeouts.validate(),
+            self.concurrency.validate(),
+            self.proxy.validate(),
+        ];
+        match checks.into_iter().find_map(Result::err) {
+            Some(msg) => Err(TorrentError::ParseError(format!(
+                "Invalid config value: {}",
+                msg
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Load configuration from a TOML file, then validate numeric and enum
@@ -787,5 +792,95 @@ backward_priority = 1
         // levels are tightened.
         let mode = fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
+    }
+
+    fn load_config(toml_str: &str) -> TorrentResult<TorrentfsConfig> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml_str).unwrap();
+        TorrentfsConfig::from_file(&path)
+    }
+
+    #[test]
+    fn test_local_timeout_keys_reject_values_above_one_day() {
+        for key in [
+            "read_timeout_secs",
+            "peer_discovery_wait_secs",
+            "peer_wait_cap_secs",
+            "no_seeder_read_timeout_secs",
+        ] {
+            let over = format!("[timeouts]\n{} = {}\n", key, MAX_LOCAL_TIMEOUT_SECS + 1);
+            let err = load_config(&over).expect_err("over-limit timeout must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(key) && msg.contains(&MAX_LOCAL_TIMEOUT_SECS.to_string()),
+                "error must name the key and its range, got: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_local_timeout_keys_accept_the_boundary_value() {
+        let at_limit = format!(
+            "[timeouts]\nread_timeout_secs = {}\n",
+            MAX_LOCAL_TIMEOUT_SECS
+        );
+        let config = load_config(&at_limit).expect("the boundary value must be accepted");
+        assert_eq!(
+            config.timeouts.resolved_read_timeout_secs(),
+            MAX_LOCAL_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_local_timeout_keys_keep_the_non_positive_fallback() {
+        // The upper bound must not turn the documented "non-positive falls
+        // back to the default" rule into a rejection.
+        let config = load_config("[timeouts]\nread_timeout_secs = -5\n")
+            .expect("a non-positive timeout still falls back");
+        assert_eq!(
+            config.timeouts.resolved_read_timeout_secs(),
+            DEFAULT_READ_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn test_concurrency_keys_reject_values_above_their_ceilings() {
+        let workers = format!(
+            "[concurrency]\ndownload_workers = {}\n",
+            MAX_DOWNLOAD_WORKERS + 1
+        );
+        let err = load_config(&workers).expect_err("over-limit worker count must be rejected");
+        assert!(
+            err.to_string().contains("download_workers"),
+            "error must name the key, got: {}",
+            err
+        );
+
+        let depth = format!(
+            "[concurrency]\ndownload_queue_depth = {}\n",
+            MAX_DOWNLOAD_QUEUE_DEPTH + 1
+        );
+        let err = load_config(&depth).expect_err("over-limit queue depth must be rejected");
+        assert!(
+            err.to_string().contains("download_queue_depth"),
+            "error must name the key, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_concurrency_keys_accept_their_ceilings_and_zero() {
+        let at_ceiling = format!(
+            "[concurrency]\ndownload_workers = {}\ndownload_queue_depth = {}\n",
+            MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_QUEUE_DEPTH
+        );
+        load_config(&at_ceiling).expect("the ceiling values must be accepted");
+
+        // Zero keeps its documented "use the default" meaning.
+        let zeros = load_config("[concurrency]\ndownload_workers = 0\ndownload_queue_depth = 0\n")
+            .expect("zero must still mean the default");
+        assert_eq!(zeros.concurrency.download_workers, Some(0));
     }
 }

@@ -27,6 +27,10 @@ const INVALID_CONFIGS: &[(&str, &str)] = &[
         "[connections]\nmax_connections = -1\n",
     ),
     (
+        "out-of-range timeout",
+        "[timeouts]\nread_timeout_secs = 9223372036854775807\n",
+    ),
+    (
         "out-of-range enum",
         "[algorithms]\nchoking_algorithm = 999\n",
     ),
