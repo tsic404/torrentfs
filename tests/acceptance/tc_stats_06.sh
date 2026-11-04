@@ -80,6 +80,12 @@ ingest "$TORRENT_SRC" >/dev/null
 wait_peer_known "$INFOHASH" 2 || fail "client never announced to the tracker"
 LEAF="$MNT/data/seed.torrent/.stats"
 slice "$MNT/data/seed.torrent/seed.bin" 0 65536 "$W/part"
+# The first read creates the record for the piece it serves.  C-6.3.1 starts a
+# record's visits at its establishment, so that read is not a hit and the piece
+# renders `[x]`.  Read the same range once more: the record exists by then, so
+# this read is served from it and the piece renders `[X n]`, while prefetched
+# pieces nobody read stay `[x]`.
+slice "$MNT/data/seed.torrent/seed.bin" 0 65536 "$W/part.again"
 
 SEEN_CACHED=0
 SEEN_UNVISITED=0
@@ -91,7 +97,7 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 check_grammar "$LEAF" "$PIECE_COUNT"
-[ "$SEEN_CACHED" = 1 ] || fail "no cached-and-visited [X n] marker appeared after a read"
+[ "$SEEN_CACHED" = 1 ] || fail "no cached-and-visited [X n] marker appeared after a read of a cached range"
 [ "$SEEN_UNVISITED" = 1 ] || fail "no cached-unvisited [x] marker appeared for prefetched pieces"
 echo "  served: $(tr '\n' ' ' < "$W/markers")"
 daemon_stop
