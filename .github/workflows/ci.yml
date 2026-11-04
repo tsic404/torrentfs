@@ -100,6 +100,10 @@ jobs:
           bash -n ./ci/tests/slow_swarm_e2e.sh
           bash -n ./tests/acceptance/lib_fuse_harness.sh
           bash -n ./tests/acceptance/lib_seed_torrent.sh
+          bash -n ./tests/acceptance/lib_acceptance_env.sh
+          perl -c ./tests/acceptance/lib_torrent_fixture.pl
+          perl -c ./tests/acceptance/lib_swarm.pl
+          perl -c ./tests/acceptance/lib_dir_walk.pl
           bash -n ./tests/acceptance/tc_ingest_01.sh
           bash -n ./tests/acceptance/tc_ingest_03.sh
           bash -n ./tests/acceptance/tc_ingest_06.sh
@@ -119,6 +123,51 @@ jobs:
           bash -n ./tests/acceptance/tc_container_06.sh
           bash -n ./tests/acceptance/tc_container_07.sh
           bash -n ./tests/acceptance/tc_container_08.sh
+          bash -n ./tests/acceptance/tc_cache_01.sh
+          bash -n ./tests/acceptance/tc_cache_03.sh
+          bash -n ./tests/acceptance/tc_cache_04.sh
+          bash -n ./tests/acceptance/tc_cache_05.sh
+          bash -n ./tests/acceptance/tc_config_01.sh
+          bash -n ./tests/acceptance/tc_config_02.sh
+          bash -n ./tests/acceptance/tc_config_03.sh
+          bash -n ./tests/acceptance/tc_config_04.sh
+          bash -n ./tests/acceptance/tc_config_05.sh
+          bash -n ./tests/acceptance/tc_config_06.sh
+          bash -n ./tests/acceptance/tc_config_07.sh
+          bash -n ./tests/acceptance/tc_ingest_02.sh
+          bash -n ./tests/acceptance/tc_ingest_04.sh
+          bash -n ./tests/acceptance/tc_ingest_05.sh
+          bash -n ./tests/acceptance/tc_ingest_07.sh
+          bash -n ./tests/acceptance/tc_ingest_08.sh
+          bash -n ./tests/acceptance/tc_negative_01.sh
+          bash -n ./tests/acceptance/tc_negative_02.sh
+          bash -n ./tests/acceptance/tc_negative_03.sh
+          bash -n ./tests/acceptance/tc_negative_04.sh
+          bash -n ./tests/acceptance/tc_negative_05.sh
+          bash -n ./tests/acceptance/tc_negative_06.sh
+          bash -n ./tests/acceptance/tc_read_01.sh
+          bash -n ./tests/acceptance/tc_read_02.sh
+          bash -n ./tests/acceptance/tc_read_03.sh
+          bash -n ./tests/acceptance/tc_read_05.sh
+          bash -n ./tests/acceptance/tc_read_06.sh
+          bash -n ./tests/acceptance/tc_read_07.sh
+          bash -n ./tests/acceptance/tc_read_08.sh
+          bash -n ./tests/acceptance/tc_read_09.sh
+          bash -n ./tests/acceptance/tc_read_10.sh
+          bash -n ./tests/acceptance/tc_read_11.sh
+          bash -n ./tests/acceptance/tc_recovery_02.sh
+          bash -n ./tests/acceptance/tc_recovery_04.sh
+          bash -n ./tests/acceptance/tc_rofs_02.sh
+          bash -n ./tests/acceptance/tc_rofs_03.sh
+          bash -n ./tests/acceptance/tc_seeding_01.sh
+          bash -n ./tests/acceptance/tc_seeding_02.sh
+          bash -n ./tests/acceptance/tc_seeding_03.sh
+          bash -n ./tests/acceptance/tc_stats_03.sh
+          bash -n ./tests/acceptance/tc_stats_04.sh
+          bash -n ./tests/acceptance/tc_stats_05.sh
+          bash -n ./tests/acceptance/tc_stats_06.sh
+          bash -n ./tests/acceptance/tc_stats_07.sh
+          bash -n ./tests/acceptance/tc_stats_08.sh
 
   deploy-rootful-test:
     name: Deploy Rootful Shell Tests
@@ -620,7 +669,13 @@ jobs:
         # fuse3 and runs as root with /dev/fuse, so the passing path is real.
         run: |
           set -euo pipefail
-          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_recovery_05; do
+          # The first ten are the long-standing carriers; the last four are a
+          # smoke subset of the added ones covering the four fixtures (torrent
+          # builder, tracker/peer swarm, stats rendering, by-name/read paths),
+          # so a fixture regression fails here instead of surfacing only in
+          # acceptance execution.
+          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_recovery_05 \
+                    tc_read_01 tc_ingest_02 tc_stats_06 tc_seeding_02; do
             rc=0
             ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc" || rc=$?
             if [ "$rc" -eq 2 ]; then
