@@ -13,7 +13,7 @@
 //! parked on [`EngineState::pending_reads`] and advanced one step per loop
 //! iteration, so its peer/piece-wait window cannot serialize other commands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1497,6 +1497,10 @@ struct PreparedRead {
     end_offset: u64,
     start_piece: i32,
     end_piece: i32,
+    /// Pieces of the read's range that already had a cache record when the
+    /// read arrived.  Only these can be cache hits: a piece downloaded for
+    /// this read did not use a record that predates it (C-5.3.3).
+    cached_pieces: HashSet<i32>,
     status: TorrentStatus,
 }
 
@@ -1516,6 +1520,8 @@ struct PendingRead {
     end_offset: u64,
     start_piece: i32,
     end_piece: i32,
+    /// Pieces of the range that had a cache record when the read arrived.
+    cached_pieces: HashSet<i32>,
     /// First piece not yet known to be available.
     current_piece: i32,
     /// Reply channel to the caller blocked in `DownloadEngine::read_file_range`.
@@ -1580,6 +1586,7 @@ impl PendingRead {
             end_offset: prepared.end_offset,
             start_piece: prepared.start_piece,
             end_piece: prepared.end_piece,
+            cached_pieces: prepared.cached_pieces,
             current_piece: prepared.start_piece,
             reply,
             phase: ReadPhase::PieceWait,
@@ -2145,6 +2152,16 @@ impl EngineState {
             return Ok(None);
         }
 
+        // Snapshot the records that exist before this read touches anything.
+        // A piece registered later in the same read was downloaded for it and
+        // is not a cache hit (C-5.3.3: a rebuilt record starts at zero).
+        let cached_pieces: HashSet<i32> = match self.store.cache_manager().lock() {
+            Ok(cache) => (start_piece..=end_piece)
+                .filter(|p| cache.has_piece(&PieceStore::piece_key(&info_hash, *p)))
+                .collect(),
+            Err(_) => HashSet::new(),
+        };
+
         Ok(Some(PreparedRead {
             info,
             file_index,
@@ -2158,6 +2175,7 @@ impl EngineState {
             end_offset,
             start_piece,
             end_piece,
+            cached_pieces,
             status,
         }))
     }
@@ -2183,6 +2201,10 @@ impl EngineState {
         );
         if !stale_pieces.is_empty() {
             for piece_idx in stale_pieces {
+                // The piece's record is gone even though the read arrived when
+                // it existed; the re-download creates a new one, so this read
+                // cannot be one of its hits.
+                read.cached_pieces.remove(&piece_idx);
                 read.record_stale_piece(piece_idx);
             }
             tracing::info!(
@@ -2256,6 +2278,7 @@ impl EngineState {
                 read.absolute_offset,
                 read.end_offset,
                 read.size,
+                &read.cached_pieces,
             ));
         }
 
@@ -2734,6 +2757,16 @@ impl EngineState {
         // one that has not — the old inline inner loop, minus the sleep on the
         // engine thread.
         loop {
+            // A record dropped since the request arrived (an eviction while
+            // this read waits) cannot serve the rest of it: drop it from the
+            // hit candidates so the rebuilding read is not counted as a hit.
+            if !read.cached_pieces.is_empty() {
+                let info_hash = read.info_hash.clone();
+                if let Ok(cache) = self.store.cache_manager().lock() {
+                    read.cached_pieces
+                        .retain(|p| cache.has_piece(&PieceStore::piece_key(&info_hash, *p)));
+                }
+            }
             let piece_idx = read.current_piece;
             if piece_idx > read.end_piece {
                 return Some(self.read_from_disk(
@@ -2746,6 +2779,7 @@ impl EngineState {
                     read.absolute_offset,
                     read.end_offset,
                     read.size,
+                    &read.cached_pieces,
                 ));
             }
 
@@ -2805,7 +2839,9 @@ impl EngineState {
                 // earlier pieces as later ones download, turning them stale
                 // mid-wait — without this the wait runs out its 60s window.
                 // The piece blocking the read is the one whose data left the
-                // cache, so record it as the read's cache evidence.
+                // cache, so record it as the read's cache evidence.  Its record
+                // is being rebuilt, so this read is not one of its hits.
+                read.cached_pieces.remove(&piece_idx);
                 read.record_stale_piece(piece_idx);
                 if self.start_recheck(read) {
                     return None;
@@ -2813,6 +2849,11 @@ impl EngineState {
                 // Recheck failed to start: fall through to the normal wait
                 // (the window will time out rather than loop).
             }
+
+            // Reaching here means the piece is neither complete nor cached:
+            // whatever the read gets now is a download, so it cannot be a hit
+            // on a record that existed when the read arrived.
+            read.cached_pieces.remove(&piece_idx);
 
             // A late-connecting seeder upgrades the wait window from the short
             // no-seeder timeout to the full read timeout.  The window restarts
@@ -2884,6 +2925,7 @@ impl EngineState {
                 read.absolute_offset,
                 partial_end,
                 partial_size,
+                &read.cached_pieces,
             );
         }
 
@@ -3152,6 +3194,7 @@ impl EngineState {
         absolute_offset: u64,
         end_offset: u64,
         size: u32,
+        cached_before: &HashSet<i32>,
     ) -> TorrentResult<Vec<u8>> {
         let mut result = Vec::with_capacity(size as usize);
         let mut bytes_read = 0usize;
@@ -3179,6 +3222,11 @@ impl EngineState {
                     continue;
                 }
             };
+            // Count the access only for a record this read found in place; a
+            // piece downloaded for this read begins its count at zero.
+            if cached_before.contains(&piece_idx) {
+                self.store.record_piece_access(&piece_key);
+            }
             if piece_data.is_empty() {
                 let piece_start = (piece_idx as u64) * piece_length;
                 let piece_end_theoretical = piece_start + piece_length;

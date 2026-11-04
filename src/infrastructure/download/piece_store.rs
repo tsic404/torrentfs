@@ -115,6 +115,10 @@ impl PieceStore {
     /// reading, so a concurrent `PieceStorage::write_piece` on the disk thread
     /// can't expose a partially-written file — without it, concurrent readers
     /// during an active download saw inconsistent (partial) data.
+    /// Read a registered piece's bytes without touching the access counters.
+    /// Whether a read counts as a hit is the caller's call: a read that
+    /// triggered this piece's download did not use the record it created
+    /// (C-5.3.3 keeps that record's count starting at zero).
     pub fn read_piece(&self, piece_key: &str) -> TorrentResult<Vec<u8>> {
         let path = {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
@@ -135,10 +139,14 @@ impl PieceStore {
             ))
         })?;
         drop(lock_guard);
+        Ok(data)
+    }
+
+    /// Count one access to a piece record (the per-record hit count).
+    pub fn record_piece_access(&self, piece_key: &str) {
         if let Ok(mut cache) = self.cache.lock() {
             let _ = cache.record_access(piece_key);
         }
-        Ok(data)
     }
 
     /// Read a byte range from a piece file without loading the whole piece.
