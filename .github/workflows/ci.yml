@@ -101,6 +101,7 @@ jobs:
           bash -n ./tests/acceptance/lib_fuse_harness.sh
           bash -n ./tests/acceptance/lib_seed_torrent.sh
           bash -n ./tests/acceptance/lib_acceptance_env.sh
+          bash -n ./tests/acceptance/lib_container_swarm.sh
           perl -c ./tests/acceptance/lib_torrent_fixture.pl
           perl -c ./tests/acceptance/lib_swarm.pl
           perl -c ./tests/acceptance/lib_dir_walk.pl
@@ -241,26 +242,6 @@ jobs:
 
       - name: Smoke test torrentfs user shell
         run: ./ci/tests/user_shell_smoke.sh torrentfs:ci
-
-      - name: Setup Rust toolchain
-        # TC-container-02 needs the self-seed tracker+seeder example on the
-        # host to produce a real swarm for the host-side byte comparison.
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/libtorrent-sys-cache
-            target
-          key: ${{ runner.os }}-${{ runner.arch }}-sid21-container-acceptance-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml', 'libtorrent-sys/src/defines.rs') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
-
-      - name: Build the self-seed example
-        run: cargo build --locked --release --example torrentfs-selfseed-env
 
       - name: Prepare a shared host directory for the container cases
         # rshared propagation only reaches the host when the bind source lives
@@ -647,10 +628,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
-      - name: Build torrentfs and the selfseed example
-        run: |
-          cargo build --locked --release
-          cargo build --locked --release --example torrentfs-selfseed-env
+      - name: Build torrentfs
+        run: cargo build --locked --release
 
       - name: Create the daemon user
         # tc_recovery_05 drives the rootful entrypoint, which drops torrentfs

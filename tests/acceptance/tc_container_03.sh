@@ -8,20 +8,23 @@
 # Container-level executable form.  Runs the production image with a host
 # directory bind-mounted as the state volume and passes `--cache` / `--db`
 # inside it, so the SQLite DB and the piece cache survive the stop/start.  The
-# swarm is the local self-seed environment; the seeder is stopped before the
-# restart, so a byte-exact read that finishes fast can only come from the
-# cache.  On restart the daemon's own cache-verification summary must report
-# all 16 pieces verified from disk, and the second read must stay inside the
-# cache-hit time bound with no no-seeder fallback.  The global cache counters
-# are printed as non-gating evidence only: they are a non-blocking snapshot and
-# may render as zero while another reader holds the cache lock (C-6.5.1).
+# swarm is synthesized inside that container from the shipped fixtures
+# (`lib_container_swarm.sh`, `lib_swarm.pl`), so the host needs docker only —
+# no build step on the host and no seeder binary to build.  A container stop kills the
+# tracker and the seeder with the daemon, so the second read has no peer at
+# all: a byte-exact read that finishes fast can only come from the cache.  On
+# restart the daemon's own cache-verification summary must report every cached
+# piece verified from disk, and the second read must stay inside the cache-hit
+# time bound with no no-seeder fallback.  The global cache counters are printed
+# as non-gating evidence only: they are a non-blocking snapshot and may render
+# as zero while another reader holds the cache lock (C-6.5.1).
 # Self-gating: SKIP (exit 2) when docker, /dev/fuse or a successful image build
 # is unavailable.
 #
 # Usage: ./tests/acceptance/tc_container_03.sh [image]
 # Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
 #
-# Every external call is bounded (docker subcommands, the seeder startup, the
+# Every external call is bounded (docker subcommands, the swarm startup, the
 # in-container reads).  A hung call fails the case with a diagnostic instead
 # of stalling the job.
 set -euo pipefail
@@ -33,8 +36,10 @@ WORK="$(mktemp -d)"
 STATE_HOST="$WORK/state"
 SEED_OUT="$WORK/seed"
 CONTAINER="tc-container-03-$$"
-SEEDER_PID=""
 CONTAINERS=()
+# shellcheck source=/dev/null
+SWARM_HOST_DIR="$SEED_OUT"
+source "$ROOT_DIR/tests/acceptance/lib_container_swarm.sh"
 
 fail() {
     echo "$CASE: FAIL — $*" >&2
@@ -51,19 +56,13 @@ skip() {
 }
 
 cleanup() {
-    local name child
+    local name
     for name in "${CONTAINERS[@]}"; do
         if [ -n "$(timeout 5 docker ps -q -f "name=^${name}$" 2>/dev/null)" ]; then
             timeout 30 docker stop -t 30 "$name" >/dev/null 2>&1 || true
         fi
         timeout 20 docker rm -f "$name" >/dev/null 2>&1 || true
     done
-    if [ -n "$SEEDER_PID" ]; then
-        for child in $(pgrep -P "$SEEDER_PID" 2>/dev/null || true); do
-            kill "$child" 2>/dev/null || true
-        done
-        kill "$SEEDER_PID" 2>/dev/null || true
-    fi
     timeout 30 rm -rf "$WORK" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -150,35 +149,27 @@ all_pieces_cached() {
     return 0
 }
 
-echo "$CASE: starting the local self-seed swarm…"
-"$ROOT_DIR/ci/run_self_seed_env.sh" \
-    --tracker-bind 127.0.0.1 --announce-host 127.0.0.1 \
-    --output-dir "$SEED_OUT" >"$WORK/seeder.log" 2>&1 &
-SEEDER_PID=$!
-DEADLINE=$((SECONDS + 240))
-while [ "$SECONDS" -lt "$DEADLINE" ]; do
-    [ -f "$SEED_OUT/selfseed.torrent" ] && break
-    if ! kill -0 "$SEEDER_PID" 2>/dev/null; then
-        { tail -n 20 "$WORK/seeder.log" >&2; } || true
-        fail "the self-seed environment exited before producing a torrent"
-    fi
-    sleep 1
-done
-[ -f "$SEED_OUT/selfseed.torrent" ] || fail "the self-seed environment produced no torrent within 240s"
-
 echo "$CASE: first run — ingest, download and cache…"
 timeout 120 docker run -d --name "$CONTAINER" \
     --device /dev/fuse --cap-add SYS_ADMIN \
     --security-opt apparmor=unconfined --network host \
     -v "$STATE_HOST:/state" \
+    -v "$SEED_OUT:/seed" \
+    -v "$ROOT_DIR/tests/acceptance:/fixtures:ro" \
     "$IMAGE" /mnt --cache /state/cache --db /state/db/metadata.db >/dev/null || {
     fail "docker run failed or did not return within 120s"
 }
 CONTAINERS+=("$CONTAINER")
 wait_for_mount "$CONTAINER" 120 || fail "the FUSE mount did not become ready on the first run"
 
+# The swarm lives inside the container under test (its own Perl + the shipped
+# fixtures), so stopping the container leaves the second read with no peer.
+echo "$CASE: starting the local swarm inside the container…"
+swarm_start "$CONTAINER" || fail "the in-container swarm fixtures did not start"
+echo "  swarm: tracker=$SWARM_TRACKER_URL pieces=$SWARM_PIECE_COUNT"
+
 timeout 30 docker exec -i --user 1000:1000 "$CONTAINER" \
-    sh -c 'cat > /mnt/metadata/selfseed.torrent' < "$SEED_OUT/selfseed.torrent" \
+    sh -c 'cat > /mnt/metadata/selfseed.torrent' < "$SWARM_TORRENT" \
     || fail "could not write the torrent into metadata/"
 DEADLINE=$((SECONDS + 60))
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
@@ -194,7 +185,7 @@ READ_RC=0
 timeout 240 docker exec "$CONTAINER" cat /mnt/data/selfseed.torrent/selfseed \
     >"$WORK/first.bin" 2>"$WORK/first.err" || READ_RC=$?
 [ "$READ_RC" -eq 0 ] || fail "the first read failed (rc=$READ_RC): $(tail -n 3 "$WORK/first.err")"
-cmp -s "$SEED_OUT/payload.txt" "$WORK/first.bin" \
+cmp -s "$SWARM_PAYLOAD" "$WORK/first.bin" \
     || fail "the first read bytes differ from the authoritative payload"
 [ -f "$STATE_HOST/db/metadata.db" ] \
     || fail "no SQLite DB under the state volume after the first run"
@@ -207,19 +198,10 @@ LOG_OFFSET="$(timeout 10 docker logs "$CONTAINER" 2>&1 | wc -l)"
 echo "$CASE: graceful stop…"
 stop_gracefully "$CONTAINER"
 
-# The seeder (and its tracker) is gone before the restart: a cache miss would
-# have no peer to download from and would stall on the no-seeder window.
-if [ -n "$SEEDER_PID" ]; then
-    for child in $(pgrep -P "$SEEDER_PID" 2>/dev/null || true); do
-        kill "$child" 2>/dev/null || true
-    done
-    kill "$SEEDER_PID" 2>/dev/null || true
-    SEEDER_PID=""
-fi
+# The tracker and the seeder were processes inside the container just stopped,
+# so the restart leaves an empty swarm: a cache miss has no peer to download
+# from and would stall on the no-seeder window.
 sleep 2
-if pgrep -f "torrentfs-selfseed-env" >/dev/null 2>&1; then
-    echo "$CASE: WARNING — a self-seed process is still alive; the cache-hit read may see a peer" >&2
-fi
 
 echo "$CASE: restart against the same state volume…"
 timeout 120 docker start "$CONTAINER" >/dev/null || fail "docker start failed after the graceful stop"
@@ -234,7 +216,7 @@ timeout 10 docker exec "$CONTAINER" test -d /mnt/data/selfseed.torrent \
 [ -f "$STATE_HOST/cache/cache_metadata.txt" ] \
     || fail "the cache metadata disappeared across stop/start"
 SIZE="$(timeout 10 docker exec "$CONTAINER" stat -c '%s' /mnt/data/selfseed.torrent/selfseed 2>/dev/null || true)"
-EXPECTED_SIZE="$(stat -c '%s' "$SEED_OUT/payload.txt")"
+EXPECTED_SIZE="$(stat -c '%s' "$SWARM_PAYLOAD")"
 [ "$SIZE" = "$EXPECTED_SIZE" ] \
     || fail "projection size after restart is $SIZE, expected $EXPECTED_SIZE"
 
@@ -252,21 +234,21 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
 done
 
 # AC-72 / C-5.3.1: the retained pieces are re-verified from disk on restart.
-# The daemon's own verification summary is the observable that all 16 cached
-# pieces (4 MiB payload / 256 KiB pieces) survived instead of being re-fetched.
+# The daemon's own verification summary is the observable that every cached
+# piece (4 MiB payload / 256 KiB pieces) survived instead of being re-fetched.
 VERIFIED=0
 DEADLINE=$((SECONDS + 60))
 RESTART_LOGS=""
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
     RESTART_LOGS="$(timeout 10 docker logs "$CONTAINER" 2>&1 | tail -n +$((LOG_OFFSET + 1)) || true)"
-    if grep -q "Cache piece verification complete: 16 verified" <<<"$RESTART_LOGS"; then
+    if grep -q "Cache piece verification complete: $SWARM_PIECE_COUNT verified" <<<"$RESTART_LOGS"; then
         VERIFIED=1
         break
     fi
     sleep 1
 done
 if [ "$VERIFIED" -ne 1 ]; then
-    fail "the restart did not verify the 16 cached pieces from disk: $(grep -m1 'Cache piece verification' <<<"$RESTART_LOGS" || echo 'no verification line')"
+    fail "the restart did not verify the $SWARM_PIECE_COUNT cached pieces from disk: $(grep -m1 'Cache piece verification' <<<"$RESTART_LOGS" || echo 'no verification line')"
 fi
 
 # Evidence only, never a verdict: the global cache counters are a non-blocking
@@ -281,7 +263,7 @@ timeout 60 docker exec "$CONTAINER" cat /mnt/data/selfseed.torrent/selfseed \
     >"$WORK/second.bin" 2>"$WORK/second.err" || READ_RC=$?
 END_NS="$(date +%s%N)"
 [ "$READ_RC" -eq 0 ] || fail "the second read failed with no seeder (rc=$READ_RC): $(tail -n 3 "$WORK/second.err")"
-cmp -s "$SEED_OUT/payload.txt" "$WORK/second.bin" \
+cmp -s "$SWARM_PAYLOAD" "$WORK/second.bin" \
     || fail "the second read bytes differ from the authoritative payload"
 ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))
 [ "$ELAPSED_MS" -lt 10000 ] \
@@ -294,4 +276,4 @@ if grep -q "no seeder connected" <<<"$NEW_LOGS"; then
 fi
 
 stop_gracefully "$CONTAINER"
-echo "$CASE: PASS (torrent and cache survived stop/start; 16 pieces verified from disk; second read ${ELAPSED_MS}ms from cache; cache counters evidence only: before=${BEFORE:-unavailable} after=${AFTER:-unavailable})"
+echo "$CASE: PASS (torrent and cache survived stop/start; $SWARM_PIECE_COUNT pieces verified from disk; second read ${ELAPSED_MS}ms from cache; cache counters evidence only: before=${BEFORE:-unavailable} after=${AFTER:-unavailable})"
