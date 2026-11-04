@@ -800,6 +800,10 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Register a complete piece.  A key that still has a record is the same
+    /// record being re-registered (startup re-check, an incomplete piece
+    /// completing), so its hit count carries over; a key without one is a new
+    /// record and starts at zero (C-5.3.3).
     pub fn add_piece(&mut self, piece_key: &str, size: u64) -> TorrentResult<()> {
         if !is_valid_piece_key(piece_key) {
             return Err(TorrentError::IoError(format!(
@@ -815,12 +819,17 @@ impl CacheManager {
         // only for the size delta instead of re-adding the full size,
         // which would inflate current_size and cause premature LRU
         // eviction of other torrents' valid cache pieces.
+        let prev_hit_count = self
+            .metadata
+            .get(piece_key)
+            .map(|m| m.hit_count)
+            .unwrap_or(0);
         let prev = self.metadata.insert(
             piece_key.to_string(),
             PieceMetadata {
                 last_accessed: now,
                 size,
-                hit_count: 0,
+                hit_count: prev_hit_count,
             },
         );
 
@@ -2770,6 +2779,100 @@ mod tests {
             5,
             "hit_count must survive re-registration"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_restart_and_recheck_keep_piece_hit_counts() -> TorrentResult<()> {
+        // The per-piece count belongs to the cache record: a restart loads it
+        // from the metadata file, and libtorrent's file check re-registers the
+        // retained piece through the same entry point a download uses without
+        // resetting it.  Aggregate counters still start over per mount.
+        let temp_dir = TempDir::new().unwrap();
+        let piece_key = key("tsi_restart_hits", 0);
+
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let piece_path = cache.ensure_piece_dir(&piece_key)?;
+            std::fs::write(&piece_path, vec![0x5Au8; 4096])?;
+            cache.add_piece(&piece_key, 4096)?;
+            for _ in 0..3 {
+                cache.record_access(&piece_key)?;
+            }
+            assert_eq!(cache.hit_count, 3);
+        }
+
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert_eq!(
+            cache.piece_hit_count(&piece_key),
+            3,
+            "the restart must load the persisted per-piece count"
+        );
+        assert_eq!(cache.hit_count, 0, "aggregate hits are per mount");
+        assert_eq!(cache.miss_count, 0, "aggregate misses are per mount");
+        assert_eq!(cache.eviction_count, 0, "aggregate evictions are per mount");
+
+        cache.add_piece(&piece_key, 4096)?;
+        assert_eq!(
+            cache.piece_hit_count(&piece_key),
+            3,
+            "re-registering the retained record must keep its count"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rebuilt_piece_record_starts_at_zero() -> TorrentResult<()> {
+        // A record that is dropped and later re-created must not inherit the
+        // count of the record it replaced; a brand-new record starts at zero.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = key("tsi_rebuild_hits", 0);
+        let piece_path = cache.ensure_piece_dir(&piece_key)?;
+        std::fs::write(&piece_path, vec![0u8; 64])?;
+        cache.add_piece(&piece_key, 64)?;
+        for _ in 0..2 {
+            cache.record_access(&piece_key)?;
+        }
+        assert_eq!(cache.piece_hit_count(&piece_key), 2);
+
+        cache.delete_piece(&piece_key)?;
+        std::fs::write(&piece_path, vec![1u8; 64])?;
+        cache.add_piece(&piece_key, 64)?;
+        assert_eq!(
+            cache.piece_hit_count(&piece_key),
+            0,
+            "a rebuilt record starts over"
+        );
+
+        let fresh_key = key("tsi_rebuild_hits", 1);
+        let fresh_path = cache.ensure_piece_dir(&fresh_key)?;
+        std::fs::write(&fresh_path, vec![0u8; 64])?;
+        cache.add_piece(&fresh_key, 64)?;
+        assert_eq!(cache.piece_hit_count(&fresh_key), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_rebuild_without_metadata_starts_at_zero() -> TorrentResult<()> {
+        // Losing the metadata file is one of the record-rebuild sources: the
+        // disk scan recreates the record at zero hits.
+        let temp_dir = TempDir::new().unwrap();
+        let piece_key = key("tsi_scan_hits", 0);
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let piece_path = cache.ensure_piece_dir(&piece_key)?;
+            std::fs::write(&piece_path, vec![0u8; 32])?;
+            cache.add_piece(&piece_key, 32)?;
+            cache.record_access(&piece_key)?;
+            cache.flush()?;
+        }
+        std::fs::remove_file(temp_dir.path().join(CACHE_METADATA_FILE))?;
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(cache.has_piece(&piece_key));
+        assert_eq!(cache.piece_hit_count(&piece_key), 0);
         Ok(())
     }
 
