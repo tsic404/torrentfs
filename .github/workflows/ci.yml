@@ -6,6 +6,12 @@ on:
   push:
     branches: [main]
 
+# The workflow only reads the repository: every job checks out and builds.
+# Declaring it explicitly keeps the default token scope from growing with the
+# repository settings.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,7 +30,7 @@ jobs:
       fail-fast: false
     container: debian:sid-slim
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -39,10 +45,14 @@ jobs:
             ca-certificates
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -55,29 +65,101 @@ jobs:
 
       - name: Run tests
         id: run_tests
-        # A libtorrent-backed test can abort the test process instead of
-        # failing cleanly (known `piece_picker` lifetime flake class), so the
-        # raw outcome is recorded here and classified by the next step: this
-        # step on its own never fails the job.
+        # The raw outcome is recorded (and the log kept for classification) so
+        # the next step can tell an allowlisted flake from a real failure; this
+        # step on its own never fails the job.  `pipefail` keeps cargo's status
+        # in front of the tee.
         continue-on-error: true
-        run: cargo test --locked --workspace --no-fail-fast
+        run: |
+          set -o pipefail
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee cargo-test.log
 
       - name: Classify test outcome
         if: steps.run_tests.outcome == 'failure'
         run: |
-          # One retry. A suite that fails and then passes is flaky, not broken;
-          # a suite that fails twice is a real failure. The two outcomes get
-          # distinct annotations so a flake is never read as a regression.
-          if cargo test --locked --workspace --no-fail-fast; then
-            echo "::warning title=Flaky test (FLAKY)::Cargo Test (${{ matrix.arch }}) failed on the first attempt and passed on retry. Treat as FLAKY, not as a real failure."
+          set -uo pipefail
+          # Only the known libtorrent `piece_picker` lifetime flake class is
+          # retried, and only when it is what failed: a retry that happens to
+          # pass would otherwise hide every new race in the suite.  The target
+          # is listed as well so a process abort — which reports no test name —
+          # is still attributable.
+          flaky_target="tests/piece_registration_test.rs"
+          flaky_tests=(
+            test_read_registers_prefetched_pieces
+            test_background_prefetch_registers_via_piece_finished_alert
+            test_truncated_piece_reheals_via_recheck_and_redownload
+          )
+
+          # Which test binaries did not report a passing run (a failed or
+          # aborted binary never prints `test result: ok`), and which tests
+          # failed.
+          failed_targets="$(awk '
+            /^ *Running / {
+              if (target != "" && !ok) print target
+              target = $2; ok = 0; next
+            }
+            /^test result: ok/ { ok = 1 }
+            END { if (target != "" && !ok) print target }
+          ' cargo-test.log | sort -u)"
+          failed_tests="$(awk '
+            /^failures:$/ { infail = 1; next }
+            /^test result:/ { infail = 0 }
+            infail && /^    [^- ]/ { print $1 }
+          ' cargo-test.log | sort -u)"
+
+          unexpected=""
+          while IFS= read -r target; do
+            [ -z "$target" ] && continue
+            [ "$target" = "$flaky_target" ] || unexpected="$unexpected $target"
+          done <<< "$failed_targets"
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            printf '%s\n' "${flaky_tests[@]}" | grep -qxF "$name" || unexpected="$unexpected $name"
+          done <<< "$failed_tests"
+
+          if [ -n "$unexpected" ]; then
+            echo "::error title=Real test failure::Cargo Test (${{ matrix.arch }}) failed outside the flaky allowlist:$unexpected"
+            exit 1
+          fi
+          if [ -z "$failed_targets" ] && [ -z "$failed_tests" ]; then
+            echo "::error title=Test failure unreadable::the suite failed but neither a test binary nor a test name could be extracted from cargo-test.log"
+            exit 1
+          fi
+
+          # Retry the allowlisted tests only; the rest of the suite already
+          # passed in the first run.  `failed_tests` is a newline-separated
+          # string: expanding "${failed_tests[@]}" on it yields ONE element that
+          # still contains the newlines, which libtest treats as a filter
+          # matching nothing — the retry would "pass" with 0 tests run.  Split
+          # it into an array so each name is its own filter argument.
+          if [ -n "$failed_tests" ]; then
+            mapfile -t retry_names <<< "$failed_tests"
+            retry=(-- "${retry_names[@]}")
+          else
+            retry=(--test piece_registration_test)
+          fi
+          # `cargo test` exits 0 when the filter matches no test, so the exit
+          # status alone cannot prove the flake was re-run.  Require a non-empty
+          # `test result: ok. N passed` line; an empty retry is a real failure.
+          cargo test --locked --workspace --no-fail-fast "${retry[@]}" 2>&1 | tee cargo-test-retry.log
+          retry_rc="${PIPESTATUS[0]}"
+          retry_ran=0
+          if grep -Eq '^test result: ok\. [1-9][0-9]* passed' cargo-test-retry.log; then
+            retry_ran=1
+          fi
+          if [ "$retry_rc" -eq 0 ] && [ "$retry_ran" -eq 1 ]; then
+            echo "::warning title=Flaky test (FLAKY)::Cargo Test (${{ matrix.arch }}) failed only in the allowlisted piece_picker flake class and passed on retry. Treat as FLAKY, not as a real failure."
             {
               echo "### FLAKY — not a real failure"
               echo
-              echo 'The first `cargo test --locked --workspace --no-fail-fast` run failed and the retry passed.'
-              echo 'This is the known libtorrent `piece_picker` lifetime flake class, not a regression from this PR.'
+              echo 'The first run failed only in the allowlisted libtorrent `piece_picker` lifetime flake class.'
+              echo 'The retry passed; no test outside the allowlist failed.'
             } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$retry_rc" -eq 0 ]; then
+            echo "::error title=Real test failure::Cargo Test (${{ matrix.arch }}) retried the allowlisted flakes but ran no test (filter matched nothing) — treating as a REAL failure."
+            exit 1
           else
-            echo "::error title=Real test failure::Cargo Test (${{ matrix.arch }}) failed twice in a row. Treat as a REAL failure."
+            echo "::error title=Real test failure::Cargo Test (${{ matrix.arch }}) failed twice in a row, including the allowlisted flake retry. Treat as a REAL failure."
             exit 1
           fi
 
@@ -88,7 +170,7 @@ jobs:
     name: Entrypoint Shell Tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Run entrypoint detection tests
         run: ./ci/tests/entrypoint_test.sh
@@ -174,7 +256,7 @@ jobs:
     name: Deploy Rootful Shell Tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Run deploy_rootful tests
         run: ./ci/tests/deploy_rootful_test.sh
@@ -183,7 +265,7 @@ jobs:
     name: Self-Seed Env Shell Tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Run self-seed env validation tests
         run: ./ci/tests/self_seed_env_test.sh
@@ -196,13 +278,13 @@ jobs:
     # would otherwise hang until the workflow's default timeout.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: false
@@ -264,10 +346,12 @@ jobs:
         # self-gates: an environment that cannot provide the required
         # capability (no /dev/fuse, no CAP_SYS_ADMIN, no shared host
         # directory) exits 2, which the loop records as a SKIP warning and then
-        # continues with the remaining cases; any other non-zero exit fails the
-        # job.
+        # continues with the remaining cases; any other non-zero exit fails
+        # the job.  A run where every case skipped asserted nothing, so it
+        # fails.
         run: |
           set -euo pipefail
+          ran=0
           for tc in tc_container_01 tc_container_02 tc_container_03 tc_container_04 tc_container_05 tc_container_06 tc_container_07 tc_container_08 tc_recovery_03; do
             rc=0
             ./tests/acceptance/$tc.sh torrentfs:ci /srv/torrentfs-acceptance || rc=$?
@@ -276,20 +360,26 @@ jobs:
               continue
             fi
             [ "$rc" -eq 0 ] || exit "$rc"
+            ran=$((ran + 1))
           done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error title=No container case ran::every TC-container case skipped — the job asserted nothing"
+            exit 1
+          fi
+          echo "TC-container cases executed: $ran"
 
   docker-build-arm64:
     name: Docker Build (arm64)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: false
@@ -325,7 +415,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -344,10 +434,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -376,7 +470,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -395,10 +489,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -427,7 +525,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -446,10 +544,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -484,7 +586,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -503,10 +605,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -535,7 +641,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -554,10 +660,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -595,7 +705,7 @@ jobs:
       # /dev/fuse is passed through (same flags the Docker image documents).
       options: --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -614,10 +724,14 @@ jobs:
           grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -642,10 +756,9 @@ jobs:
 
       - name: Run acceptance FUSE cases
         # Case exit codes: 0 = PASS, 1 = FAIL, 2 = SKIP (the case self-gated:
-        # no /dev/fuse or no fusermount3).  A bare `set -e` loop would turn a
-        # SKIP into a failure, so each case is run with `|| rc=$?` and rc=2 is
-        # reported as a warning; rc=1 still fails the job.  This job installs
-        # fuse3 and runs as root with /dev/fuse, so the passing path is real.
+        # no /dev/fuse or no fusermount3).  A job where every case skipped
+        # asserted nothing and fails too.  This job installs fuse3 and runs
+        # as root with /dev/fuse, so the passing path is real.
         run: |
           set -euo pipefail
           # The first ten are the long-standing carriers; the last four are a
@@ -653,6 +766,7 @@ jobs:
           # builder, tracker/peer swarm, stats rendering, by-name/read paths),
           # so a fixture regression fails here instead of surfacing only in
           # acceptance execution.
+          ran=0
           for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_recovery_05 \
                     tc_read_01 tc_ingest_02 tc_stats_06 tc_seeding_02; do
             rc=0
@@ -662,8 +776,15 @@ jobs:
             elif [ "$rc" -ne 0 ]; then
               echo "::error::$tc FAIL (rc=$rc)"
               exit "$rc"
+            else
+              ran=$((ran + 1))
             fi
           done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error title=No acceptance case ran::every acceptance case skipped — the job asserted nothing"
+            exit 1
+          fi
+          echo "Acceptance cases executed: $ran"
 
       # TC-negative-03's mount-dependent half (forbidden state paths inside
       # the mountpoint and the remount comparison) needs a live FUSE mount.
@@ -687,7 +808,7 @@ jobs:
     # declarations unchanged (design §4 #7).
     container: debian:bookworm-slim
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install system dependencies
         run: |
@@ -703,10 +824,14 @@ jobs:
             ca-certificates
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          # A concrete release, not `stable`: the image pins the same version,
+          # so a toolchain bump is a reviewed change instead of drift.
+          toolchain: 1.99.1
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-bindgen-cli-${{ hashFiles('libtorrent-sys/regenerate-bindings.sh') }}

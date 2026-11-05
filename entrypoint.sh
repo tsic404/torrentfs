@@ -8,10 +8,12 @@
 #      bind-mounts to the container-facing path for host visibility via
 #      shared mount propagation (rshared).
 #      See: https://docs.docker.com/engine/storage/bind-mounts/#configure-bind-propagation
-#   5. Rootless podman detection: shared propagation is unsupported in user
+#   5. Rootless detection: shared propagation is unsupported in user
 #      namespaces, so the two-stage bind mount is skipped and torrentfs mounts
-#      directly on the container path. When the mountpoint is a bind mount
-#      (e.g. -v /host:/mnt:shared) — the host-visibility recipe — the entrypoint
+#      directly on the container path. The user namespace is detected from
+#      /proc/self/uid_map, which covers rootless podman and rootless docker
+#      alike. Under rootless podman running as container root, a bind mount on
+#      the mountpoint (e.g. -v /host:/mnt:shared) — the host-visibility recipe —
 #      fails fast (exit 102) instead of silently mounting container-only: the
 #      ':shared' flag is ineffective and the host will never see the FUSE mount.
 #   6. Concurrent-mountpoint conflict handling: two containers sharing one
@@ -29,10 +31,10 @@ set -euo pipefail
 # ── privilege drop ────────────────────────────────────────────────────────────
 # torrentfs is a network-facing daemon (untrusted .torrent input + libtorrent).
 # A rootful container holds real root and drops to this dedicated non-root user
-# before the daemon starts; rootless podman maps container UID 0 to the invoking
-# host user (user namespace), so its "root" is already unprivileged on the host
-# and a drop to a subuid would sever /dev/fuse and bind-mounted state access —
-# no drop occurs there.
+# before the daemon starts; a rootless container (podman or docker) maps
+# container UID 0 to the invoking host user (user namespace), so its "root" is
+# already unprivileged on the host and a drop to a subuid would sever /dev/fuse
+# and bind-mounted state access — no drop occurs there.
 TORRENTFS_UID=1000
 TORRENTFS_GID=1000
 TORRENTFS_HOME=/home/torrentfs
@@ -42,6 +44,15 @@ TORRENTFS_HOME=/home/torrentfs
 daemon_uid=""
 daemon_gid=""
 daemon_home=""
+
+# Stop-request state shared by the start loops, the readiness wait and the
+# traps.  `stopping` is set by the trap only: a signal must never be answered
+# with SIG_IGN (PID 1 passes that disposition to every daemon it restarts, so
+# later stop requests would be unanswerable until SIGKILL).  A trapped signal
+# makes the loop's `wait` return 128+signo, so `daemon_rc` is the only place the
+# daemon's own status survives for the shutdown exit code.
+stopping=0
+daemon_rc=""
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -268,30 +279,70 @@ is_root() {
     test "$(id -u)" -eq 0
 }
 
+# Rootless (podman or docker): inside a user namespace container UID 0 maps to
+# a non-zero host UID.  Shared mount propagation cannot then reach the host --
+# "root" is the invoking host user -- and a privilege drop would sever /dev/fuse
+# and the state volumes.
+# Ref: https://lists.podman.io/archives/list/podman@lists.podman.io/thread/YOGMR5I2M4MLCMQGZGFUV3NOJYJKZZ2X/
+#
+# Pure over its argument so every mapping shape can be tested without entering a
+# namespace: $1 is a uid_map body, rows of "inside outside length".
+#
+# The row that decides is the one covering inside UID 0, not necessarily the
+# first: a namespace nested inside another one inherits the parent's row first
+# (`0 0 1`, container root mapped to that parent's root) and maps the invoking
+# user on a later row.  Rootless means inside 0 is mapped to a non-zero outside
+# id; a map with no row for inside 0 has no container root to protect (the
+# unprivileged `unshare --user` form) and answers rootful, as does anything
+# unparsable.  The failure direction is therefore always "drop": an answer this
+# cannot read costs the daemon its /dev/fuse and state access and fails visibly
+# at startup, never leaving the network-facing daemon running as root.
+uid_map_is_rootless() {
+    local -a rows=()
+    local row inside outside length
+    # No -d: read splits the whole body on whitespace, not line 1 only.
+    read -r -d '' -a rows <<< "${1:-}" || true
+    [ "${#rows[@]}" -ge 3 ] || return 1
+    (( ${#rows[@]} % 3 == 0 )) || return 1
+    for (( row = 0; row < ${#rows[@]}; row += 3 )); do
+        inside="${rows[row]}"; outside="${rows[row + 1]}"; length="${rows[row + 2]}"
+        case "$inside$outside$length" in
+            '' | *[!0-9]*) return 1 ;;
+        esac
+        (( 10#$length > 0 )) || continue
+        (( 10#$inside == 0 )) || continue
+        (( 10#$outside != 0 )) && return 0
+    done
+    return 1
+}
+
+# Read the kernel's own map, never a caller-supplied file: this decision skips
+# the privilege drop, and a path a caller could point at a fixture would let a
+# rootful container run the network-facing daemon as root.  /proc/self here is
+# the entrypoint's process, which shares the container's user namespace.
+in_rootless_user_namespace() {
+    local uid_map
+    uid_map="$(cat /proc/self/uid_map 2>/dev/null)" || return 1
+    uid_map_is_rootless "$uid_map"
+}
+
 is_rootless_podman() {
-    # Rootless podman: container detected via podman signatures AND the
-    # user namespace maps container UID 0 to a non-zero host UID.
-    # (/proc/self/uid_map row 1 col 2 is the host-side UID; != 0 means
-    # we are in a user namespace, i.e. rootless.)
-    # In rootless podman, shared mount propagation (rshared) is not supported
-    # because the user namespace lacks the necessary mount privileges.
-    # Ref: https://lists.podman.io/archives/list/podman@lists.podman.io/thread/YOGMR5I2M4MLCMQGZGFUV3NOJYJKZZ2X/
-    if in_container; then
-        # Podman signatures: /run/.containerenv or libpod- cgroup
-        if test -f /run/.containerenv || grep -q ':/libpod-' /proc/1/cgroup 2>/dev/null; then
-            if awk 'NR==1 { exit !($2 != 0) }' /proc/self/uid_map 2>/dev/null; then
-                return 0
-            fi
-        fi
+    # Podman-specific signature: the ':shared' bind recipe under a libpod
+    # container root is refused with 102, while rootless docker (same user
+    # namespace, different mount plumbing) degrades with a warning instead.
+    in_container || return 1
+    if test -f /run/.containerenv || grep -q ':/libpod-' /proc/1/cgroup 2>/dev/null; then
+        in_rootless_user_namespace
+        return
     fi
     return 1
 }
 
-# Drop privileges only in a rootful container (real root). Rootless podman's
-# "root" is the invoking host user inside a user namespace: keep it, since a
-# drop would sever /dev/fuse and state-volume access.
+# Drop privileges only in a rootful container (real root).  A rootless
+# container's "root" is the invoking host user inside a user namespace: keep
+# it, since a drop would sever /dev/fuse and state-volume access.
 should_drop_privileges() {
-    is_root && ! is_rootless_podman
+    is_root && ! in_rootless_user_namespace
 }
 
 # Resolve the daemon identity once, so the state-ownership fix and the launch
@@ -396,9 +447,11 @@ ensure_fuse_device() {
 # read-only (no chown syscalls) on every cold start.  A non-zero status means
 # the walk itself failed — unreadable subtree, unmapped UID in a user namespace,
 # I/O error — which is not a clean bill of health: the caller re-homes the path
-# rather than trust an incomplete probe.
+# rather than trust an incomplete probe.  `-xdev` matches rehome_tree's walk: a
+# foreign-owned entry on another device is never re-owned, so reporting it here
+# would warn on every cold start and never converge.
 probe_foreign_ownership() {
-    find "$1" \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null
+    find "$1" -xdev \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print -quit 2>/dev/null
 }
 
 # Report a re-home as one explicit warning block: the level, the owner the tree
@@ -414,9 +467,9 @@ warn_state_rehome() {
 ║  WARNING: torrentfs state directory ownership is being re-homed      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 BANNER
-    echo "[entrypoint] re-homing to $daemon_uid:$daemon_gid — the daemon user cannot write these paths," >&2
+    echo "[entrypoint] re-homing to $daemon_uid:$daemon_gid — the daemon user cannot write this path," >&2
     echo "[entrypoint] so torrentfs cannot persist its SQLite DB or cache metadata there and the" >&2
-    echo "[entrypoint] download engine silently disables. chown -R targets:" >&2
+    echo "[entrypoint] download engine silently disables. Recursive re-home target:" >&2
     for detail in "$@"; do
         echo "[entrypoint]   - $detail" >&2
     done
@@ -426,10 +479,123 @@ BANNER
     echo "[entrypoint] container with --user <uid>:<gid>." >&2
 }
 
-# Re-home the state tree(s) to the daemon user when a previous container run left
-# them foreign-owned.  A path that does not exist yet is skipped (torrentfs
-# creates it with correct ownership) and a consistent tree is only walked
-# read-only, so a healthy cold start pays no chown syscalls.
+# Directories where torrentfs state may never live: creating a path there, or
+# re-owning its leaf, hands a system tree to the daemon user.  A dedicated
+# subdirectory (e.g. /var/lib/torrentfs) is fine — only the exact path is
+# refused, and `..` forms are canonicalized before this comparison; a subpath
+# below a system directory is handed over as one leaf (ADR-012's leaf-only
+# rule), never recursively.
+#
+# The usrmerge aliases are listed in canonical form: the check runs after
+# `realpath -m`, and on a merged-/usr image /bin, /sbin, /lib and /lib64
+# resolve to /usr/bin, /usr/sbin, /usr/lib and /usr/lib64, so an alias entry
+# alone would never match.
+SYSTEM_STATE_PATHS=(
+    / /bin /boot /dev /dev/mqueue /dev/pts /dev/shm /etc /home /lib /lib64
+    /media /mnt /opt /proc /root /run /sbin /srv /sys /tmp /usr /usr/bin
+    /usr/include /usr/lib /usr/lib64 /usr/libexec /usr/local /usr/sbin
+    /usr/share /usr/src /var /var/cache /var/lib /var/log /var/spool /var/tmp
+)
+
+# True when $1 is exactly one of the system directories above.
+is_system_state_path() {
+    local candidate="$1" system_path
+    for system_path in "${SYSTEM_STATE_PATHS[@]}"; do
+        [ "$candidate" = "$system_path" ] && return 0
+    done
+    return 1
+}
+
+# Canonicalize an absolute --cache / --db / state-tree path into
+# `normalized_path`.  A relative path exits 2 (C-10.9 usage error): it resolves
+# against the container WORKDIR (/), which the daemon user cannot write, so
+# forwarding it would only fail later at daemon startup.  An absolute path that
+# canonicalizes to a system directory exits 2 — `/a/..` must not slip past the
+# guard as `/a/..`.
+normalize_state_path() {
+    local option="$1" path="$2"
+    normalized_path=""
+    case "$path" in
+        /*) : ;;
+        *)
+            echo "[entrypoint] ERROR: $option path '$path' must be absolute" >&2
+            echo "[entrypoint]   A relative path resolves against the container WORKDIR (/), which the" >&2
+            echo "[entrypoint]   daemon user cannot write. Pass e.g. /state/cache instead." >&2
+            exit 2
+            ;;
+    esac
+    normalized_path="$(realpath -m -- "$path" 2>/dev/null)" || normalized_path=""
+    if [ -z "$normalized_path" ]; then
+        echo "[entrypoint] ERROR: $option path '$path' cannot be resolved" >&2
+        exit 2
+    fi
+    if is_system_state_path "$normalized_path"; then
+        echo "[entrypoint] ERROR: $option path '$path' resolves to '$normalized_path', a system" >&2
+        echo "[entrypoint]   directory. Give torrentfs its own directory (e.g. /var/lib/torrentfs)." >&2
+        exit 2
+    fi
+    return 0
+}
+
+# Re-home a dedicated state tree to the daemon user.  Recursion stays inside one
+# filesystem (`-xdev`): a bind-mounted host directory below the tree is not
+# state and must not be re-owned through it.  Only foreign entries are touched,
+# so a healthy tree costs a read-only walk.
+rehome_tree() {
+    local path="$1" entry failed=0
+    # A walk that cannot complete is not a clean bill of health: say so instead
+    # of silently leaving foreign entries behind.
+    if ! find "$path" -xdev -print -quit >/dev/null 2>&1; then
+        echo "[entrypoint] WARNING: could not walk $path; ownership left unchanged" >&2
+        return
+    fi
+    while IFS= read -r -d '' entry; do
+        chown -h "$daemon_uid:$daemon_gid" -- "$entry" 2>/dev/null || failed=1
+    done < <(find "$path" -xdev \( ! -user "$daemon_uid" -o ! -group "$daemon_gid" \) -print0 2>/dev/null)
+    if [ "$failed" -ne 0 ]; then
+        echo "[entrypoint] WARNING: could not re-home every entry under $path to $daemon_uid:$daemon_gid" >&2
+    fi
+}
+
+# Hand a --db file and SQLite's -wal / -shm sidecars to the daemon user.  The
+# file is a leaf: its parent directory is prepared by create_daemon_dir and
+# nothing below it is ever walked.
+fix_db_file_ownership() {
+    local db="$1" file
+    for file in "$db" "$db-wal" "$db-shm"; do
+        [ -e "$file" ] || continue
+        if ! chown -h "$daemon_uid:$daemon_gid" -- "$file" 2>/dev/null; then
+            echo "[entrypoint] WARNING: could not chown $file to $daemon_uid:$daemon_gid" >&2
+        fi
+    done
+}
+
+# Reject a relative or system-directory state path before the daemon sees it,
+# whatever identity this run uses.  A `--user <uid>` run cannot chown and must
+# not create the tree, but its bad path is still a usage error: left to
+# torrentfs it surfaces as a start failure or, for a relative path, as state
+# written under the container root's working directory.  The guards exit 2
+# themselves; call them for their exit, not their status.
+validate_state_paths() {
+    # Plain ifs, not `test && cmd`: the guards exit non-zero themselves, so the
+    # chain's status must never be what the caller reasons about, and a later
+    # line added under `&&` would quietly stop running the moment one is empty.
+    if [ -n "${cache_arg:-}" ]; then
+        normalize_state_path "--cache" "$cache_arg"
+    fi
+    if [ -n "${db_arg:-}" ]; then
+        normalize_state_path "--db" "$db_arg"
+    fi
+    if [ -n "${log_file_arg:-}" ]; then
+        validate_log_file_path "$log_file_arg"
+    fi
+}
+
+# Re-home the state tree to the daemon user when a previous container run left
+# it foreign-owned.  Only the dedicated state tree is recursive; --cache and
+# --db are caller-chosen volumes whose leaves are fixed instead (see
+# prepare_state_paths) — a recursive chown there would re-own every unrelated
+# file sharing that host directory, and could reach a system tree.
 fix_state_dir_ownership() {
     # Only root can re-home a foreign-owned tree; non-root runs (bare metal)
     # cannot chown and should not try.
@@ -438,67 +604,38 @@ fix_state_dir_ownership() {
     fi
     # resolve_daemon_ids() runs first (main calls it before
     # fix_state_dir_ownership); an empty daemon_uid would make the probe's
-    # `! -user ""` fail and `chown -R ":"` a silent no-op that leaves the tree
+    # `! -user ""` fail and every chown a silent no-op that leaves the tree
     # foreign-owned. Fail loudly if that contract is broken.
     if [ -z "${daemon_uid:-}" ] || [ -z "${daemon_gid:-}" ]; then
         echo "[entrypoint] ERROR: daemon identity not resolved; refusing to re-home state" >&2
         return 1
     fi
 
-    local -a candidates=("${XDG_DATA_HOME:-$daemon_home/.local/share}/torrentfs")
-    if [ -n "${cache_arg:-}" ]; then
-        candidates+=("$cache_arg")
-    fi
-    if [ -n "${db_arg:-}" ]; then
-        # --db names the SQLite file; SQLite writes its -wal / -shm sidecars
-        # into the file's parent directory, so re-home that too (never `.` or
-        # `/`, which a bare filename or root path would produce).
-        local db_dir
-        db_dir="$(dirname "$db_arg")"
-        case "$db_dir" in
-            .|/|'') : ;;
-            *) candidates+=("$db_dir") ;;
-        esac
-        candidates+=("$db_arg")
-    fi
-
-    # Probe every candidate before touching any of them: one warning naming all
-    # affected paths beats one message per path, and it lands before the chowns.
-    # Candidates are deduplicated by canonical path: a --db that sits directly
-    # in the state directory (or in --cache) would otherwise enter twice — as
-    # the --db parent and as the state/cache tree — and be probed, listed and
-    # chowned twice, as would a symlinked alias of either.
-    local -A seen=()
-    local -a rehome_paths=() rehome_detail=()
-    local path canon probe rc
-    for path in "${candidates[@]}"; do
-        [ -e "$path" ] || continue
-        canon="$(readlink -f "$path" 2>/dev/null)" || canon="$path"
-        [ -z "${seen[$canon]:-}" ] || continue
-        seen[$canon]=1
-        rc=0
-        probe="$(probe_foreign_ownership "$path")" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            rehome_paths+=("$path")
-            rehome_detail+=("$path (ownership probe failed — re-homing unverified)")
-        elif [ -n "$probe" ]; then
-            rehome_paths+=("$path")
-            rehome_detail+=("$path (first foreign entry: $probe)")
+    # A consistent tree is only walked read-only, so a healthy cold start pays
+    # no chown syscalls; a missing tree is skipped (torrentfs creates it).
+    local state_tree probe probe_rc
+    if normalize_state_path "--state" "${XDG_DATA_HOME:-$daemon_home/.local/share}/torrentfs"; then
+        state_tree="$normalized_path"
+        if [ -e "$state_tree" ]; then
+            probe=""
+            probe_rc=0
+            probe="$(probe_foreign_ownership "$state_tree")" || probe_rc=$?
+            if [ "$probe_rc" -ne 0 ]; then
+                warn_state_rehome "$state_tree (ownership probe failed — re-homing unverified)"
+                rehome_tree "$state_tree"
+            elif [ -n "$probe" ]; then
+                warn_state_rehome "$state_tree (first foreign entry: $probe)"
+                rehome_tree "$state_tree"
+            fi
         fi
-    done
-
-    if [ "${#rehome_paths[@]}" -gt 0 ]; then
-        warn_state_rehome "${rehome_detail[@]}"
     fi
-    for path in "${rehome_paths[@]}"; do
-        if ! chown -R "$daemon_uid:$daemon_gid" "$path" 2>/dev/null; then
-            echo "[entrypoint] WARNING: could not chown $path to $daemon_uid:$daemon_gid" >&2
-        fi
-    done
 
-    # Existing trees are re-homed above; --cache / --db paths that do not exist
-    # yet are created and handed over here.
+    # --cache / --db paths that do not exist yet are created and handed over
+    # here; existing DB files and sidecars are re-owned leaf by leaf.
     prepare_state_paths
+    if [ -n "${db_file_resolved:-}" ]; then
+        fix_db_file_ownership "$db_file_resolved"
+    fi
 
     if [ -n "${log_file_arg:-}" ]; then
         prepare_log_file_parent "$log_file_arg"
@@ -515,11 +652,13 @@ fix_state_dir_ownership() {
 # like /var/log. Instead we (running as root) mkdir -p the full chain and chown
 # only the leaf directory (no -R): parent traversal only needs +x, which
 # mkdir -p leaves as 755 under the container umask.
-prepare_log_file_parent() {
-    local log_file="$1" log_dir
+validate_log_file_path() {
+    local log_file="$1" normalized log_dir
+    log_file_normalized=""
     # A relative path resolves against the container WORKDIR (/, root-owned):
     # the daemon can never write there, so fail fast with an actionable error
-    # rather than EACCES at startup.
+    # rather than EACCES at startup.  Exit 1 is the usage-error status this
+    # path has always returned; --cache/--db use 2 (C-10.9).
     case "$log_file" in
         /*) : ;;
         *)
@@ -550,6 +689,24 @@ prepare_log_file_parent() {
             exit 1
             ;;
     esac
+    log_file_normalized="$log_file"
+}
+
+# Prepare the --log-file parent directory for the privilege drop.
+#
+# torrentfs's open_log_file() runs as the daemon user (post-setpriv) and calls
+# create_dir_all() on the parent; every directory in that chain must already
+# exist and be traversable, and the leaf must be daemon-owned, or the daemon's
+# create/open fails with EACCES and torrentfs exits. The state re-home is the
+# wrong tool here: it skips missing paths and `chown -R`s a whole shared tree
+# like /var/log. Instead we (running as root) mkdir -p the full chain and chown
+# only the leaf directory (no -R): parent traversal only needs +x, which
+# mkdir -p leaves as 755 under the container umask.
+prepare_log_file_parent() {
+    local log_file log_dir
+    validate_log_file_path "$1"
+    log_file="$log_file_normalized"
+    log_dir="$(dirname "$log_file")"
     if ! mkdir -p "$log_dir" 2>/dev/null; then
         echo "[entrypoint] ERROR: cannot create log directory '$log_dir' for --log-file" >&2
         exit 1
@@ -564,46 +721,58 @@ prepare_log_file_parent() {
 # The daemon creates the cache directory and the SQLite DB (plus its -wal/-shm
 # sidecars) itself, but only after setpriv dropped it to the daemon user; a
 # freshly mounted state volume is root-owned, so the daemon's mkdir/open fails
-# with EACCES and torrentfs exits at startup. The state re-home misses these
-# paths when they do not exist yet (it skips missing candidates), so create
-# them here as root and hand the leaves to the daemon user. The default XDG
-# tree needs none of this: it lives under the daemon's own home directory.
+# with EACCES and torrentfs exits at startup. Only leaves are handed over —
+# the cache directory itself and the DB's parent directory — never a recursive
+# chown. The default XDG tree needs none of this: it lives under the daemon's
+# own home directory.
+#
+# Both resolved paths are kept for the caller: the DB file (with its sidecars)
+# is re-owned separately, and it must be the canonical path the guard vetted.
+cache_dir_resolved=""
+db_file_resolved=""
 prepare_state_paths() {
-    if [ -n "${cache_arg:-}" ]; then
-        create_daemon_dir "$cache_arg" "--cache"
+    cache_dir_resolved=""
+    db_file_resolved=""
+    if [ -n "${cache_arg:-}" ] && normalize_state_path "--cache" "$cache_arg"; then
+        cache_dir_resolved="$normalized_path"
+        create_daemon_dir "$cache_dir_resolved" "--cache"
     fi
-    if [ -n "${db_arg:-}" ]; then
-        create_daemon_dir "$(dirname "$db_arg")" "--db"
+    if [ -n "${db_arg:-}" ] && normalize_state_path "--db" "$db_arg"; then
+        db_file_resolved="$normalized_path"
+        create_daemon_dir "$(dirname "$db_file_resolved")" "--db"
     fi
 }
 
 # mkdir -p $1 and chown the leaf directory (no -R) to the daemon user, mirroring
-# prepare_log_file_parent. $2 names the flag for diagnostics.
+# prepare_log_file_parent. $2 names the flag for diagnostics. The caller passes
+# a canonical absolute path; the canonicalization and guard are repeated so a
+# direct call cannot mkdir or re-own `/`, `.` or a system directory either.
 create_daemon_dir() {
-    local dir="$1" option="$2" normalized
-    # Leave `.` uncanonicalized so the root guard below still recognizes a bare
-    # filename: the daemon resolves it against the same cwd (the container
-    # WORKDIR), which must never be re-owned — same rule as the re-home.
+    local dir="$1" option="$2" normalized=""
     case "$dir" in
-        .|/|'') : ;;
+        /*) : ;;
         *)
-            # Canonicalize so `//` and `..` forms cannot slip past the guard.
-            if normalized="$(realpath -m "$dir" 2>/dev/null)"; then
-                dir="$normalized"
-            fi
+            echo "[entrypoint] ERROR: $option path '$dir' is not absolute" >&2
+            echo "[entrypoint]   Give torrentfs an absolute path it can own, e.g. /state/cache." >&2
+            exit 2
             ;;
     esac
-    if [ "$dir" = "/" ] || [ "$dir" = "." ]; then
-        echo "[entrypoint] WARNING: $option path '$1' cannot be prepared for the daemon user" >&2
-        echo "[entrypoint]   (uid $daemon_uid); it must already be writable there." >&2
-        return 0
+    normalized="$(realpath -m -- "$dir" 2>/dev/null)" || normalized=""
+    if [ -z "$normalized" ]; then
+        echo "[entrypoint] ERROR: $option path '$dir' cannot be resolved" >&2
+        exit 2
     fi
-    if ! mkdir -p "$dir" 2>/dev/null; then
-        echo "[entrypoint] ERROR: cannot create $option directory '$dir' for the daemon user" >&2
+    if is_system_state_path "$normalized"; then
+        echo "[entrypoint] ERROR: $option path '$dir' resolves to '$normalized', a system directory" >&2
+        echo "[entrypoint]   Give torrentfs its own directory (e.g. /var/lib/torrentfs)." >&2
+        exit 2
+    fi
+    if ! mkdir -p "$normalized" 2>/dev/null; then
+        echo "[entrypoint] ERROR: cannot create $option directory '$normalized' for the daemon user" >&2
         exit 1
     fi
-    if ! chown "$daemon_uid:$daemon_gid" "$dir" 2>/dev/null; then
-        echo "[entrypoint] WARNING: could not chown $option directory '$dir' to $daemon_uid:$daemon_gid" >&2
+    if ! chown "$daemon_uid:$daemon_gid" -- "$normalized" 2>/dev/null; then
+        echo "[entrypoint] WARNING: could not chown $option directory '$normalized' to $daemon_uid:$daemon_gid" >&2
     fi
 }
 
@@ -664,7 +833,7 @@ RECOVERY
 
     # Give the lazy detach a moment, then confirm the path no longer fails
     # with ENOTCONN before we let mkdir/torrentfs touch it.
-    sleep 0.2
+    sleep 0.2 || true
     if mountpoint_enotconn "$target"; then
         echo "[entrypoint] ERROR: $target still reports ENOTCONN after lazy unmount" >&2
         return 1
@@ -679,6 +848,11 @@ RECOVERY
 # mount appeared, or the 30s deadline passing — prints an actionable diagnostic
 # and returns a non-zero exit code to propagate (torrentfs's own code when it
 # exited first, otherwise 1). Callers must `exit` with the returned code.
+#
+# A stop signal during startup is not a mount failure: the trap has already
+# killed and reaped the daemon, so `wait` here would report 127 for a pid that
+# is no longer a child. The stop flag and the reaped status decide the outcome
+# instead (C-10.6: a daemon that exited first has its code passed through).
 wait_for_fuse_mount() {
     local torrentfs_pid="$1" target="$2"
 
@@ -692,6 +866,10 @@ wait_for_fuse_mount() {
             ready=1
             break
         fi
+        if [ "${stopping:-0}" -ne 0 ]; then
+            echo "[entrypoint] stop requested during startup — not waiting for the FUSE mount" >&2
+            return "${daemon_rc:-0}"
+        fi
         # torrentfs died before the mount came up (e.g. fusermount3 was
         # blocked from opening /dev/fuse by Docker's seccomp profile) — stop
         # waiting so we surface its exit code instead of a bare timeout.
@@ -699,7 +877,8 @@ wait_for_fuse_mount() {
             exited=1
             break
         fi
-        sleep 0.5
+        # Interrupted by the stop trap: the next iteration reads the flag.
+        sleep 0.5 || true
     done
 
     if [ "$ready" -eq 1 ]; then
@@ -833,6 +1012,61 @@ force_unmount_fuse() {
     return 1
 }
 
+# Release the bind mount that publishes the internal FUSE mount at $1 (the
+# rootful two-stage path).
+#
+# A plain `umount` fails with EBUSY while a host-side reader still holds the
+# dead FUSE mount, and that residue is the ENOTCONN mount on the host that
+# blocks the next start — exactly the case this detach exists for. Lazy detach
+# leaves the namespace regardless of holders (C-9.2.4's fallback), and the
+# mountinfo probe verifies the entry is gone instead of assuming it: an entry
+# that survives every attempt is reported so the caller can surface it.
+detach_publish_bind() {
+    local target="$1"
+
+    if ! mountpoint_has_fuse "$target"; then
+        return 0
+    fi
+    # Prefer a direct unmount: it is the only form that can report a leak
+    # immediately, and it succeeds whenever no reader is holding the mount.
+    if umount "$target" 2>/dev/null; then
+        return 0
+    fi
+    echo "[entrypoint] publishing mount at $target is busy — lazy-detaching" >&2
+    umount -l "$target" 2>/dev/null || true
+    sleep 0.2 || true
+    if mountpoint_has_fuse "$target"; then
+        echo "[entrypoint] ERROR: could not detach the publishing mount at $target — the host may" >&2
+        echo "[entrypoint]   keep a stale (ENOTCONN) mount; run 'umount -l $target' on the host." >&2
+        return 1
+    fi
+    echo "[entrypoint] detached publishing mount at $target (lazy)" >&2
+    return 0
+}
+
+# Withdraw the bind that published the internal FUSE mount $2 onto $1, when a
+# stop landed between the publish decision and the bind.  Returns 0 when the
+# layer is gone, non-zero when it is still mounted.
+#
+# The stop trap can run either side of `mount --bind`: when it ran first, the
+# bind of the already-unmounted internal directory is still there and no detach
+# path claims it (detach_publish_bind only recognizes FUSE entries), so it must
+# be unmounted here.  When it ran after the bind completed, cleanup already
+# detached it and both umounts fail — a failing unmount alone is not a leak.  A
+# live bind makes $1 stat to $2's own directory inode; a detached one does not.
+withdraw_publish_bind() {
+    local target="$1" internal="$2" target_id inner_id
+    if umount "$target" 2>/dev/null || umount -l "$target" 2>/dev/null; then
+        return 0
+    fi
+    target_id="$(stat -L -c '%d:%i' "$target" 2>/dev/null)" || target_id=""
+    inner_id="$(stat -L -c '%d:%i' "$internal" 2>/dev/null)" || inner_id=""
+    if [ -n "$target_id" ] && [ "$target_id" = "$inner_id" ]; then
+        return 1
+    fi
+    return 0
+}
+
 # ── severed-session recovery ────────────────────────────────────────────────
 
 # torrentfs exits with this status when its FUSE connection was severed while
@@ -860,9 +1094,40 @@ should_recover_session() {
     [ "$used" -lt "$MAX_SESSION_RECOVERIES" ]
 }
 
+# Stop the daemon $1 and record its own exit status in `daemon_rc`.
+#
+# The trap calls this while it owns the daemon.  A second stop signal re-enters
+# the trap (the caller's guard makes that invocation a no-op), but it still
+# interrupts `wait` with 128+signo, so the reaping is retried until the daemon's
+# status replaces the signal's — otherwise a `docker stop` that signals twice
+# would report 143 for a cleanly stopped daemon.  A pid the loop already reaped
+# is no longer a child and answers `wait` with 127; `kill -0` tells that apart
+# from a live (or zombie) daemon, which still has a status to collect.
+reap_daemon_on_stop() {
+    local pid="$1" status=0
+    kill "$pid" 2>/dev/null || true
+    kill -0 "$pid" 2>/dev/null || return 0
+    wait "$pid" 2>/dev/null || status=$?
+    while [ "$status" -ge 128 ] && kill -0 "$pid" 2>/dev/null; do
+        status=0
+        wait "$pid" 2>/dev/null || status=$?
+    done
+    daemon_rc="$status"
+}
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 echo "[entrypoint] torrentfs container startup" >&2
+
+# Record a stop request from the very first line of main.  PID 1 drops a signal
+# that has no handler (it is not queued), so a `docker stop` arriving during
+# FUSE setup, stale-mount recovery, lock acquisition or state re-homing would
+# simply vanish: the entrypoint would keep starting, the runtime would wait out
+# the grace period and SIGKILL it, leaving a stale host mount.  This handler
+# only records the flag; the start functions replace it with the full cleanup
+# handler and keep the flag instead of resetting it.
+stop_requested() { stopping=1; }
+trap stop_requested INT TERM
 
 if in_container; then
     echo "[entrypoint] detected container environment" >&2
@@ -938,6 +1203,15 @@ start_torrentfs() {
     local mountpoint="$1"
     shift
 
+    # A stop request may have arrived during the startup work in main (FUSE
+    # device setup, stale-mount recovery, state re-homing).  The main-level trap
+    # only recorded it; unwind cleanly instead of mounting for a container that
+    # is already being stopped.
+    if [ "$stopping" -ne 0 ]; then
+        echo "[entrypoint] stop requested before startup — exiting without mounting" >&2
+        exit 0
+    fi
+
     # A previous run that was SIGKILLed (stop_timeout too short) can leave a
     # stale FUSE mount on $mountpoint: the kernel reports ENOTCONN because the
     # FUSE daemon that owned the mount is gone. mkdir -p would then fail with
@@ -994,6 +1268,13 @@ start_torrentfs_rootless() {
     local mountpoint="$1"
     shift
 
+    # Preserve a stop recorded before this function ran (main's trap): never
+    # reset `stopping`, and never mount for a container already being stopped.
+    if [ "$stopping" -ne 0 ]; then
+        echo "[entrypoint] stop requested before startup — exiting without mounting" >&2
+        exit 0
+    fi
+
     mkdir -p "$mountpoint"
 
     # A bind mount on the mountpoint signals host-visibility intent:
@@ -1038,30 +1319,31 @@ start_torrentfs_rootless() {
     echo "[entrypoint] starting torrentfs directly on $mountpoint" >&2
 
     local torrentfs_pid=""
-    # Status the cleanup trap reaped from the daemon.  A trapped signal wakes
-    # `wait` with 128+signo before the trap runs, so the trap's own status is
-    # the only place the daemon's real exit code survives for the exit path.
-    local daemon_rc=""
+    local cleanup_running=0
     cleanup() {
-        # A repeated stop signal must not re-enter this handler: the recursive
-        # call's interrupted `wait` would overwrite daemon_rc with 128+signo.
-        trap '' INT TERM
+        # A repeated stop signal must not re-enter this handler while it owns
+        # the daemon: the nested call would compete for the status the outer
+        # one is collecting.  The flag is cleared before returning so the EXIT
+        # trap still runs the detach as the safety net.
+        if [ "$cleanup_running" -ne 0 ]; then
+            stopping=1
+            return 0
+        fi
+        cleanup_running=1
+        # Record the stop and reap the daemon; the loop and the readiness wait
+        # poll `stopping` and unwind.  Never ignore the signal here: a PID 1
+        # with SIG_IGN passes that disposition to every daemon it restarts, so
+        # later stop requests would be unanswerable until SIGKILL left a stale
+        # mount on the host (C-9.2.1).
+        stopping=1
         echo "[entrypoint] shutting down" >&2
         if [ -n "${torrentfs_pid:-}" ]; then
-            kill "$torrentfs_pid" 2>/dev/null || true
-            # A pid the loop already reaped is no longer a child and answers
-            # `wait` with 127; only a live (or zombie) daemon has a status.
-            if kill -0 "$torrentfs_pid" 2>/dev/null; then
-                if wait "$torrentfs_pid" 2>/dev/null; then
-                    daemon_rc=0
-                else
-                    daemon_rc=$?
-                fi
-            fi
+            reap_daemon_on_stop "$torrentfs_pid"
             torrentfs_pid=""
         fi
         umount "${mountpoint:-}" 2>/dev/null || true
         force_unmount_fuse "${mountpoint:-}" || true
+        cleanup_running=0
     }
     trap cleanup EXIT INT TERM
 
@@ -1070,11 +1352,26 @@ start_torrentfs_rootless() {
     # bind publish to restore, so recovery is just the mount itself.
     local rc=0 recoveries=0
     while :; do
+        # A stop that arrived before this iteration (during the backoff, or
+        # before the first start) must not spawn another daemon.
+        if [ "$stopping" -ne 0 ]; then
+            rc="${daemon_rc:-0}"
+            daemon_rc=""
+            break
+        fi
         local mount_rc=0
         run_daemon torrentfs "$mountpoint" "$@" &
         torrentfs_pid=$!
 
         wait_for_fuse_mount "$torrentfs_pid" "$mountpoint" || mount_rc=$?
+        if [ "$stopping" -ne 0 ]; then
+            # Stop during startup: the trap already reaped the daemon, so the
+            # readiness result says nothing — the daemon's own status is the
+            # shutdown result (C-10.6).
+            rc="${daemon_rc:-0}"
+            daemon_rc=""
+            break
+        fi
         if [ "$mount_rc" -ne 0 ]; then
             exit "$mount_rc"
         fi
@@ -1082,8 +1379,6 @@ start_torrentfs_rootless() {
         echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
 
         rc=0
-        # The trap may already have reaped the daemon (a stop signal that
-        # arrived before this `wait`); `daemon_rc` then carries its status.
         if [ -n "$torrentfs_pid" ]; then
             wait "$torrentfs_pid" || rc=$?
             torrentfs_pid=""
@@ -1091,8 +1386,8 @@ start_torrentfs_rootless() {
         # A stop signal wakes `wait` with 128+signo, but the trap reaped the
         # daemon: its status is the shutdown result the container must report
         # (0 = clean), and a stop request must not become a recovery restart.
-        if [ -n "$daemon_rc" ]; then
-            rc="$daemon_rc"
+        if [ "$stopping" -ne 0 ]; then
+            rc="${daemon_rc:-0}"
             daemon_rc=""
             break
         fi
@@ -1109,7 +1404,8 @@ start_torrentfs_rootless() {
             echo "[entrypoint] ERROR: cannot detach the dead FUSE mount at $mountpoint — not restarting" >&2
             exit "$rc"
         fi
-        sleep "$SESSION_RECOVERY_BACKOFF_SECS"
+        # A stop during the backoff is handled at the top of the loop.
+        sleep "$SESSION_RECOVERY_BACKOFF_SECS" || true
     done
 
     # The daemon has stopped; detach any FUSE mount it left behind. If it exited
@@ -1130,6 +1426,13 @@ start_torrentfs_rootful() {
     shift
     local internal_mnt="/mnt-inner"
 
+    # Preserve a stop recorded before this function ran (main's trap): never
+    # reset `stopping`, and never mount for a container already being stopped.
+    if [ "$stopping" -ne 0 ]; then
+        echo "[entrypoint] stop requested before startup — exiting without mounting" >&2
+        exit 0
+    fi
+
     mkdir -p "$internal_mnt"
     if should_drop_privileges; then
         chown "$daemon_uid:$daemon_gid" "$internal_mnt"
@@ -1139,33 +1442,36 @@ start_torrentfs_rootful() {
     echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
 
     local torrentfs_pid=""
-    # Status the cleanup trap reaped from the daemon.  A trapped signal wakes
-    # `wait` with 128+signo before the trap runs, so the trap's own status is
-    # the only place the daemon's real exit code survives for the exit path.
-    local daemon_rc=""
+    local cleanup_running=0
     cleanup() {
-        # A repeated stop signal must not re-enter this handler: the recursive
-        # call's interrupted `wait` would overwrite daemon_rc with 128+signo.
-        trap '' INT TERM
+        # A repeated stop signal must not re-enter this handler while it owns
+        # the daemon: the nested call would compete for the status the outer
+        # one is collecting.  The flag is cleared before returning so the EXIT
+        # trap still runs the detach as the safety net.
+        if [ "$cleanup_running" -ne 0 ]; then
+            stopping=1
+            return 0
+        fi
+        cleanup_running=1
+        # Record the stop and reap the daemon; the loop and the readiness wait
+        # poll `stopping` and unwind.  Never ignore the signal here: a PID 1
+        # with SIG_IGN passes that disposition to every daemon it restarts, so
+        # later stop requests would be unanswerable until SIGKILL left a stale
+        # mount on the host (C-9.2.1).
+        stopping=1
         echo "[entrypoint] shutting down" >&2
         if [ -n "${torrentfs_pid:-}" ]; then
-            kill "$torrentfs_pid" 2>/dev/null || true
-            # A pid the loop already reaped is no longer a child and answers
-            # `wait` with 127; only a live (or zombie) daemon has a status.
-            if kill -0 "$torrentfs_pid" 2>/dev/null; then
-                if wait "$torrentfs_pid" 2>/dev/null; then
-                    daemon_rc=0
-                else
-                    daemon_rc=$?
-                fi
-            fi
+            reap_daemon_on_stop "$torrentfs_pid"
             torrentfs_pid=""
         fi
         # Detach the FUSE mount first (the daemon unmounts $internal_mnt itself,
         # but a killed daemon may have skipped it), then release the bind mount
-        # that publishes it at $mountpoint.
+        # that publishes it at $mountpoint. The release goes through the lazy
+        # fallback: a host reader still holding the dead mount makes a plain
+        # umount fail EBUSY and leaves the ENOTCONN residue on the host.
         force_unmount_fuse "${internal_mnt:-}" || true
-        umount "${mountpoint:-}" 2>/dev/null || true
+        detach_publish_bind "${mountpoint:-}" || true
+        cleanup_running=0
     }
     trap cleanup EXIT INT TERM
 
@@ -1175,23 +1481,61 @@ start_torrentfs_rootful() {
     # restart.
     local rc=0 recoveries=0
     while :; do
+        # A stop that arrived before this iteration (during the backoff, or
+        # before the first start) must not spawn another daemon.
+        if [ "$stopping" -ne 0 ]; then
+            rc="${daemon_rc:-0}"
+            daemon_rc=""
+            break
+        fi
         local mount_rc=0
         run_daemon torrentfs "$internal_mnt" "$@" &
         torrentfs_pid=$!
 
         wait_for_fuse_mount "$torrentfs_pid" "$internal_mnt" || mount_rc=$?
+        if [ "$stopping" -ne 0 ]; then
+            # Stop during startup: the trap already reaped the daemon, so the
+            # readiness result says nothing — the daemon's own status is the
+            # shutdown result (C-10.6). Never publish a dead mount.
+            rc="${daemon_rc:-0}"
+            daemon_rc=""
+            break
+        fi
         if [ "$mount_rc" -ne 0 ]; then
             exit "$mount_rc"
         fi
 
         echo "[entrypoint] FUSE mount ready — publishing to $mountpoint" >&2
+        # A trapped signal runs at the next command boundary, so a stop can land
+        # between the check above and this bind.  Cleanup would then unmount the
+        # internal FUSE mount and the bind would publish an *empty* directory:
+        # no detach path claims it (detach_publish_bind only handles FUSE
+        # entries), and rshared propagation leaves that bare bind masking the
+        # host directory until someone unmounts it by hand.  Check on both sides
+        # of the bind and withdraw our own layer when the stop won the race.
+        if [ "$stopping" -ne 0 ]; then
+            rc="${daemon_rc:-0}"
+            daemon_rc=""
+            break
+        fi
         mount --bind "$internal_mnt" "$mountpoint"
+        if [ "$stopping" -ne 0 ]; then
+            # The trap may have detached the layer already (it ran after the
+            # bind completed) or not (it ran before the bind); the helper tells
+            # the two apart so only a real leftover is reported as a failure.
+            rc="${daemon_rc:-0}"
+            if ! withdraw_publish_bind "$mountpoint" "$internal_mnt"; then
+                echo "[entrypoint] ERROR: stop raced the publish bind at $mountpoint and it could not" >&2
+                echo "[entrypoint]   be withdrawn — check the host with 'findmnt $mountpoint'" >&2
+                rc=103
+            fi
+            daemon_rc=""
+            break
+        fi
 
         echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
 
         rc=0
-        # The trap may already have reaped the daemon (a stop signal that
-        # arrived before this `wait`); `daemon_rc` then carries its status.
         if [ -n "$torrentfs_pid" ]; then
             wait "$torrentfs_pid" || rc=$?
             torrentfs_pid=""
@@ -1199,8 +1543,8 @@ start_torrentfs_rootful() {
         # A stop signal wakes `wait` with 128+signo, but the trap reaped the
         # daemon: its status is the shutdown result the container must report
         # (0 = clean), and a stop request must not become a recovery restart.
-        if [ -n "$daemon_rc" ]; then
-            rc="$daemon_rc"
+        if [ "$stopping" -ne 0 ]; then
+            rc="${daemon_rc:-0}"
             daemon_rc=""
             break
         fi
@@ -1210,38 +1554,40 @@ start_torrentfs_rootful() {
         fi
         recoveries=$((recoveries + 1))
         echo "[entrypoint] FUSE session severed (exit $rc) — restarting torrentfs (recovery $recoveries/$MAX_SESSION_RECOVERIES)" >&2
-        # The dead FUSE mount and the bind that publishes it must be gone
-        # before the next mount: a stale mount would make the restart's
-        # readiness probe succeed on the dead mount and publish it. A mount
-        # that cannot be detached is not recoverable — stop instead.
+        # The dead FUSE mount must be gone before the next mount: a stale mount
+        # would make the restart's readiness probe succeed on the dead mount. A
+        # mount that cannot be detached is not recoverable — stop instead.
         if ! force_unmount_fuse "$internal_mnt"; then
             echo "[entrypoint] ERROR: cannot detach the dead FUSE mount at $internal_mnt — not restarting" >&2
             exit "$rc"
         fi
-        # Lazy-detach the publish bind: a reader still holding the dead mount
-        # makes a plain umount fail with EBUSY — the sustained-read case this
-        # recovery exists for — and the next `mount --bind` would then stack on
-        # the dead bind, which nothing reclaims (force_unmount_fuse only probes
-        # the internal mountpoint) and which can reach the host via rshared.
-        # Lazy detach leaves the namespace regardless of holders; a FUSE mount
-        # still published afterwards means the detach did not take, so stop
-        # rather than publish on top of a dead mount.
-        umount -l "$mountpoint" 2>/dev/null || true
-        if mountpoint_has_fuse "$mountpoint"; then
+        # The publish bind goes through the same lazy chain: a reader still
+        # holding the dead mount makes a plain umount fail EBUSY, and the next
+        # `mount --bind` would stack on the dead bind (nothing reclaims it, and
+        # it can reach the host via rshared). An entry that survives the lazy
+        # detach means publishing again would stack — stop instead.
+        if ! detach_publish_bind "$mountpoint"; then
             echo "[entrypoint] ERROR: dead FUSE mount still published at $mountpoint — not restarting" >&2
             exit "$rc"
         fi
-        sleep "$SESSION_RECOVERY_BACKOFF_SECS"
+        # A stop during the backoff is handled at the top of the loop.
+        sleep "$SESSION_RECOVERY_BACKOFF_SECS" || true
     done
 
-    # The daemon has stopped; detach any FUSE mount it left behind. If it exited
-    # cleanly (0) but the mount cannot be detached, surface that as a distinct
-    # status (103) so a false-clean shutdown does not leave the next
-    # `docker start` blocked by a stale ENOTCONN mount. The EXIT trap re-runs
-    # this idempotently as the safety net for the signal/error paths.
-    if [ "$rc" -eq 0 ] && ! force_unmount_fuse "$internal_mnt"; then
-        echo "[entrypoint] ERROR: stale FUSE mount could not be detached after clean shutdown — check the host with 'findmnt $mountpoint'; if a fuse entry remains, run 'umount -l $mountpoint' (no entry means the bind release already cleaned it)" >&2
-        rc=103
+    # The daemon has stopped; detach any FUSE mount it left behind, then the
+    # bind that published it. If it exited cleanly (0) but either detach fails,
+    # surface that as a distinct status (103) so a false-clean shutdown does not
+    # leave the next `docker start` blocked by a stale ENOTCONN mount. The EXIT
+    # trap re-runs both idempotently as the safety net for the signal/error
+    # paths.
+    if [ "$rc" -eq 0 ]; then
+        if ! force_unmount_fuse "$internal_mnt"; then
+            echo "[entrypoint] ERROR: stale FUSE mount could not be detached after clean shutdown — check the host with 'findmnt $mountpoint'" >&2
+            rc=103
+        elif ! detach_publish_bind "$mountpoint"; then
+            echo "[entrypoint] ERROR: publishing mount could not be detached after clean shutdown (exit 103)" >&2
+            rc=103
+        fi
     fi
     exit "$rc"
 }
@@ -1251,6 +1597,8 @@ echo "[entrypoint] /dev/fuse is available" >&2
 resolve_daemon_ids
 
 revalidate_config_as_daemon
+
+validate_state_paths
 
 fix_state_dir_ownership
 

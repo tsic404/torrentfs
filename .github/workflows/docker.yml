@@ -14,29 +14,84 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  ci-gate:
+    name: Require green CI for this commit
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for the CI workflow result on ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # A publish must never outrun the tests: the build jobs below wait for
+          # ci.yml to report success for this exact commit. A run that is not
+          # visible yet gets a short grace window (the push-triggered run can
+          # take a few seconds to appear); a commit with no run at all is not
+          # published, and a wait that exceeds the deadline is a failure rather
+          # than a silent push of untested bytes.
+          start="$(date +%s)"
+          grace_deadline=$((start + 120))
+          wait_deadline=$((start + 3600))
+          while :; do
+            if ! runs="$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100")"; then
+              echo "::error title=CI query failed::could not read the ci.yml runs for $SHA"
+              exit 1
+            fi
+            status=""
+            conclusion=""
+            read -r status conclusion < <(jq -r --arg sha "$SHA" '
+              ([.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.run_started_at) | last) as $run
+              | [($run.status // ""), ($run.conclusion // "")] | @tsv' <<<"$runs") || true
+            if [ "$conclusion" = "success" ]; then
+              echo "CI is green for $SHA"
+              exit 0
+            fi
+            if [ -n "$conclusion" ]; then
+              echo "::error title=CI not green::ci.yml concluded '$conclusion' for $SHA — refusing to publish"
+              exit 1
+            fi
+            now="$(date +%s)"
+            if [ -z "$status" ]; then
+              if [ "$now" -ge "$grace_deadline" ]; then
+                echo "::error title=No CI run::no ci.yml run found for $SHA — refusing to publish an untested commit"
+                exit 1
+              fi
+            elif [ "$now" -ge "$wait_deadline" ]; then
+              echo "::error title=CI timeout::ci.yml for $SHA was still '$status' after 60 minutes"
+              exit 1
+            fi
+            sleep 15
+          done
+
   build-and-push-amd64:
     name: Build and Push (amd64)
     runs-on: ubuntu-24.04
+    needs: [ci-gate]
     permissions:
       contents: read
       packages: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
@@ -49,7 +104,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -79,26 +134,27 @@ jobs:
   build-and-push-arm64:
     name: Build and Push (arm64)
     runs-on: ubuntu-24.04-arm
+    needs: [ci-gate]
     permissions:
       contents: read
       packages: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: |
@@ -111,7 +167,7 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           push: true
@@ -148,18 +204,18 @@ jobs:
 
     steps:
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |

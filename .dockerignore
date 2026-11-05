@@ -1,0 +1,10 @@
+# The image build copies the tree (`COPY . .`) and compiles the crate from
+# source, so only the sources are useful to it.  Keeping VCS data, local build
+# output and CI scratch out of the context makes the build smaller and keeps the
+# host's state (including anything under .git) out of the image.
+.git
+.github
+target
+ci
+tests
+*.log

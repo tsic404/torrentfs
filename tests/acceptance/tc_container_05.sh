@@ -19,7 +19,7 @@
 # shared on a best-effort basis when running as root.
 #
 # Usage: ./tests/acceptance/tc_container_05.sh [image] [host-dir]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).
 #
 # Every external call is bounded; a hung docker subcommand fails the case.
 set -euo pipefail
@@ -129,7 +129,7 @@ if [ -z "$IMAGE_ID" ]; then
     if [ "$rc" -eq 124 ] || [ "$rc" -ge 128 ]; then
         fail "docker build hung (rc=$rc)"
     fi
-    [ "$rc" -eq 0 ] || skip "docker build failed (rc=$rc)"
+    [ "$rc" -eq 0 ] || fail "docker build failed (rc=$rc)"
 fi
 
 container_running() {

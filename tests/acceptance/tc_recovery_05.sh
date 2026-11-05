@@ -396,4 +396,43 @@ restarts="$(grep -cF "restarting torrentfs" "$ENTRY2_LOG" || true)"
 [ "$restarts" -eq 3 ] || fail "the entrypoint restarted $restarts times, the budget is 3"
 echo "[TC-recovery-05] 3 recoveries then exit 104 on the fourth severed session"
 
-echo "TC-recovery-05: PASS (102 final on external unmount; 104 recovery budget, 1s backoff, exit 104 on budget exhaustion)"
+# ── D. SIGTERM inside the recovery window ───────────────────────────────────
+# A stop request that lands during the 1s backoff must end the container
+# cleanly: the trap records the request, the loop unwinds instead of starting
+# another daemon, and the mounts are detached. Ignoring the signal there — the
+# old `trap '' INT TERM` disposition — is what left the entrypoint as an
+# unkillable PID 1 and the host with an ENOTCONN residue after SIGKILL
+# (AC-84 / C-10.7 / C-9.2.1).
+D_LOG="$WORK/d.log"
+PATH="$WORK/bin:$PATH" bash "$ROOT_DIR/entrypoint.sh" "$ENTRY_MNT" \
+    --cache "$WORK/entry-cache" --db "$WORK/entry-db/metadata.db" --config "$CONFIG" >"$D_LOG" 2>&1 &
+ENTRY_PID=$!
+wait_for_fuse "$ENTRY_MNT" 90 || mount_unavailable "$D_LOG" "$ENTRY_PID" "the entrypoint"
+D_MNT="$(daemon_mountpoint)"
+if [ "$D_MNT" = "$INTERNAL_MNT" ]; then
+    INTERNAL_MNT_USED=1
+fi
+D_MINOR="$(fuse_minor_at "$D_MNT")"
+[ -n "$D_MINOR" ] || fail "no FUSE connection at $D_MNT"
+echo 1 >"/sys/fs/fuse/connections/$D_MINOR/abort" 2>/dev/null ||
+    fail "cannot sever connection $D_MINOR"
+wait_for_daemon_exit 30 >/dev/null ||
+    fail "the daemon was still running 30s after the abort"
+wait_for_log "$D_LOG" "restarting torrentfs" 30 ||
+    fail "the entrypoint did not enter its recovery window"
+kill -TERM "$ENTRY_PID" 2>/dev/null || true
+wait_pid "$ENTRY_PID" 30 || fail "the entrypoint ignored SIGTERM during the recovery window"
+ENTRY_PID=""
+[ "$WAIT_STATUS" -eq 0 ] ||
+    fail "SIGTERM during the recovery window must exit 0, got $WAIT_STATUS"
+[ -z "$(fuse_minor_at "$ENTRY_MNT")" ] ||
+    fail "SIGTERM during the recovery window left a mount at $ENTRY_MNT"
+if [ "$INTERNAL_MNT_USED" -eq 1 ] && [ -n "$(fuse_minor_at "$INTERNAL_MNT")" ]; then
+    fail "SIGTERM during the recovery window left a mount at $INTERNAL_MNT"
+fi
+restarts_now="$(grep -cF "restarting torrentfs" "$D_LOG" || true)"
+[ "$restarts_now" -eq 1 ] ||
+    fail "a stop request produced $restarts_now recovery restarts (expected only the one already logged)"
+echo "[TC-recovery-05] SIGTERM during the recovery window → exit 0, no residue"
+
+echo "TC-recovery-05: PASS (102 final on external unmount; 104 recovery budget, 1s backoff, exit 104 on budget exhaustion; SIGTERM in the recovery window exits 0 with no residue)"

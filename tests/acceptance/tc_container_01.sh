@@ -8,7 +8,7 @@
 # a rootful FUSE-capable container.  The container mountpoint is `/mnt` — the
 # container-side path of the rshared bind — while `$HOST_DIR` is the host
 # source directory.  Self-gating: SKIP (exit 2) when the environment cannot
-# provide docker + /dev/fuse + a successful image build.
+# provide docker + /dev/fuse; a failed image build is a real failure (exit 1).
 #
 # The host directory must live on a shared mount for the FUSE mount to
 # propagate to the host (see README "bind-propagation=rshared"); when the
@@ -18,7 +18,7 @@
 # modified.
 #
 # Usage: ./tests/acceptance/tc_container_01.sh [image] [host-dir]
-# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case.
+# Exit: 0 = pass, 1 = fail, 2 = environment cannot run this case (skip).
 #
 # Every external call is bounded (docker subcommands, host-side reads through
 # the propagated FUSE mount, mount/umount helpers).  A hung call fails the
@@ -55,8 +55,8 @@ if [ -z "$IMAGE_ID" ]; then
         exit 1
     fi
     [ "$rc" -eq 0 ] || {
-        echo "TC-container-01: SKIP — docker build failed (rc=$rc)" >&2
-        exit 2
+        echo "TC-container-01: FAIL — docker build failed (rc=$rc)" >&2
+        exit 1
     }
 fi
 
