@@ -1786,3 +1786,139 @@ fn test_migrate_v5_cleans_orphaned_child_rows() {
         assert_eq!(dangling, 0, "orphan directory_closure rows cleaned up");
     }
 }
+
+/// Renaming a directory whose name contains non-ASCII characters must rewrite
+/// the descendant paths by character position: the old code cut with the Rust
+/// byte length, so `电影/子目录` became `films/` + a truncated suffix and the
+/// database (the restart-time truth) kept the wrong projection path.
+#[test]
+fn test_rename_metadata_directory_non_ascii_prefix_keeps_suffix() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    db.ensure_metadata_directories("电影/子目录").unwrap();
+    db.insert_torrent("电影", "Top", "top.torrent", 100, "h-top", 1)
+        .unwrap();
+    db.insert_torrent(
+        "电影/子目录",
+        "Nested",
+        "nested.torrent",
+        200,
+        "h-nested",
+        1,
+    )
+    .unwrap();
+
+    db.rename_metadata_directory("电影", "films", "films")
+        .unwrap();
+
+    let dir_paths: Vec<String> = db
+        .get_all_metadata_directories()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, _, path)| path)
+        .collect();
+    assert!(
+        dir_paths.contains(&"films".to_string()),
+        "the renamed directory itself must keep its path, got {dir_paths:?}"
+    );
+    assert!(
+        dir_paths.contains(&"films/子目录".to_string()),
+        "the child directory must keep its non-ASCII suffix, got {dir_paths:?}"
+    );
+    assert!(
+        !dir_paths.iter().any(|path| path.contains("电影")),
+        "no path may keep the old prefix, got {dir_paths:?}"
+    );
+
+    let top = db
+        .get_torrent_by_filename_and_source_path("top.torrent", "films")
+        .unwrap();
+    assert!(top.is_some(), "the exact source_path must follow the rename");
+    let nested = db
+        .get_torrent_by_filename_and_source_path("nested.torrent", "films/子目录")
+        .unwrap();
+    assert!(
+        nested.is_some(),
+        "the descendant source_path must follow the rename intact"
+    );
+}
+
+/// `LIKE` is case-insensitive for ASCII, so renaming `movies` used to rewrite
+/// `Movies/...` too. The prefix match must be case-sensitive.
+#[test]
+fn test_rename_metadata_directory_case_variant_prefix_untouched() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    db.ensure_metadata_directories("movies/sub").unwrap();
+    db.ensure_metadata_directories("Movies/other").unwrap();
+    db.insert_torrent("movies/sub", "Lower", "lower.torrent", 100, "h-lower", 1)
+        .unwrap();
+    db.insert_torrent(
+        "Movies/other",
+        "Upper",
+        "upper.torrent",
+        200,
+        "h-upper",
+        1,
+    )
+    .unwrap();
+
+    db.rename_metadata_directory("movies", "films", "films")
+        .unwrap();
+
+    let lower = db
+        .get_torrent_by_filename_and_source_path("lower.torrent", "films/sub")
+        .unwrap();
+    assert!(lower.is_some(), "the renamed subtree must follow `movies`");
+    let upper = db
+        .get_torrent_by_filename_and_source_path("upper.torrent", "Movies/other")
+        .unwrap();
+    assert!(
+        upper.is_some(),
+        "a case-variant sibling (`Movies/`) must not be rewritten by renaming `movies`"
+    );
+
+    let dir_paths: Vec<String> = db
+        .get_all_metadata_directories()
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, _, path)| path)
+        .collect();
+    assert!(dir_paths.contains(&"Movies/other".to_string()));
+}
+
+/// `Database::open` must survive a database whose migration body committed but
+/// whose `user_version` write was lost (the old code wrote it after the
+/// transaction): re-running the rebuilt-schema migration used to fail on
+/// columns that no longer exist, making every later start exit 1.
+#[test]
+fn test_reopen_after_lost_user_version_succeeds_and_keeps_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("lost-version.db");
+
+    {
+        let mut db = Database::open(&db_path).unwrap();
+        db.insert_torrent("shelf", "Kept", "kept.torrent", 100, "h-kept", 1)
+            .unwrap();
+    }
+
+    // Simulate the crash: the v6/v7 schema is in place, the stamp says v5.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+    }
+
+    let db = Database::open(&db_path)
+        .expect("reopening after a lost user_version stamp must succeed");
+    let version: i64 = db
+        .conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7, "the stamp must be repaired to the current schema");
+
+    let torrent = db
+        .get_torrent_by_filename_and_source_path("kept.torrent", "shelf")
+        .unwrap()
+        .expect("the row inserted before the simulated crash must survive");
+    assert_eq!(torrent.info_hash, "h-kept");
+}

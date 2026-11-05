@@ -7,15 +7,6 @@
 //! - `file_ops` — file and directory query operations
 //! - `metadata_ops` — metadata directory management operations
 
-/// Escape SQLite LIKE metacharacters (`%`, `_`) and the escape character (`\`)
-/// in a literal string so it can be embedded into a LIKE pattern and matched
-/// verbatim. Must be paired with `ESCAPE '\\'` in the SQL statement.
-pub(super) fn escape_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// SHA-1 hex of a `.torrent` file's raw bytes, used as the indexed dedup key
 /// on `torrents.content_hash`.  The index narrows the lookup to a hash
 /// match; callers still compare `torrent_data` bytes exactly so a (theoretical)

@@ -20,42 +20,72 @@ pub const STATS_INO: u64 = 4;
 pub const MAX_TORRENT_SIZE: usize = 10 * 1024 * 1024;
 
 // ── Data inode base addresses ──
+//
+// The inode space is split into disjoint bands, and every derived inode must
+// land in exactly one of them:
+//
+//   [DATA_TORRENT_INO_BASE, DATA_TORRENT_INO_BASE + MAX_DATA_ROWS)  torrent roots
+//   [DATA_DIR_INO_BASE,     ... + MAX_DATA_ROWS)                    torrent dirs
+//   [DATA_FILE_INO_BASE,    ... + MAX_DATA_ROWS)                    torrent files
+//   [SOURCE_PATH_DIR_INO_BASE, + HASH_INO_SLOTS)                    source-path dirs
+//   [PENDING_TORRENT_INO_BASE, + HASH_INO_SLOTS)                    pending roots
+//   [PENDING_TORRENT_DIR_INO_BASE, + HASH_INO_SLOTS)                pending dirs
+//   [PENDING_TORRENT_FILE_INO_BASE, + HASH_INO_SLOTS)               pending files
+//   [STATS_INO_OFFSET + data_ino, same span as the data bands)      `.stats` files
+//
+// The first three bands are encoded as `base + row_id` and are therefore bounded
+// by the row cap: a row id at or beyond [`MAX_DATA_ROWS`] cannot be encoded and
+// yields [`INVALID_INO`]. The next four are hash-derived and use a 2^48-slot
+// band each — large enough that two real paths colliding (the birthday bound for
+// thousands of directories is below 1e-8) is not a practical concern. `.stats`
+// inodes are derived as `dir_ino + STATS_INO_OFFSET`, so the offset sits above
+// every data band and its window spans the whole data-inode range.
 pub const DATA_TORRENT_INO_BASE: u64 = 1_000_000;
 pub const DATA_DIR_INO_BASE: u64 = 2_000_000;
 pub const DATA_FILE_INO_BASE: u64 = 3_000_000;
-pub const SOURCE_PATH_DIR_INO_BASE: u64 = 4_000_000;
-pub const PENDING_TORRENT_INO_BASE: u64 = 5_000_000;
-pub const PENDING_TORRENT_DIR_INO_BASE: u64 = 6_000_000;
-pub const PENDING_TORRENT_FILE_INO_BASE: u64 = 7_000_000;
-pub const STATS_INO_OFFSET: u64 = 10_000_000;
+pub const SOURCE_PATH_DIR_INO_BASE: u64 = 1 << 48;
+pub const PENDING_TORRENT_INO_BASE: u64 = SOURCE_PATH_DIR_INO_BASE + HASH_INO_SLOTS;
+pub const PENDING_TORRENT_DIR_INO_BASE: u64 = PENDING_TORRENT_INO_BASE + HASH_INO_SLOTS;
+pub const PENDING_TORRENT_FILE_INO_BASE: u64 = PENDING_TORRENT_DIR_INO_BASE + HASH_INO_SLOTS;
 
-/// Row cap for the ID-derived data inode ranges (`DATA_TORRENT` /
-/// `DATA_DIR` / `DATA_FILE`), each encoded as `base + id` — one inode
-/// slot per DB row. Their real extent is the row count, not the
-/// `1_000_000` nominal slot width used by the hash-derived ranges.
-///
-/// This is a *soft* runtime constraint: the derive functions guard row
-/// ids against it with `debug_assert!`, which is compiled out of release
-/// builds. The compile-time assertions below only keep the constant
-/// layout consistent (`base + MAX_DATA_ROWS < STATS_INO_OFFSET`) — they
-/// do NOT bound the row ids actually handed to the derive functions.
-const MAX_DATA_ROWS: u64 = 1_000_000;
+/// Base of the `.stats` band. Every stats inode is `dir_ino + STATS_INO_OFFSET`,
+/// so the offset must exceed the largest data inode by at least the data span.
+pub const STATS_INO_OFFSET: u64 = 1 << 62;
+
+/// Width of the `.stats` band: it covers every possible `dir_ino` (all data
+/// inodes are below it), so a derived stats inode never leaves the band.
+pub const STATS_INO_SPAN: u64 = 1 << 51;
+
+/// Returned instead of an out-of-range derived inode. `0` is not a valid FUSE
+/// node id: `lookup` reports the entry as absent, and every other operation on
+/// it ends in `ENOENT`. Rejecting at the derivation point keeps an oversized DB
+/// row id from silently aliasing an unrelated inode (a `.stats` file, a
+/// source-path directory, or a pending torrent).
+pub const INVALID_INO: u64 = 0;
+
+/// Row cap for the ID-derived data inode bands (`DATA_TORRENT` / `DATA_DIR` /
+/// `DATA_FILE`), each encoded as `base + id` — one inode slot per DB row.
+pub const MAX_DATA_ROWS: u64 = 1_000_000;
+
+/// Slot count of every hash-derived band.
+const HASH_INO_SLOTS: u64 = 1 << 48;
 
 // ── Compile-time invariants ──
-// Every data inode range must end below `STATS_INO_OFFSET`; otherwise a real
-// data inode would fall inside `is_stats_ino`'s window and — since the stats
-// guard runs before the data/ guard in `setattr` — be misclassified as a stats
-// inode (EPERM instead of EROFS). These assertions turn a future boundary
-// crossing into a compile error. Hash-derived ranges are capped by
-// `% 1_000_000` (exact `+ 1_000_000` slot); ID-derived ranges use
-// `MAX_DATA_ROWS` since `base + id` has no intrinsic bound.
-const _: () = assert!(DATA_TORRENT_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
-const _: () = assert!(DATA_DIR_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
-const _: () = assert!(DATA_FILE_INO_BASE + MAX_DATA_ROWS < STATS_INO_OFFSET);
-const _: () = assert!(SOURCE_PATH_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
-const _: () = assert!(PENDING_TORRENT_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
-const _: () = assert!(PENDING_TORRENT_DIR_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
-const _: () = assert!(PENDING_TORRENT_FILE_INO_BASE + 1_000_000 < STATS_INO_OFFSET);
+// The three row-encoded bands must not overlap each other, and the hash-derived
+// bands must sit completely above the `.stats` window so a hash-derived inode
+// can never be mistaken for a stats inode (`setattr`/`write` classify stats
+// first). A future boundary crossing becomes a compile error.
+const _: () = assert!(DATA_TORRENT_INO_BASE + MAX_DATA_ROWS <= DATA_DIR_INO_BASE);
+const _: () = assert!(DATA_DIR_INO_BASE + MAX_DATA_ROWS <= DATA_FILE_INO_BASE);
+const _: () = assert!(DATA_FILE_INO_BASE + MAX_DATA_ROWS <= SOURCE_PATH_DIR_INO_BASE);
+const _: () = assert!(PENDING_TORRENT_FILE_INO_BASE + HASH_INO_SLOTS <= STATS_INO_SPAN);
+const _: () = assert!(STATS_INO_OFFSET >= STATS_INO_SPAN);
+const _: () = assert!(STATS_INO_OFFSET + STATS_INO_SPAN <= u64::MAX);
+const _: () = assert!(PENDING_TORRENT_INO_BASE == SOURCE_PATH_DIR_INO_BASE + HASH_INO_SLOTS);
+const _: () = assert!(PENDING_TORRENT_DIR_INO_BASE == PENDING_TORRENT_INO_BASE + HASH_INO_SLOTS);
+const _: () = assert!(
+    PENDING_TORRENT_FILE_INO_BASE == PENDING_TORRENT_DIR_INO_BASE + HASH_INO_SLOTS
+);
 
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
 pub static NEXT_FH: AtomicU64 = AtomicU64::new(1);
@@ -178,90 +208,104 @@ impl InodeManager {
     }
 
     // ── Inode ID generators ──
+
     pub fn make_torrent_root_ino(torrent_id: i64) -> u64 {
-        debug_assert!(
-            Self::is_valid_row_id(torrent_id),
-            "row id {torrent_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
-        );
-        DATA_TORRENT_INO_BASE + (torrent_id as u64)
+        Self::row_inode(DATA_TORRENT_INO_BASE, "torrent root", torrent_id)
     }
 
     pub fn make_torrent_dir_ino(dir_id: i64) -> u64 {
-        debug_assert!(
-            Self::is_valid_row_id(dir_id),
-            "row id {dir_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
-        );
-        DATA_DIR_INO_BASE + (dir_id as u64)
+        Self::row_inode(DATA_DIR_INO_BASE, "torrent directory", dir_id)
     }
 
     pub fn make_torrent_file_ino(file_id: i64) -> u64 {
-        debug_assert!(
-            Self::is_valid_row_id(file_id),
-            "row id {file_id} exceeds MAX_DATA_ROWS={MAX_DATA_ROWS}"
-        );
-        DATA_FILE_INO_BASE + (file_id as u64)
+        Self::row_inode(DATA_FILE_INO_BASE, "torrent file", file_id)
+    }
+
+    /// Encode a DB row id into its inode band, or [`INVALID_INO`] when the id
+    /// cannot be represented.
+    ///
+    /// The guard is unconditional — unlike a `debug_assert!` it also runs in
+    /// release builds, where an oversized id would otherwise be added to the
+    /// base and land in an unrelated band: `DATA_FILE_INO_BASE + 4_000_000`
+    /// renders a pending-torrent file, `+ 7_000_000` renders `.stats`.
+    fn row_inode(base: u64, kind: &str, row_id: i64) -> u64 {
+        if Self::is_valid_row_id(row_id) {
+            base + row_id as u64
+        } else {
+            tracing::error!(
+                "Cannot derive a {} inode from row id {} (valid range 0..{}); \
+                 the row is not addressable and is reported as absent",
+                kind,
+                row_id,
+                MAX_DATA_ROWS
+            );
+            INVALID_INO
+        }
     }
 
     /// `true` if `id` is a valid DB row id for an ID-derived data inode
-    /// (`base + id` stays below `STATS_INO_OFFSET`).
-    ///
-    /// Shared by the `debug_assert!` guards in the derive functions and
-    /// the unit tests, so the bound check itself is exercised by tests
-    /// even in release builds (where `debug_assert!` is compiled out).
+    /// (`base + id` stays inside its band).
     fn is_valid_row_id(id: i64) -> bool {
         id >= 0 && (id as u64) < MAX_DATA_ROWS
     }
 
-    pub fn make_source_path_dir_ino(path: &str) -> u64 {
+    fn hash_inode(base: u64, parts: &[&str]) -> u64 {
         let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        SOURCE_PATH_DIR_INO_BASE + (hasher.finish() % 1_000_000)
+        for part in parts {
+            part.hash(&mut hasher);
+        }
+        base + (hasher.finish() % HASH_INO_SLOTS)
+    }
+
+    pub fn make_source_path_dir_ino(path: &str) -> u64 {
+        Self::hash_inode(SOURCE_PATH_DIR_INO_BASE, &[path])
     }
 
     /// deterministic inode for a pending torrent (background
     /// add_torrent in-flight, no DB row yet).  Hashes `(source_path,
-    /// filename)` into the `PENDING_TORRENT_INO_BASE` range so each
+    /// filename)` into the `PENDING_TORRENT_INO_BASE` band so each
     /// pending torrent gets a unique inode — two simultaneous cp's of
     /// different .torrent files must not collide.
     pub fn make_pending_torrent_ino(source_path: &str, filename: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        source_path.hash(&mut hasher);
-        filename.hash(&mut hasher);
-        PENDING_TORRENT_INO_BASE + (hasher.finish() % 1_000_000)
+        Self::hash_inode(PENDING_TORRENT_INO_BASE, &[source_path, filename])
     }
 
     /// deterministic inode for a directory *inside* a pending
     /// torrent (e.g. `data/seed.torrent/subdir/`).  Hashes
     /// `(source_path, filename, dir_path)` into the
-    /// `PENDING_TORRENT_DIR_INO_BASE` range so each pending directory
+    /// `PENDING_TORRENT_DIR_INO_BASE` band so each pending directory
     /// gets a unique, stable inode across lookups and readdir.
     pub fn make_pending_torrent_dir_ino(source_path: &str, filename: &str, dir_path: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        source_path.hash(&mut hasher);
-        filename.hash(&mut hasher);
-        dir_path.hash(&mut hasher);
-        PENDING_TORRENT_DIR_INO_BASE + (hasher.finish() % 1_000_000)
+        Self::hash_inode(
+            PENDING_TORRENT_DIR_INO_BASE,
+            &[source_path, filename, dir_path],
+        )
     }
 
     /// deterministic inode for a file *inside* a pending
     /// torrent (e.g. `data/seed.torrent/subdir/file.txt`).  Hashes
     /// `(source_path, filename, file_path)` into the
-    /// `PENDING_TORRENT_FILE_INO_BASE` range so each pending file gets a
+    /// `PENDING_TORRENT_FILE_INO_BASE` band so each pending file gets a
     /// unique, stable inode.
     pub fn make_pending_torrent_file_ino(
         source_path: &str,
         filename: &str,
         file_path: &str,
     ) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        source_path.hash(&mut hasher);
-        filename.hash(&mut hasher);
-        file_path.hash(&mut hasher);
-        PENDING_TORRENT_FILE_INO_BASE + (hasher.finish() % 1_000_000)
+        Self::hash_inode(
+            PENDING_TORRENT_FILE_INO_BASE,
+            &[source_path, filename, file_path],
+        )
     }
 
+    /// `true` for a derived `data/` inode.
+    ///
+    /// The `.stats` window is excluded: stats inodes are numerically above
+    /// every data band but belong to the stats namespace, and callers classify
+    /// them first (`setattr`, `write`). Keeping them out of `is_data_ino` makes
+    /// `is_data_namespace` describe the read-only projection only.
     pub fn is_data_ino(ino: u64) -> bool {
-        ino >= DATA_TORRENT_INO_BASE
+        ino >= DATA_TORRENT_INO_BASE && !Self::is_stats_ino(ino)
     }
 
     /// Check if an inode belongs to the read-only `data/` namespace.
@@ -282,7 +326,7 @@ impl InodeManager {
 
     /// Check if an inode is a stats inode (derived from a directory inode).
     pub fn is_stats_ino(ino: u64) -> bool {
-        ino >= STATS_INO_OFFSET && ino < STATS_INO_OFFSET + 10_000_000
+        ino >= STATS_INO_OFFSET && ino < STATS_INO_OFFSET + STATS_INO_SPAN
     }
 
     /// Get the parent directory inode from a stats inode.
@@ -587,12 +631,10 @@ mod tests {
 
     #[test]
     fn test_is_stats_ino_boundaries() {
-        // STATS_INO_OFFSET (10_000_000) is included, STATS_INO_OFFSET + 10_000_000 is excluded
+        // The window starts at STATS_INO_OFFSET and is STATS_INO_SPAN wide.
         assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET));
-        assert!(InodeManager::is_stats_ino(
-            STATS_INO_OFFSET + 10_000_000 - 1
-        ));
-        assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000));
+        assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET + STATS_INO_SPAN - 1));
+        assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET + STATS_INO_SPAN));
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET - 1));
     }
 
@@ -607,14 +649,54 @@ mod tests {
     }
 
     #[test]
-    fn test_id_derived_inos_stay_below_stats_offset_at_row_cap() {
-        // At the row cap, the derived inodes still fall below the stats
-        // window start — this is the invariant the compile-time asserts
-        // express for the constant layout.
+    fn test_id_derived_inos_stay_inside_their_bands_at_row_cap() {
+        // At the row cap each band still ends before the next one starts —
+        // this is the invariant the compile-time asserts express.
         let max_id = MAX_DATA_ROWS as i64 - 1;
-        assert!(InodeManager::make_torrent_root_ino(max_id) < STATS_INO_OFFSET);
-        assert!(InodeManager::make_torrent_dir_ino(max_id) < STATS_INO_OFFSET);
-        assert!(InodeManager::make_torrent_file_ino(max_id) < STATS_INO_OFFSET);
+        let root = InodeManager::make_torrent_root_ino(max_id);
+        let dir = InodeManager::make_torrent_dir_ino(max_id);
+        let file = InodeManager::make_torrent_file_ino(max_id);
+        assert!((DATA_TORRENT_INO_BASE..DATA_DIR_INO_BASE).contains(&root));
+        assert!((DATA_DIR_INO_BASE..DATA_FILE_INO_BASE).contains(&dir));
+        assert!((DATA_FILE_INO_BASE..SOURCE_PATH_DIR_INO_BASE).contains(&file));
+        assert!(!InodeManager::is_stats_ino(file));
+    }
+
+    /// An out-of-range row id must not alias another namespace even in a
+    /// release build (where the old `debug_assert!` was compiled out). Each
+    /// derivation returns `INVALID_INO`, which no real inode occupies and
+    /// which every lookup path reports as absent.
+    #[test]
+    fn test_row_derived_inodes_reject_out_of_range_ids() {
+        for bad in [MAX_DATA_ROWS as i64, MAX_DATA_ROWS as i64 + 4_000_000, i64::MAX, -1] {
+            assert_eq!(InodeManager::make_torrent_root_ino(bad), INVALID_INO);
+            assert_eq!(InodeManager::make_torrent_dir_ino(bad), INVALID_INO);
+            assert_eq!(InodeManager::make_torrent_file_ino(bad), INVALID_INO);
+        }
+        assert!(!InodeManager::is_data_ino(INVALID_INO));
+        assert!(!InodeManager::is_stats_ino(INVALID_INO));
+    }
+
+    /// The source-path band must be wide enough that distinct real directory
+    /// paths do not share an inode: the old 1_000_000-slot hash collided for
+    /// about half the trees once ~1_200 directories existed, and a collision
+    /// makes one directory resolve as another (or as `..`).
+    #[test]
+    fn test_source_path_inodes_are_distinct_for_many_paths() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..10_000 {
+            let path = format!("library/collection-{i}");
+            let ino = InodeManager::make_source_path_dir_ino(&path);
+            assert!(
+                (SOURCE_PATH_DIR_INO_BASE
+                    ..SOURCE_PATH_DIR_INO_BASE + HASH_INO_SLOTS)
+                    .contains(&ino),
+                "source-path inode {ino} escaped its band"
+            );
+            assert!(!InodeManager::is_stats_ino(ino));
+            assert!(InodeManager::is_data_ino(ino));
+            assert!(seen.insert(ino), "source-path inode collision at {path}");
+        }
     }
 
     #[test]

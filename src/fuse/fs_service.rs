@@ -35,7 +35,7 @@ use super::fs_types::{
 };
 use super::inodes::{
     DataInode, InodeData, InodeManager, DATA_DIR_INO_BASE, DATA_INO, DATA_TORRENT_INO_BASE,
-    MAX_TORRENT_SIZE, METADATA_INO, NEXT_FH, NEXT_INO, ROOT_INO, STATS_INO,
+    INVALID_INO, MAX_TORRENT_SIZE, METADATA_INO, NEXT_FH, NEXT_INO, ROOT_INO, STATS_INO,
 };
 #[cfg(test)]
 use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
@@ -150,6 +150,14 @@ pub struct FsService {
     /// most recent `data/` listing, so the kernel's per-page `readdir` calls do
     /// not each rebuild it. See [`DataReaddirCache`].
     data_readdir_cache: Option<DataReaddirCache>,
+    /// `(source_path, filename)` keys whose background persist has landed and
+    /// whose cached `data/` projection therefore has to be evicted.
+    ///
+    /// A background thread cannot touch the inode tables (FUSE dispatch is
+    /// single-threaded), so it queues the key here and the dispatch side drains
+    /// the queue before answering the next request. See
+    /// [`FsService::drain_projection_evictions`].
+    pending_projection_evictions: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 // ── Kernel cache invalidation ─────────────────────────────────
@@ -184,6 +192,93 @@ impl FsService {
                 name.to_string(),
             ),
             None => (DATA_INO, path.to_string()),
+        }
+    }
+
+    /// Drop the cached `data/` inodes an overwrite superseded and refresh the
+    /// root's display name.
+    ///
+    /// Only superseded row-backed children are removed. Pending-window entries
+    /// stay: their inode is hash-derived, so dropping the one an in-flight
+    /// lookup walks through turns its child lookup into `ENOENT`. A row-backed
+    /// root is refreshed in place because its id survives the overwrite. Never
+    /// notify the kernel here — the persist thread does (see `release`).
+    fn evict_projection(&mut self, source_path: &str, filename: &str) {
+        // Cached children carry their root's source id; once the source was
+        // repointed, every cached child under that id is replaced content.
+        let superseded_ids: Vec<i64> = self
+            .inode_mgr
+            .data_inodes
+            .values()
+            .filter_map(|data_inode| match data_inode {
+                DataInode::TorrentRoot {
+                    torrent_id,
+                    source_path: cached_source_path,
+                    filename: cached_filename,
+                    ..
+                } if *torrent_id != 0
+                    && cached_source_path.as_str() == source_path
+                    && cached_filename.as_str() == filename =>
+                {
+                    Some(*torrent_id)
+                }
+                _ => None,
+            })
+            .collect();
+
+        // The row is the post-overwrite truth; keep the cached root's display
+        // name in step with it (the inode itself does not change).
+        let current = self.db.as_ref().and_then(|db| {
+            let guard = db.lock().ok()?;
+            guard
+                .get_torrent_by_filename_and_source_path(filename, source_path)
+                .ok()
+                .flatten()
+        });
+        if let Some(torrent) = current {
+            for data_inode in self.inode_mgr.data_inodes.values_mut() {
+                if let DataInode::TorrentRoot {
+                    torrent_id, name, ..
+                } = data_inode
+                {
+                    if *torrent_id == torrent.id {
+                        name.clone_from(&torrent.name);
+                    }
+                }
+            }
+        }
+
+        self.inode_mgr
+            .data_inodes
+            .retain(|_, data_inode| match data_inode {
+                DataInode::TorrentRoot { .. }
+                | DataInode::SourcePathDir { .. }
+                | DataInode::TorrentDir { torrent_id: 0, .. }
+                | DataInode::TorrentFile { torrent_id: 0, .. } => true,
+                DataInode::TorrentDir { torrent_id, .. }
+                | DataInode::TorrentFile { torrent_id, .. } => {
+                    !superseded_ids.contains(torrent_id)
+                }
+            });
+    }
+
+    /// Apply every projection eviction a background persist queued.
+    ///
+    /// Runs on the dispatch thread before a request is answered: superseded
+    /// cached inodes are dropped, so the request resolves against the row the
+    /// persist wrote. No kernel notification is issued here — the persist
+    /// thread owns that (see `release`), because a notification from this
+    /// context would take the lock the in-flight lookup already holds.
+    fn drain_projection_evictions(&mut self) {
+        let queued = match self.pending_projection_evictions.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(e) => {
+                error!("Mutex poisoned in drain_projection_evictions(): {}", e);
+                return;
+            }
+        };
+        for (source_path, filename) in queued {
+            self.evict_projection(&source_path, &filename);
         }
     }
 }
@@ -243,6 +338,7 @@ impl FsService {
             metrics,
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -358,6 +454,7 @@ impl FsService {
     }
 
     pub fn lookup(&mut self, parent: u64, name: &str) -> FsResult<Option<Entry>> {
+        self.drain_projection_evictions();
         if parent == ROOT_INO {
             return Ok(match name {
                 "metadata" => Some(Entry {
@@ -443,6 +540,16 @@ impl FsService {
                     parent,
                     name,
                 ) {
+                    if ino == INVALID_INO {
+                        // The row id cannot be encoded (see
+                        // `InodeManager::make_torrent_root_ino`). Never hand
+                        // the kernel a node id that aliases another inode.
+                        self.inode_mgr.data_inodes.remove(&ino);
+                        return Err(FsError::Internal(format!(
+                            "torrent '{}' has a database row id outside the addressable inode range",
+                            name
+                        )));
+                    }
                     let attr = match kind {
                         FileKind::Directory => self.inode_mgr.attr_for_dir(ino, false),
                         FileKind::RegularFile => self.inode_mgr.attr_for_file(ino, size),
@@ -474,6 +581,7 @@ impl FsService {
     }
 
     pub fn getattr(&mut self, ino: u64) -> FsResult<Attr> {
+        self.drain_projection_evictions();
         match ino {
             ROOT_INO => Ok(self.inode_mgr.attr_for_dir(ino, false)),
             METADATA_INO => Ok(self.inode_mgr.attr_for_dir(ino, true)),
@@ -544,12 +652,10 @@ impl FsService {
     /// buffer and returns updated attributes; `data/` stays `EROFS`, `.stats`
     /// and root stay `EPERM`. `size` is `Some(n)` only for a pure truncate.
     pub fn setattr(&mut self, ino: u64, size: Option<u64>) -> FsResult<Attr> {
-        // Stats-derived inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000)
-        // also satisfy `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must
-        // be classified as stats *before* the data/ guard — otherwise they
-        // would wrongly return EROFS instead of EPERM.
-        // Invariant: data base + slot width < STATS_INO_OFFSET (compile-time
-        // asserts in `src/fuse/inodes.rs`).
+        // `.stats` files belong to the stats namespace, not to the read-only
+        // `data/` projection, and must be classified first: a write/attribute
+        // change returns EPERM, never EROFS. (`is_data_ino` excludes the stats
+        // window; the ordering keeps the classification explicit.)
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
             return Err(FsError::NotPermitted);
         }
@@ -599,6 +705,7 @@ impl FsService {
     }
 
     pub fn readdir(&mut self, ino: u64, offset: i64) -> FsResult<Vec<DirEntry>> {
+        self.drain_projection_evictions();
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
             // surface failed persists in this directory as EIO.
             if let Some(sp) = self.data_dir_source_path(ino) {
@@ -641,6 +748,16 @@ impl FsService {
                             name,
                         })
                         .collect();
+                    if entries.iter().any(|entry| entry.ino == INVALID_INO) {
+                        // An unaddressable row id must fail loudly instead of
+                        // listing an entry that can never be opened.
+                        self.inode_mgr.data_inodes.remove(&INVALID_INO);
+                        return Err(FsError::Internal(
+                            "a torrent in this directory has a database row id outside \
+                             the addressable inode range"
+                                .to_string(),
+                        ));
+                    }
                     let page = page_after_offset(&entries, offset);
                     self.data_readdir_cache = Some(DataReaddirCache {
                         ino,
@@ -743,6 +860,7 @@ impl FsService {
     /// daemon's errno (e.g. ENODATA for "no seeder") reach userspace instead
     /// of being converted to EIO by `filemap_read_folio`.
     pub fn open(&mut self, ino: u64) -> FsResult<OpenOutcome> {
+        self.drain_projection_evictions();
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Ok(0.into()),
             STATS_INO => {
@@ -782,6 +900,7 @@ impl FsService {
         }
     }
     pub fn opendir(&mut self, ino: u64) -> FsResult<()> {
+        self.drain_projection_evictions();
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Ok(()),
             _ => {
@@ -880,11 +999,10 @@ impl FsService {
     pub fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> FsResult<u32> {
         // `.stats` files have virtual, immutable attributes — not a read-only
         // namespace — so a write is rejected with `EPERM` (`NotPermitted`),
-        // matching `setattr` and `symlink`. Stats-derived
-        // inodes (`dir_ino + STATS_INO_OFFSET`, >= 10_000_000) also satisfy
-        // `is_data_ino` (>= DATA_TORRENT_INO_BASE), so they must be classified
-        // as stats *before* the data/ guard below — otherwise they would
-        // wrongly return EROFS instead of EPERM.
+        // matching `setattr` and `symlink`. Derived stats inodes belong to the
+        // stats namespace, not to the read-only `data/` projection, so they
+        // are classified before the data/ guard below: a write returns EPERM,
+        // never EROFS.
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
             return Err(FsError::NotPermitted);
         }
@@ -1063,8 +1181,17 @@ impl FsService {
                         return Ok(());
                     }
 
-                    // Dedup guard — check + insert atomically, then DROP the
-                    // lock before spawning background work. Keyed by
+                    // An overwrite whose close lands while the previous
+                    // content is still being persisted must not be dropped:
+                    // wait for the in-flight add to settle (bounded by
+                    // C-2.5.5's close-path deadline), then persist this
+                    // content on top of it. Returning early here left the
+                    // database holding the OLD bytes while `metadata/` showed
+                    // the new torrent, so `data/` and a restart disagreed.
+                    self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
+
+                    // Mark the key in-flight, then DROP the lock before
+                    // spawning background work. Keyed by
                     // `(source_path, filename)` so same-directory torrents
                     // (root has `source_path == ""`) don't collide. Persistence
                     // + handle registration run detached so the FUSE
@@ -1076,14 +1203,6 @@ impl FsService {
                             error!("Mutex poisoned in release(): {}", e);
                             FsError::LockPoisoned
                         })?;
-
-                        if processing.contains_key(&dedup_key) {
-                            warn!(
-                                "Torrent at '{}{}' already being processed, skipping",
-                                source_path, name
-                            );
-                            return Ok(());
-                        }
                         processing.insert(dedup_key.clone(), ());
                     }
                     // Lock released here.
@@ -1098,32 +1217,70 @@ impl FsService {
                         let processing = self.processing_torrents.clone();
                         let processing_cv = self.processing_torrents_cv.clone();
                         let persist_errors = self.persist_errors.clone();
+                        let evictions = self.pending_projection_evictions.clone();
+                        let notifier = self.notifier.clone();
                         let key = dedup_key.clone();
                         std::thread::spawn(move || {
-                            match ts.persist_torrent(&data, &source_path, &name) {
-                                Ok(persisted) => {
-                                    // Clear any stale failure from a prior
-                                    // attempt; this one succeeded.
-                                    if let Ok(mut guard) = persist_errors.lock() {
-                                        guard.remove(&key);
+                            let persisted_ok =
+                                match ts.persist_torrent(&data, &source_path, &name) {
+                                    Ok(persisted) => {
+                                        // Clear any stale failure from a prior
+                                        // attempt; this one succeeded.
+                                        if let Ok(mut guard) = persist_errors.lock() {
+                                            guard.remove(&key);
+                                        }
+                                        // The new content has landed: queue an
+                                        // eviction of the projection inodes the
+                                        // row superseded, so the dispatch side
+                                        // stops serving the replaced content.
+                                        if let Ok(mut queue) = evictions.lock() {
+                                            if !queue.contains(&key) {
+                                                queue.push(key.clone());
+                                            }
+                                        }
+                                        ts.register_torrent_handle(&persisted);
+                                        true
                                     }
-                                    ts.register_torrent_handle(&persisted);
-                                }
-                                Err(e) => {
-                                    error!("Failed to persist torrent {}: {}", name, e);
-                                    // record the failure so the next
-                                    // user-visible lookup/readdir of data/
-                                    // surfaces it as EIO.
-                                    if let Ok(mut guard) = persist_errors.lock() {
-                                        guard.insert(key.clone(), e.to_string());
+                                    Err(e) => {
+                                        error!("Failed to persist torrent {}: {}", name, e);
+                                        // record the failure so the next
+                                        // user-visible lookup/readdir of data/
+                                        // surfaces it as EIO.
+                                        if let Ok(mut guard) = persist_errors.lock() {
+                                            guard.insert(key.clone(), e.to_string());
+                                        }
+                                        false
                                     }
-                                }
-                            }
+                                };
+                            // Clear the key and wake a rename/release blocked
+                            // on this pending add under one lock hold: a notify
+                            // after the guard dropped could land between the
+                            // waiter's predicate check and its wait, and the
+                            // waiter would sleep out the full deadline.
                             if let Ok(mut guard) = processing.lock() {
                                 guard.remove(&key);
+                                processing_cv.notify_one();
                             }
-                            // wake a rename blocked on this pending add.
-                            processing_cv.notify_one();
+                            // Purge the root dentry so a pending-window
+                            // lookup re-resolves against the landed row. Sent
+                            // here, never from the drain: the notify takes the
+                            // parent lock the in-flight lookup already holds.
+                            // The key is cleared first so no waiter on this
+                            // add is blocked behind the notification.
+                            if persisted_ok {
+                                if let Some(Some(notifier)) = notifier.get() {
+                                    let (parent_ino, _) =
+                                        FsService::split_data_dir_parent(&source_path);
+                                    if let Err(e) = notifier
+                                        .inval_entry(parent_ino, OsStr::new(&name))
+                                    {
+                                        warn!(
+                                            "inval_entry(parent={}, name={}) failed: {}",
+                                            parent_ino, name, e
+                                        );
+                                    }
+                                }
+                            }
                         });
                     } else {
                         info!(
@@ -1132,9 +1289,9 @@ impl FsService {
                         );
                         if let Ok(mut guard) = self.processing_torrents.lock() {
                             guard.remove(&dedup_key);
+                            // wake any waiter (defensive; no-DB path).
+                            self.processing_torrents_cv.notify_one();
                         }
-                        // wake any waiter (defensive; no-DB path).
-                        self.processing_torrents_cv.notify_one();
                     }
                 }
             }
@@ -1268,16 +1425,6 @@ impl FsService {
             return Err(FsError::AlreadyExists);
         }
 
-        let new_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
-        self.inode_mgr.inodes.insert(
-            new_ino,
-            InodeData::Directory {
-                parent,
-                name: name.to_string(),
-            },
-        );
-
-        // Persist the directory to the database.
         let source_path = if parent == METADATA_INO {
             name.to_string()
         } else {
@@ -1289,9 +1436,22 @@ impl FsService {
             }
         };
 
+        // Persist before touching the in-memory tree: a database failure must
+        // leave `metadata/` unchanged (the directory row and its closure are
+        // the restart-time truth), not create an inode that vanishes on the
+        // next mount.
         if let Some(ref ts) = self.torrent_service {
-            let _ = ts.ensure_metadata_directories(&source_path);
+            ts.ensure_metadata_directories(&source_path)?;
         }
+
+        let new_ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        self.inode_mgr.inodes.insert(
+            new_ino,
+            InodeData::Directory {
+                parent,
+                name: name.to_string(),
+            },
+        );
 
         info!(
             "Created directory {} with inode {} in {}",
@@ -1334,6 +1494,14 @@ impl FsService {
                 }
 
                 let source_path = self.inode_mgr.extract_source_path(ino);
+
+                // Delete the row first: on failure the inode (and the
+                // directory) stays visible, matching the database truth that
+                // would otherwise restore it on the next mount.
+                if let Some(ref ts) = self.torrent_service {
+                    ts.delete_metadata_directory(&source_path)?;
+                }
+
                 self.inode_mgr.inodes.remove(&ino);
 
                 // Clean up data_inodes cache.
@@ -1357,10 +1525,6 @@ impl FsService {
                 // once instead of lingering for the 1s FUSE TTL.
                 let (dir_parent, dir_name) = Self::split_data_dir_parent(&source_path);
                 self.inval_data_entry(dir_parent, &dir_name);
-
-                if let Some(ref ts) = self.torrent_service {
-                    let _ = ts.delete_metadata_directory(&source_path);
-                }
 
                 info!(
                     "Deleted directory '{}' (source_path='{}')",
@@ -1584,6 +1748,25 @@ impl FsService {
                 }
             };
 
+            // Persist first: the row rename is one transaction, and applying
+            // the new name in memory before it committed left `metadata/`
+            // showing a moved directory whose database rows still pointed at
+            // the old path (the next mount restored the old name, and `data/`
+            // disagreed in between). A failed rename now leaves both names
+            // exactly as they were in memory and in the database.
+            if let Some(ref ts) = self.torrent_service {
+                ts.rename_metadata_directory(&old_source_path, newname, &new_source_path)?;
+                info!(
+                    "Renamed metadata directory '{}' to '{}' (source_path: '{}' -> '{}')",
+                    name, newname, old_source_path, new_source_path
+                );
+            } else {
+                info!(
+                    "Renamed directory '{}' to '{}' (no database)",
+                    name, newname
+                );
+            }
+
             self.inode_mgr.inodes.insert(
                 source_ino,
                 InodeData::Directory {
@@ -1614,20 +1797,6 @@ impl FsService {
                     }
                     _ => {}
                 }
-            }
-
-            // Persist to database.
-            if let Some(ref ts) = self.torrent_service {
-                ts.rename_metadata_directory(&old_source_path, newname, &new_source_path)?;
-                info!(
-                    "Renamed metadata directory '{}' to '{}' (source_path: '{}' -> '{}')",
-                    name, newname, old_source_path, new_source_path
-                );
-            } else {
-                info!(
-                    "Renamed directory '{}' to '{}' (no database)",
-                    name, newname
-                );
             }
 
             // purge the kernel dentry cache for the renamed directory's old
@@ -1918,6 +2087,7 @@ impl FsService {
 
     /// Serve a read request across all namespaces (EISDIR, stats, data, metadata).
     pub fn read(&mut self, ino: u64, offset: i64, size: u32) -> FsResult<ReadOutcome> {
+        self.drain_projection_evictions();
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Err(FsError::IsDirectory),
             STATS_INO => {
@@ -2602,6 +2772,7 @@ mod tests {
             metrics: metrics.clone(),
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         };
         (svc, info_hash, torrent_id, metrics)
     }
@@ -2680,6 +2851,7 @@ mod tests {
             metrics,
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2999,10 +3171,8 @@ mod tests {
         let err = svc.setattr(STATS_INO, None).unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
 
-        // Derived stats inode (`dir_ino + STATS_INO_OFFSET`) falls inside the
-        // `is_data_ino` range (>= DATA_TORRENT_INO_BASE), so it must be
-        // classified as stats *before* the data/ guard, otherwise it would
-        // wrongly return EROFS (Radian 💭3).
+        // A derived stats inode is not part of the read-only projection; it
+        // must be classified as stats and rejected with EPERM, never EROFS.
         let stats_ino = InodeManager::make_stats_ino(DATA_INO);
         assert!(InodeManager::is_stats_ino(stats_ino));
         let err = svc.setattr(stats_ino, None).unwrap_err();
@@ -3020,10 +3190,8 @@ mod tests {
         let err = svc.write(STATS_INO, 0, b"x").unwrap_err();
         assert_eq!(err, FsError::NotPermitted);
 
-        // Derived stats inode (`dir_ino + STATS_INO_OFFSET`) falls inside the
-        // `is_data_ino` range (>= DATA_TORRENT_INO_BASE), so it must be
-        // classified as stats *before* the data/ guard, otherwise it would
-        // wrongly return EROFS instead of EPERM.
+        // A derived stats inode is not part of the read-only projection; it
+        // must be classified as stats and rejected with EPERM, never EROFS.
         let stats_ino = InodeManager::make_stats_ino(DATA_INO);
         assert!(InodeManager::is_stats_ino(stats_ino));
         let err = svc.write(stats_ino, 0, b"x").unwrap_err();
@@ -4687,6 +4855,7 @@ mod tests {
             metrics,
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -5128,6 +5297,7 @@ mod tests {
             metrics,
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         };
 
         let (ino, fh) = create_torrent_file(&mut svc, "full.torrent");
@@ -5806,6 +5976,7 @@ mod tests {
             metrics,
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
         };
 
         // `offset == file_size` (16) → `pieces_on_disk` says "empty range"
@@ -5948,6 +6119,299 @@ mod tests {
                 (DATA_INO, "top".to_string()),
             ],
             "a root-level rename must invalidate the old name under data/"
+        );
+    }
+
+    /// An overwrite whose close lands while the previous content is still
+    /// being persisted must not be dropped. `release` waits for the in-flight
+    /// add to settle and then persists the new bytes; before the fix it
+    /// returned early, leaving the OLD bytes in the database while
+    /// `metadata/` already showed the new torrent.
+    #[test]
+    fn release_overwrite_waits_for_in_flight_add_then_persists() {
+        let mut svc = service_with_db();
+        let key = ("".to_string(), "race.torrent".to_string());
+
+        // The first close's detached persist is still running.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        let (ino, fh) = create_torrent_file(&mut svc, "race.torrent");
+        let bytes = minimal_torrent_named("second");
+        svc.write(ino, 0, &bytes).expect("write");
+
+        // The in-flight add settles shortly after the second close starts
+        // waiting on the pending key.
+        let processing = svc.processing_torrents.clone();
+        let cv = svc.processing_torrents_cv.clone();
+        let settle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            processing.lock().unwrap().remove(&key);
+            cv.notify_one();
+        });
+
+        svc.release(fh)
+            .expect("release must persist the new bytes after the wait");
+        settle.join().expect("settle thread");
+        wait_for_processing_empty(&svc);
+
+        let db = svc.db.as_ref().unwrap().lock().unwrap();
+        let row = db
+            .get_torrent_by_filename_and_source_path("race.torrent", "")
+            .unwrap()
+            .expect("the overwrite must have persisted a row");
+        assert_eq!(
+            row.torrent_data.as_deref(),
+            Some(bytes.as_slice()),
+            "the database must hold the second close's bytes, not the first's"
+        );
+    }
+
+    /// An overwrite must evict the cached projection inodes of the replaced
+    /// content: otherwise an inode the kernel already holds keeps reporting
+    /// the old file tree (name, size, children) after the database moved on.
+    #[test]
+    fn release_overwrite_evicts_the_old_projection_inodes() {
+        let mut svc = service_with_db();
+
+        let (ino, fh) = create_torrent_file(&mut svc, "swap.torrent");
+        svc.write(ino, 0, &minimal_torrent_named("first"))
+            .expect("prime write");
+        svc.release(fh).expect("prime release");
+        wait_for_processing_empty(&svc);
+
+        // Warm `data/` with the first content's root and file inodes.
+        let old_root = svc
+            .lookup(DATA_INO, "swap.torrent")
+            .expect("lookup")
+            .expect("the first content must project");
+        let old_file = svc
+            .lookup(old_root.ino, "first")
+            .expect("lookup")
+            .expect("the single-file torrent projects its content name");
+        assert!(svc.inode_mgr.data_inodes.contains_key(&old_file.ino));
+
+        // The replacement must also invalidate the kernel's dentry for the
+        // torrent root, otherwise the old attrs stay cached for the TTL.
+        let recorder = RecordingInvalidator::new();
+        svc.notifier.set(Some(recorder.clone())).ok();
+
+        // Overwrite with a torrent whose content name differs.
+        let replacement = minimal_torrent_named("second");
+        let fh = svc.open(ino).expect("reopen").fh;
+        svc.setattr(ino, Some(0)).expect("truncate");
+        svc.write(ino, 0, &replacement).expect("overwrite write");
+        svc.release(fh).expect("overwrite release");
+        wait_for_processing_empty(&svc);
+
+        // The next dispatch-facing call drains the queued eviction.
+        let new_root = svc
+            .lookup(DATA_INO, "swap.torrent")
+            .expect("lookup")
+            .expect("the replacement must project");
+
+        assert!(
+            !svc.inode_mgr.data_inodes.contains_key(&old_file.ino),
+            "the replaced content's file inode must be evicted"
+        );
+        // The source row id is unchanged by an overwrite, so the root inode is
+        // stable — it must be re-resolved, not keep the replaced content's
+        // metadata.
+        match svc.inode_mgr.data_inodes.get(&new_root.ino) {
+            Some(DataInode::TorrentRoot { name, .. }) => assert_eq!(
+                name, "second",
+                "the root inode must be re-resolved to the replacement's content"
+            ),
+            other => panic!("expected a cached TorrentRoot, got {other:?}"),
+        }
+        // The dentry invalidation is issued by the persist thread after it
+        // clears the pending key, so wait for it instead of assuming it landed
+        // before `wait_for_processing_empty` returned.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while recorder.calls().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            recorder.calls(),
+            vec![(DATA_INO, "swap.torrent".to_string())],
+            "the overwrite must invalidate the kernel dentry of the torrent root"
+        );
+        assert!(
+            svc.lookup(new_root.ino, "second")
+                .expect("lookup")
+                .is_some(),
+            "the projection must serve the replacement's content name"
+        );
+        assert!(
+            svc.lookup(new_root.ino, "first")
+                .expect("lookup")
+                .is_none(),
+            "the replaced content's name must no longer resolve"
+        );
+    }
+
+    /// A torrent row id outside the addressable band must never be encoded
+    /// into another namespace (a `.stats` inode or a source-path directory):
+    /// lookup fails with an I/O error and the listing refuses the entry.
+    #[test]
+    fn data_lookup_rejects_unaddressable_torrent_row_id() {
+        let mut svc = service_with_db();
+        {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            db.conn
+                .execute_batch(
+                    "INSERT INTO torrents
+                         (id, info_hash, name, total_size, file_count, status)
+                     VALUES (1000000, 'h-big', 'big', 16, 1, 'pending');
+                     INSERT INTO torrent_sources
+                         (id, torrent_id, source_path, filename)
+                     VALUES (1000000, 1000000, '', 'big.torrent');",
+                )
+                .expect("seed an out-of-range row id");
+        }
+
+        let err = svc
+            .lookup(DATA_INO, "big.torrent")
+            .expect_err("an unaddressable row id must not resolve");
+        assert!(
+            matches!(err, FsError::Internal(_)),
+            "expected EIO-class error, got {err:?}"
+        );
+        assert!(
+            !svc.inode_mgr.data_inodes.contains_key(&INVALID_INO),
+            "the sentinel must not stay cached as a data inode"
+        );
+
+        let err = svc
+            .readdir(DATA_INO, 0)
+            .expect_err("a listing containing an unaddressable entry must fail");
+        assert!(
+            matches!(err, FsError::Internal(_)),
+            "expected EIO-class error, got {err:?}"
+        );
+    }
+
+    /// A lookup may already be walking through a pending-window root when the
+    /// persist lands and queues its eviction. The drain must leave that root
+    /// cached: its inode is hash-derived (the resolver cannot rebuild it from
+    /// the number), so removing it turns the in-flight child lookup into
+    /// `ENOENT` — `data/<seed>.torrent` visible, its content missing. Pending
+    /// entries are dropped by the readdir-driven `evict_stale_pending` once a
+    /// listing observes the landed row.
+    #[test]
+    fn pending_root_keeps_resolving_children_after_the_eviction_drain() {
+        let mut svc = service_with_db();
+        let (ino, _fh) = create_torrent_file(&mut svc, "race.torrent");
+        let bytes = minimal_torrent_named("seed.txt");
+        svc.write(ino, 0, &bytes).expect("write");
+
+        let key = ("".to_string(), "race.torrent".to_string());
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        let pending_root = svc
+            .lookup(DATA_INO, "race.torrent")
+            .expect("lookup")
+            .expect("pending projection")
+            .ino;
+        assert_eq!(
+            pending_root,
+            InodeManager::make_pending_torrent_ino("", "race.torrent")
+        );
+        assert!(svc
+            .lookup(pending_root, "seed.txt")
+            .expect("pending child lookup")
+            .is_some());
+
+        // The detached persist lands.
+        let persisted = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .persist_torrent(&bytes, "", "race.torrent")
+            .expect("persist");
+        drop(persisted);
+        svc.pending_projection_evictions
+            .lock()
+            .unwrap()
+            .push(key);
+        svc.processing_torrents.lock().unwrap().clear();
+
+        let after = svc
+            .lookup(pending_root, "seed.txt")
+            .expect("child lookup after persist");
+        assert!(
+            after.is_some(),
+            "the kernel's pending root inode must still resolve its child after the persist lands"
+        );
+        assert!(
+            svc.inode_mgr.data_inodes.contains_key(&pending_root),
+            "the drain must leave the kernel-held pending root cached"
+        );
+
+        // A path walk that starts at `data/` resolves the row-backed root and
+        // still reaches the content.
+        let db_root = svc
+            .lookup(DATA_INO, "race.torrent")
+            .expect("row-backed lookup")
+            .expect("the persisted row must project");
+        assert_ne!(db_root.ino, pending_root);
+        assert!(svc
+            .lookup(db_root.ino, "seed.txt")
+            .expect("row-backed child lookup")
+            .is_some());
+    }
+
+    /// The dispatch-side drain runs inside a request the kernel is holding the
+    /// parent directory's inode lock for; `FUSE_NOTIFY_INVAL_ENTRY` takes that
+    /// same lock, so notifying from here deadlocks the mount until the kernel
+    /// gives up. The dentry invalidation must come from the persist thread
+    /// instead (`release`), never from the drain.
+    #[test]
+    fn dispatch_drain_never_notifies_the_kernel() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "deferred.torrent");
+        svc.write(ino, 0, &minimal_torrent_named("first"))
+            .expect("write");
+        svc.release(fh).expect("release");
+        wait_for_processing_empty(&svc);
+
+        let root = svc
+            .lookup(DATA_INO, "deferred.torrent")
+            .expect("lookup")
+            .expect("projection");
+        let child = svc
+            .lookup(root.ino, "first")
+            .expect("lookup")
+            .expect("content");
+        assert!(svc.inode_mgr.data_inodes.contains_key(&child.ino));
+
+        // A row has landed for this key: the drain has real eviction work.
+        let recorder = RecordingInvalidator::new();
+        svc.notifier.set(Some(recorder.clone())).ok();
+        svc.pending_projection_evictions
+            .lock()
+            .unwrap()
+            .push(("".to_string(), "deferred.torrent".to_string()));
+
+        // Run every dispatch entry point that drains the queue.
+        svc.lookup(DATA_INO, "deferred.torrent").expect("lookup");
+        svc.readdir(DATA_INO, 0).expect("readdir");
+        svc.getattr(root.ino).expect("getattr");
+        svc.open(root.ino).expect("open");
+
+        assert!(
+            !svc.inode_mgr.data_inodes.contains_key(&child.ino),
+            "the drain must still evict the superseded child inode"
+        );
+        assert!(
+            recorder.calls().is_empty(),
+            "the dispatch-side drain must not issue FUSE notifications: {:?}",
+            recorder.calls()
         );
     }
 }
