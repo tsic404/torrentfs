@@ -1,10 +1,23 @@
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::database::Database;
 use super::types::DbError;
 
 impl Database {
     pub fn ensure_metadata_directories(&mut self, source_path: &str) -> Result<(), DbError> {
+        Self::ensure_metadata_directories_on(&self.conn, source_path)
+    }
+
+    /// Create the directory chain for `source_path` on an open connection.
+    ///
+    /// Taking the connection explicitly lets the torrent-insert path run this
+    /// inside its own transaction: the directory rows and the source row are
+    /// then atomic (a failure leaves neither a source row nor half a directory
+    /// tree), and every statement commits once instead of per path segment.
+    pub(super) fn ensure_metadata_directories_on(
+        conn: &Connection,
+        source_path: &str,
+    ) -> Result<(), DbError> {
         let parts: Vec<&str> = source_path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             return Ok(());
@@ -20,8 +33,7 @@ impl Database {
                 current_path = format!("{}/{}", current_path, part);
             }
 
-            let existing_id: Option<i64> = self
-                .conn
+            let existing_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM metadata_directories WHERE path = ?",
                     params![&current_path],
@@ -35,19 +47,19 @@ impl Database {
                 continue;
             }
 
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO metadata_directories (parent_id, name, path) VALUES (?, ?, ?)",
                 params![parent_id, part, &current_path],
             )?;
-            let dir_id = self.conn.last_insert_rowid();
+            let dir_id = conn.last_insert_rowid();
 
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO metadata_directory_closure (ancestor_id, descendant_id, depth) VALUES (?, ?, 0)",
                 params![dir_id, dir_id],
             )?;
 
             if let Some(pid) = parent_id {
-                self.conn.execute(
+                conn.execute(
                     "INSERT INTO metadata_directory_closure (ancestor_id, descendant_id, depth)
                      SELECT ancestor_id, ?, depth + 1 FROM metadata_directory_closure WHERE descendant_id = ?",
                     params![dir_id, pid],
@@ -97,15 +109,23 @@ impl Database {
             params![new_name, new_path, new_parent_id, old_path],
         )?;
 
-        // 2. Update all child directories' paths (replace old_path prefix with new_path).
-        // Escape LIKE metacharacters in old_prefix so directory names containing
-        // %, _, or \ are matched literally rather than as glob wildcards.
+        // 2. Update all child directories' paths (replace the old_path prefix
+        // with new_path).
+        //
+        // Both the cut position and the prefix test are done in SQLite's own
+        // text semantics: `length()`/`substr()` count characters, so a
+        // non-ASCII directory name keeps the suffix intact (`substr(path,
+        // length(prefix) + 1)`), while a Rust `str::len()` byte count would
+        // cut too far and corrupt every descendant path. `substr(...) = ...`
+        // is a case-sensitive comparison, unlike `LIKE`, which is
+        // case-insensitive for ASCII and would sweep `Movies/...` into a
+        // rename of `movies`.
         let old_prefix = format!("{}/", old_path);
         let new_prefix = format!("{}/", new_path);
-        let escaped_old_prefix = super::escape_like_pattern(&old_prefix);
         tx.execute(
-            "UPDATE metadata_directories SET path = ? || substr(path, ?) WHERE path LIKE ? ESCAPE '\\'",
-            params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
+            "UPDATE metadata_directories SET path = ?1 || substr(path, length(?2) + 1)
+             WHERE substr(path, 1, length(?2)) = ?2",
+            params![new_prefix, old_prefix],
         )?;
 
         // 3. Update source entries whose source_path matches exactly
@@ -116,8 +136,9 @@ impl Database {
 
         // 4. Update source entries whose source_path starts with old_path/
         tx.execute(
-            "UPDATE torrent_sources SET source_path = ? || substr(source_path, ?) WHERE source_path LIKE ? ESCAPE '\\'",
-            params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
+            "UPDATE torrent_sources SET source_path = ?1 || substr(source_path, length(?2) + 1)
+             WHERE substr(source_path, 1, length(?2)) = ?2",
+            params![new_prefix, old_prefix],
         )?;
 
         tx.commit()?;
