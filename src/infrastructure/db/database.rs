@@ -35,48 +35,63 @@ impl Database {
     }
 
     pub(crate) fn run_migrations(&mut self) -> Result<(), DbError> {
-        let tx = self.conn.transaction()?;
-        let user_version: i64 = tx
+        let user_version: i64 = self
+            .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .optional()?
             .unwrap_or(0);
 
-        if user_version < 1 {
-            Self::migrate_v1(&tx)?;
-            tx.pragma_update(None, "user_version", 2)?;
-        } else if user_version == 1 {
-            Self::migrate_v2(&tx)?;
-            tx.pragma_update(None, "user_version", 2)?;
-        }
-
-        if user_version < 3 {
-            Self::migrate_v3(&tx)?;
-            tx.pragma_update(None, "user_version", 3)?;
-        }
-
         if user_version < 4 {
-            Self::migrate_v4(&tx)?;
-            tx.pragma_update(None, "user_version", 4)?;
+            let tx = self.conn.transaction()?;
+
+            if user_version < 1 {
+                Self::migrate_v1(&tx)?;
+                tx.pragma_update(None, "user_version", 2)?;
+            } else if user_version == 1 {
+                Self::migrate_v2(&tx)?;
+                tx.pragma_update(None, "user_version", 2)?;
+            }
+
+            if user_version < 3 {
+                Self::migrate_v3(&tx)?;
+                tx.pragma_update(None, "user_version", 3)?;
+            }
+
+            if user_version < 4 {
+                Self::migrate_v4(&tx)?;
+                tx.pragma_update(None, "user_version", 4)?;
+            }
+
+            tx.commit()?;
         }
 
-        tx.commit()?;
+        // `torrent_sources` exists only once v6 has run. A database whose
+        // `user_version` write was lost — the version used to be written after
+        // the migration transaction committed, so a crash in that window left
+        // the new schema stamped with the old version — would otherwise
+        // re-enter a migration that has already dropped the old columns, and
+        // `Database::open` would fail forever. Detect the rebuilt schema and
+        // only repair the version stamp.
+        let schema_past_v6 = Self::table_exists(&self.conn, "torrent_sources")?;
 
-        // v5 runs outside any transaction so that PRAGMA foreign_keys = OFF
-        // takes effect — inside a transaction it is silently ignored, causing
-        // DROP TABLE to cascade-delete child rows.
-        if user_version < 5 {
+        // v5 and v6 rebuild `torrents` (DROP TABLE), so foreign_keys must be
+        // OFF for their bodies — inside a transaction the PRAGMA is silently
+        // ignored, which would let the DROP cascade into the child tables.
+        // Each migration writes its own `user_version` inside its transaction,
+        // so the stamp can never outlive or precede the schema change.
+        if user_version < 5 && !schema_past_v6 {
             self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            Self::migrate_v5(&self.conn)?;
+            let migrated = Self::migrate_v5(&self.conn);
             self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            self.conn.pragma_update(None, "user_version", 5)?;
+            migrated?;
         }
 
-        // v6 also rebuilds `torrents` (DROP TABLE), so foreign_keys must be
-        // OFF — otherwise the DROP cascades into the child tables.
-        if user_version < 6 {
+        if user_version < 6 && !schema_past_v6 {
             self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-            Self::migrate_v6(&self.conn)?;
+            let migrated = Self::migrate_v6(&self.conn);
             self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            migrated?;
+        } else if user_version < 6 {
             self.conn.pragma_update(None, "user_version", 6)?;
         }
 
@@ -97,11 +112,25 @@ impl Database {
         }
 
         if user_version < 7 {
-            Self::migrate_v7(&self.conn)?;
-            self.conn.pragma_update(None, "user_version", 7)?;
+            let tx = self.conn.transaction()?;
+            Self::migrate_v7(&tx)?;
+            tx.pragma_update(None, "user_version", 7)?;
+            tx.commit()?;
         }
 
         Ok(())
+    }
+
+    /// `true` if `table` exists in the main schema.
+    fn table_exists(conn: &Connection, table: &str) -> Result<bool, DbError> {
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                params![table],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Add the composite indexes that name lookups under `data/` rely on:
@@ -339,6 +368,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_torrents_source_path ON torrents(source_path);",
         )?;
 
+        tx.pragma_update(None, "user_version", 5)?;
         tx.commit()?;
         Ok(())
     }
@@ -523,6 +553,7 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_torrent_sources_source_path ON torrent_sources(source_path);",
         )?;
 
+        tx.pragma_update(None, "user_version", 6)?;
         tx.commit()?;
         Ok(())
     }

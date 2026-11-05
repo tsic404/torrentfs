@@ -197,3 +197,87 @@ fn tc_ingest_05_same_info_hash_different_bytes_stay_independent() {
         "the second projection must list its own entry"
     );
 }
+
+/// `cp a x.torrent; cp b x.torrent` back to back: the second close may land
+/// while the first one's persistence is still running. The database — and
+/// therefore `data/` and a restart — must carry the second content
+/// (`C-3.2.6`, `C-2.5.4`).
+#[test]
+fn tc_ingest_05_overwrite_inside_persistence_window_keeps_latest_content() {
+    use torrentfs::fuse::inodes::METADATA_INO;
+
+    let _slot = wave_slot();
+    let mut ingest = IngestHarness::with_file_db();
+    let announce = "http://127.0.0.1:6973/announce";
+    let (first, _) = create_single_piece_torrent(announce, "ingest-05-window-first.bin");
+    let (second, _) = create_single_piece_torrent(announce, "ingest-05-window-second.bin");
+
+    {
+        let svc = ingest.service();
+        let created = svc
+            .create(METADATA_INO, "race.torrent")
+            .expect("create the first file");
+        let ino = created.attr.ino;
+        svc.write(ino, 0, &first).expect("write the first bytes");
+        svc.flush(ino).expect("flush the first bytes");
+        svc.release(created.fh).expect("release the first close");
+
+        // The overwriting `cp` runs before the first add necessarily settled.
+        let fh = svc.open(ino).expect("reopen for the overwrite").fh;
+        svc.setattr(ino, Some(0)).expect("truncate");
+        svc.write(ino, 0, &second).expect("write the second bytes");
+        svc.flush(ino).expect("flush the second bytes");
+        svc.release(fh).expect("release the second close");
+    }
+
+    ingest.wait_persisted();
+
+    let second_hash = hex::encode(
+        torrentfs::TorrentInfo::from_bytes(second.clone())
+            .expect("parse the second torrent")
+            .info_hash()
+            .expect("info hash"),
+    );
+    let rows: Vec<_> = ingest
+        .torrents()
+        .into_iter()
+        .filter(|torrent| torrent.filename == "race.torrent")
+        .collect();
+    assert_eq!(rows.len(), 1, "one source row per metadata name");
+    assert_eq!(
+        rows[0].info_hash, second_hash,
+        "the database must hold the second close's content, not the first's"
+    );
+    assert_eq!(
+        rows[0].torrent_data.as_deref(),
+        Some(second.as_slice()),
+        "the stored bytes must be the second torrent"
+    );
+
+    assert!(
+        ingest
+            .data_lookup(&["race.torrent", "ingest-05-window-second.bin"])
+            .is_some(),
+        "data/ must project the second content's file"
+    );
+    assert!(
+        ingest
+            .data_lookup(&["race.torrent", "ingest-05-window-first.bin"])
+            .is_none(),
+        "data/ must not keep the replaced content's file"
+    );
+
+    let mut remounted = ingest.remount();
+    assert!(
+        remounted
+            .data_lookup(&["race.torrent", "ingest-05-window-second.bin"])
+            .is_some(),
+        "a restart must restore the second content"
+    );
+    assert!(
+        remounted
+            .data_lookup(&["race.torrent", "ingest-05-window-first.bin"])
+            .is_none(),
+        "a restart must not restore the replaced content"
+    );
+}

@@ -122,3 +122,95 @@ fn tc_ingest_03_directory_rename_moves_descendant_projections() {
         "a seed in a nested directory must follow the rename"
     );
 }
+
+/// Renaming a directory whose name is non-ASCII must rewrite the descendant
+/// directory paths and source paths by character position, not by byte
+/// length — and the corrected paths must still be there after a remount
+/// (`C-3.1.5`, `C-3.3.6`).
+#[test]
+fn tc_ingest_03_non_ascii_directory_rename_rewrites_descendants() {
+    let _slot = wave_slot();
+    let mut ingest = IngestHarness::with_file_db();
+    let announce = "http://127.0.0.1:9/announce";
+    let (inner, _) = create_single_piece_torrent(announce, "ingest-03-unicode.bin");
+
+    let group = ingest.mkdir(&["电影"]);
+    let sub = ingest.mkdir(&["电影", "子目录"]);
+    ingest.copy_torrent(sub, "inner.torrent", &inner);
+
+    ingest
+        .service()
+        .rename(METADATA_INO, "电影", METADATA_INO, "films")
+        .expect("renaming a non-ASCII directory must succeed");
+
+    assert!(
+        ingest.data_lookup(&["电影"]).is_none(),
+        "the old non-ASCII projection must disappear"
+    );
+    assert!(
+        ingest
+            .data_lookup(&["films", "子目录", "inner.torrent", "ingest-03-unicode.bin"])
+            .is_some(),
+        "the descendant seed must project under the renamed path with its suffix intact"
+    );
+
+    let mut remounted = ingest.remount();
+    assert!(
+        remounted.data_lookup(&["电影"]).is_none(),
+        "the old path must stay gone after a remount"
+    );
+    assert!(
+        remounted
+            .data_lookup(&["films", "子目录", "inner.torrent", "ingest-03-unicode.bin"])
+            .is_some(),
+        "the character-based path rewrite must survive a remount"
+    );
+}
+
+/// Renaming `movies` must not rewrite a sibling `Movies/` whose path only
+/// matches case-insensitively (`C-3.3.6`).
+#[test]
+fn tc_ingest_03_case_variant_sibling_survives_directory_rename() {
+    let _slot = wave_slot();
+    let mut ingest = IngestHarness::with_file_db();
+    let announce = "http://127.0.0.1:9/announce";
+    let (lower, _) = create_single_piece_torrent(announce, "ingest-03-lower.bin");
+    let (upper, _) = create_single_piece_torrent(announce, "ingest-03-upper.bin");
+
+    let lower_dir = ingest.mkdir(&["movies"]);
+    ingest.copy_torrent(lower_dir, "lower.torrent", &lower);
+    let upper_dir = ingest.mkdir(&["Movies"]);
+    ingest.copy_torrent(upper_dir, "upper.torrent", &upper);
+
+    ingest
+        .service()
+        .rename(METADATA_INO, "movies", METADATA_INO, "films")
+        .expect("renaming the lower-case directory must succeed");
+
+    assert!(
+        ingest
+            .data_lookup(&["films", "lower.torrent", "ingest-03-lower.bin"])
+            .is_some(),
+        "the renamed directory's seed must follow it"
+    );
+    assert!(
+        ingest
+            .data_lookup(&["Movies", "upper.torrent", "ingest-03-upper.bin"])
+            .is_some(),
+        "the case-variant sibling must keep its own path"
+    );
+
+    let mut remounted = ingest.remount();
+    assert!(
+        remounted
+            .data_lookup(&["Movies", "upper.torrent", "ingest-03-upper.bin"])
+            .is_some(),
+        "the case-variant sibling must keep its path after a remount"
+    );
+    assert!(
+        remounted
+            .data_lookup(&["films", "lower.torrent", "ingest-03-lower.bin"])
+            .is_some(),
+        "the renamed seed must stay renamed after a remount"
+    );
+}
