@@ -176,17 +176,14 @@ impl Database {
         )?;
         let source_id = tx.last_insert_rowid();
 
-        tx.commit()?;
-
+        // The directory chain is part of the insert: the source row, its file
+        // tree and the `metadata/` directories commit in one transaction, so a
+        // failure leaves no half-built tree behind (C-12.7).
         if !source_path.is_empty() {
-            if let Err(e) = self.ensure_metadata_directories(source_path) {
-                tracing::warn!(
-                    "Failed to create metadata directories for {}: {}",
-                    source_path,
-                    e
-                );
-            }
+            Self::ensure_metadata_directories_on(&tx, source_path)?;
         }
+
+        tx.commit()?;
 
         Ok(InsertTorrentResult::Inserted(source_id))
     }
@@ -414,17 +411,14 @@ impl Database {
             }
         };
 
-        tx.commit()?;
-
+        // The directory chain is part of the insert: the source row, its file
+        // tree and the `metadata/` directories commit in one transaction, so a
+        // failure leaves no half-built tree behind (C-12.7).
         if !source_path.is_empty() {
-            if let Err(e) = self.ensure_metadata_directories(source_path) {
-                tracing::warn!(
-                    "Failed to create metadata directories for {}: {}",
-                    source_path,
-                    e
-                );
-            }
+            Self::ensure_metadata_directories_on(&tx, source_path)?;
         }
+
+        tx.commit()?;
 
         Ok(InsertTorrentOutcome {
             source_id,
@@ -525,18 +519,27 @@ impl Database {
         &self,
         source_path: &str,
     ) -> Result<Vec<Torrent>, DbError> {
-        let escaped_path = super::escape_like_pattern(source_path);
-        let pattern = if source_path.is_empty() {
-            "%".to_string()
-        } else {
-            format!("{}/%", escaped_path)
-        };
+        // A child match is a literal, case-sensitive prefix test done in
+        // SQLite's text semantics: `LIKE` is case-insensitive for ASCII, so
+        // listing `movies` would also have pulled in `Movies/...`, and
+        // `substr(...) = ...` compares characters exactly.
+        if source_path.is_empty() {
+            let sql = format!("{TORRENT_SELECT} ORDER BY s.id");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let torrents = stmt
+                .query_map([], torrent_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(torrents);
+        }
+
+        let child_prefix = format!("{}/", source_path);
         let sql = format!(
-            "{TORRENT_SELECT} WHERE s.source_path = ?1 OR s.source_path LIKE ?2 ESCAPE '\\' ORDER BY s.id"
+            "{TORRENT_SELECT} WHERE s.source_path = ?1 \
+             OR substr(s.source_path, 1, length(?2)) = ?2 ORDER BY s.id"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let torrents = stmt
-            .query_map(params![source_path, pattern], torrent_from_row)?
+            .query_map(params![source_path, child_prefix], torrent_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(torrents)
     }
