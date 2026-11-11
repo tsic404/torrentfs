@@ -761,13 +761,13 @@ jobs:
         # as root with /dev/fuse, so the passing path is real.
         run: |
           set -euo pipefail
-          # The first ten are the long-standing carriers; the last four are a
-          # smoke subset of the added ones covering the four fixtures (torrent
+          # The first eleven are the long-standing carriers; the last four are
+          # a smoke subset of the added ones covering the four fixtures (torrent
           # builder, tracker/peer swarm, stats rendering, by-name/read paths),
           # so a fixture regression fails here instead of surfacing only in
           # acceptance execution.
           ran=0
-          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_recovery_05 \
+          for tc in tc_ingest_01 tc_ingest_03 tc_ingest_06 tc_rofs_01 tc_read_04 tc_stats_01 tc_stats_02 tc_recovery_01 tc_cache_02 tc_cache_03 tc_recovery_05 \
                     tc_read_01 tc_ingest_02 tc_stats_06 tc_seeding_02; do
             rc=0
             ./tests/acceptance/$tc.sh ./target/release/torrentfs "/tmp/torrentfs_acceptance_$tc" || rc=$?
