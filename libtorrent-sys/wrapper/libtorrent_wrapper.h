@@ -103,6 +103,9 @@ lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
 lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error);
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
+// Detaches the torrent from the session; the caller still owns `handle` and
+// MUST release it with lt_torrent_handle_destroy. Calls on the detached handle
+// fail (invalid_torrent_handle) instead of dereferencing freed memory.
 void lt_session_remove_torrent(lt_session_t session, lt_torrent_handle_t handle, int remove_files);
 void lt_torrent_handle_destroy(lt_torrent_handle_t handle);
 
@@ -110,7 +113,6 @@ int lt_torrent_handle_is_valid(lt_torrent_handle_t handle);
 int lt_torrent_handle_status(lt_torrent_handle_t handle, int* state, float* progress, uint64_t* total_done, uint64_t* total,
     int64_t* download_rate, int64_t* upload_rate, int64_t* total_download, int64_t* total_upload,
     int32_t* num_peers, int32_t* num_seeds);
-int lt_torrent_handle_read_piece(lt_session_t session, lt_torrent_handle_t handle, int piece_index, uint8_t** data_out, size_t* size_out, lt_error_t* error);
 void lt_piece_data_free(uint8_t* data);
 int lt_torrent_handle_get_piece_info(lt_torrent_handle_t handle, int file_index, int64_t* first_piece, int64_t* num_pieces, int64_t* file_offset);
 int lt_torrent_handle_get_torrent_info(lt_torrent_handle_t handle, int64_t* piece_length, int64_t* num_pieces);

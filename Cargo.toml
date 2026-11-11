@@ -27,6 +27,8 @@ toml = "0.8"
 libtorrent-sys = { path = "libtorrent-sys" }
 tempfile = "3.10"
 parking_lot = "0.12"
+# Builds the BEP 52 block hashes of the hybrid-torrent fixture.
+sha2 = "0.10"
 
 [[example]]
 name = "torrentfs-selfseed-env"

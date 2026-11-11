@@ -243,11 +243,12 @@ impl Session {
         }
     }
 
-    /// Remove a torrent from the session.  The C++ wrapper (`lt_session_remove_torrent`)
-    /// deletes the underlying `lt::torrent_handle*`, so we must prevent Rust's
-    /// `TorrentHandle::Drop` from calling `lt_torrent_handle_destroy` on the
-    /// same pointer — otherwise double-free.
-    pub fn remove_torrent(&mut self, handle: TorrentHandle, remove_files: bool) {
+    /// Remove a torrent from the session.  The torrent is detached but the
+    /// handle object stays valid — calls on it fail with
+    /// `invalid_torrent_handle` instead of dereferencing freed memory — so the
+    /// caller receives it back and releases it by dropping it (which runs
+    /// `lt_torrent_handle_destroy`, the same as any other handle).
+    pub fn remove_torrent(&mut self, handle: TorrentHandle, remove_files: bool) -> TorrentHandle {
         unsafe {
             libtorrent_sys::lt_session_remove_torrent(
                 self.inner,
@@ -255,8 +256,7 @@ impl Session {
                 if remove_files { 1 } else { 0 },
             );
         }
-        // The C++ side has freed the handle pointer; skip Rust's Drop.
-        std::mem::forget(handle);
+        handle
     }
 
     pub(crate) fn inner(&self) -> libtorrent_sys::lt_session_t {
@@ -342,6 +342,14 @@ impl TorrentHandle {
     }
 
     pub fn get_file_piece_info(&self, file_index: i32) -> TorrentResult<FilePieceInfo> {
+        // The FFI boundary rejects a negative index too; rejecting it here
+        // keeps the invalid value from reaching libtorrent at all and gives the
+        // caller a domain error instead of a bare code.
+        if file_index < 0 {
+            return Err(TorrentError::InvalidFile(format!(
+                "negative file index {file_index}"
+            )));
+        }
         let mut first_piece: i64 = 0;
         let mut num_pieces: i64 = 0;
         let mut file_offset: i64 = 0;
@@ -392,6 +400,10 @@ impl TorrentHandle {
         }
     }
 
+    /// Range validation — `0 <= piece_index < num_pieces` — is owned by
+    /// `lt_torrent_handle_have_piece`: it is the only side that knows the
+    /// torrent's piece count, and it answers `false` for a negative or
+    /// past-the-end index instead of reading past the piece bitfield.
     pub fn have_piece(&self, piece_index: i32) -> bool {
         unsafe { libtorrent_sys::lt_torrent_handle_have_piece(self.inner, piece_index) != 0 }
     }
