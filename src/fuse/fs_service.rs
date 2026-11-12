@@ -120,6 +120,21 @@ pub trait EntryInvalidator: Send + Sync {
     fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()>;
 }
 
+/// Send one `inval_entry` and log a failure.
+///
+/// The persist thread invalidates a superset of what the kernel may hold, so
+/// the sink is expected to treat a missing parent/entry as success
+/// (`Notifier` maps `ENOENT` that way). Anything it does surface is a real
+/// failure worth a warning.
+fn notify_inval_entry(sink: &Arc<dyn EntryInvalidator>, parent: u64, name: &str) {
+    if let Err(error) = sink.inval_entry(parent, OsStr::new(name)) {
+        warn!(
+            "inval_entry(parent={}, name={}) failed: {}",
+            parent, name, error
+        );
+    }
+}
+
 pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -195,14 +210,19 @@ impl FsService {
         }
     }
 
-    /// Drop the cached `data/` inodes an overwrite superseded and refresh the
-    /// root's display name.
+    /// Drop the cached `data/` inodes an overwrite superseded, promote a
+    /// pending-window root to the landed row, and refresh the root's display
+    /// name.
     ///
-    /// Only superseded row-backed children are removed. Pending-window entries
-    /// stay: their inode is hash-derived, so dropping the one an in-flight
-    /// lookup walks through turns its child lookup into `ENOENT`. A row-backed
-    /// root is refreshed in place because its id survives the overwrite. Never
-    /// notify the kernel here — the persist thread does (see `release`).
+    /// Runs on the dispatch thread; the kernel is told by the persist thread
+    /// instead (see `release`), because a notification from here would take the
+    /// lock an in-flight lookup already holds. A row-backed root is refreshed
+    /// in place: its inode is derived from the source row, which survives the
+    /// overwrite. A pending-window root is promoted in place for the same
+    /// reason one step earlier — the kernel may already hold its hash-derived
+    /// inode, and the contract wants the temporary projection gone, not the
+    /// walk broken. Pending children are dropped: the promoted root resolves
+    /// children from the row, so no reader is left for the bencode entries.
     fn evict_projection(&mut self, source_path: &str, filename: &str) {
         // Cached children carry their root's source id; once the source was
         // repointed, every cached child under that id is replaced content.
@@ -226,40 +246,54 @@ impl FsService {
             })
             .collect();
 
-        // The row is the post-overwrite truth; keep the cached root's display
-        // name in step with it (the inode itself does not change).
-        let current = self.db.as_ref().and_then(|db| {
+        // The row is the post-overwrite truth. Read it before touching the
+        // tables so the promotion below can carry its id and display name.
+        let landed = self.db.as_ref().and_then(|db| {
             let guard = db.lock().ok()?;
             guard
                 .get_torrent_by_filename_and_source_path(filename, source_path)
                 .ok()
                 .flatten()
         });
-        if let Some(torrent) = current {
-            for data_inode in self.inode_mgr.data_inodes.values_mut() {
-                if let DataInode::TorrentRoot {
-                    torrent_id, name, ..
-                } = data_inode
-                {
-                    if *torrent_id == torrent.id {
-                        name.clone_from(&torrent.name);
-                    }
-                }
-            }
-        }
 
         self.inode_mgr
             .data_inodes
             .retain(|_, data_inode| match data_inode {
-                DataInode::TorrentRoot { .. }
-                | DataInode::SourcePathDir { .. }
-                | DataInode::TorrentDir { torrent_id: 0, .. }
-                | DataInode::TorrentFile { torrent_id: 0, .. } => true,
-                DataInode::TorrentDir { torrent_id, .. }
-                | DataInode::TorrentFile { torrent_id, .. } => {
-                    !superseded_ids.contains(torrent_id)
+                DataInode::TorrentRoot { .. } | DataInode::SourcePathDir { .. } => true,
+                DataInode::TorrentDir {
+                    torrent_id: 0,
+                    torrent_source_path,
+                    torrent_filename,
+                    ..
                 }
+                | DataInode::TorrentFile {
+                    torrent_id: 0,
+                    torrent_source_path,
+                    torrent_filename,
+                    ..
+                } => {
+                    torrent_source_path.as_str() != source_path
+                        || torrent_filename.as_str() != filename
+                }
+                DataInode::TorrentDir { torrent_id, .. }
+                | DataInode::TorrentFile { torrent_id, .. } => !superseded_ids.contains(torrent_id),
             });
+
+        let Some(torrent) = landed else {
+            return;
+        };
+        let pending_ino = InodeManager::make_pending_torrent_ino(source_path, filename);
+        for (ino, data_inode) in self.inode_mgr.data_inodes.iter_mut() {
+            if let DataInode::TorrentRoot {
+                torrent_id, name, ..
+            } = data_inode
+            {
+                if *torrent_id == torrent.id || (*torrent_id == 0 && *ino == pending_ino) {
+                    *torrent_id = torrent.id;
+                    name.clone_from(&torrent.name);
+                }
+            }
+        }
     }
 
     /// Apply every projection eviction a background persist queued.
@@ -1221,37 +1255,36 @@ impl FsService {
                         let notifier = self.notifier.clone();
                         let key = dedup_key.clone();
                         std::thread::spawn(move || {
-                            let persisted_ok =
-                                match ts.persist_torrent(&data, &source_path, &name) {
-                                    Ok(persisted) => {
-                                        // Clear any stale failure from a prior
-                                        // attempt; this one succeeded.
-                                        if let Ok(mut guard) = persist_errors.lock() {
-                                            guard.remove(&key);
-                                        }
-                                        // The new content has landed: queue an
-                                        // eviction of the projection inodes the
-                                        // row superseded, so the dispatch side
-                                        // stops serving the replaced content.
-                                        if let Ok(mut queue) = evictions.lock() {
-                                            if !queue.contains(&key) {
-                                                queue.push(key.clone());
-                                            }
-                                        }
-                                        ts.register_torrent_handle(&persisted);
-                                        true
+                            let persisted = match ts.persist_torrent(&data, &source_path, &name) {
+                                Ok(persisted) => {
+                                    // Clear any stale failure from a prior
+                                    // attempt; this one succeeded.
+                                    if let Ok(mut guard) = persist_errors.lock() {
+                                        guard.remove(&key);
                                     }
-                                    Err(e) => {
-                                        error!("Failed to persist torrent {}: {}", name, e);
-                                        // record the failure so the next
-                                        // user-visible lookup/readdir of data/
-                                        // surfaces it as EIO.
-                                        if let Ok(mut guard) = persist_errors.lock() {
-                                            guard.insert(key.clone(), e.to_string());
+                                    // The new content has landed: queue an
+                                    // eviction of the projection inodes the
+                                    // row superseded, so the dispatch side
+                                    // stops serving the replaced content.
+                                    if let Ok(mut queue) = evictions.lock() {
+                                        if !queue.contains(&key) {
+                                            queue.push(key.clone());
                                         }
-                                        false
                                     }
-                                };
+                                    ts.register_torrent_handle(&persisted);
+                                    Some(persisted)
+                                }
+                                Err(e) => {
+                                    error!("Failed to persist torrent {}: {}", name, e);
+                                    // record the failure so the next
+                                    // user-visible lookup/readdir of data/
+                                    // surfaces it as EIO.
+                                    if let Ok(mut guard) = persist_errors.lock() {
+                                        guard.insert(key.clone(), e.to_string());
+                                    }
+                                    None
+                                }
+                            };
                             // Clear the key and wake a rename/release blocked
                             // on this pending add under one lock hold: a notify
                             // after the guard dropped could land between the
@@ -1261,23 +1294,33 @@ impl FsService {
                                 guard.remove(&key);
                                 processing_cv.notify_one();
                             }
-                            // Purge the root dentry so a pending-window
-                            // lookup re-resolves against the landed row. Sent
-                            // here, never from the drain: the notify takes the
-                            // parent lock the in-flight lookup already holds.
-                            // The key is cleared first so no waiter on this
-                            // add is blocked behind the notification.
-                            if persisted_ok {
-                                if let Some(Some(notifier)) = notifier.get() {
+                            // Purge the kernel's cached entries for what the
+                            // write replaced. Sent here, never from the drain:
+                            // the notify takes the parent lock the in-flight
+                            // lookup already holds. The key is cleared first so
+                            // no waiter on this add is blocked behind it.
+                            if let Some(persisted) = persisted {
+                                if let Some(Some(sink)) = notifier.get() {
                                     let (parent_ino, _) =
                                         FsService::split_data_dir_parent(&source_path);
-                                    if let Err(e) = notifier
-                                        .inval_entry(parent_ino, OsStr::new(&name))
-                                    {
-                                        warn!(
-                                            "inval_entry(parent={}, name={}) failed: {}",
-                                            parent_ino, name, e
-                                        );
+                                    notify_inval_entry(sink, parent_ino, &name);
+                                    // Root-level entries of the replaced and
+                                    // the landed content. The kernel holds them
+                                    // under whichever inode it resolved for the
+                                    // seed root: the landed row's, or the
+                                    // pending-window hash when the seed was
+                                    // looked up before the row landed.
+                                    let roots = [
+                                        InodeManager::make_torrent_root_ino(persisted.source_id()),
+                                        InodeManager::make_pending_torrent_ino(&source_path, &name),
+                                    ];
+                                    for root in roots {
+                                        if root == INVALID_INO {
+                                            continue;
+                                        }
+                                        for stale in persisted.changed_root_names() {
+                                            notify_inval_entry(sink, root, stale);
+                                        }
                                     }
                                 }
                             }
@@ -4882,6 +4925,23 @@ mod tests {
         }
     }
 
+    /// Wait (bounded) for the persist thread to have issued `expected` entry
+    /// invalidations. It notifies after clearing the pending key, so an empty
+    /// `processing_torrents` does not mean the notifications already landed.
+    fn wait_for_invalidations(
+        recorder: &RecordingInvalidator,
+        expected: usize,
+    ) -> Vec<(u64, String)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let calls = recorder.calls();
+            if calls.len() >= expected || std::time::Instant::now() > deadline {
+                return calls;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Closing an empty `.torrent` file hits the fast path.
     /// `release` discards the inode and returns `NotFound` (ENOENT) — a
     /// zero-byte file is treated as if it never existed — without touching
@@ -6229,14 +6289,19 @@ mod tests {
         // The dentry invalidation is issued by the persist thread after it
         // clears the pending key, so wait for it instead of assuming it landed
         // before `wait_for_processing_empty` returned.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while recorder.calls().is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let pending_ino = InodeManager::make_pending_torrent_ino("", "swap.torrent");
+        let expected = vec![
+            (DATA_INO, "swap.torrent".to_string()),
+            (old_root.ino, "first".to_string()),
+            (old_root.ino, "second".to_string()),
+            (pending_ino, "first".to_string()),
+            (pending_ino, "second".to_string()),
+        ];
         assert_eq!(
-            recorder.calls(),
-            vec![(DATA_INO, "swap.torrent".to_string())],
-            "the overwrite must invalidate the kernel dentry of the torrent root"
+            wait_for_invalidations(&recorder, expected.len()),
+            expected,
+            "the overwrite must drop the kernel's cached root dentry and both \
+             contents' root entries, under the landed and the pending root id"
         );
         assert!(
             svc.lookup(new_root.ino, "second")
@@ -6245,10 +6310,155 @@ mod tests {
             "the projection must serve the replacement's content name"
         );
         assert!(
-            svc.lookup(new_root.ino, "first")
+            svc.lookup(new_root.ino, "first").expect("lookup").is_none(),
+            "the replaced content's name must no longer resolve"
+        );
+    }
+
+    /// Regression for the overwrite that leaves the replaced content's entry
+    /// resolvable on a mount that never lists the seed root: the persist thread
+    /// must invalidate every root-level name of the replaced and the landed
+    /// content, not just the seed root's own name.
+    #[test]
+    fn overwrite_without_readdir_invalidates_the_replaced_root_entries() {
+        let mut svc = service_with_db();
+
+        let (ino, fh) = create_torrent_file(&mut svc, "swap.torrent");
+        svc.write(ino, 0, &minimal_torrent_named("old.bin"))
+            .expect("prime write");
+        svc.release(fh).expect("prime release");
+        wait_for_processing_empty(&svc);
+
+        // What a client that browsed the seed root holds when it overwrites.
+        let root = svc
+            .lookup(DATA_INO, "swap.torrent")
+            .expect("lookup")
+            .expect("the first content must project");
+        assert!(svc.lookup(root.ino, "old.bin").expect("lookup").is_some());
+
+        let recorder = RecordingInvalidator::new();
+        svc.notifier.set(Some(recorder.clone())).ok();
+
+        let fh = svc.open(ino).expect("reopen").fh;
+        svc.setattr(ino, Some(0)).expect("truncate");
+        svc.write(ino, 0, &minimal_torrent_named("new.bin"))
+            .expect("overwrite write");
+        svc.release(fh).expect("overwrite release");
+        wait_for_processing_empty(&svc);
+
+        // No readdir happens in this test: the drain runs from the next
+        // lookup, exactly as on a mount that only ever resolves by name.
+        let pending_ino = InodeManager::make_pending_torrent_ino("", "swap.torrent");
+        let expected = vec![
+            (DATA_INO, "swap.torrent".to_string()),
+            (root.ino, "old.bin".to_string()),
+            (root.ino, "new.bin".to_string()),
+            (pending_ino, "old.bin".to_string()),
+            (pending_ino, "new.bin".to_string()),
+        ];
+        assert_eq!(
+            wait_for_invalidations(&recorder, expected.len()),
+            expected,
+            "each replaced root entry must be dropped from the kernel cache"
+        );
+
+        let after = svc
+            .lookup(DATA_INO, "swap.torrent")
+            .expect("lookup")
+            .expect("the replacement must project");
+        assert!(
+            svc.lookup(after.ino, "old.bin").expect("lookup").is_none(),
+            "the replaced entry must not resolve without a readdir"
+        );
+        assert!(
+            svc.lookup(after.ino, "new.bin").expect("lookup").is_some(),
+            "the replacement's entry must resolve without a readdir"
+        );
+    }
+
+    /// The temporary projection of a landed source must not survive on the
+    /// daemon side until some listing happens to observe the row: the drain
+    /// evicts its children and promotes the pending root onto the row, so a
+    /// kernel-held pending inode still resolves the landed content.
+    #[test]
+    fn drain_drops_the_temporary_projection_without_a_readdir() {
+        let mut svc = service_with_db();
+
+        let bytes = minimal_torrent_named("seed.txt");
+        let (ino, _fh) = create_torrent_file(&mut svc, "race.torrent");
+        svc.write(ino, 0, &bytes).expect("write");
+        let key = ("".to_string(), "race.torrent".to_string());
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert(key.clone(), ());
+
+        // A client resolves the seed root while the add is in flight.
+        let pending_root = svc
+            .lookup(DATA_INO, "race.torrent")
+            .expect("lookup")
+            .expect("pending projection")
+            .ino;
+        assert_eq!(
+            pending_root,
+            InodeManager::make_pending_torrent_ino("", "race.torrent")
+        );
+        let pending_child = svc
+            .lookup(pending_root, "seed.txt")
+            .expect("pending child lookup")
+            .expect("the bencode tree exposes the entry")
+            .ino;
+        assert!(matches!(
+            svc.inode_mgr.data_inodes.get(&pending_child),
+            Some(DataInode::TorrentFile { torrent_id: 0, .. })
+        ));
+
+        // The detached persist lands and queues the eviction; the persist
+        // thread is the only one that notifies, so the queue is all the
+        // dispatch side gets.
+        drop(
+            svc.torrent_service
+                .as_ref()
+                .unwrap()
+                .persist_torrent(&bytes, "", "race.torrent")
+                .expect("persist"),
+        );
+        svc.pending_projection_evictions.lock().unwrap().push(key);
+        svc.processing_torrents.lock().unwrap().clear();
+
+        // Any dispatch request drains; this one is not a readdir.
+        svc.getattr(DATA_INO).expect("getattr");
+
+        assert!(
+            !svc.inode_mgr.data_inodes.contains_key(&pending_child),
+            "the temporary child entry must be evicted once the row lands"
+        );
+        match svc.inode_mgr.data_inodes.get(&pending_root) {
+            Some(DataInode::TorrentRoot { torrent_id, .. }) => assert_ne!(
+                *torrent_id, 0,
+                "the pending root must be promoted onto the landed row"
+            ),
+            other => panic!("expected a promoted TorrentRoot, got {other:?}"),
+        }
+        assert!(
+            svc.lookup(pending_root, "seed.txt")
+                .expect("child lookup through the promoted root")
+                .is_some(),
+            "a kernel-held pending root must keep resolving through the row"
+        );
+        assert!(
+            svc.lookup(pending_root, "gone.bin")
                 .expect("lookup")
                 .is_none(),
-            "the replaced content's name must no longer resolve"
+            "the promoted root must not invent entries the row lacks"
+        );
+        let row_root = svc
+            .lookup(DATA_INO, "race.torrent")
+            .expect("row-backed lookup")
+            .expect("the row must project");
+        assert_ne!(
+            row_root.ino, pending_root,
+            "the row-backed root keeps its own inode id"
         );
     }
 
@@ -6294,12 +6504,13 @@ mod tests {
     }
 
     /// A lookup may already be walking through a pending-window root when the
-    /// persist lands and queues its eviction. The drain must leave that root
-    /// cached: its inode is hash-derived (the resolver cannot rebuild it from
-    /// the number), so removing it turns the in-flight child lookup into
-    /// `ENOENT` — `data/<seed>.torrent` visible, its content missing. Pending
-    /// entries are dropped by the readdir-driven `evict_stale_pending` once a
-    /// listing observes the landed row.
+    /// persist lands and queues its eviction. The drain must keep that root
+    /// resolvable: its inode is hash-derived (the resolver cannot rebuild it
+    /// from the number), so dropping it turns the in-flight child lookup into
+    /// `ENOENT` — `data/<seed>.torrent` visible, its content missing. The drain
+    /// therefore promotes the pending root onto the landed row instead of
+    /// dropping it, which retires the temporary projection while the entry the
+    /// kernel holds keeps serving the row's tree.
     #[test]
     fn pending_root_keeps_resolving_children_after_the_eviction_drain() {
         let mut svc = service_with_db();
@@ -6335,10 +6546,7 @@ mod tests {
             .persist_torrent(&bytes, "", "race.torrent")
             .expect("persist");
         drop(persisted);
-        svc.pending_projection_evictions
-            .lock()
-            .unwrap()
-            .push(key);
+        svc.pending_projection_evictions.lock().unwrap().push(key);
         svc.processing_torrents.lock().unwrap().clear();
 
         let after = svc
