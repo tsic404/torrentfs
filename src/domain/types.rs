@@ -135,6 +135,10 @@ pub struct InsertTorrentOutcome {
     /// whose info-hash is no longer referenced; the download handle and piece
     /// cache for that hash must be released by the caller.
     pub stale_info_hash: Option<String>,
+    /// Root-level entry names of the content this write replaced. Empty for a
+    /// fresh source and when the write resolved to the content already in
+    /// place (identical bytes), which changes no entry under the seed root.
+    pub replaced_root_names: Vec<String>,
 }
 
 pub struct FileEntry {

@@ -18,6 +18,14 @@
 # now a regression guard: a red result here means the active invalidation
 # regressed, and no TTL tolerance is applied.
 #
+# The last block covers the overwrite form of the same contract: replacing a
+# seed's bytes removes the previous content's root-level entry, and that entry
+# must stop resolving without any readdir of the seed root.  The replaced entry
+# is held open across the overwrite, so its dentry stays referenced and only the
+# per-name invalidation can retire it; the landing is awaited by name lookup,
+# never by a listing, so the 1s TTL cannot expire first and hide a missing
+# invalidation.
+#
 # Usage: ./tests/acceptance/tc_ingest_03.sh [torrentfs_binary] [mountpoint]
 # Exit: 0 = pass, 1 = fail, 2 = skipped (no FUSE 3 mount capability).
 set -euo pipefail
@@ -108,4 +116,48 @@ if [ -e "$MNT/data/renamedir" ]; then
 fi
 [ -d "$MNT/data/moved/deep/leaf.torrent" ] || fail "data/moved/deep/leaf.torrent did not appear immediately"
 
-echo "tc_ingest_03: PASS (seed rename/delete, subtree delete and directory rename reflect immediately)"
+# Overwrite: replacing a seed's bytes must drop the previous content's root
+# entry from the kernel cache at once, with no readdir of the seed root
+# (contract C-1.3.4).  The old entry is looked up right before the overwrite so
+# the kernel holds a positive dentry whose entry timeout (1s) is still running
+# when the check happens; a daemon that only relied on that timeout would pass
+# this block by accident, hence the short post-landing budget below.
+make_seed_torrent "$TORRENT_FILE" ingest-03-old.bin
+cp "$TORRENT_FILE" "$MNT/metadata/over.torrent"
+DEADLINE=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+    [ -e "$MNT/data/over.torrent/ingest-03-old.bin" ] && break
+    sleep 0.05
+done
+[ -e "$MNT/data/over.torrent/ingest-03-old.bin" ] || fail "the first content of over.torrent did not project"
+
+make_seed_torrent "$TORRENT_FILE" ingest-03-new.bin
+test -e "$MNT/data/over.torrent/ingest-03-old.bin"   # hold the dentry in the cache
+# Keep the replaced entry open across the overwrite, as a reader or a `less`
+# would: a referenced dentry is not pruned when its parent entry is
+# invalidated, so only the per-name invalidation can retire the old name.
+exec 9<"$MNT/data/over.torrent/ingest-03-old.bin"
+cp "$TORRENT_FILE" "$MNT/metadata/over.torrent"
+# Landing proof, by name lookup only (no listing): the replacement's entry.
+DEADLINE=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+    [ -e "$MNT/data/over.torrent/ingest-03-new.bin" ] && break
+    sleep 0.02
+done
+[ -e "$MNT/data/over.torrent/ingest-03-new.bin" ] || fail "the replacement's entry did not appear"
+
+# The persist thread notifies right after the row lands, so allow it a short
+# budget — far below the 1s entry timeout — before declaring the stale dentry
+# undropped.
+STALE_DEADLINE=$((SECONDS + 1))
+while [ "$SECONDS" -lt "$STALE_DEADLINE" ]; do
+    [ -e "$MNT/data/over.torrent/ingest-03-old.bin" ] || break
+    sleep 0.02
+done
+if [ -e "$MNT/data/over.torrent/ingest-03-old.bin" ]; then
+    exec 9<&-
+    fail "data/over.torrent/ingest-03-old.bin still resolves right after the overwrite (stale dentry)"
+fi
+exec 9<&-
+
+echo "tc_ingest_03: PASS (seed rename/delete, subtree delete, directory rename and overwrite reflect immediately)"
