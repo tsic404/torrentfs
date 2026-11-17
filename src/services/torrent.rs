@@ -32,6 +32,24 @@ pub struct PersistedTorrent {
     /// the old hash's engine handle and piece cache are released in
     /// [`TorrentService::register_torrent_handle`].
     stale_info_hash: Option<String>,
+    /// Source row id this write landed on. The `data/` projection derives the
+    /// torrent root inode from it.
+    source_id: i64,
+    /// Root-level entry names of the replaced and the landed content. Both can
+    /// carry a stale kernel dentry under the torrent root — the first as a
+    /// stale positive, the second as a stale negative — so the caller drops
+    /// them all.
+    changed_root_names: Vec<String>,
+}
+
+impl PersistedTorrent {
+    pub fn source_id(&self) -> i64 {
+        self.source_id
+    }
+
+    pub fn changed_root_names(&self) -> &[String] {
+        &self.changed_root_names
+    }
 }
 
 impl TorrentService {
@@ -71,7 +89,7 @@ impl TorrentService {
         let info = Arc::new(info);
         let info_hash_hex = hex::encode(metadata.info_hash);
 
-        let (is_new, stale_info_hash) = {
+        let (is_new, stale_info_hash, replaced_root_names, landed_source_id) = {
             let mut db_guard = self.db.lock().map_err(|_| {
                 error!("Database lock poisoned");
                 FsError::LockPoisoned
@@ -140,13 +158,35 @@ impl TorrentService {
                 );
             }
 
-            (is_new, outcome.stale_info_hash)
+            (
+                is_new,
+                outcome.stale_info_hash,
+                outcome.replaced_root_names,
+                outcome.source_id,
+            )
         };
+
+        // The kernel may hold a dentry for any root-level entry of either
+        // content: a stale positive for what the overwrite replaced, a stale
+        // negative for what it added. The landed content's entries are reported
+        // even for a fresh source, because its temporary projection is evicted
+        // at the same time and those are the names it was serving.
+        let mut changed_root_names = replaced_root_names;
+        for file in &metadata.files {
+            let Some(root) = file.path.split('/').next().filter(|part| !part.is_empty()) else {
+                continue;
+            };
+            if !changed_root_names.iter().any(|known| known == root) {
+                changed_root_names.push(root.to_string());
+            }
+        }
 
         Ok(PersistedTorrent {
             info,
             is_new,
             stale_info_hash,
+            source_id: landed_source_id,
+            changed_root_names,
         })
     }
 

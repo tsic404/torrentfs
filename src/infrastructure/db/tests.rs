@@ -125,6 +125,64 @@ fn test_identical_bytes_share_content_across_source_paths() {
     );
 }
 
+/// Overwriting a source reports the root-level names its previous content
+/// exposed — files and directories alike — so the projection can drop their
+/// kernel dentries. A fresh source reports none.
+#[test]
+fn test_overwrite_reports_the_replaced_root_names() {
+    let mut db = Database::open_in_memory().unwrap();
+    let previous = vec![
+        FileEntry {
+            path: "tree/leaf.bin".to_string(),
+            size: 4,
+        },
+        FileEntry {
+            path: "old.bin".to_string(),
+            size: 4,
+        },
+    ];
+    let first = db
+        .insert_torrent_with_files_and_data(
+            "",
+            "old",
+            "swap.torrent",
+            8,
+            "h-old",
+            2,
+            &previous,
+            b"old-bytes",
+        )
+        .unwrap();
+    assert!(
+        first.replaced_root_names.is_empty(),
+        "a fresh source replaces nothing"
+    );
+
+    let replacement = vec![FileEntry {
+        path: "tree/other.bin".to_string(),
+        size: 4,
+    }];
+    let second = db
+        .insert_torrent_with_files_and_data(
+            "",
+            "new",
+            "swap.torrent",
+            4,
+            "h-new",
+            1,
+            &replacement,
+            b"new-bytes",
+        )
+        .unwrap();
+
+    assert!(second.source_reused, "the source row is reused");
+    assert_eq!(
+        second.replaced_root_names,
+        vec!["old.bin".to_string(), "tree".to_string()],
+        "the replaced content's root file and root directory must both be reported"
+    );
+}
+
 /// Different `.torrent` bytes (even with the same info_hash) must store one
 /// content row each.
 #[test]

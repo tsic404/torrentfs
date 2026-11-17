@@ -29,6 +29,26 @@ fn torrent_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Torrent> {
     })
 }
 
+/// Root-level entry names of a content row: the direct children of a seed
+/// root in the `data/` projection. Both tables are keyed by the *content* row
+/// id, so the caller passes `torrents.id`.
+fn root_entry_names(
+    tx: &rusqlite::Transaction<'_>,
+    content_id: i64,
+) -> Result<Vec<String>, DbError> {
+    let mut stmt = tx.prepare(
+        "SELECT name FROM torrent_directories WHERE torrent_id = ?1 AND parent_id IS NULL
+         UNION ALL
+         SELECT name FROM torrent_files WHERE torrent_id = ?1 AND directory_id IS NULL",
+    )?;
+    let mut names: Vec<String> = stmt
+        .query_map(params![content_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
 /// Insert a torrent's file/directory tree under a content id inside `tx`.
 /// Content-scoped: two source paths sharing one content row also share this
 /// file list, so it must be built once per content.
@@ -354,7 +374,8 @@ impl Database {
             }
         };
 
-        let (source_id, source_reused, stale_info_hash) = match existing_source {
+        let (source_id, source_reused, stale_info_hash, replaced_root_names) = match existing_source
+        {
             Some(sid) => {
                 let old: Option<(i64, String)> = tx
                     .query_row(
@@ -363,6 +384,16 @@ impl Database {
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;
+
+                // Read the replaced content's root entries before the pointer
+                // moves: once the source row is repointed they are unreachable
+                // through this key, and the projection must invalidate them.
+                let replaced_root_names = match &old {
+                    Some((old_content_id, _)) if *old_content_id != content_id => {
+                        root_entry_names(&tx, *old_content_id)?
+                    }
+                    _ => Vec::new(),
+                };
 
                 tx.execute(
                     "UPDATE torrent_sources SET torrent_id = ? WHERE id = ?",
@@ -400,14 +431,14 @@ impl Database {
                         }
                     }
                 }
-                (sid, true, stale)
+                (sid, true, stale, replaced_root_names)
             }
             None => {
                 tx.execute(
                     "INSERT INTO torrent_sources (torrent_id, source_path, filename) VALUES (?, ?, ?)",
                     params![content_id, source_path, filename],
                 )?;
-                (tx.last_insert_rowid(), false, None)
+                (tx.last_insert_rowid(), false, None, Vec::new())
             }
         };
 
@@ -426,6 +457,7 @@ impl Database {
             content_created,
             source_reused,
             stale_info_hash,
+            replaced_root_names,
         })
     }
 
