@@ -40,6 +40,7 @@ use crate::db::Database;
 use crate::domain::fs_error::FsError;
 use crate::infrastructure::metrics::Metrics;
 use crate::services::download::DownloadService;
+use crate::services::torrent::ContentVersion;
 
 /// `fuser::Notifier` is the production kernel-cache invalidation sink.
 impl fs_service::EntryInvalidator for fuser::Notifier {
@@ -102,6 +103,11 @@ struct RangeKey {
 struct PendingEntry<R: PendingReply> {
     reply: R,
     torrent_id: i64,
+    /// Content id from the same authoritative read that produced this
+    /// waiter's bytes. A replacement cancels waiters of any other content, so
+    /// a late source-id cancel cannot kill a read of the landed content
+    /// (C-4.5.3).
+    content_id: i64,
     deadline: Instant,
 }
 
@@ -159,7 +165,20 @@ impl<R: PendingReply> PendingTable<R> {
     /// Insert a pending reply for `key`, blocking while the table is full
     /// (backpressure).  Coalesces with an existing in-flight group for the
     /// same range so the piece downloads once and the result fans out.
+    #[cfg(test)]
     fn insert(&self, reply: R, torrent_id: i64, deadline: Instant, key: RangeKey) -> InsertOutcome {
+        self.insert_content(reply, torrent_id, 0, deadline, key)
+    }
+
+    /// Insert a pending reply registered under a content id.
+    fn insert_content(
+        &self,
+        reply: R,
+        torrent_id: i64,
+        content_id: i64,
+        deadline: Instant,
+        key: RangeKey,
+    ) -> InsertOutcome {
         let mut inner = self
             .inner
             .lock()
@@ -176,6 +195,7 @@ impl<R: PendingReply> PendingTable<R> {
                 group.waiters.push(PendingEntry {
                     reply,
                     torrent_id,
+                    content_id,
                     deadline,
                 });
                 return InsertOutcome::Joined;
@@ -191,6 +211,7 @@ impl<R: PendingReply> PendingTable<R> {
                         waiters: vec![PendingEntry {
                             reply,
                             torrent_id,
+                            content_id,
                             deadline,
                         }],
                     },
@@ -248,11 +269,23 @@ impl<R: PendingReply> PendingTable<R> {
         }
     }
 
-    /// Cancel all pending waiters for a given `torrent_id` (unlink /
-    /// remove_torrent), resolving each with EIO.  A group with remaining
-    /// waiters (other torrents sharing the info_hash) stays in flight and its
-    /// worker still resolves those.  Returns the number of waiters cancelled.
+    /// Cancel every pending waiter for a given `torrent_id`, resolving each
+    /// with EIO. Used by tests and by callers that need a wholesale cancel.
+    #[cfg(test)]
     fn cancel_by_torrent_id(&self, torrent_id: i64) -> usize {
+        self.cancel_reads_not_for_content(torrent_id, None)
+    }
+
+    /// Cancel the pending waiters of `torrent_id` that do not belong to
+    /// `content_id`, resolving each with EIO; `None` cancels all of them.
+    ///
+    /// The content id comes from the same read as the waiter's bytes, so a
+    /// replacement settles the old content's reads now while a read of the
+    /// landed content survives a late cancel keyed on the same source row id.
+    /// A group with remaining waiters (other torrents sharing the info_hash)
+    /// stays in flight and its worker still resolves those. Returns the number
+    /// of waiters cancelled.
+    fn cancel_reads_not_for_content(&self, torrent_id: i64, content_id: Option<i64>) -> usize {
         let removed: Vec<R> = {
             let mut inner = self
                 .inner
@@ -268,7 +301,9 @@ impl<R: PendingReply> PendingTable<R> {
                         .expect("id collected from live groups");
                     let mut i = 0;
                     while i < group.waiters.len() {
-                        if group.waiters[i].torrent_id == torrent_id {
+                        let stale = group.waiters[i].torrent_id == torrent_id
+                            && content_id.is_none_or(|id| group.waiters[i].content_id != id);
+                        if stale {
                             removed.push(group.waiters.remove(i).reply);
                         } else {
                             i += 1;
@@ -360,6 +395,61 @@ impl<R: PendingReply> PendingTable<R> {
         }
     }
 }
+impl<R: PendingReply + Send> fs_service::ReadCancelSink for PendingTable<R> {
+    fn cancel_reads_not_for_content(&self, torrent_id: i64, content_id: Option<i64>) -> usize {
+        PendingTable::cancel_reads_not_for_content(self, torrent_id, content_id)
+    }
+}
+
+/// Result of registering a deferred read under a content id.
+enum ContentRegistration {
+    /// The content id still matches the source row: the waiter is live.
+    Live(InsertOutcome),
+    /// A replacement landed between the read's content resolution and its
+    /// registration, so the waiter was settled as stale.
+    Stale { cancelled: usize },
+}
+
+/// Register `reply` under the content id that its identity snapshot carried
+/// and validate atomically with the replacement publish: the waiter is
+/// inserted first, then the source's current content pointer is checked.
+///
+/// The pointer is the content row id itself, published by the write before it
+/// exposes the new identities — never a counter sampled around the read. A
+/// replacement settles waiters of any other content before this check; a
+/// registration that lands after that sweep is caught here. Either way an
+/// old-content read cannot survive and a read of the landed content cannot be
+/// mistaken for it.
+fn register_content_validated<R, F>(
+    table: &PendingTable<R>,
+    reply: R,
+    torrent_id: i64,
+    content_id: i64,
+    deadline: Instant,
+    key: RangeKey,
+    current_version: F,
+) -> ContentRegistration
+where
+    R: PendingReply,
+    F: FnOnce() -> Option<ContentVersion>,
+{
+    let outcome = table.insert_content(reply, torrent_id, content_id, deadline, key);
+    match current_version() {
+        Some(ContentVersion::Current(current)) if current == content_id => {
+            ContentRegistration::Live(outcome)
+        }
+        Some(ContentVersion::Current(current)) => ContentRegistration::Stale {
+            cancelled: table.cancel_reads_not_for_content(torrent_id, Some(current)),
+        },
+        Some(ContentVersion::Removed) => ContentRegistration::Stale {
+            cancelled: table.cancel_reads_not_for_content(torrent_id, None),
+        },
+        // The row predates this mount: no replacement was observed, so the
+        // waiter is live. A later replacement's sweep still settles it.
+        None => ContentRegistration::Live(outcome),
+    }
+}
+
 /// FUSE entry TTL (seconds).
 const TTL: Duration = Duration::from_secs(1);
 
@@ -370,6 +460,36 @@ pub struct TorrentFs {
     worker_pool: Arc<WorkerPool>,
 }
 impl TorrentFs {
+    /// Settle every in-flight read whose source row was removed or repointed
+    /// with `EIO` (C-4.5.3).
+    ///
+    /// Removal paths (unlink, empty/invalid overwrite on release, overwrite
+    /// rename, directory removal) record the affected source row ids on the
+    /// service; the adapter drains them after the operation returns, on the
+    /// dispatch thread — so no read can slip in between the removal and the
+    /// cancellation.
+    fn drain_cancelled_reads(&mut self) {
+        let pending = match self.service.cancelled_reads.lock() {
+            Ok(mut queue) => std::mem::take(&mut *queue),
+            Err(_) => return,
+        };
+        for (torrent_id, content_id) in pending {
+            // The persist thread already settled its own entry through the
+            // sink, and a read of the landed content carries the new
+            // content id, so this drain only has work left for removal paths.
+            let cancelled = self
+                .pending_table
+                .cancel_reads_not_for_content(torrent_id, content_id);
+            if cancelled > 0 {
+                warn!(
+                    "Cancelled {} pending read(s) for torrent_id={} (content={:?})",
+                    cancelled, torrent_id, content_id
+                );
+                self.service.metrics.pending_reads_dec_n(cancelled);
+            }
+        }
+    }
+
     fn read_timeout(config: &TorrentfsConfig) -> u64 {
         config.timeouts.resolved_read_timeout_secs()
     }
@@ -424,6 +544,8 @@ impl TorrentFs {
         let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let sink: Arc<dyn fs_service::ReadCancelSink> = pending_table.clone();
+        let _ = service.read_cancel_sink.set(sink);
         let worker_pool = WorkerPool::new(
             Self::download_workers(config),
             Self::download_queue_depth(config),
@@ -442,6 +564,8 @@ impl TorrentFs {
         let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let sink: Arc<dyn fs_service::ReadCancelSink> = pending_table.clone();
+        let _ = service.read_cancel_sink.set(sink);
         let worker_pool = WorkerPool::new(
             Self::download_workers(&TorrentfsConfig::default_config()),
             Self::download_queue_depth(&TorrentfsConfig::default_config()),
@@ -469,6 +593,8 @@ impl TorrentFs {
         let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let sink: Arc<dyn fs_service::ReadCancelSink> = pending_table.clone();
+        let _ = service.read_cancel_sink.set(sink);
         let worker_pool = WorkerPool::new(
             Self::download_workers(config),
             Self::download_queue_depth(config),
@@ -631,7 +757,11 @@ impl Filesystem for TorrentFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.service.release(fh) {
+        let result = self.service.release(fh);
+        // An empty/invalid overwrite removes the source row; its in-flight
+        // reads must settle with EIO (C-4.5.3).
+        self.drain_cancelled_reads();
+        match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
@@ -658,6 +788,18 @@ impl Filesystem for TorrentFs {
                 info_hash,
                 torrent_id,
             }) => {
+                // Register under the content id of the identity this inode was
+                // read through: the same immutable snapshot that produced the
+                // bytes, so the token can never describe different content.
+                let Some(content_id) = self
+                    .service
+                    .read_identity(ino)
+                    .map(|identity| identity.content_id)
+                else {
+                    reply
+                        .error(FsError::Io("pending read identity unavailable".to_string()).into());
+                    return;
+                };
                 // the deadline must cover the engine's worst-case
                 // read budget (state wait + recheck wait + peer-discovery wait
                 // + piece wait), not just `read_timeout_secs`.  The old
@@ -689,7 +831,25 @@ impl Filesystem for TorrentFs {
                     offset,
                     size,
                 };
-                let outcome = self.pending_table.insert(reply, torrent_id, deadline, key);
+                // Content identity, waiter registration and the replacement
+                // publish are related atomically here: insert first, then
+                // reject the waiter if the source row already points at a
+                // different content id than the one its bytes came from.
+                let outcome = match register_content_validated(
+                    &self.pending_table,
+                    reply,
+                    torrent_id,
+                    content_id,
+                    deadline,
+                    key,
+                    || self.service.content_version(torrent_id),
+                ) {
+                    ContentRegistration::Live(outcome) => outcome,
+                    ContentRegistration::Stale { cancelled } => {
+                        self.service.metrics.pending_reads_dec_n(cancelled);
+                        return;
+                    }
+                };
 
                 match outcome {
                     InsertOutcome::Joined => {
@@ -843,22 +1003,10 @@ impl Filesystem for TorrentFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.service.unlink(parent, &name.to_string_lossy()) {
-            Ok(Some(torrent_id)) => {
-                // Cancel any in-flight reads for the removed torrent.
-                let cancelled = self.pending_table.cancel_by_torrent_id(torrent_id);
-                if cancelled > 0 {
-                    warn!(
-                        "Cancelled {} pending read(s) for removed torrent_id={}",
-                        cancelled, torrent_id
-                    );
-                    for _ in 0..cancelled {
-                        self.service.metrics.pending_reads_dec();
-                    }
-                }
-                reply.ok();
-            }
-            Ok(None) => reply.ok(),
+        let result = self.service.unlink(parent, &name.to_string_lossy());
+        self.drain_cancelled_reads();
+        match result {
+            Ok(_) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
     }
@@ -913,19 +1061,25 @@ impl Filesystem for TorrentFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        match self.service.rename(
+        let result = self.service.rename(
             parent,
             &name.to_string_lossy(),
             newparent,
             &newname.to_string_lossy(),
-        ) {
+        );
+        // An overwriting rename removes the destination source row.
+        self.drain_cancelled_reads();
+        match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        match self.service.rmdir(parent, &name.to_string_lossy()) {
+        let result = self.service.rmdir(parent, &name.to_string_lossy());
+        // Removing a metadata directory removes every source row under it.
+        self.drain_cancelled_reads();
+        match result {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e.into()),
         }
@@ -1362,6 +1516,115 @@ mod pending_tests {
         let resolved = table.resolve(id, b"ok");
         assert_eq!(resolved, 1);
         assert_eq!(resolves.load(Ordering::Relaxed), 2);
+    }
+
+    /// A replacement publishes a new content id: waiters registered under the
+    /// old one settle with `EIO`, while a read of the landed content survives
+    /// a later cancel keyed on the same source row (C-4.5.3). The sink is the
+    /// exact trait object the persist thread uses.
+    #[test]
+    fn cancel_reads_not_for_content_spares_waiters_of_landed_content() {
+        let table = Arc::new(PendingTable::<MockReply>::new());
+        let sink: Arc<dyn fs_service::ReadCancelSink> = table.clone();
+
+        let (old_reply, old_resolves, old_errno, _) = MockReply::tracked();
+        table.insert_content(
+            old_reply,
+            7,
+            10,
+            deadline_in(std::time::Duration::from_secs(60)),
+            key(0),
+        );
+        let (new_reply, new_resolves, new_errno, new_got_data) = MockReply::tracked();
+        let new_id = leader(table.insert_content(
+            new_reply,
+            7,
+            20,
+            deadline_in(std::time::Duration::from_secs(60)),
+            key(1),
+        ));
+
+        // The persist thread settles old-content reads on the spot.
+        assert_eq!(sink.cancel_reads_not_for_content(7, Some(20)), 1);
+        assert_eq!(old_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(old_errno.load(Ordering::Relaxed), libc::EIO);
+
+        // A late cancel carrying the same source row id must not kill the
+        // read registered after the replacement.
+        assert_eq!(sink.cancel_reads_not_for_content(7, Some(20)), 0);
+        assert_eq!(new_resolves.load(Ordering::Relaxed), 0);
+        assert_eq!(table.resolve(new_id, b"landed content"), 1);
+        assert_eq!(new_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(new_errno.load(Ordering::Relaxed), 0);
+        assert!(new_got_data.load(Ordering::Relaxed));
+    }
+
+    /// A replacement can publish entirely between the read resolving its
+    /// content and registering its waiter, so the replacement's cancel sink
+    /// never saw it. The post-insert content check must settle that stale
+    /// waiter anyway — an old-content read must not escape under the new
+    /// content id.
+    #[test]
+    fn stale_registration_is_settled_by_post_insert_content_check() {
+        let table: PendingTable<MockReply> = PendingTable::new();
+        let (reply, resolves, errno, got_data) = MockReply::tracked();
+
+        let outcome = register_content_validated(
+            &table,
+            reply,
+            7,
+            10,
+            deadline_in(std::time::Duration::from_secs(60)),
+            key(0),
+            || Some(ContentVersion::Current(20)),
+        );
+        match outcome {
+            ContentRegistration::Stale { cancelled } => assert_eq!(cancelled, 1),
+            ContentRegistration::Live(_) => {
+                panic!("a waiter of superseded content must not stay live")
+            }
+        }
+        assert_eq!(resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(errno.load(Ordering::Relaxed), libc::EIO);
+        assert!(!got_data.load(Ordering::Relaxed));
+    }
+
+    /// When a stale waiter coalesces onto a group whose leader belongs to the
+    /// landed content, only the stale waiter settles; the new-content read
+    /// still resolves with data.
+    #[test]
+    fn stale_joiner_is_settled_without_killing_the_new_group() {
+        let table: PendingTable<MockReply> = PendingTable::new();
+        let (new_reply, new_resolves, new_errno, new_got_data) = MockReply::tracked();
+        let id = leader(table.insert_content(
+            new_reply,
+            7,
+            20,
+            deadline_in(std::time::Duration::from_secs(60)),
+            key(0),
+        ));
+
+        let (old_reply, old_resolves, old_errno, old_got_data) = MockReply::tracked();
+        match register_content_validated(
+            &table,
+            old_reply,
+            7,
+            10,
+            deadline_in(std::time::Duration::from_secs(60)),
+            key(0),
+            || Some(ContentVersion::Current(20)),
+        ) {
+            ContentRegistration::Stale { cancelled } => assert_eq!(cancelled, 1),
+            ContentRegistration::Live(_) => panic!("stale joiner must not survive"),
+        }
+        assert_eq!(old_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(old_errno.load(Ordering::Relaxed), libc::EIO);
+        assert!(!old_got_data.load(Ordering::Relaxed));
+
+        assert_eq!(table.resolve(id, b"landed content"), 1);
+        assert_eq!(new_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(new_errno.load(Ordering::Relaxed), 0);
+        assert!(new_got_data.load(Ordering::Relaxed));
     }
 
     /// after a group is resolved (removing its `by_range`

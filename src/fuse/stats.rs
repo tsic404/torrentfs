@@ -82,6 +82,13 @@ fn format_cache_usage(current: u64, max: u64) -> String {
 const BANNER: &str = "===========================================================\n";
 const BANNER_LINE: &str = "===========================================================";
 
+/// Degraded rendering shared by every stats layer when the state lock is
+/// held: the read still returns promptly with the usual banner shape instead
+/// of stalling behind an ingest transaction (C-6.5.1 / F6).
+pub(crate) fn locked_rendering() -> Vec<u8> {
+    format!("  Database busy (locked)\n\n{BANNER_LINE}\n").into_bytes()
+}
+
 fn write_banner(output: &mut String, subtitle: Option<&str>) {
     let version = env!("CARGO_PKG_VERSION");
     output.push_str(BANNER);
@@ -191,40 +198,56 @@ fn write_connections(output: &mut String, session_stats: Option<&SessionStats>) 
 
 fn write_torrent_overview_counts(output: &mut String, db: &Option<Arc<Mutex<Database>>>) {
     output.push_str("\n-- Torrents --\n");
-    let (pending, downloading, seeding, error, total_torrents) = if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            db_guard
-                .get_torrent_counts_by_status()
-                .unwrap_or((0, 0, 0, 0, 0))
-        } else {
-            (0, 0, 0, 0, 0)
-        }
-    } else {
-        (0, 0, 0, 0, 0)
-    };
-
-    let unique_info_hashes = if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            if let Ok(torrents) = db_guard.get_all_torrents() {
-                let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for t in &torrents {
-                    set.insert(t.info_hash.as_str());
-                }
-                set.len() as i64
-            } else {
-                0
+    // Rendering never waits for the state database (F6 / C-6.5.1): an ingest
+    // transaction can hold the single connection for seconds, so a contended
+    // lock degrades the values instead of stalling the dispatch thread.
+    // `None` means "no database configured" (zeroes, as the pre-contract
+    // behaviour) and must stay distinct from a lock that was merely busy.
+    let counts = match db.as_ref() {
+        Some(db) => match db.try_lock() {
+            Ok(guard) => {
+                let (pending, downloading, seeding, error, total) = guard
+                    .get_torrent_counts_by_status()
+                    .unwrap_or((0, 0, 0, 0, 0));
+                let unique_info_hashes = guard
+                    .get_all_torrents()
+                    .map(|torrents| {
+                        let mut set: std::collections::HashSet<&str> =
+                            std::collections::HashSet::new();
+                        for t in &torrents {
+                            set.insert(t.info_hash.as_str());
+                        }
+                        set.len() as i64
+                    })
+                    .unwrap_or(0);
+                Some((
+                    total,
+                    unique_info_hashes,
+                    pending,
+                    downloading,
+                    seeding,
+                    error,
+                ))
             }
-        } else {
-            0
-        }
-    } else {
-        0
+            Err(_) => None,
+        },
+        None => Some((0, 0, 0, 0, 0, 0)),
     };
 
-    output.push_str(&format!(
-        "  Total: {}  Unique: {}  Pending: {}  Downloading: {}  Seeding: {}  Error: {}\n",
-        total_torrents, unique_info_hashes, pending, downloading, seeding, error
-    ));
+    match counts {
+        Some((total, unique, pending, downloading, seeding, error)) => {
+            output.push_str(&format!(
+                "  Total: {}  Unique: {}  Pending: {}  Downloading: {}  Seeding: {}  Error: {}\n",
+                total, unique, pending, downloading, seeding, error
+            ));
+        }
+        None => {
+            output.push_str(
+                "  Total: (locked)  Unique: (locked)  Pending: (locked)  \
+                 Downloading: (locked)  Seeding: (locked)  Error: (locked)\n",
+            );
+        }
+    }
 }
 
 fn write_global_cache_summary(
@@ -620,14 +643,15 @@ pub fn generate_torrent_stats(
 ) -> Vec<u8> {
     let mut output = String::new();
 
-    let torrent = if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            db_guard.get_torrent_by_id(torrent_id).ok().flatten()
-        } else {
-            None
-        }
-    } else {
-        None
+    // C-6.5.1 / F6: never block the dispatch thread on the engine or the
+    // state database. A contended state lock degrades the whole rendering
+    // instead of hiding behind a multi-second ingest transaction.
+    let torrent = match db.as_ref() {
+        Some(db) => match db.try_lock() {
+            Ok(db_guard) => db_guard.get_torrent_by_id(torrent_id).ok().flatten(),
+            Err(_) => return locked_rendering(),
+        },
+        None => None,
     };
 
     let t = match torrent {
@@ -934,16 +958,17 @@ pub fn generate_directory_stats(
 
     output.push_str(&format!("===== directory: {} =====\n\n", source_path));
 
-    let torrents = if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            db_guard
+    // C-6.5.1 / F6: a contended state lock degrades the directory listing
+    // rather than blocking the dispatch thread for the duration of an ingest
+    // transaction.
+    let torrents = match db.as_ref() {
+        Some(db) => match db.try_lock() {
+            Ok(db_guard) => db_guard
                 .get_torrents_by_source_path_prefix(source_path)
-                .unwrap_or_default()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
+                .unwrap_or_default(),
+            Err(_) => return locked_rendering(),
+        },
+        None => vec![],
     };
 
     if torrents.is_empty() {
@@ -1168,6 +1193,41 @@ pub fn generate_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `C-6.5.1`/F6/M6: rendering never blocks on the state database. While
+    /// another holder (here an ingest transaction) owns the lock, every stats
+    /// layer degrades to `(locked)` instead of waiting for it.
+    #[test]
+    fn contended_state_lock_degrades_instead_of_blocking() {
+        let db = Some(Arc::new(Mutex::new(
+            Database::open_in_memory().expect("db"),
+        )));
+        let guard = db.as_ref().unwrap().lock().expect("lock db");
+
+        let global = generate_global_stats(Duration::from_secs(0), &db, None, || None, "", None);
+        assert!(
+            String::from_utf8(global)
+                .expect("utf8")
+                .contains("(locked)"),
+            "global stats must degrade while the state lock is held"
+        );
+
+        let torrent = generate_torrent_stats(1, "hash", &db, &None, || None);
+        assert!(
+            String::from_utf8(torrent).expect("utf8").contains("locked"),
+            "torrent stats must degrade while the state lock is held"
+        );
+
+        let directory = generate_directory_stats("", &db, &None, || None);
+        assert!(
+            String::from_utf8(directory)
+                .expect("utf8")
+                .contains("locked"),
+            "directory stats must degrade while the state lock is held"
+        );
+
+        drop(guard);
+    }
 
     #[test]
     fn test_format_num_zero() {
