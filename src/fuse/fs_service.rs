@@ -28,7 +28,7 @@ use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
 use crate::services::download::DownloadService;
-use crate::services::torrent::TorrentService;
+use crate::services::torrent::{ContentVersion, FileIdentity, TorrentService};
 
 use super::fs_types::{
     Attr, Created, DirEntry, Entry, FileKind, OpenOutcome, ReadOutcome, StatsKind,
@@ -39,7 +39,7 @@ use super::inodes::{
 };
 #[cfg(test)]
 use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
-use super::lookup::DataResolver;
+use super::lookup::{DataResolver, PendingIndexCache};
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
 /// maximum number of entries in the L1 range cache.  Each entry
@@ -53,6 +53,10 @@ const MAX_L1_ENTRIES: usize = 256;
 /// `add_torrent` (spawned detached by `release`) to settle its DB
 /// insert before giving up and failing the rename.
 const PENDING_ADD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `(source row id, landed content id)` whose in-flight reads are queued for
+/// the adapter's drain; `None` marks a removed row.
+type CancelledRead = (i64, Option<i64>);
 
 /// Guard against a silent 0-byte EOF: when `read_file_range` returns empty
 /// data for a non-zero `size`, translate it into `Err(FsError::NoPeers)` (→
@@ -90,6 +94,25 @@ struct DataReaddirCache {
     entries: Vec<DirEntry>,
 }
 
+/// Snapshot of the metadata-namespace inode table.
+///
+/// `by_parent` keeps each directory's children in inode order, the order
+/// `readdir` assigns offsets in; `by_name` answers a by-name lookup for one
+/// parent. Both are rebuilt only after the table changed, so a directory
+/// listing and a by-name resolution cost O(page) / O(1) instead of a scan of
+/// every inode (C-11.6 / F2).
+struct MetadataIndex {
+    generation: u64,
+    inode_count: usize,
+    by_parent: HashMap<u64, Vec<(u64, FileKind, String)>>,
+    by_name: HashMap<u64, HashMap<String, u64>>,
+}
+
+/// Entries kept in the L3 (parsed metadata) cache. Also implementation-defined
+/// (the contract only requires a bound); the cache clears on overflow, so a
+/// cold entry costs one extra parse.
+const MAX_L3_ENTRIES: usize = 64;
+
 /// Most entries one `readdir` call returns.
 ///
 /// A kernel readdir reply holds roughly a hundred entries, so a page this size
@@ -106,7 +129,9 @@ const READDIR_PAGE_ENTRIES: usize = 128;
 /// binary search and only the returned page is cloned.
 fn page_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
     let start = entries.partition_point(|entry| entry.offset <= offset);
-    let end = start.saturating_add(READDIR_PAGE_ENTRIES).min(entries.len());
+    let end = start
+        .saturating_add(READDIR_PAGE_ENTRIES)
+        .min(entries.len());
     entries[start..end].to_vec()
 }
 
@@ -118,6 +143,20 @@ fn page_after_offset(entries: &[DirEntry], offset: i64) -> Vec<DirEntry> {
 pub trait EntryInvalidator: Send + Sync {
     /// Drop the kernel's cached dentry for `name` under `parent`.
     fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()>;
+}
+
+/// Sink the background persist thread uses to settle in-flight reads of a
+/// source row it just repointed, without waiting for another FUSE operation.
+///
+/// Waiters are tagged with the content id from the same authoritative read
+/// that produced their bytes. Only waiters of another content are cancelled:
+/// a read of the landed content carries the landed id and survives a late
+/// cancel keyed on the same source row (C-4.5.3).
+pub trait ReadCancelSink: Send + Sync {
+    /// Cancel every waiter for `torrent_id` that is not for `content_id`;
+    /// `None` cancels all of them (the source row was removed). Returns the
+    /// number of waiters settled with `EIO`.
+    fn cancel_reads_not_for_content(&self, torrent_id: i64, content_id: Option<i64>) -> usize;
 }
 
 /// Send one `inval_entry` and log a failure.
@@ -173,6 +212,51 @@ pub struct FsService {
     /// the queue before answering the next request. See
     /// [`FsService::drain_projection_evictions`].
     pending_projection_evictions: Arc<Mutex<Vec<(String, String)>>>,
+    /// Snapshot of the metadata-namespace inode table: children per parent in
+    /// inode order (the order readdir offsets are assigned in) plus a
+    /// name->inode map. Rebuilt only when the table changed, so name
+    /// resolution and directory paging never scan the whole table per request
+    /// (C-11.6 / F2).
+    metadata_index: Option<MetadataIndex>,
+    /// Bumped by every operation that can change the metadata inode table.
+    /// A cached [`MetadataIndex`] whose generation differs is rebuilt before
+    /// use, so it can never outlive its snapshot.
+    metadata_generation: u64,
+    /// Read identity per live data-file inode (see [`FileIdentity`]).
+    ///
+    /// Filled by `lookup`/`readdir` from the identities the write and
+    /// projection already prepared for the source, so a read of an open file
+    /// never resolves identity from the database — evicting the prepared
+    /// source cache cannot turn a read into a whole-table load. Entries live
+    /// exactly as long as the inode they describe.
+    read_identities: HashMap<u64, Arc<FileIdentity>>,
+    /// Source row ids whose in-flight reads must be resolved with `EIO`
+    /// because the row was removed or repointed, paired with the landed
+    /// content id (`None` for a removal) that superseded them (C-4.5.3).
+    /// Filled by the removal paths and by the persist thread; the adapter
+    /// drains this after the operation that produced it returns, and the
+    /// persist thread also settles its entry immediately through
+    /// [`Self::read_cancel_sink`].
+    pub(crate) cancelled_reads: Arc<Mutex<Vec<CancelledRead>>>,
+    /// Authoritative content pointer per source row, shared with
+    /// [`TorrentService`]: the write that moves the pointer publishes the new
+    /// content id here before its identities become observable. A deferred
+    /// read registers the content id from its own identity snapshot, so a
+    /// read of the landed content can never be mistaken for the old one.
+    pub(crate) content_versions: Arc<Mutex<HashMap<i64, ContentVersion>>>,
+    /// Immediate cancellation sink for the background persist thread. Wired by
+    /// the FUSE adapter once the pending table exists; a service used without
+    /// an adapter (unit tests) leaves it unset and relies on the queue.
+    pub read_cancel_sink: Arc<OnceLock<Arc<dyn ReadCancelSink>>>,
+    /// Last persisted bytes of a metadata `.torrent` inode, shared with the
+    /// persist thread instead of copied: `release` moves the buffer here as an
+    /// `Arc` and the thread takes another handle. Reads/writes adopt it back
+    /// (zero-copy once the thread is done) when the inode's own buffer is
+    /// empty.
+    buffered_torrents: HashMap<u64, Arc<Vec<u8>>>,
+    /// Built pending-torrent lookups, invalidated whenever metadata content or
+    /// inode structure changes (see [`PendingIndexCache`]).
+    pending_index_cache: Arc<Mutex<PendingIndexCache>>,
 }
 
 // ── Kernel cache invalidation ─────────────────────────────────
@@ -278,6 +362,7 @@ impl FsService {
                 DataInode::TorrentDir { torrent_id, .. }
                 | DataInode::TorrentFile { torrent_id, .. } => !superseded_ids.contains(torrent_id),
             });
+        self.retain_live_read_identities();
 
         let Some(torrent) = landed else {
             return;
@@ -314,6 +399,274 @@ impl FsService {
         for (source_path, filename) in queued {
             self.evict_projection(&source_path, &filename);
         }
+    }
+
+    /// Mark the cached metadata index stale. Called by every operation that
+    /// can add, remove, rename, or retire a metadata-namespace inode.
+    fn touch_metadata_index(&mut self) {
+        self.metadata_generation = self.metadata_generation.wrapping_add(1);
+        self.invalidate_pending_index();
+    }
+
+    /// Drop every built pending-torrent index. A pending `.torrent` can be
+    /// rewritten while its persist is in flight, so any structural or content
+    /// change must not leave a lookup serving the old tree.
+    fn invalidate_pending_index(&mut self) {
+        if let Ok(mut cache) = self.pending_index_cache.lock() {
+            cache.invalidate();
+        }
+    }
+
+    /// Authoritative content state of one source row, if this process has
+    /// published one. `None` means the row predates this mount; a read of it
+    /// is live because no replacement could have been observed.
+    pub(crate) fn content_version(&self, torrent_id: i64) -> Option<ContentVersion> {
+        self.content_versions
+            .lock()
+            .ok()
+            .and_then(|versions| versions.get(&torrent_id).copied())
+    }
+
+    /// Read identity captured for a live data-file inode.
+    pub(crate) fn read_identity(&self, ino: u64) -> Option<Arc<FileIdentity>> {
+        self.read_identities.get(&ino).cloned()
+    }
+
+    /// Bind the identity prepared for `ino`'s file to the inode.
+    ///
+    /// Runs on the projection path (lookup/readdir), never on `read`. A miss
+    /// means the inode belongs to content the source has already left behind;
+    /// the read then fails with `EIO` rather than materializing the new
+    /// content's file table under an old inode.
+    fn cache_read_identity(&mut self, ino: u64) {
+        if self.read_identities.contains_key(&ino) {
+            return;
+        }
+        let (source_id, file_id) = match self.inode_mgr.data_inodes.get(&ino) {
+            Some(DataInode::TorrentFile {
+                torrent_id,
+                file_id,
+                ..
+            }) if *torrent_id != 0 => (*torrent_id, *file_id),
+            _ => return,
+        };
+        let Some(ts) = &self.torrent_service else {
+            return;
+        };
+        if let Some(identity) = ts.prepared_file_identity(source_id, file_id) {
+            self.read_identities.insert(ino, identity);
+        }
+    }
+
+    /// Drop identities whose inode no longer exists. Called after the
+    /// projection removes data inodes so the map tracks inode lifetime.
+    fn retain_live_read_identities(&mut self) {
+        let live = &self.inode_mgr.data_inodes;
+        self.read_identities.retain(|ino, _| live.contains_key(ino));
+    }
+
+    /// Publish the content pointer a write just landed and settle every
+    /// in-flight read of another content id immediately (C-4.5.3).
+    ///
+    /// The queue lets the adapter drain after the operation that produced it;
+    /// the sink settles now so the background persist thread does not wait
+    /// for another FUSE request.
+    #[cfg(test)]
+    pub(crate) fn record_content_published(&self, torrent_id: i64, content_id: i64) -> usize {
+        Self::record_content_published_shared(
+            &self.content_versions,
+            &self.read_cancel_sink,
+            &self.cancelled_reads,
+            &self.metrics,
+            torrent_id,
+            Some(content_id),
+        )
+    }
+
+    /// Mark a source row as removed and settle every in-flight read of it.
+    pub(crate) fn record_source_removed(&self, torrent_id: i64) -> usize {
+        Self::record_content_published_shared(
+            &self.content_versions,
+            &self.read_cancel_sink,
+            &self.cancelled_reads,
+            &self.metrics,
+            torrent_id,
+            None,
+        )
+    }
+
+    /// Body of the two methods above, callable from the background persist
+    /// thread, which cannot borrow the service.
+    fn record_content_published_shared(
+        versions: &Arc<Mutex<HashMap<i64, ContentVersion>>>,
+        cancel_sink: &Arc<OnceLock<Arc<dyn ReadCancelSink>>>,
+        cancelled: &Arc<Mutex<Vec<CancelledRead>>>,
+        metrics: &Arc<Metrics>,
+        torrent_id: i64,
+        content_id: Option<i64>,
+    ) -> usize {
+        let version = match content_id {
+            Some(id) => ContentVersion::Current(id),
+            None => ContentVersion::Removed,
+        };
+        if let Ok(mut versions) = versions.lock() {
+            versions.insert(torrent_id, version);
+        }
+        let settled = if let Some(sink) = cancel_sink.get() {
+            let settled = sink.cancel_reads_not_for_content(torrent_id, content_id);
+            metrics.pending_reads_dec_n(settled);
+            settled
+        } else {
+            0
+        };
+        if let Ok(mut queue) = cancelled.lock() {
+            if !queue.contains(&(torrent_id, content_id)) {
+                queue.push((torrent_id, content_id));
+            }
+        }
+        settled
+    }
+
+    /// Move the buffered bytes of one metadata `.torrent` inode out of the
+    /// inode, returning `(name, parent, data)`.
+    ///
+    /// `None` when the inode is absent or not a regular file. The caller owns
+    /// the buffer: either the persist thread takes it, or it is parked in
+    /// [`Self::buffered_torrents`] as a shared handle so reads still work.
+    fn take_buffered_file(&mut self, ino: u64) -> Option<(String, u64, Vec<u8>)> {
+        let (name, parent, data) = match self.inode_mgr.inodes.get_mut(&ino) {
+            Some(InodeData::File {
+                name, parent, data, ..
+            }) => (name.clone(), *parent, std::mem::take(data)),
+            _ => return None,
+        };
+        if !data.is_empty() {
+            return Some((name, parent, data));
+        }
+        // The inode's own buffer is empty because `release` already moved it
+        // into `buffered_torrents`. A read-only open/close must hand back the
+        // same bytes, not an empty buffer — otherwise the close would read as
+        // a zero-byte overwrite and delete the row.
+        let data = match self.buffered_torrents.remove(&ino) {
+            Some(shared) => match Arc::try_unwrap(shared) {
+                Ok(bytes) => bytes,
+                Err(shared) => shared.as_slice().to_vec(),
+            },
+            None => Vec::new(),
+        };
+        Some((name, parent, data))
+    }
+
+    /// Put a buffer `take_buffered_file` moved out back when a recoverable
+    /// step fails, so the close can be retried without losing the bytes.
+    /// Prefers the inode's own slot (what `write`/`flush` expect) and parks a
+    /// shared handle if the inode is already gone or occupied.
+    fn restore_buffered_file(&mut self, ino: u64, data: Vec<u8>) {
+        if let Some(InodeData::File { data: slot, .. }) = self.inode_mgr.inodes.get_mut(&ino) {
+            if slot.is_empty() {
+                *slot = data;
+                return;
+            }
+        }
+        self.buffered_torrents.insert(ino, Arc::new(data));
+    }
+
+    /// Bytes buffered for one metadata `.torrent` inode.
+    ///
+    /// The inode's own buffer is authoritative while it is non-empty; after
+    /// `release` moved the bytes into [`Self::buffered_torrents`] the shared
+    /// handle serves reads until a write adopts it back.
+    fn buffered_torrent_bytes(&self, ino: u64) -> Option<&[u8]> {
+        match self.inode_mgr.inodes.get(&ino) {
+            Some(InodeData::File { data, .. }) if !data.is_empty() => Some(data.as_slice()),
+            Some(InodeData::File { .. }) => Some(
+                self.buffered_torrents
+                    .get(&ino)
+                    .map_or(&[], |bytes| bytes.as_slice()),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Move a shared buffer parked by `release` back into the inode before a
+    /// write mutates it. The move is zero-copy once the persist thread dropped
+    /// its handle; only a write that races the in-flight persist copies.
+    fn adopt_buffered_torrent(&mut self, ino: u64) {
+        let Some(shared) = self.buffered_torrents.remove(&ino) else {
+            return;
+        };
+        let Some(InodeData::File { data, .. }) = self.inode_mgr.inodes.get_mut(&ino) else {
+            return;
+        };
+        if !data.is_empty() {
+            return;
+        }
+        match Arc::try_unwrap(shared) {
+            Ok(bytes) => *data = bytes,
+            Err(shared) => *data = shared.as_slice().to_vec(),
+        }
+    }
+
+    /// The metadata-namespace child index, rebuilt when the inode table
+    /// changed since the snapshot was taken.
+    fn metadata_index(&mut self) -> &MetadataIndex {
+        let stale = match &self.metadata_index {
+            Some(index) => {
+                index.generation != self.metadata_generation
+                    || index.inode_count != self.inode_mgr.inodes.len()
+            }
+            None => true,
+        };
+        if stale {
+            let mut by_parent: HashMap<u64, Vec<(u64, FileKind, String)>> = HashMap::new();
+            let mut by_name: HashMap<u64, HashMap<String, u64>> = HashMap::new();
+            for (ino, data) in &self.inode_mgr.inodes {
+                let (parent, name, kind) = match data {
+                    InodeData::Directory { parent, name } if !name.is_empty() => {
+                        (*parent, name, FileKind::Directory)
+                    }
+                    InodeData::File {
+                        parent,
+                        name,
+                        unlinked,
+                        ..
+                    } if !*unlinked => (*parent, name, FileKind::RegularFile),
+                    // Root ("") and unlinked-but-open files are invisible.
+                    _ => continue,
+                };
+                by_parent
+                    .entry(parent)
+                    .or_default()
+                    .push((*ino, kind, name.clone()));
+                by_name
+                    .entry(parent)
+                    .or_default()
+                    .insert(name.clone(), *ino);
+            }
+            // Entry order fixes the paging offsets, so it must not depend on
+            // the map's iteration order.
+            for children in by_parent.values_mut() {
+                children.sort_unstable_by_key(|(ino, ..)| *ino);
+            }
+            self.metadata_index = Some(MetadataIndex {
+                generation: self.metadata_generation,
+                inode_count: self.inode_mgr.inodes.len(),
+                by_parent,
+                by_name,
+            });
+        }
+        self.metadata_index
+            .as_ref()
+            .expect("metadata index was just built")
+    }
+
+    /// Resolve one child of a metadata directory by name.
+    fn metadata_child(&mut self, parent: u64, name: &str) -> Option<u64> {
+        self.metadata_index()
+            .by_name
+            .get(&parent)?
+            .get(name)
+            .copied()
     }
 }
 
@@ -373,6 +726,14 @@ impl FsService {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions: Arc::new(Mutex::new(HashMap::new())),
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         }
     }
 
@@ -403,10 +764,10 @@ impl FsService {
         };
 
         let db_arc = Arc::new(Mutex::new(db));
-        svc.torrent_service = Some(TorrentService::new(
-            db_arc.clone(),
-            svc.download_service.clone(),
-        ));
+        let torrent_service = TorrentService::new(db_arc.clone(), svc.download_service.clone());
+        // Reads validate against the same publish map the write path updates.
+        svc.content_versions = torrent_service.content_versions();
+        svc.torrent_service = Some(torrent_service);
         svc.db = Some(db_arc);
         svc.inode_mgr.restore_metadata_inodes(dirs, torrents);
 
@@ -567,10 +928,23 @@ impl FsService {
                 }
             }
             if let Some(db) = &self.db {
-                if let Some((ino, kind, size)) = DataResolver::lookup_data_inode(
+                // Warm the cached `(info_hash, file_index)` identities for the
+                // torrent this lookup descends into, outside the read path: a
+                // later `read` must not resolve them from the database.
+                if let Some(DataInode::TorrentRoot { torrent_id, .. })
+                | Some(DataInode::TorrentDir { torrent_id, .. }) =
+                    self.inode_mgr.data_inodes.get(&parent)
+                {
+                    if *torrent_id != 0 {
+                        self.ensure_file_identities(*torrent_id);
+                    }
+                }
+                if let Some((ino, kind, size)) = DataResolver::lookup_data_inode_with_buffers(
                     &mut self.inode_mgr,
                     db,
                     &self.processing_torrents,
+                    &self.pending_index_cache,
+                    &self.buffered_torrents,
                     parent,
                     name,
                 ) {
@@ -584,6 +958,9 @@ impl FsService {
                             name
                         )));
                     }
+                    // Bind the identity to the inode here, on the projection
+                    // path, so `read` never resolves it from the database.
+                    self.cache_read_identity(ino);
                     let attr = match kind {
                         FileKind::Directory => self.inode_mgr.attr_for_dir(ino, false),
                         FileKind::RegularFile => self.inode_mgr.attr_for_file(ino, size),
@@ -594,15 +971,19 @@ impl FsService {
             return Ok(None);
         }
 
-        if let Some(child_ino) = self.inode_mgr.find_child_by_name(parent, name) {
+        if let Some(child_ino) = self.metadata_child(parent, name) {
             if let Some(data) = self.inode_mgr.inodes.get(&child_ino) {
                 let attr = match data {
                     InodeData::Directory { .. } => self.inode_mgr.attr_for_dir(child_ino, true),
-                    InodeData::File {
-                        data: file_data, ..
-                    } => self
-                        .inode_mgr
-                        .attr_for_file(child_ino, file_data.len() as u64),
+                    InodeData::File { .. } => {
+                        // The inode's own buffer is empty after `release`
+                        // moved it into `buffered_torrents`; attributes must
+                        // report the authoritative bytes, not zero.
+                        let size = self
+                            .buffered_torrent_bytes(child_ino)
+                            .map_or(0, |bytes| bytes.len() as u64);
+                        self.inode_mgr.attr_for_file(child_ino, size)
+                    }
                 };
                 return Ok(Some(Entry {
                     ino: child_ino,
@@ -666,9 +1047,12 @@ impl FsService {
                         InodeData::Directory { .. } => Ok(self
                             .inode_mgr
                             .attr_for_dir(ino, self.inode_mgr.is_metadata_child(ino))),
-                        InodeData::File {
-                            data: file_data, ..
-                        } => Ok(self.inode_mgr.attr_for_file(ino, file_data.len() as u64)),
+                        InodeData::File { .. } => {
+                            let size = self
+                                .buffered_torrent_bytes(ino)
+                                .map_or(0, |bytes| bytes.len() as u64);
+                            Ok(self.inode_mgr.attr_for_file(ino, size))
+                        }
                     }
                 } else {
                     Err(FsError::NotFound)
@@ -701,6 +1085,8 @@ impl FsService {
                 // A truncate on a `metadata/` `.torrent` buffer (the
                 // `O_TRUNC` overwrite path). Only a `File` inode carries
                 // resizable data; a directory has no size to set.
+                self.invalidate_pending_index();
+                self.adopt_buffered_torrent(ino);
                 return match self.inode_mgr.inodes.get_mut(&ino) {
                     Some(InodeData::File { data, name, .. }) => {
                         if target > MAX_TORRENT_SIZE as u64 {
@@ -764,14 +1150,29 @@ impl FsService {
                         return Ok(page_after_offset(&cache.entries, offset));
                     }
                 }
+                if let Some(DataInode::TorrentRoot { torrent_id, .. })
+                | Some(DataInode::TorrentDir { torrent_id, .. }) =
+                    self.inode_mgr.data_inodes.get(&ino)
+                {
+                    if *torrent_id != 0 {
+                        self.ensure_file_identities(*torrent_id);
+                    }
+                }
                 // The listing carries the state it was built from, so the cache
                 // key can never describe a different snapshot than the entries.
-                if let Some(listing) = DataResolver::readdir_data(
+                if let Some(listing) = DataResolver::readdir_data_with_buffers(
                     &mut self.inode_mgr,
                     db,
                     &self.processing_torrents,
+                    &self.pending_index_cache,
+                    &self.buffered_torrents,
                     ino,
                 ) {
+                    for (entry_ino, _, kind, _) in &listing.entries {
+                        if *kind == FileKind::RegularFile {
+                            self.cache_read_identity(*entry_ino);
+                        }
+                    }
                     let entries: Vec<DirEntry> = listing
                         .entries
                         .into_iter()
@@ -804,14 +1205,15 @@ impl FsService {
             return Err(FsError::NotFound);
         }
 
-        let mut entries: Vec<DirEntry> = vec![DirEntry {
-            ino,
-            offset: 1,
-            kind: FileKind::Directory,
-            name: ".".to_string(),
-        }];
+        let mut entries: Vec<DirEntry> = Vec::new();
 
         if ino == ROOT_INO {
+            entries.push(DirEntry {
+                ino,
+                offset: 1,
+                kind: FileKind::Directory,
+                name: ".".to_string(),
+            });
             entries.push(DirEntry {
                 ino: ROOT_INO,
                 offset: 2,
@@ -837,51 +1239,49 @@ impl FsService {
                 name: ".stats".to_string(),
             });
         } else if let Some(InodeData::Directory { parent, .. }) = self.inode_mgr.inodes.get(&ino) {
-            entries.push(DirEntry {
-                ino: *parent,
-                offset: 2,
-                kind: FileKind::Directory,
-                name: "..".to_string(),
-            });
-
-            let mut offset_counter = entries.len() as i64 + 1;
-            // Collect entries first to avoid borrowing issues.
-            let mut children: Vec<(u64, FileKind, String)> = self
-                .inode_mgr
-                .inodes
-                .iter()
-                .filter_map(|(child_ino, data)| match data {
-                    InodeData::Directory {
-                        parent: p, name, ..
-                    } if *p == ino && !name.is_empty() => {
-                        Some((*child_ino, FileKind::Directory, name.clone()))
+            let parent = *parent;
+            // Page straight out of the index: child `i` keeps offset `3 + i`,
+            // so a page costs O(page) regardless of the directory size. The
+            // order is inode order and therefore stable between calls.
+            let first = (offset + 1).max(1);
+            let last = first.saturating_add(READDIR_PAGE_ENTRIES as i64);
+            let index = self.metadata_index();
+            let children = index.by_parent.get(&ino).map(Vec::as_slice).unwrap_or(&[]);
+            for entry_offset in first..last {
+                let entry = match entry_offset {
+                    1 => DirEntry {
+                        ino,
+                        offset: 1,
+                        kind: FileKind::Directory,
+                        name: ".".to_string(),
+                    },
+                    2 => DirEntry {
+                        ino: parent,
+                        offset: 2,
+                        kind: FileKind::Directory,
+                        name: "..".to_string(),
+                    },
+                    child_offset => {
+                        let Some((child_ino, kind, name)) =
+                            children.get((child_offset - 3) as usize)
+                        else {
+                            break;
+                        };
+                        DirEntry {
+                            ino: *child_ino,
+                            offset: child_offset,
+                            kind: *kind,
+                            name: name.clone(),
+                        }
                     }
-                    InodeData::File {
-                        parent: p,
-                        name,
-                        unlinked,
-                        ..
-                    } if *p == ino && !*unlinked => {
-                        Some((*child_ino, FileKind::RegularFile, name.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            // Paged listing: an entry must keep its offset between calls, so
-            // the order cannot come from the inode map's iteration order.
-            children.sort_unstable_by_key(|(child_ino, ..)| *child_ino);
-
-            for (child_ino, kind, name) in children {
-                entries.push(DirEntry {
-                    ino: child_ino,
-                    offset: offset_counter,
-                    kind,
-                    name,
-                });
-                offset_counter += 1;
+                };
+                entries.push(entry);
             }
+            return Ok(entries);
         } else {
-            return Err(FsError::NotDirectory);
+            // C-2.2.6: a directory listing aimed at a file (or an unknown
+            // inode, C-2.5.8) is reported as `ENOENT`, never `ENOTDIR`.
+            return Err(FsError::NotFound);
         }
 
         Ok(page_after_offset(&entries, offset))
@@ -900,13 +1300,22 @@ impl FsService {
             STATS_INO => {
                 let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                 self.inode_mgr.open_files.insert(fh, ino);
-                Ok(fh.into())
+                // C-6.1.4: every read re-renders the file, so its length must
+                // come from that read. Serving it through the kernel page
+                // cache would freeze a stale rendering (and length).
+                Ok(OpenOutcome {
+                    fh,
+                    direct_io: true,
+                })
             }
             _ => {
                 if InodeManager::is_stats_ino(ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
-                    return Ok(fh.into());
+                    return Ok(OpenOutcome {
+                        fh,
+                        direct_io: true,
+                    });
                 }
 
                 if InodeManager::is_data_ino(ino) {
@@ -938,10 +1347,18 @@ impl FsService {
         match ino {
             ROOT_INO | METADATA_INO | DATA_INO => Ok(()),
             _ => {
-                if InodeManager::is_data_ino(ino) || self.inode_mgr.inodes.contains_key(&ino) {
-                    Ok(())
+                if InodeManager::is_data_ino(ino) {
+                    // Only directories may be opened as a directory handle;
+                    // a torrent file inode is reported as absent (C-2.2.6).
+                    match self.inode_mgr.data_inodes.get(&ino) {
+                        Some(DataInode::TorrentFile { .. }) | None => Err(FsError::NotFound),
+                        Some(_) => Ok(()),
+                    }
                 } else {
-                    Err(FsError::NotFound)
+                    match self.inode_mgr.inodes.get(&ino) {
+                        Some(InodeData::Directory { .. }) => Ok(()),
+                        Some(InodeData::File { .. }) | None => Err(FsError::NotFound),
+                    }
                 }
             }
         }
@@ -950,6 +1367,7 @@ impl FsService {
     // ── Metadata namespace (.torrent lifecycle) ─────────────────────────────
 
     pub fn mknod(&mut self, parent: u64, name: &str) -> FsResult<Entry> {
+        self.touch_metadata_index();
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
         }
@@ -961,7 +1379,7 @@ impl FsService {
             return Err(FsError::InvalidArgument);
         }
 
-        if self.inode_mgr.find_child_by_name(parent, name).is_some() {
+        if self.metadata_child(parent, name).is_some() {
             return Err(FsError::AlreadyExists);
         }
 
@@ -989,6 +1407,7 @@ impl FsService {
     }
 
     pub fn create(&mut self, parent: u64, name: &str) -> FsResult<Created> {
+        self.touch_metadata_index();
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
         }
@@ -1000,7 +1419,7 @@ impl FsService {
             return Err(FsError::InvalidArgument);
         }
 
-        if self.inode_mgr.find_child_by_name(parent, name).is_some() {
+        if self.metadata_child(parent, name).is_some() {
             return Err(FsError::AlreadyExists);
         }
 
@@ -1048,6 +1467,12 @@ impl FsService {
         if InodeManager::is_data_namespace(ino) {
             return Err(FsError::ReadOnlyFileSystem);
         }
+
+        // A re-opened `.torrent` whose previous close handed its bytes to the
+        // persist thread starts from that shared buffer, moved back if the
+        // thread is done (zero-copy), so a partial rewrite keeps the old bytes.
+        self.invalidate_pending_index();
+        self.adopt_buffered_torrent(ino);
 
         match self.inode_mgr.inodes.get_mut(&ino) {
             Some(InodeData::File {
@@ -1111,42 +1536,46 @@ impl FsService {
 
     /// Validate a buffered `.torrent` on close (flush).
     pub fn flush(&mut self, ino: u64) -> FsResult<()> {
-        if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
-            if name.ends_with(".torrent") {
-                // Every close of a zero-byte `.torrent` fails with EINVAL:
-                // FUSE can't distinguish `cp` of an empty seed from `touch`,
-                // `>` redirection, or a truncate-to-zero then close. The
-                // rejection lands in `flush`/`close`, so only callers that
-                // check `close(2)` (e.g. `cp`) can witness the errno; a tool
-                // that ignores it (`touch`, `>`, `dd`) reporting rc=0 is its
-                // own semantics, not an acceptance criterion. `release` still
-                // discards the empty inode, so no ghost `data/` mirror survives.
-                if data.is_empty() {
-                    warn!("Zero-byte torrent file {} rejected", name);
-                    return Err(FsError::InvalidArgument);
-                }
+        let name = match self.inode_mgr.inodes.get(&ino) {
+            Some(InodeData::File { name, .. }) if name.ends_with(".torrent") => name.clone(),
+            _ => return Ok(()),
+        };
+        // Validate the buffer in place: the close path must not copy the whole
+        // (up to 10 MiB) buffer just to parse it and throw the parse away.
+        let data = self.buffered_torrent_bytes(ino).unwrap_or(&[]);
 
-                if data.len() > MAX_TORRENT_SIZE {
-                    warn!(
-                        "Torrent file {} exceeds size limit ({} bytes)",
-                        name,
-                        data.len()
-                    );
-                    return Err(FsError::FileTooLarge(format!(
-                        "{} exceeds {} bytes",
-                        name, MAX_TORRENT_SIZE
-                    )));
-                }
+        // Every close of a zero-byte `.torrent` fails with EINVAL:
+        // FUSE can't distinguish `cp` of an empty seed from `touch`,
+        // `>` redirection, or a truncate-to-zero then close. The
+        // rejection lands in `flush`/`close`, so only callers that
+        // check `close(2)` (e.g. `cp`) can witness the errno; a tool
+        // that ignores it (`touch`, `>`, `dd`) reporting rc=0 is its
+        // own semantics, not an acceptance criterion. `release` still
+        // discards the empty inode, so no ghost `data/` mirror survives.
+        if data.is_empty() {
+            warn!("Zero-byte torrent file {} rejected", name);
+            return Err(FsError::InvalidArgument);
+        }
 
-                match TorrentInfo::from_bytes(data.clone()) {
-                    Ok(_) => {
-                        info!("Torrent {} validated successfully", name);
-                    }
-                    Err(e) => {
-                        warn!("Invalid .torrent file {}: {}", name, e.reason());
-                        return Err(FsError::CorruptTorrent(e.reason().to_string()));
-                    }
-                }
+        if data.len() > MAX_TORRENT_SIZE {
+            warn!(
+                "Torrent file {} exceeds size limit ({} bytes)",
+                name,
+                data.len()
+            );
+            return Err(FsError::FileTooLarge(format!(
+                "{} exceeds {} bytes",
+                name, MAX_TORRENT_SIZE
+            )));
+        }
+
+        match TorrentInfo::validate_slice(data) {
+            Ok(()) => {
+                info!("Torrent {} validated successfully", name);
+            }
+            Err(e) => {
+                warn!("Invalid .torrent file {}: {}", name, e.reason());
+                return Err(FsError::CorruptTorrent(e.reason().to_string()));
             }
         }
         Ok(())
@@ -1154,6 +1583,17 @@ impl FsService {
 
     /// Persist a closed `.torrent` into the database (release).
     pub fn release(&mut self, fh: u64) -> FsResult<()> {
+        self.release_with_pending_timeout(fh, PENDING_ADD_TIMEOUT)
+    }
+
+    /// [`Self::release`] with an injectable pending-add deadline, so the
+    /// "previous persist still in flight" path is testable in milliseconds.
+    pub(crate) fn release_with_pending_timeout(
+        &mut self,
+        fh: u64,
+        pending_timeout: Duration,
+    ) -> FsResult<()> {
+        self.touch_metadata_index();
         if let Some(ino) = self.inode_mgr.open_files.remove(&fh) {
             // the file handle is now closed. If the inode was
             // unlinked while still open, this `release` is the "last close"
@@ -1164,13 +1604,18 @@ impl FsService {
             if self.inode_mgr.is_unlinked_file(ino) {
                 if self.inode_mgr.open_handle_count(ino) == 0 {
                     self.inode_mgr.inodes.remove(&ino);
+                    self.buffered_torrents.remove(&ino);
                 }
                 return Ok(());
             }
 
-            if let Some(InodeData::File {
-                data, name, parent, ..
-            }) = self.inode_mgr.inodes.get(&ino).cloned()
+            // Move the buffered bytes out of the inode instead of cloning the
+            // whole (up to 10 MiB) buffer: the persist thread takes ownership,
+            // and the dispatch side keeps a shared `Arc` handle so a read of
+            // the same `.torrent` still sees its bytes.
+            let Some((name, parent, data)) = self.take_buffered_file(ino) else {
+                return Ok(());
+            };
             {
                 if name.ends_with(".torrent") {
                     let source_path = self.inode_mgr.extract_source_path(parent);
@@ -1184,8 +1629,16 @@ impl FsService {
                         // `data/<seed>.torrent/` mirror.  Wait for an in-flight
                         // `add_torrent` first so its row lands
                         // before we delete it, then drop the row + inode.
-                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
-                        self.remove_torrent_and_data_state(&source_path, &name)?;
+                        if let Err(e) =
+                            self.wait_for_pending_add(&dedup_key, pending_timeout, "release")
+                        {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
+                        if let Err(e) = self.remove_torrent_and_data_state(&source_path, &name) {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
                         self.inode_mgr.inodes.remove(&ino);
                         return Err(FsError::NotFound);
                     }
@@ -1197,20 +1650,36 @@ impl FsService {
                         // `write` with EFBIG and lands in the invalid-bencode
                         // branch below.  Kept (mirroring `flush`'s size guard)
                         // in case a future path lets the buffer overshoot.
-                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
-                        self.remove_torrent_and_data_state(&source_path, &name)?;
+                        if let Err(e) =
+                            self.wait_for_pending_add(&dedup_key, pending_timeout, "release")
+                        {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
+                        if let Err(e) = self.remove_torrent_and_data_state(&source_path, &name) {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
                         self.inode_mgr.inodes.remove(&ino);
                         return Ok(());
                     }
 
-                    if TorrentInfo::from_bytes(data.clone()).is_err() {
+                    if TorrentInfo::validate_slice(&data).is_err() {
                         warn!("Torrent {} invalid, removing inode", name);
                         // same orphan fix + pending-add wait for
                         // unparseable content (the oversized-`cp` case lands
                         // here: `write` rejects the tail with EFBIG, leaving
                         // partial invalid bytes behind).
-                        self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
-                        self.remove_torrent_and_data_state(&source_path, &name)?;
+                        if let Err(e) =
+                            self.wait_for_pending_add(&dedup_key, pending_timeout, "release")
+                        {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
+                        if let Err(e) = self.remove_torrent_and_data_state(&source_path, &name) {
+                            self.restore_buffered_file(ino, data);
+                            return Err(e);
+                        }
                         self.inode_mgr.inodes.remove(&ino);
                         return Ok(());
                     }
@@ -1222,7 +1691,17 @@ impl FsService {
                     // content on top of it. Returning early here left the
                     // database holding the OLD bytes while `metadata/` showed
                     // the new torrent, so `data/` and a restart disagreed.
-                    self.wait_for_pending_add(&dedup_key, PENDING_ADD_TIMEOUT, "release")?;
+                    // C-2.5.5: this wait may time out. The bytes must survive a
+                    // recoverable early return — the kernel ignores the
+                    // RELEASE error, so dropping them here would lose the new
+                    // content permanently and a later close would see an empty
+                    // buffer and delete the previously landed source.
+                    if let Err(e) =
+                        self.wait_for_pending_add(&dedup_key, pending_timeout, "release")
+                    {
+                        self.restore_buffered_file(ino, data);
+                        return Err(e);
+                    }
 
                     // Mark the key in-flight, then DROP the lock before
                     // spawning background work. Keyed by
@@ -1248,43 +1727,68 @@ impl FsService {
                     // DB-backed entry supersedes this inode (lookup queries the
                     // DB), so keeping it is harmless.
                     if let Some(ts) = self.torrent_service.clone() {
+                        let shared = Arc::new(data);
+                        self.buffered_torrents.insert(ino, Arc::clone(&shared));
                         let processing = self.processing_torrents.clone();
                         let processing_cv = self.processing_torrents_cv.clone();
                         let persist_errors = self.persist_errors.clone();
                         let evictions = self.pending_projection_evictions.clone();
+                        let versions = self.content_versions.clone();
+                        let cancel_sink = self.read_cancel_sink.clone();
+                        let cancelled = self.cancelled_reads.clone();
+                        let metrics = self.metrics.clone();
                         let notifier = self.notifier.clone();
                         let key = dedup_key.clone();
                         std::thread::spawn(move || {
-                            let persisted = match ts.persist_torrent(&data, &source_path, &name) {
-                                Ok(persisted) => {
-                                    // Clear any stale failure from a prior
-                                    // attempt; this one succeeded.
-                                    if let Ok(mut guard) = persist_errors.lock() {
-                                        guard.remove(&key);
-                                    }
-                                    // The new content has landed: queue an
-                                    // eviction of the projection inodes the
-                                    // row superseded, so the dispatch side
-                                    // stops serving the replaced content.
-                                    if let Ok(mut queue) = evictions.lock() {
-                                        if !queue.contains(&key) {
-                                            queue.push(key.clone());
+                            let persisted =
+                                match ts.persist_torrent(shared.as_slice(), &source_path, &name) {
+                                    Ok(persisted) => {
+                                        // Clear any stale failure from a prior
+                                        // attempt; this one succeeded.
+                                        if let Ok(mut guard) = persist_errors.lock() {
+                                            guard.remove(&key);
                                         }
+                                        // A replacement must settle the old
+                                        // content's in-flight reads now, without
+                                        // waiting for another FUSE request
+                                        // (C-4.5.3): publish the landed content id
+                                        // and cancel waiters of any other content,
+                                        // then queue the dispatch-side eviction. A
+                                        // re-persist of identical bytes changes
+                                        // nothing and cancels nothing.
+                                        if persisted.content_changed() {
+                                            FsService::record_content_published_shared(
+                                                &versions,
+                                                &cancel_sink,
+                                                &cancelled,
+                                                &metrics,
+                                                persisted.source_id(),
+                                                Some(persisted.content_id()),
+                                            );
+                                        }
+                                        // The new content has landed: queue an
+                                        // eviction of the projection inodes the
+                                        // row superseded, so the dispatch side
+                                        // stops serving the replaced content.
+                                        if let Ok(mut queue) = evictions.lock() {
+                                            if !queue.contains(&key) {
+                                                queue.push(key.clone());
+                                            }
+                                        }
+                                        ts.register_torrent_handle(&persisted);
+                                        Some(persisted)
                                     }
-                                    ts.register_torrent_handle(&persisted);
-                                    Some(persisted)
-                                }
-                                Err(e) => {
-                                    error!("Failed to persist torrent {}: {}", name, e);
-                                    // record the failure so the next
-                                    // user-visible lookup/readdir of data/
-                                    // surfaces it as EIO.
-                                    if let Ok(mut guard) = persist_errors.lock() {
-                                        guard.insert(key.clone(), e.to_string());
+                                    Err(e) => {
+                                        error!("Failed to persist torrent {}: {}", name, e);
+                                        // record the failure so the next
+                                        // user-visible lookup/readdir of data/
+                                        // surfaces it as EIO.
+                                        if let Ok(mut guard) = persist_errors.lock() {
+                                            guard.insert(key.clone(), e.to_string());
+                                        }
+                                        None
                                     }
-                                    None
-                                }
-                            };
+                                };
                             // Clear the key and wake a rename/release blocked
                             // on this pending add under one lock hold: a notify
                             // after the guard dropped could land between the
@@ -1330,6 +1834,7 @@ impl FsService {
                             "Torrent {} received (no DB configured, skipping insert)",
                             name
                         );
+                        self.buffered_torrents.insert(ino, Arc::new(data));
                         if let Ok(mut guard) = self.processing_torrents.lock() {
                             guard.remove(&dedup_key);
                             // wake any waiter (defensive; no-DB path).
@@ -1399,7 +1904,7 @@ impl FsService {
     fn cleanup_removed_torrent_data_state(
         &mut self,
         torrent_id: i64,
-        info_hash: &str,
+        _info_hash: &str,
         source_path: &str,
         filename: &str,
     ) -> FsResult<()> {
@@ -1439,24 +1944,24 @@ impl FsService {
             processing.remove(&(source_path.to_string(), filename.to_string()));
         }
 
-        {
-            let mut cache = self.torrent_data_cache.lock().map_err(|e| {
-                error!(
-                    "Mutex poisoned in cleanup_removed_torrent_data_state() torrent_data_cache: {}",
-                    e
-                );
-                FsError::LockPoisoned
-            })?;
-            // L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
-            // drop every range cached for this torrent.
-            let prefix = format!("{}:", info_hash);
-            cache.retain(|k, _| !k.starts_with(&prefix));
+        // L1 entries are keyed by the content-scoped `file_id`, which is never
+        // reused, so entries of a removed torrent can no longer be hit; the
+        // bounded cache reclaims them on overflow.
+        self.retain_live_read_identities();
+        if let Some(ts) = &self.torrent_service {
+            ts.invalidate_file_identities(torrent_id);
         }
+
+        // Any in-flight read for this source row settles with `EIO`
+        // (C-4.5.3). The sink settles it now; the queued entry is the adapter's
+        // fallback drain.
+        self.record_source_removed(torrent_id);
 
         Ok(())
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &str) -> FsResult<Attr> {
+        self.touch_metadata_index();
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
         }
@@ -1464,7 +1969,7 @@ impl FsService {
             return Err(FsError::PermissionDenied);
         }
 
-        if self.inode_mgr.find_child_by_name(parent, name).is_some() {
+        if self.metadata_child(parent, name).is_some() {
             return Err(FsError::AlreadyExists);
         }
 
@@ -1506,6 +2011,7 @@ impl FsService {
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &str) -> FsResult<()> {
+        self.touch_metadata_index();
         if InodeManager::is_data_namespace(parent) {
             return Err(FsError::ReadOnlyFileSystem);
         }
@@ -1513,7 +2019,7 @@ impl FsService {
             return Err(FsError::PermissionDenied);
         }
 
-        let ino = match self.inode_mgr.find_child_by_name(parent, name) {
+        let ino = match self.metadata_child(parent, name) {
             Some(ino) => ino,
             None => {
                 return Err(FsError::NotFound);
@@ -1522,15 +2028,11 @@ impl FsService {
 
         match self.inode_mgr.inodes.get(&ino) {
             Some(InodeData::Directory { .. }) => {
-                let has_children = self.inode_mgr.inodes.iter().any(|(_, data)| match data {
-                    InodeData::Directory { parent: p, .. } if *p == ino => true,
-                    InodeData::File {
-                        parent: p,
-                        unlinked,
-                        ..
-                    } if *p == ino && !*unlinked => true,
-                    _ => false,
-                });
+                let has_children = self
+                    .metadata_index()
+                    .by_parent
+                    .get(&ino)
+                    .is_some_and(|children| !children.is_empty());
 
                 if has_children {
                     return Err(FsError::DirectoryNotEmpty);
@@ -1538,11 +2040,29 @@ impl FsService {
 
                 let source_path = self.inode_mgr.extract_source_path(ino);
 
+                // Every source row under this directory disappears with it;
+                // remember them so their in-flight reads settle with EIO
+                // (C-4.5.3). The rows are still present before the delete.
+                let removed_ids: Vec<i64> = self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.lock().ok())
+                    .and_then(|guard| guard.get_torrents_by_source_path_prefix(&source_path).ok())
+                    .map(|torrents| torrents.iter().map(|t| t.id).collect())
+                    .unwrap_or_default();
+
                 // Delete the row first: on failure the inode (and the
                 // directory) stays visible, matching the database truth that
                 // would otherwise restore it on the next mount.
                 if let Some(ref ts) = self.torrent_service {
                     ts.delete_metadata_directory(&source_path)?;
+                }
+
+                for torrent_id in &removed_ids {
+                    if let Some(ref ts) = self.torrent_service {
+                        ts.invalidate_file_identities(*torrent_id);
+                    }
+                    self.record_source_removed(*torrent_id);
                 }
 
                 self.inode_mgr.inodes.remove(&ino);
@@ -1562,6 +2082,7 @@ impl FsService {
                         }
                         _ => true,
                     });
+                self.retain_live_read_identities();
 
                 // purge the kernel dentry cache for the removed
                 // `data/` SourcePathDir so the stale mirror vanishes at
@@ -1593,6 +2114,7 @@ impl FsService {
         name: &str,
         pending_timeout: Duration,
     ) -> FsResult<Option<i64>> {
+        self.touch_metadata_index();
         let mut removed_id = None;
 
         // `.stats` is a reserved virtual filename whose files have
@@ -1617,7 +2139,7 @@ impl FsService {
             return Err(FsError::InvalidArgument);
         }
 
-        let ino = match self.inode_mgr.find_child_by_name(parent, name) {
+        let ino = match self.metadata_child(parent, name) {
             Some(ino) => ino,
             None => {
                 return Err(FsError::NotFound);
@@ -1655,6 +2177,9 @@ impl FsService {
                             // destroys it now; `open_files` is NOT stripped (it
                             // would orphan the handle and drop buffered bytes).
                             self.inode_mgr.unlink_file(ino);
+                            if !self.inode_mgr.inodes.contains_key(&ino) {
+                                self.buffered_torrents.remove(&ino);
+                            }
                             info!(
                                 "Deleted torrent '{}' (id={}, source_path='{}')",
                                 filename, torrent_id, source_path
@@ -1663,6 +2188,9 @@ impl FsService {
                         Ok(None) => {
                             // same deferred-destruction logic.
                             self.inode_mgr.unlink_file(ino);
+                            if !self.inode_mgr.inodes.contains_key(&ino) {
+                                self.buffered_torrents.remove(&ino);
+                            }
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
@@ -1673,9 +2201,16 @@ impl FsService {
                 } else {
                     // same deferred-destruction logic (no DB).
                     self.inode_mgr.unlink_file(ino);
+                    if !self.inode_mgr.inodes.contains_key(&ino) {
+                        self.buffered_torrents.remove(&ino);
+                    }
                     info!("Deleted file '{}' (no database)", filename);
                 }
 
+                // The inode survives an unlink while a handle is open, so its
+                // count is unchanged: invalidate the metadata index explicitly
+                // or `readdir` keeps serving the now-unlinked name.
+                self.touch_metadata_index();
                 Ok(removed_id)
             }
             Some(InodeData::Directory { .. }) => Err(FsError::IsDirectory),
@@ -1704,6 +2239,7 @@ impl FsService {
         newname: &str,
         pending_timeout: Duration,
     ) -> FsResult<()> {
+        self.touch_metadata_index();
         // data/ is a read-only namespace — renames into or out
         // of it must return `EROFS`, not `ENOENT` or `EPERM`. Check this
         // before parent existence: an inode number in the data range is
@@ -1738,7 +2274,7 @@ impl FsService {
             return Err(FsError::NotPermitted);
         }
 
-        let source_ino = match self.inode_mgr.find_child_by_name(parent, name) {
+        let source_ino = match self.metadata_child(parent, name) {
             Some(ino) => ino,
             None => {
                 return Err(FsError::NotFound);
@@ -1750,27 +2286,26 @@ impl FsService {
         // source takes its name. Every other destination collision is still
         // rejected: a directory cannot silently replace (or be replaced by) a
         // file, and directory-over-directory keeps its existing EEXIST.
-        let overwrite_target =
-            if let Some(target_ino) = self.inode_mgr.find_child_by_name(newparent, newname) {
-                if target_ino == source_ino {
-                    return Ok(());
-                }
-                let source_is_file = matches!(
-                    self.inode_mgr.inodes.get(&source_ino),
-                    Some(InodeData::File { .. })
-                );
-                let target_is_file = matches!(
-                    self.inode_mgr.inodes.get(&target_ino),
-                    Some(InodeData::File { .. })
-                );
-                if source_is_file && target_is_file {
-                    Some(target_ino)
-                } else {
-                    return Err(FsError::AlreadyExists);
-                }
+        let overwrite_target = if let Some(target_ino) = self.metadata_child(newparent, newname) {
+            if target_ino == source_ino {
+                return Ok(());
+            }
+            let source_is_file = matches!(
+                self.inode_mgr.inodes.get(&source_ino),
+                Some(InodeData::File { .. })
+            );
+            let target_is_file = matches!(
+                self.inode_mgr.inodes.get(&target_ino),
+                Some(InodeData::File { .. })
+            );
+            if source_is_file && target_is_file {
+                Some(target_ino)
             } else {
-                None
-            };
+                return Err(FsError::AlreadyExists);
+            }
+        } else {
+            None
+        };
 
         let is_directory = matches!(
             self.inode_mgr.inodes.get(&source_ino),
@@ -1848,6 +2383,10 @@ impl FsService {
             let (dir_parent, dir_name) = Self::split_data_dir_parent(&old_source_path);
             self.inval_data_entry(dir_parent, &dir_name);
 
+            // Renaming reuses the same inode, so the index's inode count does
+            // not change: invalidate explicitly or `readdir`/`lookup` keep
+            // resolving the old name.
+            self.touch_metadata_index();
             Ok(())
         } else {
             // --- File rename ---
@@ -1866,28 +2405,15 @@ impl FsService {
                 return Err(FsError::InvalidArgument);
             }
 
-            let (file_data, old_name, was_unlinked) = match self.inode_mgr.inodes.get(&source_ino) {
-                Some(InodeData::File {
-                    data,
-                    name,
-                    unlinked,
-                    ..
-                }) => (data.clone(), name.clone(), *unlinked),
+            let (old_name, was_unlinked) = match self.inode_mgr.inodes.get(&source_ino) {
+                Some(InodeData::File { name, unlinked, .. }) => (name.clone(), *unlinked),
                 None => {
                     return Err(FsError::NotFound);
                 }
                 _ => unreachable!(),
             };
 
-            self.inode_mgr.inodes.insert(
-                source_ino,
-                InodeData::File {
-                    parent: newparent,
-                    name: newname.to_string(),
-                    data: file_data.clone(),
-                    unlinked: was_unlinked,
-                },
-            );
+            self.move_file_inode(source_ino, newparent, newname, was_unlinked)?;
 
             if let Some(ref ts) = self.torrent_service {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
@@ -1907,15 +2433,7 @@ impl FsService {
                 // metadata/ showing the new name while the still-pending
                 // background add lands the DB row at the OLD one,
                 if let Err(e) = self.wait_for_pending_add(&dedup_key, pending_timeout, "rename") {
-                    self.inode_mgr.inodes.insert(
-                        source_ino,
-                        InodeData::File {
-                            parent,
-                            name: old_name.clone(),
-                            data: file_data.clone(),
-                            unlinked: was_unlinked,
-                        },
-                    );
+                    self.restore_renamed_file(source_ino, parent, &old_name, was_unlinked);
                     return Err(e);
                 }
 
@@ -1932,15 +2450,7 @@ impl FsService {
                     if let Err(e) =
                         self.wait_for_pending_add(&target_dedup_key, pending_timeout, "rename")
                     {
-                        self.inode_mgr.inodes.insert(
-                            source_ino,
-                            InodeData::File {
-                                parent,
-                                name: old_name.clone(),
-                                data: file_data.clone(),
-                                unlinked: was_unlinked,
-                            },
-                        );
+                        self.restore_renamed_file(source_ino, parent, &old_name, was_unlinked);
                         return Err(e);
                     }
 
@@ -1952,15 +2462,7 @@ impl FsService {
                     ) {
                         Ok(r) => r,
                         Err(e) => {
-                            self.inode_mgr.inodes.insert(
-                                source_ino,
-                                InodeData::File {
-                                    parent,
-                                    name: old_name.clone(),
-                                    data: file_data.clone(),
-                                    unlinked: was_unlinked,
-                                },
-                            );
+                            self.restore_renamed_file(source_ino, parent, &old_name, was_unlinked);
                             return Err(e);
                         }
                     };
@@ -1975,15 +2477,7 @@ impl FsService {
                             // non-overwrite path's silent inode-only move) is
                             // deliberate — the destination must not be
                             // destroyed for a source that cannot replace it.
-                            self.inode_mgr.inodes.insert(
-                                source_ino,
-                                InodeData::File {
-                                    parent,
-                                    name: old_name.clone(),
-                                    data: file_data.clone(),
-                                    unlinked: was_unlinked,
-                                },
-                            );
+                            self.restore_renamed_file(source_ino, parent, &old_name, was_unlinked);
                             return Err(FsError::Internal(format!(
                                 "cannot rename '{}': torrent has no persisted row",
                                 old_name
@@ -1995,7 +2489,7 @@ impl FsService {
                             if let Ok(mut guard) = self.persist_errors.lock() {
                                 guard.remove(&(new_source_path.clone(), newname.to_string()));
                             }
-                            self.inode_mgr.unlink_file(target_ino);
+                            self.retire_overwritten_file(target_ino);
                             if let Some((target_id, target_info_hash)) = removed_target {
                                 self.cleanup_removed_torrent_data_state(
                                     target_id,
@@ -2074,11 +2568,76 @@ impl FsService {
                 // No database: an overwrite still retires the destination
                 // inode so the source takes its name.
                 if let Some(target_ino) = overwrite_target {
-                    self.inode_mgr.unlink_file(target_ino);
+                    self.retire_overwritten_file(target_ino);
                 }
                 info!("Renamed file '{}' to '{}' (no database)", old_name, newname);
             }
+            // Same reason as the directory branch: the moved inode keeps its
+            // count, so a cached index would still list it under the old name.
+            self.touch_metadata_index();
             Ok(())
+        }
+    }
+
+    /// Remove a rename destination that the source replaces.
+    ///
+    /// `InodeManager::unlink_file` destroys the inode immediately when no
+    /// handle is open and only marks it unlinked otherwise. Its parked shared
+    /// buffer must follow the same lifetime: reclaim it now on immediate
+    /// destruction, or keep it until the last handle closes (`release` already
+    /// removes it there). Without this, repeated overwrite-renames leak one
+    /// `Arc<Vec<u8>>` per destroyed destination.
+    fn retire_overwritten_file(&mut self, target_ino: u64) {
+        if self.inode_mgr.unlink_file(target_ino) {
+            self.buffered_torrents.remove(&target_ino);
+        }
+    }
+
+    /// Move a file inode's directory entry, carrying its buffer without a
+    /// copy. The caller restores the old entry with
+    /// [`Self::restore_renamed_file`] if the persist step fails.
+    fn move_file_inode(
+        &mut self,
+        ino: u64,
+        parent: u64,
+        name: &str,
+        unlinked: bool,
+    ) -> FsResult<()> {
+        match self.inode_mgr.inodes.remove(&ino) {
+            Some(InodeData::File { data, .. }) => {
+                self.inode_mgr.inodes.insert(
+                    ino,
+                    InodeData::File {
+                        parent,
+                        name: name.to_string(),
+                        data,
+                        unlinked,
+                    },
+                );
+                Ok(())
+            }
+            Some(other) => {
+                self.inode_mgr.inodes.insert(ino, other);
+                Err(FsError::NotFound)
+            }
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Put a file inode back at its pre-rename `(parent, name)`. The buffered
+    /// `.torrent` bytes move back instead of being cloned, so a failed rename
+    /// never copies the (up to 10 MiB) buffer a second time.
+    fn restore_renamed_file(&mut self, ino: u64, parent: u64, name: &str, unlinked: bool) {
+        if let Some(InodeData::File { data, .. }) = self.inode_mgr.inodes.remove(&ino) {
+            self.inode_mgr.inodes.insert(
+                ino,
+                InodeData::File {
+                    parent,
+                    name: name.to_string(),
+                    data,
+                    unlinked,
+                },
+            );
         }
     }
 
@@ -2155,23 +2714,25 @@ impl FsService {
                 }
 
                 if InodeManager::is_data_ino(ino) {
-                    if let Some(DataInode::TorrentFile {
-                        torrent_id,
-                        file_id,
-                        name,
-                        size: file_size,
-                        ..
-                    }) = self.inode_mgr.data_inodes.get(&ino)
-                    {
+                    let file = match self.inode_mgr.data_inodes.get(&ino) {
+                        Some(DataInode::TorrentFile {
+                            torrent_id,
+                            file_id,
+                            size,
+                            ..
+                        }) => Some((*torrent_id, *file_id, *size)),
+                        _ => None,
+                    };
+                    if let Some((torrent_id, file_id, file_size)) = file {
                         let offset = offset as usize;
                         let read_size = size as usize;
 
                         debug!(
-                            "Read request for torrent file: {} (torrent_id={}, file_id={}, offset={}, size={})",
-                            name, torrent_id, file_id, offset, read_size
+                            "Read request for torrent file (torrent_id={}, file_id={}, offset={}, size={})",
+                            torrent_id, file_id, offset, read_size
                         );
 
-                        let actual_size = *file_size as usize;
+                        let actual_size = file_size as usize;
                         if offset >= actual_size {
                             return Ok(ReadOutcome::Ready(Vec::new()));
                         }
@@ -2179,18 +2740,48 @@ impl FsService {
                         let end = std::cmp::min(offset + read_size, actual_size);
                         let result_size = end - offset;
 
+                        // A zero-length read returns zero bytes without
+                        // entering the download path (C-4.1.6).
+                        if result_size == 0 {
+                            return Ok(ReadOutcome::Ready(Vec::new()));
+                        }
+
+                        // A pending projection has no landed source row yet
+                        // (its inode carries the sentinel `torrent_id == 0`).
+                        // The read becomes possible once the persist publishes
+                        // the row, so report the retryable miss instead of the
+                        // `EIO` reserved for superseded content.
+                        if torrent_id == 0 || file_id == 0 {
+                            return Err(FsError::NotFound);
+                        }
+                        // The identity was bound to this inode by the same
+                        // projection that created it. Without it the inode
+                        // belongs to superseded content: settle `EIO` instead
+                        // of resolving (and materializing) the new content's
+                        // file table underneath it.
+                        let identity = self.read_identity(ino).ok_or_else(|| {
+                            FsError::Io(format!(
+                                "read identity unavailable for inode {ino} \
+                                 (content was replaced or removed)",
+                            ))
+                        })?;
                         return self.read_data(
-                            *torrent_id,
-                            *file_id,
+                            torrent_id,
+                            file_id,
+                            identity,
                             offset as u64,
                             result_size as u32,
                         );
                     }
 
+                    // C-2.2.6: reading a directory is `EISDIR`, not `ENOENT`.
+                    if self.inode_mgr.data_inodes.contains_key(&ino) {
+                        return Err(FsError::IsDirectory);
+                    }
                     return Err(FsError::NotFound);
                 }
 
-                if let Some(InodeData::File { data, .. }) = &self.inode_mgr.inodes.get(&ino) {
+                if let Some(data) = self.buffered_torrent_bytes(ino) {
                     let offset = offset as usize;
                     let end = std::cmp::min(offset + size as usize, data.len());
                     if offset < data.len() {
@@ -2198,6 +2789,11 @@ impl FsService {
                     } else {
                         Ok(ReadOutcome::Ready(Vec::new()))
                     }
+                } else if matches!(
+                    self.inode_mgr.inodes.get(&ino),
+                    Some(InodeData::Directory { .. })
+                ) {
+                    Err(FsError::IsDirectory)
                 } else {
                     Err(FsError::NotFound)
                 }
@@ -2210,36 +2806,20 @@ impl FsService {
         &mut self,
         torrent_id: i64,
         file_id: i64,
+        identity: Arc<FileIdentity>,
         offset: u64,
         size: u32,
     ) -> FsResult<ReadOutcome> {
-        let ts = self.torrent_service.as_ref().ok_or_else(|| {
-            error!("Torrent service not available");
-            FsError::Internal("torrent service not available".to_string())
-        })?;
+        if size == 0 {
+            return Ok(ReadOutcome::Ready(Vec::new()));
+        }
 
-        let (info_hash, _source_path, files) =
-            ts.get_torrent_with_files(torrent_id)?.ok_or_else(|| {
-                error!("Torrent not found: {}", torrent_id);
-                FsError::NotFound
-            })?;
-
-        let _file = files.iter().find(|f| f.id == file_id).ok_or_else(|| {
-            error!("File not found: {}", file_id);
-            FsError::NotFound
-        })?;
-
-        let file_index = files.iter().position(|f| f.id == file_id).ok_or_else(|| {
-            error!("File index not found for file_id: {}", file_id);
-            FsError::Internal(format!("file index not found for file_id: {}", file_id))
-        })? as i32;
-
-        // L1 range cache — keyed by `{info_hash}:{file_id}:{offset}:{size}` so
-        // repeated reads of the same range hit RAM and bypass L2 disk + the
-        // (now throttled) metadata fsync. `size` is in the key to prevent
-        // silent truncation: a smaller cached read must not satisfy a larger
-        // one with fewer bytes than requested.
-        let cache_key = format!("{}:{}:{}:{}", info_hash, file_id, offset, size);
+        // L1 range cache first (C-4.1.1): the key is content identity + file +
+        // offset + length. The content-scoped, never-reused `file_id` carries
+        // the content identity, so an L1 hit is answered without touching the
+        // state database at all. `size` stays in the key so a smaller cached
+        // read cannot satisfy a larger request with fewer bytes.
+        let cache_key = format!("{}:{}:{}", file_id, offset, size);
         {
             let cache = self
                 .torrent_data_cache
@@ -2252,10 +2832,20 @@ impl FsService {
         }
         self.metrics.l1_miss();
 
+        // The identity was captured by the projection that created this
+        // inode, from the same statement that produced the bytes it names, so
+        // a read never loads the torrent's file list (C-11.4 / F2) and its
+        // content token cannot disagree with the info-hash.
+        let info_hash = identity.info_hash.as_ref();
+        let file_index = identity.file_index;
+
         if let Some(ds) = &self.download_service {
             // L3 (metadata) cache: parsed `TorrentInfo` keyed by info_hash,
-            // avoiding a DB re-read + bencode re-parse on every read.
-            let info = self.get_or_parse_torrent_info(&info_hash, torrent_id)?;
+            // avoiding a DB re-read + bencode re-parse on every read. The
+            // lookup is content-scoped: the source row may already point at
+            // replacement bytes while this inode still belongs to the old
+            // content.
+            let info = self.get_or_parse_torrent_info(&identity)?;
 
             // Fast pre-check: are all needed pieces already on disk?
             match ds.pieces_on_disk(&info, file_index, offset, size) {
@@ -2283,7 +2873,7 @@ impl FsService {
                                     file_index,
                                     offset,
                                     size,
-                                    info_hash: info_hash.clone(),
+                                    info_hash: info_hash.to_string(),
                                     torrent_id,
                                 });
                             }
@@ -2341,7 +2931,7 @@ impl FsService {
                         file_index,
                         offset,
                         size,
-                        info_hash: info_hash.clone(),
+                        info_hash: info_hash.to_string(),
                         torrent_id,
                     })
                 }
@@ -2368,11 +2958,15 @@ impl FsService {
     /// parses them once; subsequent reads for the same torrent reuse the
     /// cached `Arc<TorrentInfo>` and skip both the DB re-read and the
     /// bencode re-parse.
-    fn get_or_parse_torrent_info(
-        &self,
-        info_hash: &str,
-        torrent_id: i64,
-    ) -> FsResult<Arc<TorrentInfo>> {
+    /// Parsed metadata of the content a read identity was minted for.
+    ///
+    /// The L3 key and the database lookup both use the identity's content,
+    /// never the source row: a replacement can already have repointed the row
+    /// to different bytes while this inode still belongs to the old content.
+    /// A parsed hash that disagrees with the identity is reported as `EIO`
+    /// and cached in neither L1 nor L3.
+    fn get_or_parse_torrent_info(&self, identity: &FileIdentity) -> FsResult<Arc<TorrentInfo>> {
+        let info_hash = identity.info_hash.as_ref();
         {
             let cache = self
                 .torrent_info_cache
@@ -2386,47 +2980,99 @@ impl FsService {
 
         self.metrics.l3_miss();
         let info = Arc::new(
-            TorrentInfo::from_bytes(self.get_torrent_raw_data(torrent_id)?).map_err(|e| {
+            TorrentInfo::from_bytes(self.get_torrent_raw_data(identity)?).map_err(|e| {
                 error!("Failed to parse torrent info for download: {:?}", e);
-                FsError::Internal(format!(
-                    "failed to parse torrent info for download: {:?}",
-                    e
-                ))
+                FsError::Internal(format!("failed to parse torrent info for download: {e:?}"))
             })?,
         );
+
+        let parsed_hash = info.info_hash().map_err(|e| {
+            error!("Failed to read parsed torrent info hash: {:?}", e);
+            FsError::Internal(format!("failed to read parsed torrent info hash: {e:?}"))
+        })?;
+        if hex::encode(parsed_hash) != info_hash {
+            error!(
+                "Torrent metadata mismatch: identity expects info hash {} but parsed {}",
+                info_hash,
+                hex::encode(parsed_hash)
+            );
+            return Err(FsError::Io(format!(
+                "torrent metadata for info hash {info_hash} does not describe that content"
+            )));
+        }
 
         {
             let mut cache = self
                 .torrent_info_cache
                 .lock()
                 .map_err(|_| FsError::LockPoisoned)?;
+            if cache.len() >= MAX_L3_ENTRIES {
+                // Bounded cache (the contract leaves the bound to the
+                // implementation): clear instead of growing without limit.
+                cache.clear();
+            }
             cache.insert(info_hash.to_string(), info.clone());
         }
 
         Ok(info)
     }
 
-    fn get_torrent_raw_data(&self, torrent_id: i64) -> FsResult<Vec<u8>> {
+    /// Prepare every file identity of one source row before the read path
+    /// needs them (a lookup/readdir of the torrent's data tree). Best-effort:
+    /// a failure leaves the affected inodes without an identity, so their
+    /// reads fail with `EIO` instead of falling back to a table load.
+    fn ensure_file_identities(&self, source_id: i64) {
+        if let Some(ts) = &self.torrent_service {
+            if let Err(e) = ts.prepare_file_identities(source_id) {
+                warn!(
+                    "Failed to prepare file identities for torrent_id={}: {:?}",
+                    source_id, e
+                );
+            }
+        }
+    }
+
+    /// Raw `.torrent` bytes of the content `identity` was minted for.
+    ///
+    /// The content id is the authoritative pointer. The DB exposes source-row
+    /// accessors only, so the identity's info hash narrows the candidate rows
+    /// and [`Torrent::torrent_id`] selects the exact content; a row that has
+    /// already moved to other bytes is never read. Missing content is `EIO`:
+    /// the inode belongs to superseded content, not to a retryable miss.
+    fn get_torrent_raw_data(&self, identity: &FileIdentity) -> FsResult<Vec<u8>> {
         let db = DataResolver::get_db(&self.db)?;
-        let db_guard = db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            FsError::LockPoisoned
-        })?;
-
-        let torrent = db_guard
-            .get_torrent_by_id(torrent_id)
-            .map_err(|e| {
-                error!("Failed to get torrent: {:?}", e);
-                FsError::from(e)
-            })?
-            .ok_or_else(|| {
-                error!("Torrent not found for id: {}", torrent_id);
-                FsError::NotFound
+        let stored = {
+            let db_guard = db.lock().map_err(|_| {
+                error!("Database lock poisoned");
+                FsError::LockPoisoned
             })?;
+            let candidates = db_guard
+                .get_torrents_by_infohash(identity.info_hash.as_ref())
+                .map_err(|e| {
+                    error!("Failed to look up torrent metadata by info hash: {:?}", e);
+                    FsError::from(e)
+                })?;
+            let mut matched = None;
+            for (source_id, ..) in candidates {
+                let torrent = db_guard.get_torrent_by_id(source_id).map_err(|e| {
+                    error!("Failed to get torrent {}: {:?}", source_id, e);
+                    FsError::from(e)
+                })?;
+                if let Some(torrent) = torrent {
+                    if torrent.torrent_id == identity.content_id {
+                        matched = Some(torrent);
+                        break;
+                    }
+                }
+            }
+            matched
+        };
 
-        if let Some(ref data) = torrent.torrent_data {
-            if !data.is_empty() {
-                return Ok(data.clone());
+        if let Some(torrent) = stored {
+            if let Some(data) = torrent.torrent_data {
+                if !data.is_empty() {
+                    return Ok(data);
+                }
             }
         }
 
@@ -2444,7 +3090,7 @@ impl FsService {
                 if !*unlinked && name.ends_with(".torrent") && !file_data.is_empty() {
                     if let Ok(info) = TorrentInfo::from_bytes(file_data.clone()) {
                         if let Ok(metadata) = info.metadata() {
-                            if hex::encode(metadata.info_hash) == torrent.info_hash {
+                            if hex::encode(metadata.info_hash) == identity.info_hash.as_ref() {
                                 return Ok(file_data.clone());
                             }
                         }
@@ -2453,7 +3099,22 @@ impl FsService {
             }
         }
 
-        Err(FsError::NotFound)
+        // A close whose persist has not landed yet moved its bytes into the
+        // shared buffer map; the inode itself is empty by then.
+        for bytes in self.buffered_torrents.values() {
+            if let Ok(info) = TorrentInfo::from_bytes(bytes.as_slice().to_vec()) {
+                if let Ok(metadata) = info.metadata() {
+                    if hex::encode(metadata.info_hash) == identity.info_hash.as_ref() {
+                        return Ok(bytes.as_slice().to_vec());
+                    }
+                }
+            }
+        }
+
+        Err(FsError::Io(format!(
+            "torrent metadata for info hash {} is no longer available",
+            identity.info_hash
+        )))
     }
 
     // ── Stats namespace ─────────────────────────────────────────────────────
@@ -2493,12 +3154,18 @@ impl FsService {
     }
 
     fn generate_torrent_stats_for_id(&self, torrent_id: i64) -> Vec<u8> {
-        // Extract info_hash inside a short-lived lock scope, then release before
-        // calling generate_torrent_stats() which acquires its own lock.
+        // Extract info_hash inside a short-lived lock scope, then release
+        // before calling generate_torrent_stats() which takes its own lock.
+        // The lookup stays non-blocking (C-6.5.1 / F6): the render sits on the
+        // dispatch thread, so a contended state lock degrades the output
+        // instead of stalling behind an ingest transaction.
         let info_hash = {
-            let db_guard = match self.db.as_ref().and_then(|db| db.lock().ok()) {
-                Some(g) => g,
-                None => return b"Database not available\n".to_vec(),
+            let Some(db) = self.db.as_ref() else {
+                return b"Database not available\n".to_vec();
+            };
+            let db_guard = match db.try_lock() {
+                Ok(g) => g,
+                Err(_) => return super::stats::locked_rendering(),
             };
             match db_guard.get_torrent_by_id(torrent_id).ok().flatten() {
                 Some(t) => t.info_hash,
@@ -2738,7 +3405,7 @@ fn is_sparse_file(meta: &std::fs::Metadata, logical_size: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2801,10 +3468,12 @@ mod tests {
 
         let db_arc = Arc::new(Mutex::new(db));
         let metrics = Arc::new(Metrics::new());
+        let torrent_service = TorrentService::new(db_arc.clone(), None);
+        let content_versions = torrent_service.content_versions();
         let svc = FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(db_arc, None)),
+            torrent_service: Some(torrent_service),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             persist_errors: Arc::new(Mutex::new(HashMap::new())),
             processing_torrents_cv: Arc::new(Condvar::new()),
@@ -2816,6 +3485,14 @@ mod tests {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions,
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         };
         (svc, info_hash, torrent_id, metrics)
     }
@@ -2824,18 +3501,24 @@ mod tests {
     fn torrent_info_cached_by_info_hash() {
         let torrent_bytes = minimal_torrent_bytes();
         let (svc, info_hash, torrent_id, metrics) = service_with_torrent(&torrent_bytes);
+        let content_id = {
+            let db = svc.db.as_ref().expect("test service has a db");
+            let guard = db.lock().expect("db lock");
+            guard
+                .get_torrent_by_id(torrent_id)
+                .expect("read row")
+                .expect("row exists")
+                .torrent_id
+        };
+        let identity = identity_for(&info_hash, 0, content_id);
 
         // First lookup: miss → parse + insert.
-        let first = svc
-            .get_or_parse_torrent_info(&info_hash, torrent_id)
-            .unwrap();
+        let first = svc.get_or_parse_torrent_info(&identity).unwrap();
         assert_eq!(metrics.snapshot().l3_misses, 1);
         assert_eq!(metrics.snapshot().l3_hits, 0);
 
         // Second lookup: hit → same Arc, no re-parse.
-        let second = svc
-            .get_or_parse_torrent_info(&info_hash, torrent_id)
-            .unwrap();
+        let second = svc.get_or_parse_torrent_info(&identity).unwrap();
         assert_eq!(metrics.snapshot().l3_misses, 1);
         assert_eq!(metrics.snapshot().l3_hits, 1);
         assert!(Arc::ptr_eq(&first, &second));
@@ -2895,7 +3578,31 @@ mod tests {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions: Arc::new(Mutex::new(HashMap::new())),
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         }
+    }
+
+    fn test_identity(file_index: i32, content_id: i64) -> Arc<FileIdentity> {
+        Arc::new(FileIdentity {
+            info_hash: Arc::from("0123456789abcdef0123456789abcdef01234567"),
+            file_index,
+            content_id,
+        })
+    }
+
+    fn identity_for(info_hash: &str, file_index: i32, content_id: i64) -> Arc<FileIdentity> {
+        Arc::new(FileIdentity {
+            info_hash: Arc::from(info_hash),
+            file_index,
+            content_id,
+        })
     }
 
     #[test]
@@ -3193,10 +3900,12 @@ mod tests {
             .lookup(METADATA_INO, "debian.torrent")
             .expect("lookup")
             .expect("file exists");
-        let data = match s.inode_mgr.inodes.get(&entry.ino) {
-            Some(InodeData::File { data, .. }) => data.clone(),
-            other => panic!("expected File inode, got {:?}", other),
-        };
+        // `release` moves the buffer into the shared handle now, so the current
+        // bytes live in whichever of the inode / parked Arc holds them.
+        let data = s
+            .buffered_torrent_bytes(entry.ino)
+            .expect("file inode has buffered bytes")
+            .to_vec();
         assert_eq!(data, payload);
     }
 
@@ -4605,6 +5314,7 @@ mod tests {
         // offset < file_size (in bounds) must NOT be served as EOF: it
         // proceeds to `read_data`, which fails here because `bare_service`
         // has no torrent service. This asserts the guard does not over-fire.
+        svc.read_identities.insert(ino, test_identity(0, 1));
         let err = match svc.read(ino, 15, 4096) {
             Err(e) => e,
             Ok(_) => panic!("in-bounds read must not be served as Ready"),
@@ -4637,13 +5347,181 @@ mod tests {
         );
     }
 
-    /// stats inodes must NOT set direct_io.
+    /// `C-6.1.4`: every `.stats` read re-renders the file, so the open must
+    /// bypass the kernel page cache — otherwise the kernel serves a stale
+    /// rendering (and an outdated length) until its cache expires.
     #[test]
-    fn open_stats_file_does_not_set_direct_io() {
+    fn open_stats_file_sets_direct_io() {
         let mut svc = bare_service();
-        // STATS_INO is the global `.stats` file.
-        let outcome = svc.open(STATS_INO).expect("open stats");
-        assert!(!outcome.direct_io, "stats file must not request direct_io");
+        let outcome = svc.open(STATS_INO).expect("open global stats");
+        assert!(
+            outcome.direct_io,
+            "global .stats must request direct_io to re-render per read"
+        );
+
+        let derived = InodeManager::make_stats_ino(DATA_INO);
+        let outcome = svc.open(derived).expect("open derived stats");
+        assert!(
+            outcome.direct_io,
+            "derived .stats must request direct_io to re-render per read"
+        );
+    }
+
+    /// `C-2.2.6`: a directory listing aimed at a file is `ENOENT`, never
+    /// `ENOTDIR`.
+    #[test]
+    fn readdir_on_a_metadata_file_returns_not_found() {
+        let mut svc = bare_service();
+        let ino = svc
+            .create(METADATA_INO, "x.torrent")
+            .expect("create metadata file")
+            .attr
+            .ino;
+        assert_eq!(
+            svc.readdir(ino, 0)
+                .expect_err("readdir on a file must fail"),
+            FsError::NotFound,
+            "C-2.2.6 requires ENOENT for a listing aimed at a file"
+        );
+    }
+
+    /// `C-2.2.6`: reading a directory is `EISDIR`, not `ENOENT`.
+    #[test]
+    fn read_on_a_directory_returns_is_directory() {
+        let mut svc = bare_service();
+        let sub = svc.mkdir(METADATA_INO, "sub").expect("mkdir").ino;
+        match svc.read(sub, 0, 4096) {
+            Err(FsError::IsDirectory) => {}
+            Err(other) => panic!("expected EISDIR for a metadata directory, got {:?}", other),
+            Ok(_) => panic!("expected EISDIR for a metadata directory, got a read"),
+        }
+
+        let root_ino = DATA_DIR_INO_BASE + 7;
+        svc.inode_mgr.data_inodes.insert(
+            root_ino,
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: String::new(),
+                name: "t".to_string(),
+                filename: "t.torrent".to_string(),
+            },
+        );
+        match svc.read(root_ino, 0, 4096) {
+            Err(FsError::IsDirectory) => {}
+            Err(other) => panic!("expected EISDIR for a data directory, got {:?}", other),
+            Ok(_) => panic!("expected EISDIR for a data directory, got a read"),
+        }
+    }
+
+    /// `C-4.1.6`: a zero-length read returns zero bytes without entering the
+    /// download path (the old `.max(1)` clamp turned it into one byte).
+    #[test]
+    fn zero_length_read_returns_empty() {
+        let mut svc = bare_service();
+        let ino = DATA_FILE_INO_BASE + 2;
+        svc.inode_mgr.data_inodes.insert(
+            ino,
+            DataInode::TorrentFile {
+                torrent_id: 1,
+                file_id: 2,
+                name: "foo".to_string(),
+                size: 16,
+                torrent_source_path: String::new(),
+                torrent_filename: String::new(),
+            },
+        );
+
+        let out = svc.read(ino, 4, 0).expect("zero-length read");
+        assert!(
+            matches!(&out, ReadOutcome::Ready(d) if d.is_empty()),
+            "a zero-length read must return zero bytes"
+        );
+        // The per-read helper must short-circuit too, not fall through to the
+        // (here unavailable) torrent service.
+        let out = svc
+            .read_data(1, 2, test_identity(0, 1), 4, 0)
+            .expect("zero-length read_data");
+        assert!(matches!(&out, ReadOutcome::Ready(d) if d.is_empty()));
+    }
+
+    /// `C-11.4`/H3: an L1 hit is answered without touching the state database
+    /// or the torrent service at all. A service with neither must still serve
+    /// the cached range.
+    #[test]
+    fn read_hits_l1_without_the_state_database() {
+        let mut svc = bare_service();
+        svc.torrent_data_cache
+            .lock()
+            .unwrap()
+            .insert(format!("{}:{}:{}", 42, 8, 4), vec![7, 8, 9, 10]);
+        let out = svc
+            .read_data(1, 42, test_identity(0, 1), 8, 4)
+            .expect("L1 hit");
+        assert!(matches!(&out, ReadOutcome::Ready(d) if d == &vec![7, 8, 9, 10]));
+    }
+
+    /// `C-4.5.3`/M4: unlinking a landed source row queues its id so the
+    /// adapter can settle that row's in-flight reads with `EIO`.
+    #[test]
+    fn unlink_queues_cancellation_for_the_removed_source_row() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "media").expect("mkdir media");
+        let media_ino = svc
+            .metadata_child(METADATA_INO, "media")
+            .expect("media inode");
+        let torrent_id = {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            match db.insert_torrent("media", "t1", "t1.torrent", 16, "hash-cancel", 1) {
+                Ok(crate::db::InsertTorrentResult::Inserted(id)) => id,
+                other => panic!("unexpected insert result: {:?}", other),
+            }
+        };
+        svc.inode_mgr.inodes.insert(
+            NEXT_INO.fetch_add(1, Ordering::SeqCst),
+            InodeData::File {
+                parent: media_ino,
+                name: "t1.torrent".to_string(),
+                data: minimal_torrent_bytes(),
+                unlinked: false,
+            },
+        );
+
+        svc.unlink(media_ino, "t1.torrent").expect("unlink torrent");
+        let cancelled = svc.cancelled_reads.lock().unwrap();
+        assert!(
+            cancelled.iter().any(|(id, _)| *id == torrent_id),
+            "removed source row must be queued for read cancellation"
+        );
+    }
+
+    /// `C-4.5.3`/M4: removing a metadata directory removes every source row
+    /// under it, so all of their ids are queued for cancellation.
+    #[test]
+    fn rmdir_queues_cancellation_for_every_source_row_under_it() {
+        let mut svc = service_with_db();
+        svc.mkdir(METADATA_INO, "media").expect("mkdir media");
+        let ids: Vec<i64> = {
+            let mut db = svc.db.as_ref().unwrap().lock().unwrap();
+            ["a.torrent", "b.torrent"]
+                .iter()
+                .map(
+                    |name| match db.insert_torrent("media", "t", name, 16, "hash-rmdir", 1) {
+                        Ok(crate::db::InsertTorrentResult::Inserted(id)) => id,
+                        other => panic!("unexpected insert result: {:?}", other),
+                    },
+                )
+                .collect()
+        };
+
+        svc.rmdir(METADATA_INO, "media").expect("rmdir media");
+        let cancelled = svc.cancelled_reads.lock().unwrap();
+        for id in ids {
+            assert!(
+                cancelled.iter().any(|(queued, _)| *queued == id),
+                "source row {} under the removed directory must be cancelled",
+                id
+            );
+        }
     }
 
     #[test]
@@ -4884,10 +5762,12 @@ mod tests {
         let db = Database::open_in_memory().expect("in-memory db");
         let db_arc = Arc::new(Mutex::new(db));
         let metrics = Arc::new(Metrics::new());
+        let torrent_service = TorrentService::new(db_arc.clone(), None);
+        let content_versions = torrent_service.content_versions();
         FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(db_arc, None)),
+            torrent_service: Some(torrent_service),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             persist_errors: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
@@ -4899,7 +5779,55 @@ mod tests {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions,
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         }
+    }
+
+    /// Service with a real download engine, so `read` on an uncached range
+    /// yields `ReadOutcome::Pending` exactly as the adapter sees it.
+    fn service_with_download() -> (FsService, tempfile::TempDir) {
+        let cache_dir = tempfile::TempDir::new().expect("cache dir");
+        let download_service = Arc::new(
+            DownloadService::new(cache_dir.path(), &TorrentfsConfig::default_config())
+                .expect("download service"),
+        );
+        let db = Database::open_in_memory().expect("in-memory db");
+        let db_arc = Arc::new(Mutex::new(db));
+        let metrics = Arc::new(Metrics::new());
+        let torrent_service = TorrentService::new(db_arc.clone(), Some(download_service.clone()));
+        let content_versions = torrent_service.content_versions();
+        let svc = FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(torrent_service),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            persist_errors: Arc::new(Mutex::new(HashMap::new())),
+            processing_torrents_cv: Arc::new(Condvar::new()),
+            download_service: Some(download_service),
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+            notifier: Arc::new(OnceLock::new()),
+            data_readdir_cache: None,
+            pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions,
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
+        };
+        (svc, cache_dir)
     }
 
     /// Create a writable `.torrent` inode via the public `create()` path and
@@ -4907,6 +5835,868 @@ mod tests {
     fn create_torrent_file(svc: &mut FsService, name: &str) -> (u64, u64) {
         let created = svc.create(METADATA_INO, name).expect("create file");
         (created.attr.ino, created.fh)
+    }
+
+    /// A mock sink that records each cancellation the persist thread issues.
+    struct RecordingCancelSink {
+        calls: Mutex<Vec<(i64, Option<i64>)>>,
+    }
+
+    impl RecordingCancelSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(i64, Option<i64>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ReadCancelSink for RecordingCancelSink {
+        fn cancel_reads_not_for_content(&self, torrent_id: i64, content_id: Option<i64>) -> usize {
+            self.calls.lock().unwrap().push((torrent_id, content_id));
+            0
+        }
+    }
+
+    /// Wait for the persist thread to issue `expected` sink calls. The
+    /// detached persist thread can run before or after `release` returns, so
+    /// an immediate assertion would race.
+    fn wait_for_sink_calls(sink: &RecordingCancelSink, expected: usize) -> Vec<(i64, Option<i64>)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let calls = sink.calls();
+            if calls.len() >= expected || std::time::Instant::now() > deadline {
+                return calls;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Insert a source row with `count` files (and no raw torrent bytes), so
+    /// file-identity tests can exercise a wide table cheaply.
+    fn insert_wide_torrent(svc: &mut FsService, count: usize) -> i64 {
+        let info_hash = "0123456789abcdef0123456789abcdef01234567";
+        insert_source_with_files(svc, "wide", "wide.torrent", info_hash, count)
+    }
+
+    fn insert_source_with_files(
+        svc: &mut FsService,
+        source_path: &str,
+        filename: &str,
+        info_hash: &str,
+        count: usize,
+    ) -> i64 {
+        let files: Vec<FileEntry> = (0..count)
+            .map(|index| FileEntry {
+                path: format!("dir/f{index}.txt"),
+                size: index as i64,
+            })
+            .collect();
+        let db = svc.db.as_ref().expect("test service has a database");
+        let mut guard = db.lock().expect("test database lock");
+        match guard.insert_torrent_with_files(
+            source_path,
+            source_path,
+            filename,
+            files.iter().map(|file| file.size).sum(),
+            info_hash,
+            files.len() as i64,
+            &files,
+        ) {
+            Ok(InsertTorrentResult::Inserted(id)) => id,
+            other => panic!("unexpected insert result: {other:?}"),
+        }
+    }
+
+    /// Read the last file's row id for the `count`-file source created by
+    /// [`insert_wide_torrent`].
+    fn last_file_id(svc: &mut FsService) -> i64 {
+        let db = svc.db.as_ref().expect("test service has a database");
+        let guard = db.lock().expect("test database lock");
+        guard
+            .conn
+            .query_row("SELECT MAX(id) FROM torrent_files", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .expect("read last file id")
+            .expect("wide torrent has files")
+    }
+
+    /// `PersistedTorrent::content_changed` must report what the source row
+    /// actually did: replacing the location's content differs from a re-persist
+    /// of identical bytes or the first landing at a new source.
+    #[test]
+    fn persisted_content_changed_distinguishes_overwrite_from_first_persist() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "identity.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes()).expect("write");
+        svc.flush(ino).expect("flush");
+        svc.release(fh).expect("release");
+        wait_for_processing_empty(&svc);
+
+        let first = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .persist_torrent(&minimal_torrent_named("bar"), "", "identity.torrent")
+            .expect("overwrite");
+        assert!(first.content_changed(), "different bytes must be a replace");
+
+        let same = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .persist_torrent(&minimal_torrent_named("bar"), "", "identity.torrent")
+            .expect("identical re-persist");
+        assert!(
+            !same.content_changed(),
+            "identical bytes re-persisted at the same location must not cancel"
+        );
+
+        let fresh = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .persist_torrent(&minimal_torrent_bytes(), "", "fresh.torrent")
+            .expect("first persist at a new source");
+        assert!(
+            !fresh.content_changed(),
+            "a new source has nothing to cancel"
+        );
+    }
+
+    /// `release` moves the buffer into the shared handle (no 10 MiB copy) and
+    /// a read-only close hands that same allocation back; `flush` validates the
+    /// shared bytes in place. This is the E5 evidence.
+    #[test]
+    fn release_moves_the_buffer_and_flush_shares_it() {
+        let mut svc = service_with_db();
+        let bytes = minimal_torrent_bytes();
+        let (ino, fh) = create_torrent_file(&mut svc, "shared.torrent");
+        svc.write(ino, 0, &bytes).expect("write");
+        let original_ptr = match svc.inode_mgr.inodes.get(&ino) {
+            Some(InodeData::File { data, .. }) => data.as_ptr(),
+            _ => panic!("created inode must be a file"),
+        };
+
+        svc.flush(ino).expect("flush validates in place");
+        svc.release(fh).expect("release");
+        wait_for_processing_empty(&svc);
+
+        let parked = svc
+            .buffered_torrents
+            .get(&ino)
+            .expect("release parks the buffer as a shared handle");
+        assert_eq!(
+            parked.as_ptr(),
+            original_ptr,
+            "release must move the allocation into the Arc, not copy it"
+        );
+        svc.flush(ino)
+            .expect("flush must validate the shared buffer without moving it");
+        assert_eq!(
+            svc.buffered_torrents.get(&ino).map(|bytes| bytes.as_ptr()),
+            Some(original_ptr),
+            "flush must not replace the shared allocation"
+        );
+        match svc
+            .read(ino, 0, bytes.len() as u32)
+            .expect("read parked torrent")
+        {
+            ReadOutcome::Ready(data) => {
+                assert_eq!(data, bytes, "the shared buffer must still serve reads")
+            }
+            _ => panic!("a metadata read must be ready, not deferred"),
+        }
+
+        // A read-only close reclaims the same allocation (zero-copy).
+        let (_, _, reclaimed) = svc.take_buffered_file(ino).expect("close reclaims bytes");
+        assert_eq!(reclaimed.as_ptr(), original_ptr);
+        assert_eq!(reclaimed.as_slice(), bytes.as_slice());
+
+        let db = svc.db.as_ref().expect("test service has a database");
+        let row = db
+            .lock()
+            .unwrap()
+            .get_torrent_by_source_path("")
+            .expect("read row")
+            .expect("release persisted the torrent");
+        assert!(
+            row.torrent_data.is_some_and(|data| !data.is_empty()),
+            "the close must not look like a zero-byte overwrite"
+        );
+    }
+
+    /// A metadata close with unchanged bytes must not cancel in-flight data
+    /// reads; a real content replace must fire the sink immediately with the
+    /// landed content id.
+    #[test]
+    fn unchanged_metadata_close_does_not_cancel_but_a_replace_does() {
+        let mut svc = service_with_db();
+        let sink = RecordingCancelSink::new();
+        svc.read_cancel_sink
+            .set(sink.clone() as Arc<dyn ReadCancelSink>)
+            .ok()
+            .expect("sink is unset in a fresh test service");
+
+        // First landing: a new source has nothing to cancel.
+        let (ino, fh) = create_torrent_file(&mut svc, "cancel.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes()).expect("write");
+        svc.flush(ino).expect("flush");
+        svc.release(fh).expect("first release");
+        wait_for_processing_empty(&svc);
+        assert!(
+            sink.calls().is_empty(),
+            "persisting a new source must not cancel reads"
+        );
+
+        // Read-only open + close of the persisted file: same bytes, same
+        // content row — still nothing to cancel.
+        let entry = svc
+            .lookup(METADATA_INO, "cancel.torrent")
+            .expect("lookup metadata child")
+            .expect("persisted file is visible");
+        let fh = svc.open(entry.ino).expect("read-only open").fh;
+        svc.release(fh).expect("identical release");
+        wait_for_processing_empty(&svc);
+        assert!(
+            sink.calls().is_empty(),
+            "an unchanged byte-for-byte close must not cancel in-flight reads"
+        );
+
+        let (source_id, first_content_id) = {
+            let db = svc.db.as_ref().expect("test service has a database");
+            let guard = db.lock().unwrap();
+            let row = guard
+                .get_torrent_by_source_path("")
+                .expect("read row")
+                .expect("row exists");
+            (row.id, row.torrent_id)
+        };
+        assert_eq!(
+            svc.content_version(source_id),
+            Some(ContentVersion::Current(first_content_id)),
+            "the landed content id is the authoritative publish token"
+        );
+
+        // Overwrite with different bytes through the kernel's sequence:
+        // open → truncate → write → flush → release.
+        let different = minimal_torrent_named("bar");
+        let fh = svc.open(entry.ino).expect("open for overwrite").fh;
+        svc.setattr(entry.ino, Some(0)).expect("truncate");
+        svc.write(entry.ino, 0, &different)
+            .expect("overwrite write");
+        svc.flush(entry.ino).expect("flush");
+        svc.release(fh).expect("overwrite release");
+        let calls = wait_for_sink_calls(&sink, 1);
+        let replaced_content_id = {
+            let db = svc.db.as_ref().expect("test service has a database");
+            let guard = db.lock().unwrap();
+            guard
+                .get_torrent_by_source_path("")
+                .expect("read row")
+                .expect("row exists")
+                .torrent_id
+        };
+        assert_ne!(replaced_content_id, first_content_id);
+        assert_eq!(
+            calls,
+            vec![(source_id, Some(replaced_content_id))],
+            "a content replace must settle older reads immediately, once"
+        );
+        assert!(
+            svc.cancelled_reads
+                .lock()
+                .unwrap()
+                .contains(&(source_id, Some(replaced_content_id))),
+            "the adapter drain must receive the landed content id"
+        );
+    }
+
+    /// Identity resolution lives on the projection path: opening a file binds
+    /// the identity its lookup prepared to the inode, so neither a cold read
+    /// nor a read of an already-open file after the 256-source prepared cache
+    /// overflowed (or after the source's identities were invalidated) visits a
+    /// single file-table row. Only a fresh lookup may prepare the source once
+    /// (H3 / C-11.4 / F2).
+    #[test]
+    fn open_file_reads_never_load_the_file_table_after_cache_overflow() {
+        const FILES: usize = 20_000;
+        let mut svc = service_with_db();
+        let source_id = insert_wide_torrent(&mut svc, FILES);
+        let file_id = last_file_id(&mut svc);
+        let preparations = |svc: &FsService| {
+            svc.torrent_service
+                .as_ref()
+                .unwrap()
+                .file_identity_query_count()
+        };
+        let rows_visited = |svc: &FsService| {
+            svc.torrent_service
+                .as_ref()
+                .unwrap()
+                .file_identity_rows_read()
+        };
+        let table_loads = |svc: &FsService| {
+            svc.torrent_service
+                .as_ref()
+                .unwrap()
+                .full_file_list_load_count()
+        };
+        assert_eq!(preparations(&svc), 0);
+        assert_eq!(rows_visited(&svc), 0);
+        assert_eq!(table_loads(&svc), 0);
+
+        // Walk the real data tree to the last file. The lookup of its parent
+        // prepares the source once (one ordered statement over every row) and
+        // binds the identity to the file inode.
+        let source_dir = svc
+            .lookup(DATA_INO, "wide")
+            .expect("lookup source-path dir")
+            .expect("source-path dir exists");
+        let root = svc
+            .lookup(source_dir.ino, "wide.torrent")
+            .expect("lookup torrent root")
+            .expect("torrent root exists");
+        let dir = svc
+            .lookup(root.ino, "dir")
+            .expect("lookup torrent dir")
+            .expect("torrent dir exists");
+        let file = svc
+            .lookup(dir.ino, "f19999.txt")
+            .expect("lookup torrent file")
+            .expect("torrent file exists");
+        assert_eq!(preparations(&svc), 1, "one bulk preparation on lookup");
+        assert_eq!(
+            rows_visited(&svc),
+            FILES as u64,
+            "preparation visits one row per file, once"
+        );
+        assert_eq!(table_loads(&svc), 0, "never a whole-table load");
+        let identity = svc
+            .read_identity(file.ino)
+            .expect("lookup binds the read identity to the inode");
+        assert_eq!(identity.file_index, (FILES - 1) as i32);
+        assert_eq!(
+            identity.info_hash.as_ref(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(identity.content_id, {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            db.get_torrent_by_id(source_id).unwrap().unwrap().torrent_id
+        });
+
+        let before_prep = preparations(&svc);
+        let before_rows = rows_visited(&svc);
+        // Cold read: the inode already carries the identity.
+        let _ = svc.read(file.ino, 0, 1);
+        assert_eq!(preparations(&svc), before_prep, "cold read: zero prep");
+        assert_eq!(rows_visited(&svc), before_rows, "cold read: zero rows");
+
+        // Fill the 256-source prepared cache so the wide source is cleared by
+        // real overflow, exactly as a long-lived daemon would.
+        for index in 0..256 {
+            let info_hash = format!("{:040x}", index + 1);
+            let source = insert_source_with_files(
+                &mut svc,
+                &format!("src{index}"),
+                &format!("src{index}.torrent"),
+                &info_hash,
+                1,
+            );
+            svc.ensure_file_identities(source);
+        }
+        assert!(
+            svc.torrent_service
+                .as_ref()
+                .unwrap()
+                .prepared_file_identity(source_id, file_id)
+                .is_none(),
+            "the 256-source overflow must have cleared the wide source"
+        );
+
+        // The file is still open: its inode-bound identity keeps the read off
+        // the file table even though every prepared entry is gone.
+        let overflow_prep = preparations(&svc);
+        let overflow_rows = rows_visited(&svc);
+        let _ = svc.read(file.ino, 0, 1);
+        assert_eq!(
+            preparations(&svc),
+            overflow_prep,
+            "post-overflow read: zero preparations"
+        );
+        assert_eq!(
+            rows_visited(&svc),
+            overflow_rows,
+            "post-overflow read: zero rows"
+        );
+
+        // The same holds when only this source is invalidated (the old
+        // per-file cache eviction path) and every other cache is dropped.
+        svc.torrent_service
+            .as_ref()
+            .unwrap()
+            .invalidate_file_identities(source_id);
+        svc.torrent_data_cache.lock().unwrap().clear();
+        svc.torrent_info_cache.lock().unwrap().clear();
+        let _ = svc.read(file.ino, 0, 1);
+        assert_eq!(preparations(&svc), overflow_prep);
+        assert_eq!(rows_visited(&svc), overflow_rows);
+        assert_eq!(table_loads(&svc), 0, "read path never loads the file table");
+
+        // A fresh lookup after the overflow re-prepares the source once on the
+        // projection path; the following read is still free.
+        let _ = svc.lookup(dir.ino, "f19999.txt").expect("relookup file");
+        assert_eq!(
+            preparations(&svc),
+            overflow_prep + 1,
+            "lookup: one bulk preparation after overflow"
+        );
+        assert_eq!(
+            rows_visited(&svc),
+            overflow_rows + FILES as u64,
+            "lookup: the only enumeration is one preparation"
+        );
+        let _ = svc.read(file.ino, 0, 1);
+        assert_eq!(preparations(&svc), overflow_prep + 1);
+        assert_eq!(rows_visited(&svc), overflow_rows + FILES as u64);
+        assert_eq!(table_loads(&svc), 0);
+    }
+
+    /// Counting reply for the real pending-table interleaving test.
+    struct CountReply {
+        resolves: Arc<std::sync::atomic::AtomicUsize>,
+        errno: Arc<std::sync::atomic::AtomicI32>,
+        got_data: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CountReply {
+        fn new() -> (
+            Self,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicI32>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let resolves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let errno = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let got_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                Self {
+                    resolves: resolves.clone(),
+                    errno: errno.clone(),
+                    got_data: got_data.clone(),
+                },
+                resolves,
+                errno,
+                got_data,
+            )
+        }
+    }
+
+    impl super::super::PendingReply for CountReply {
+        fn resolve_data(self, _data: &[u8]) {
+            self.got_data
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.resolves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn resolve_error(self, errno: libc::c_int) {
+            self.errno
+                .store(errno, std::sync::atomic::Ordering::Relaxed);
+            self.resolves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The real lookup→read interleaving the review asks for: content B has
+    /// already landed in the database (lookup and read both see it) while the
+    /// persist thread has not yet published the cancellation. The identity
+    /// B's read registers comes from the same statement as its bytes, so it
+    /// must survive the sweep; A's older read must settle with `EIO` exactly
+    /// once.
+    #[test]
+    fn read_of_db_landed_content_survives_publish_and_old_read_settles_once() {
+        use std::sync::atomic::Ordering;
+
+        let (mut svc, _cache_dir) = service_with_download();
+        let table = Arc::new(super::super::PendingTable::<CountReply>::new());
+        svc.read_cancel_sink
+            .set(table.clone() as Arc<dyn ReadCancelSink>)
+            .ok()
+            .expect("sink is unset in a fresh test service");
+
+        // Land content A through the kernel's real write→release path.
+        let (ino, fh) = create_torrent_file(&mut svc, "identity.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes())
+            .expect("write A");
+        svc.flush(ino).expect("flush A");
+        svc.release(fh).expect("release A");
+        wait_for_processing_empty(&svc);
+
+        let root = svc
+            .lookup(DATA_INO, "identity.torrent")
+            .expect("lookup root")
+            .expect("root exists");
+        let a_file = svc
+            .lookup(root.ino, "foo")
+            .expect("lookup A file")
+            .expect("A file exists");
+        let (source_id, content_a) = {
+            let db = svc.db.as_ref().unwrap().lock().unwrap();
+            let row = db
+                .get_torrent_by_source_path("")
+                .expect("read row")
+                .expect("row exists");
+            (row.id, row.torrent_id)
+        };
+        let (a_hash, a_index, a_content) = pending_identity(&mut svc, a_file.ino);
+        assert_eq!(a_content, content_a);
+
+        // Register A while its content is still the published one.
+        let (a_reply, a_resolves, a_errno, a_data) = CountReply::new();
+        let _ = expect_leader(super::super::register_content_validated(
+            &table,
+            a_reply,
+            source_id,
+            a_content,
+            pending_deadline(),
+            range_key(&a_hash, a_index),
+            || svc.content_version(source_id),
+        ));
+        assert_eq!(a_resolves.load(Ordering::Relaxed), 0);
+
+        // Content B lands in the database and its identities are prepared,
+        // but the persist thread has not run its cancellation sweep yet.
+        let b_bytes = minimal_torrent_named("bar");
+        let persisted = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .persist_torrent(&b_bytes, "", "identity.torrent")
+            .expect("persist B");
+        assert!(persisted.content_changed(), "B replaces A");
+        assert_eq!(persisted.source_id(), source_id);
+        let content_b = persisted.content_id();
+        assert_ne!(content_b, content_a);
+        assert_eq!(
+            svc.content_version(source_id),
+            Some(ContentVersion::Current(content_b)),
+            "the landed pointer is published before identities become visible"
+        );
+        assert_eq!(
+            a_resolves.load(Ordering::Relaxed),
+            0,
+            "no sweep has run yet: A's waiter is still parked"
+        );
+
+        // DB-first lookup and read of B: both see the landed content.
+        let root_b = svc
+            .lookup(DATA_INO, "identity.torrent")
+            .expect("relookup root")
+            .expect("root exists");
+        let b_file = svc
+            .lookup(root_b.ino, "bar")
+            .expect("lookup B file")
+            .expect("B file exists");
+        let (b_hash, b_index, b_content) = pending_identity(&mut svc, b_file.ino);
+        assert_eq!(b_content, content_b);
+
+        let (b_reply, b_resolves, b_errno, b_data) = CountReply::new();
+        let b_ticket = expect_leader(super::super::register_content_validated(
+            &table,
+            b_reply,
+            source_id,
+            b_content,
+            pending_deadline(),
+            range_key(&b_hash, b_index),
+            || svc.content_version(source_id),
+        ));
+        assert_eq!(
+            b_resolves.load(Ordering::Relaxed),
+            0,
+            "B's read must not be cancelled by its own publish"
+        );
+
+        // The persist thread now publishes the new content and settles only
+        // the old content's waiters.
+        assert_eq!(
+            svc.record_content_published(source_id, content_b),
+            1,
+            "exactly A's waiter is settled"
+        );
+        assert_eq!(a_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(a_errno.load(Ordering::Relaxed), libc::EIO);
+        assert!(!a_data.load(Ordering::Relaxed));
+        assert_eq!(
+            b_resolves.load(Ordering::Relaxed),
+            0,
+            "the landed content's read survives"
+        );
+
+        // A repeated publish settles nothing: no double settlement.
+        assert_eq!(svc.record_content_published(source_id, content_b), 0);
+        assert_eq!(a_resolves.load(Ordering::Relaxed), 1);
+
+        assert_eq!(table.resolve(b_ticket, b"landed-content"), 1);
+        assert_eq!(b_resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(b_errno.load(Ordering::Relaxed), 0);
+        assert!(b_data.load(Ordering::Relaxed));
+    }
+
+    /// Land `bytes` at a source path through the real persist path and return
+    /// `(source row id, content id, first file id)`.
+    fn persist_at(
+        svc: &mut FsService,
+        bytes: &[u8],
+        source_path: &str,
+        filename: &str,
+    ) -> (i64, i64, i64) {
+        let persisted = svc
+            .torrent_service
+            .as_ref()
+            .expect("test service has a torrent service")
+            .persist_torrent(bytes, source_path, filename)
+            .expect("persist torrent");
+        let source_id = persisted.source_id();
+        let content_id = persisted.content_id();
+        let file_id = svc
+            .db
+            .as_ref()
+            .expect("test service has a db")
+            .lock()
+            .expect("db lock")
+            .get_files_by_torrent_id(source_id)
+            .expect("read files")[0]
+            .id;
+        (source_id, content_id, file_id)
+    }
+
+    fn info_hash_of(bytes: &[u8]) -> String {
+        hex::encode(
+            TorrentInfo::from_bytes(bytes.to_vec())
+                .expect("parse torrent")
+                .info_hash()
+                .expect("info hash"),
+        )
+    }
+
+    /// The window the review reproduced: content B is already in the database
+    /// and the source row points at it, but the projection eviction has not
+    /// run, so the inode still carries content A's identity. A second source
+    /// keeps A referenced, so the DB can still legitimately resolve A and the
+    /// test isolates the source-row/content mismatch.
+    fn stale_identity_fixture() -> (
+        FsService,
+        tempfile::TempDir,
+        i64,
+        i64,
+        Arc<FileIdentity>,
+        String,
+    ) {
+        let (mut svc, cache_dir) = service_with_download();
+        let bytes_a = minimal_torrent_bytes();
+        let bytes_b = minimal_torrent_named("bar");
+        let (source_a, content_a, file_a) = persist_at(&mut svc, &bytes_a, "a", "a.torrent");
+        let _shared = persist_at(&mut svc, &bytes_a, "shared", "shared.torrent");
+        let (repointed, content_b, _) = persist_at(&mut svc, &bytes_b, "a", "a.torrent");
+
+        assert_eq!(repointed, source_a, "the same source row is repointed");
+        assert_ne!(content_a, content_b);
+        let a_hash = info_hash_of(&bytes_a);
+        let row_hash = {
+            let db = svc.db.as_ref().expect("test service has a db");
+            let guard = db.lock().expect("db lock");
+            guard
+                .get_torrent_by_id(source_a)
+                .expect("read row")
+                .expect("row exists")
+                .info_hash
+        };
+        assert_eq!(
+            row_hash,
+            info_hash_of(&bytes_b),
+            "the source row already serves B while the inode is still A"
+        );
+        (
+            svc,
+            cache_dir,
+            source_a,
+            file_a,
+            identity_for(&a_hash, 0, content_a),
+            a_hash,
+        )
+    }
+
+    #[test]
+    fn stale_inode_pending_read_keeps_its_own_content() {
+        let (mut svc, _cache_dir, source_a, file_a, identity, a_hash) = stale_identity_fixture();
+
+        let (info, info_hash, file_index) = match svc
+            .read_data(source_a, file_a, identity, 0, 16)
+            .expect("uncached read defers")
+        {
+            ReadOutcome::Pending {
+                info,
+                info_hash,
+                file_index,
+                ..
+            } => (info, info_hash, file_index),
+            ReadOutcome::Ready(data) => {
+                panic!("uncached read must defer, got {} bytes", data.len())
+            }
+        };
+        assert_eq!(
+            hex::encode(info.info_hash().expect("pending info hash")),
+            a_hash,
+            "the deferred read must carry A's piece map, not the row's replacement"
+        );
+        assert_eq!(info_hash, a_hash);
+        assert_eq!(file_index, 0);
+        assert!(
+            svc.torrent_data_cache.lock().unwrap().is_empty(),
+            "a deferred read must not populate L1"
+        );
+        let cache = svc.torrent_info_cache.lock().unwrap();
+        let cached = cache
+            .get(&a_hash)
+            .expect("A's parsed metadata is cached under A's key");
+        assert_eq!(
+            hex::encode(cached.info_hash().expect("cached info hash")),
+            a_hash,
+            "the L3 entry keyed by A must describe A"
+        );
+    }
+
+    #[test]
+    fn stale_inode_ready_arm_resolves_metadata_by_content() {
+        let (mut svc, _cache_dir, source_a, file_a, identity, a_hash) = stale_identity_fixture();
+
+        // `offset == file_size` makes the on-disk pre-check short-circuit to
+        // true for an empty range, so the Ready arm runs; the engine then
+        // returns an empty range, which defers with the metadata it was given.
+        let (info, info_hash) = match svc
+            .read_data(source_a, file_a, identity, 16, 1)
+            .expect("ready-arm read")
+        {
+            ReadOutcome::Pending {
+                info, info_hash, ..
+            } => (info, info_hash),
+            ReadOutcome::Ready(data) => {
+                panic!("an empty range must defer, got {} bytes", data.len())
+            }
+        };
+        assert_eq!(
+            hex::encode(info.info_hash().expect("pending info hash")),
+            a_hash,
+            "the Ready arm must give the engine A's metadata, not B's"
+        );
+        assert_eq!(info_hash, a_hash);
+        assert_eq!(
+            svc.metrics.snapshot().l2_hits,
+            1,
+            "the on-disk fast path must have run"
+        );
+        assert!(
+            svc.torrent_data_cache.lock().unwrap().is_empty(),
+            "the Ready arm wrote no L1 entry for the empty range"
+        );
+        let cache = svc.torrent_info_cache.lock().unwrap();
+        let cached = cache
+            .get(&a_hash)
+            .expect("A's parsed metadata is cached under A's key");
+        assert_eq!(
+            hex::encode(cached.info_hash().expect("cached info hash")),
+            a_hash
+        );
+    }
+
+    #[test]
+    fn stale_inode_read_fails_when_its_content_is_gone() {
+        let (mut svc, _cache_dir) = service_with_download();
+        let bytes_a = minimal_torrent_bytes();
+        let bytes_b = minimal_torrent_named("bar");
+        let (source_a, content_a, file_a) = persist_at(&mut svc, &bytes_a, "a", "a.torrent");
+        let a_hash = info_hash_of(&bytes_a);
+        let (_, content_b, _) = persist_at(&mut svc, &bytes_b, "a", "a.torrent");
+        assert_ne!(content_a, content_b);
+        assert!(
+            svc.db
+                .as_ref()
+                .expect("test service has a db")
+                .lock()
+                .expect("db lock")
+                .get_torrents_by_infohash(&a_hash)
+                .expect("look up content")
+                .is_empty(),
+            "the replaced content row is gone, so only B is reachable"
+        );
+
+        let err = match svc.read_data(source_a, file_a, identity_for(&a_hash, 0, content_a), 0, 16)
+        {
+            Err(e) => e,
+            Ok(ReadOutcome::Ready(data)) => {
+                panic!("superseded content served {} bytes", data.len())
+            }
+            Ok(ReadOutcome::Pending { .. }) => {
+                panic!("superseded content produced a deferred transfer")
+            }
+        };
+        assert!(
+            matches!(err, FsError::Io(_)),
+            "superseded content must settle as EIO, got {err:?}"
+        );
+        assert!(
+            !svc.torrent_info_cache.lock().unwrap().contains_key(&a_hash),
+            "a failed content lookup must not cache B under A's key"
+        );
+        assert!(
+            svc.torrent_data_cache.lock().unwrap().is_empty(),
+            "a failed content lookup must not populate L1"
+        );
+    }
+
+    fn pending_identity(svc: &mut FsService, ino: u64) -> (String, i32, i64) {
+        let content_id = svc
+            .read_identity(ino)
+            .expect("the inode is bound to a read identity")
+            .content_id;
+        match svc.read(ino, 0, 16).expect("read yields a pending outcome") {
+            ReadOutcome::Pending {
+                info_hash,
+                file_index,
+                ..
+            } => (info_hash, file_index, content_id),
+            ReadOutcome::Ready(_) => panic!("an uncached range must not be ready"),
+        }
+    }
+
+    fn range_key(info_hash: &str, file_index: i32) -> super::super::RangeKey {
+        super::super::RangeKey {
+            info_hash: info_hash.to_string(),
+            file_index,
+            offset: 0,
+            size: 16,
+        }
+    }
+
+    fn pending_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    fn expect_leader(outcome: super::super::ContentRegistration) -> u64 {
+        match outcome {
+            super::super::ContentRegistration::Live(super::super::InsertOutcome::Leader(id)) => id,
+            super::super::ContentRegistration::Live(super::super::InsertOutcome::Joined) => {
+                panic!("distinct ranges must not coalesce")
+            }
+            super::super::ContentRegistration::Stale { .. } => {
+                panic!("the read's own content must be live")
+            }
+        }
     }
 
     /// Wait (bounded) for the detached `add_torrent` thread(s) spawned by
@@ -5343,10 +7133,12 @@ mod tests {
             .expect("set query_only");
         let db_arc = Arc::new(Mutex::new(db));
         let metrics = Arc::new(Metrics::new());
+        let torrent_service = TorrentService::new(db_arc.clone(), None);
+        let content_versions = torrent_service.content_versions();
         let mut svc = FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(db_arc, None)),
+            torrent_service: Some(torrent_service),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             processing_torrents_cv: Arc::new(Condvar::new()),
             persist_errors: Arc::new(Mutex::new(HashMap::new())),
@@ -5358,6 +7150,14 @@ mod tests {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions,
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         };
 
         let (ino, fh) = create_torrent_file(&mut svc, "full.torrent");
@@ -6019,13 +7819,12 @@ mod tests {
             Arc::new(DownloadService::new(cache_dir.path(), &config).expect("download service"));
 
         let metrics = Arc::new(Metrics::new());
+        let torrent_service = TorrentService::new(db_arc.clone(), Some(download_service.clone()));
+        let content_versions = torrent_service.content_versions();
         let mut svc = FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(
-                db_arc.clone(),
-                Some(download_service.clone()),
-            )),
+            torrent_service: Some(torrent_service),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             persist_errors: Arc::new(Mutex::new(HashMap::new())),
             processing_torrents_cv: Arc::new(Condvar::new()),
@@ -6037,12 +7836,27 @@ mod tests {
             notifier: Arc::new(OnceLock::new()),
             data_readdir_cache: None,
             pending_projection_evictions: Arc::new(Mutex::new(Vec::new())),
+            metadata_index: None,
+            metadata_generation: 0,
+            read_identities: HashMap::new(),
+            cancelled_reads: Arc::new(Mutex::new(Vec::new())),
+            content_versions,
+            read_cancel_sink: Arc::new(OnceLock::new()),
+            buffered_torrents: HashMap::new(),
+            pending_index_cache: Arc::new(Mutex::new(PendingIndexCache::new())),
         };
 
         // `offset == file_size` (16) → `pieces_on_disk` says "empty range"
         // (true) and `read_file_range` returns empty → defer, not error.
+        svc.ensure_file_identities(torrent_id);
+        let identity = svc
+            .torrent_service
+            .as_ref()
+            .unwrap()
+            .prepared_file_identity(torrent_id, file_id)
+            .expect("source identities are prepared on insert");
         let outcome = svc
-            .read_data(torrent_id, file_id, 16, 1)
+            .read_data(torrent_id, file_id, identity, 16, 1)
             .expect("read_data must succeed");
         assert!(
             matches!(outcome, ReadOutcome::Pending { .. }),
@@ -6621,5 +8435,242 @@ mod tests {
             "the dispatch-side drain must not issue FUSE notifications: {:?}",
             recorder.calls()
         );
+    }
+
+    /// After `release` moves the bytes into `buffered_torrents`, attributes and
+    /// lookup must report that authoritative length, not the empty inode
+    /// buffer. A non-empty `.torrent` reported as 0 bytes breaks `cp`/`stat`.
+    #[test]
+    fn parked_metadata_bytes_drive_getattr_and_lookup_sizes() {
+        let mut svc = service_with_db();
+        let bytes = minimal_torrent_bytes();
+        let (ino, fh) = create_torrent_file(&mut svc, "sized.torrent");
+        svc.write(ino, 0, &bytes).expect("write");
+        svc.flush(ino).expect("flush");
+        svc.release(fh).expect("release");
+        wait_for_processing_empty(&svc);
+
+        assert!(
+            matches!(
+                svc.inode_mgr.inodes.get(&ino),
+                Some(InodeData::File { data, .. }) if data.is_empty()
+            ),
+            "release must leave the inode buffer empty (bytes moved to the Arc)"
+        );
+        assert!(
+            svc.buffered_torrents.contains_key(&ino),
+            "release must park the bytes as a shared handle"
+        );
+
+        assert_eq!(
+            svc.getattr(ino).expect("getattr").size,
+            bytes.len() as u64,
+            "getattr must report the parked byte length, not zero"
+        );
+        let entry = svc
+            .lookup(METADATA_INO, "sized.torrent")
+            .expect("lookup")
+            .expect("metadata child is visible");
+        assert_eq!(
+            entry.attr.size,
+            bytes.len() as u64,
+            "lookup must report the parked byte length, not zero"
+        );
+        assert_eq!(entry.ino, ino);
+    }
+
+    /// In the window between `release` parking the bytes and the DB row
+    /// landing, `data/` must parse the parked buffer: the declared torrent
+    /// name (C-3.1.3), the directory listing and by-name resolution all come
+    /// from it, not from the filename stem.
+    #[test]
+    fn pending_persist_uses_parked_bytes_for_name_listing_and_lookup() {
+        let mut svc = service_with_db();
+        let bytes = minimal_torrent_named("declared-name");
+        let (ino, fh) = create_torrent_file(&mut svc, "paused.torrent");
+        svc.write(ino, 0, &bytes).expect("write");
+        svc.flush(ino).expect("flush");
+
+        // Freeze the exact state `release` leaves before its persist thread
+        // finishes: inode buffer moved out, bytes parked, key in flight.
+        let (name, _parent, data) = svc.take_buffered_file(ino).expect("buffer");
+        svc.buffered_torrents.insert(ino, Arc::new(data));
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert((String::new(), name.clone()), ());
+        let _ = fh;
+
+        let root = svc
+            .lookup(DATA_INO, "paused.torrent")
+            .expect("pending root lookup")
+            .expect("pending root is visible");
+        match svc.inode_mgr.data_inodes.get(&root.ino) {
+            Some(DataInode::TorrentRoot { name, .. }) => {
+                assert_eq!(
+                    name, "declared-name",
+                    "C-3.1.3: the first-level name is the metadata declaration"
+                );
+            }
+            other => panic!("expected a pending TorrentRoot, got {other:?}"),
+        }
+
+        // The `data/` entry keeps the metadata filename; the declared name is
+        // the torrent's first-level entry (C-3.1.3) and must come from the
+        // parked bytes below.
+        let data_entries = svc.readdir(DATA_INO, 0).expect("data listing");
+        assert!(
+            data_entries
+                .iter()
+                .any(|entry| entry.name == "paused.torrent"),
+            "the data/ directory lists the metadata filename: {data_entries:?}"
+        );
+
+        let children = svc.readdir(root.ino, 0).expect("pending torrent listing");
+        assert!(
+            children.iter().any(|entry| entry.name == "declared-name"),
+            "the pending torrent tree must come from the parked bytes: {children:?}"
+        );
+        let child = svc
+            .lookup(root.ino, "declared-name")
+            .expect("pending by-name lookup")
+            .expect("pending child resolves by its declared path");
+        assert_eq!(child.attr.size, 16, "the bencode file size must survive");
+    }
+
+    /// A close that finds the previous persist still in flight must not lose
+    /// the new bytes: the timeout restores buffer ownership, keeps the
+    /// previously landed source, and a later close persists the new content
+    /// (C-2.5.5; the kernel drops RELEASE errors, so this cannot be an error
+    /// path that discards data).
+    #[test]
+    fn release_timeout_keeps_new_bytes_and_previous_row() {
+        let mut svc = service_with_db();
+        let first_bytes = minimal_torrent_named("alpha");
+        let (ino, fh) = create_torrent_file(&mut svc, "retry.torrent");
+        svc.write(ino, 0, &first_bytes).expect("write");
+        svc.flush(ino).expect("flush");
+        svc.release(fh).expect("first release");
+        wait_for_processing_empty(&svc);
+
+        let row_bytes = |svc: &FsService| {
+            svc.db
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .get_torrent_by_source_path("")
+                .expect("read row")
+                .and_then(|torrent| torrent.torrent_data)
+        };
+        assert_eq!(
+            row_bytes(&svc).as_deref(),
+            Some(first_bytes.as_slice()),
+            "the first persist must have landed"
+        );
+
+        let entry = svc
+            .lookup(METADATA_INO, "retry.torrent")
+            .expect("lookup")
+            .expect("persisted file");
+        let second_bytes = minimal_torrent_named("bravo");
+        let fh = svc.open(entry.ino).expect("open for overwrite").fh;
+        svc.setattr(entry.ino, Some(0)).expect("truncate");
+        svc.write(entry.ino, 0, &second_bytes).expect("overwrite");
+        svc.flush(entry.ino).expect("flush");
+
+        // Simulate the previous add still being in flight for this key.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .insert((String::new(), "retry.torrent".to_string()), ());
+        let err = svc
+            .release_with_pending_timeout(fh, Duration::from_millis(100))
+            .expect_err("the injected pending add must time out");
+        assert!(matches!(err, FsError::Internal(_)));
+
+        assert_eq!(
+            svc.buffered_torrent_bytes(entry.ino),
+            Some(second_bytes.as_slice()),
+            "a timeout must restore the new bytes, not drop them"
+        );
+        assert_eq!(
+            row_bytes(&svc).as_deref(),
+            Some(first_bytes.as_slice()),
+            "the previous landed source must survive the timeout"
+        );
+
+        // Let the pending add settle and retry the close: the new content is
+        // persisted, proving nothing was irrecoverably lost.
+        svc.processing_torrents
+            .lock()
+            .unwrap()
+            .remove(&(String::new(), "retry.torrent".to_string()));
+        let fh = svc.open(entry.ino).expect("reopen after timeout").fh;
+        svc.release(fh).expect("retry release");
+        wait_for_processing_empty(&svc);
+        assert_eq!(
+            row_bytes(&svc).as_deref(),
+            Some(second_bytes.as_slice()),
+            "the retried close must persist the recovered bytes"
+        );
+    }
+
+    /// Repeated overwrite-renames destroy each destination inode; their parked
+    /// shared buffers must be reclaimed with the inode, or every overwrite
+    /// leaks one (up to 10 MiB) allocation.
+    #[test]
+    fn repeated_overwrite_rename_reclaims_destination_buffers() {
+        let mut svc = service_with_db();
+        let source_bytes = minimal_torrent_named("source");
+        let (source_ino, source_fh) = create_torrent_file(&mut svc, "source.torrent");
+        svc.write(source_ino, 0, &source_bytes)
+            .expect("source write");
+        svc.flush(source_ino).expect("source flush");
+        svc.release(source_fh).expect("source release");
+        wait_for_processing_empty(&svc);
+
+        let mut target_inos = Vec::new();
+        let mut source_name = "source.torrent".to_string();
+        for index in 0..5 {
+            let name = format!("target-{index}.torrent");
+            let (target_ino, target_fh) = create_torrent_file(&mut svc, &name);
+            svc.write(target_ino, 0, &minimal_torrent_named(&format!("t{index}")))
+                .expect("target write");
+            svc.flush(target_ino).expect("target flush");
+            svc.release(target_fh).expect("target release");
+            wait_for_processing_empty(&svc);
+            assert!(
+                svc.buffered_torrents.contains_key(&target_ino),
+                "the destination buffer is parked before the rename"
+            );
+            target_inos.push(target_ino);
+
+            svc.rename(METADATA_INO, &source_name, METADATA_INO, &name)
+                .expect("overwrite rename");
+            source_name = name.clone();
+            assert!(
+                !svc.inode_mgr.inodes.contains_key(&target_ino),
+                "no open handle: the destination inode is destroyed immediately"
+            );
+            assert!(
+                !svc.buffered_torrents.contains_key(&target_ino),
+                "an immediately destroyed destination must not leak its buffer"
+            );
+        }
+
+        let live: HashSet<u64> = svc.inode_mgr.inodes.keys().copied().collect();
+        for ino in svc.buffered_torrents.keys() {
+            assert!(
+                live.contains(ino),
+                "a parked buffer must belong to a live inode: {ino} is gone"
+            );
+        }
+        assert_eq!(
+            svc.buffered_torrents.len(),
+            1,
+            "only the surviving source buffer remains"
+        );
+        assert!(svc.buffered_torrents.contains_key(&source_ino));
     }
 }

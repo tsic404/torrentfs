@@ -123,6 +123,41 @@ impl TorrentInfo {
         }
     }
 
+    /// Validate `.torrent` bytes without taking ownership of them.
+    ///
+    /// The C++ `torrent_info` only borrows the buffer, so the handle is
+    /// destroyed before this returns and the caller's bytes are neither copied
+    /// nor retained. The close path (`flush`/`release`) keeps the buffered
+    /// bytes for later reads, so validating through [`Self::from_bytes`] would
+    /// clone the whole (up to 10 MiB) buffer just to throw the handle away.
+    pub fn validate_slice(data: &[u8]) -> TorrentResult<()> {
+        let mut error = libtorrent_sys::lt_error_t {
+            message: ptr::null(),
+            code: 0,
+        };
+
+        // SAFETY: `data.as_ptr()` points to `data.len()` valid bytes and the
+        // handle is destroyed before the borrow ends, so the C++ object never
+        // outlives the slice. `error` is a live stack value.
+        let inner = unsafe {
+            libtorrent_sys::lt_torrent_info_create_from_buffer(
+                data.as_ptr(),
+                data.len(),
+                &mut error,
+            )
+        };
+        if inner.is_null() {
+            // SAFETY: `error` was initialized above and is written only on the
+            // failure path.
+            Err(unsafe { error_from_c(&error) })
+        } else {
+            // SAFETY: `inner` was created by the FFI call above, is non-null,
+            // and is not used afterwards; the borrow ends here.
+            unsafe { libtorrent_sys::lt_torrent_info_destroy(inner) };
+            Ok(())
+        }
+    }
+
     pub fn name(&self) -> String {
         // SAFETY: `self.inner` is a valid, non-null `lt_torrent_info_t`.
         // `lt_torrent_info_name` returns a pointer to an internal C string.

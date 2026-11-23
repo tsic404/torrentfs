@@ -171,6 +171,7 @@ impl AlertConsumer {
         stats: SharedSessionStats,
         metrics: Arc<Metrics>,
         piece_finished_tx: mpsc::Sender<(String, i32)>,
+        resync_tx: mpsc::Sender<()>,
     ) -> Self {
         let notify = Arc::new(NotifyState {
             flag: AtomicBool::new(false),
@@ -207,7 +208,7 @@ impl AlertConsumer {
                         break;
                     }
 
-                    if drain_alerts(session, &stats, &metrics, &piece_finished_tx) {
+                    if drain_alerts(session, &stats, &metrics, &piece_finished_tx, &resync_tx) {
                         // Drained some alerts; loop again to drain any that
                         // arrived while we were dispatching before blocking.
                         continue;
@@ -279,6 +280,7 @@ fn drain_alerts(
     stats: &SharedSessionStats,
     metrics: &Metrics,
     piece_finished_tx: &mpsc::Sender<(String, i32)>,
+    resync_tx: &mpsc::Sender<()>,
 ) -> bool {
     let list = unsafe { libtorrent_sys::lt_session_pop_alerts(session) };
     if list.is_null() {
@@ -292,7 +294,14 @@ fn drain_alerts(
         for i in 0..count {
             let alert = unsafe { &*alerts.add(i as usize) };
             let alert_type = AlertType::from(alert.type_);
-            dispatch(alert_type, alert, stats, metrics, piece_finished_tx);
+            dispatch(
+                alert_type,
+                alert,
+                stats,
+                metrics,
+                piece_finished_tx,
+                resync_tx,
+            );
         }
     }
 
@@ -322,6 +331,7 @@ pub(crate) fn dispatch(
     stats: &SharedSessionStats,
     _metrics: &Metrics,
     piece_finished_tx: &mpsc::Sender<(String, i32)>,
+    resync_tx: &mpsc::Sender<()>,
 ) {
     match alert_type {
         AlertType::ReadPiece => {
@@ -378,6 +388,15 @@ pub(crate) fn dispatch(
         AlertType::Other(category) => {
             let msg = cstr_ptr(alert.message);
             tracing::debug!("alert: category={}, message={}", category, msg);
+            // libtorrent drops alerts when its internal queue overflows. Any
+            // `piece_finished` alert lost that way never reaches the engine,
+            // so the `.stats` piece grid would keep showing `[N]` for pieces
+            // already on disk. Ask the engine to re-derive the marks from the
+            // handle's have-bitmap (C-11.9's convergence guarantee).
+            if msg.starts_with("dropped alerts") {
+                tracing::warn!("libtorrent dropped alerts; resyncing piece marks: {}", msg);
+                let _ = resync_tx.send(());
+            }
         }
     }
 }
@@ -516,12 +535,14 @@ mod tests {
             category: 0,
             finished_complete: 0,
         };
+        let (resync_tx, _resync_rx) = mpsc::channel::<()>();
         dispatch(
             AlertType::from(alert.type_),
             &alert,
             &shared,
             &metrics,
             &piece_finished_tx,
+            &resync_tx,
         );
 
         let ss = shared.snapshot();
@@ -565,17 +586,61 @@ mod tests {
             category: 0,
             finished_complete: 0,
         };
+        let (resync_tx, _resync_rx) = mpsc::channel::<()>();
         dispatch(
             AlertType::from(alert.type_),
             &alert,
             &shared,
             &metrics,
             &piece_finished_tx,
+            &resync_tx,
         );
 
         let (got_hash, got_piece) = piece_finished_rx.try_recv().expect("event forwarded");
         assert_eq!(got_hash, hex);
         assert_eq!(got_piece, 7);
+    }
+
+    /// `C-11.9`/E6: when libtorrent reports dropped alerts, the consumer must
+    /// ask the engine to re-derive the piece marks from the have-bitmap — a
+    /// dropped `piece_finished` would otherwise leave `.stats` stale forever.
+    #[test]
+    fn dropped_alerts_request_a_piece_mark_resync() {
+        let shared = SharedSessionStats::new();
+        let metrics = Metrics::new();
+        let (piece_finished_tx, _piece_rx) = mpsc::channel::<(String, i32)>();
+        let (resync_tx, resync_rx) = mpsc::channel::<()>();
+        let message = std::ffi::CString::new("dropped alerts: piece_finished ").unwrap();
+        let alert = libtorrent_sys::lt_alert_data_t {
+            type_: libtorrent_sys::lt_alert_type_t_LT_ALERT_OTHER as i32,
+            info_hash: [0; 41],
+            piece_index: 0,
+            error_code: 0,
+            piece_data: std::ptr::null_mut(),
+            piece_data_size: 0,
+            download_rate: 0,
+            upload_rate: 0,
+            total_downloaded: 0,
+            total_uploaded: 0,
+            dht_nodes: 0,
+            peers_connected: 0,
+            half_open_connections: 0,
+            message: message.as_ptr(),
+            category: 0,
+            finished_complete: 0,
+        };
+        dispatch(
+            AlertType::from(alert.type_),
+            &alert,
+            &shared,
+            &metrics,
+            &piece_finished_tx,
+            &resync_tx,
+        );
+        assert!(
+            resync_rx.try_recv().is_ok(),
+            "a dropped-alerts alert must request a piece-mark resync"
+        );
     }
 
     #[test]

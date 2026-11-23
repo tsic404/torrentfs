@@ -190,6 +190,10 @@ struct EngineState {
     /// Piece-completion events forwarded by the alert consumer thread,
     /// drained by the engine loop and turned into piece registration.
     piece_finished_rx: mpsc::Receiver<(String, i32)>,
+    /// Requests to re-derive piece marks from the have-bitmap after
+    /// libtorrent dropped alerts; a dropped `piece_finished` would otherwise
+    /// leave `.stats` reporting an on-disk piece as still wanted.
+    resync_rx: mpsc::Receiver<()>,
     /// Reads parked while they wait on the swarm.  The engine loop polls them
     /// once per iteration instead of blocking the engine thread inside a read,
     /// so one sourceless read cannot serialize every other command behind its
@@ -347,12 +351,14 @@ impl DownloadEngine {
                 // them and registers finished pieces (background/prefetch
                 // downloads never go through a read's piece-wait loop).
                 let (piece_finished_tx, piece_finished_rx) = mpsc::channel::<(String, i32)>();
+                let (resync_tx, resync_rx) = mpsc::channel::<()>();
                 let alert_consumer = unsafe {
                     AlertConsumer::spawn(
                         session.inner(),
                         shared_stats.clone(),
                         thread_metrics.clone(),
                         piece_finished_tx,
+                        resync_tx,
                     )
                 };
                 let state = EngineState {
@@ -371,6 +377,7 @@ impl DownloadEngine {
                     stopping: thread_stopping,
                     alert_consumer: Some(alert_consumer),
                     piece_finished_rx,
+                    resync_rx,
                     pending_reads: Vec::new(),
                     cold_flights: HashMap::new(),
                     sourceless: HashMap::new(),
@@ -1160,6 +1167,31 @@ pub(crate) enum ReadStallCause {
     SlowSwarm,
 }
 
+/// What an expired read settles to once the completed-prefix probe has run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StalledOutcome {
+    /// The completed prefix of the range, served as a short read.
+    Prefix(Vec<u8>),
+    /// Nothing servable; the classified cause decides the error family.
+    Empty(ReadStallCause),
+}
+
+/// Decide an expired read's outcome.
+///
+/// A failed prefix probe yields `Empty(cause)` — it must not replace the cause
+/// with the probe's error. In particular a no-seeder stall stays `NoSeeder`
+/// (`ENODATA`, C-2.3.6) even when a partially written piece file made the
+/// short-read probe fail with `PieceNotReady` (which would be `EIO`, C-2.3.5).
+pub(crate) fn settle_stalled_read(
+    cause: ReadStallCause,
+    prefix: Option<Vec<u8>>,
+) -> StalledOutcome {
+    match prefix {
+        Some(data) => StalledOutcome::Prefix(data),
+        None => StalledOutcome::Empty(cause),
+    }
+}
+
 /// Classify a read whose piece-wait window elapsed.
 ///
 /// `stale_blockers` holds every piece this read found stale — libtorrent's bit
@@ -1316,6 +1348,23 @@ fn partial_read_bounds(
         return None;
     }
     Some((partial_end, (partial_end - absolute_offset) as u32))
+}
+
+/// Piece indices libtorrent reports complete that the cache has not recorded.
+///
+/// This is the convergence decision behind a dropped `piece_finished` alert:
+/// the bytes are on disk and the have-bitmap knows it, but the cache metadata
+/// (and therefore the `.stats` marker) does not. Pure so the recovery can be
+/// tested against a real [`PieceStore`] without a live session.
+fn missing_piece_marks(
+    num_pieces: i64,
+    have_piece: impl Fn(i32) -> bool,
+    is_recorded: impl Fn(i32) -> bool,
+) -> Vec<i32> {
+    (0..num_pieces)
+        .map(|piece| piece as i32)
+        .filter(|&piece| have_piece(piece) && !is_recorded(piece))
+        .collect()
 }
 
 /// Snapshot refresh interval. Alerts are drained by a dedicated consumer
@@ -1679,6 +1728,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                     break;
                 }
                 state.drain_piece_finished();
+                state.drain_resync_requests();
                 state.poll_pending_reads();
                 let has_parked_read = !state.pending_reads.is_empty();
                 if has_parked_read
@@ -1710,6 +1760,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                     last_housekeeping = Instant::now();
                 }
                 state.drain_piece_finished();
+                state.drain_resync_requests();
                 state.poll_pending_reads();
                 let has_parked_read = !state.pending_reads.is_empty();
                 if has_parked_read || (housekeeping && is_watched) {
@@ -2152,10 +2203,16 @@ impl EngineState {
             TorrentError::InvalidFile("file end overflows the torrent layout".to_string())
         })?;
         let size = if absolute_offset < file_end {
-            (std::cmp::min(size as u64, file_end - absolute_offset) as u32).max(1)
+            std::cmp::min(size as u64, file_end - absolute_offset) as u32
         } else {
             return Ok(None);
         };
+        // A zero-length read is served as zero bytes, not as a one-byte
+        // download (C-4.1.6). The clamp above can only reach zero when the
+        // caller asked for zero bytes, since the offset is inside the file.
+        if size == 0 {
+            return Ok(None);
+        }
 
         let start_piece = (absolute_offset / piece_length) as i32;
         let end_offset = absolute_offset.checked_add(size as u64).ok_or_else(|| {
@@ -2696,7 +2753,20 @@ impl EngineState {
                     read.status = s;
                     self.publish_snapshot();
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                // A status read that fails during discovery is not itself the
+                // read's outcome: keep the last known swarm state and let the
+                // window expire, which classifies the stall as `NoPeers`
+                // (`ENODATA`). Aborting here surfaced a transient FFI failure
+                // as `EIO` before the discovery window had elapsed.
+                Some(Err(e)) => {
+                    tracing::debug!(
+                        "read_file_range {}: status unavailable at discovery deadline: {:?}",
+                        read.info_hash,
+                        e
+                    );
+                    read.is_peer_wait_exhausted =
+                        swarm_is_empty(read.status.num_peers, read.status.num_seeds);
+                }
                 None => return Some(Err(Self::missing())),
             }
             // The window elapsed: retire the flight so the next read of this
@@ -2748,7 +2818,13 @@ impl EngineState {
                     return None;
                 }
             }
-            Some(Err(e)) => return Some(Err(e)),
+            Some(Err(e)) => {
+                tracing::debug!(
+                    "read_file_range {}: status unavailable while waiting for a peer: {:?}",
+                    read.info_hash,
+                    e
+                );
+            }
             None => return Some(Err(Self::missing())),
         }
 
@@ -2927,32 +3003,6 @@ impl EngineState {
         // actually made.
         self.register_incomplete_on_disk_pieces(&read.info_hash, read.start_piece, read.end_piece);
 
-        // Instead of empty (ENODATA) after the window, return the contiguous
-        // prefix of completed pieces.  `current_piece` advances in order, so
-        // every piece before `piece_idx` is complete (it is the first missing
-        // one); returning that prefix as a short read gives visible progress
-        // instead of 0 bytes the client can't tell from EOF.
-        if let Some((partial_end, partial_size)) = partial_read_bounds(
-            read.start_piece,
-            piece_idx - 1,
-            read.piece_length,
-            read.absolute_offset,
-            read.end_offset,
-        ) {
-            return self.read_from_disk(
-                &read.info_hash,
-                read.start_piece,
-                piece_idx - 1,
-                read.piece_length,
-                read.num_pieces,
-                read.total_size,
-                read.absolute_offset,
-                partial_end,
-                partial_size,
-                &read.cached_pieces,
-            );
-        }
-
         // Tell the three stalls apart: no seeder (`NoPeers`), a read the
         // on-disk cache window cannot cover (`Timeout` naming the cache), and
         // a slow-but-healthy swarm (`Timeout`).  The inherited settlement
@@ -2995,13 +3045,21 @@ impl EngineState {
         // FUSE has no channel into the client's stderr) via a direct,
         // non-panicking write: `eprintln!` panics on a broken stderr (aborting
         // this thread), and `tracing` writes to stdout, not stderr.
-        match classify_read_stall(
+        let cause = classify_read_stall(
             num_seeds,
             &read.stale_blockers,
             piece_idx,
             read_span_bytes,
             cache_capacity_bytes,
-        ) {
+        );
+        // The prefix probe is attempted once, before the cause decides the
+        // error: a failed probe leaves the cause untouched.
+        if let StalledOutcome::Prefix(data) =
+            settle_stalled_read(cause, self.partial_prefix(read, piece_idx))
+        {
+            return Ok(data);
+        }
+        match cause {
             ReadStallCause::NoSeeder => {
                 let wait = no_seeder_wait(
                     read.is_peer_wait_exhausted,
@@ -3065,6 +3123,33 @@ impl EngineState {
                 )))
             }
         }
+    }
+
+    /// Serve the completed prefix of a timed-out read as a short read, when the
+    /// range has one. A prefix probe that itself fails (piece file missing or
+    /// short) yields `None`: the caller still classifies the timeout, so a
+    /// discovery-window stall is `ENODATA`, not a piece-read `EIO`.
+    fn partial_prefix(&mut self, read: &PendingRead, piece_idx: i32) -> Option<Vec<u8>> {
+        let (partial_end, partial_size) = partial_read_bounds(
+            read.start_piece,
+            piece_idx - 1,
+            read.piece_length,
+            read.absolute_offset,
+            read.end_offset,
+        )?;
+        self.read_from_disk(
+            &read.info_hash,
+            read.start_piece,
+            piece_idx - 1,
+            read.piece_length,
+            read.num_pieces,
+            read.total_size,
+            read.absolute_offset,
+            partial_end,
+            partial_size,
+            &read.cached_pieces,
+        )
+        .ok()
     }
 
     /// Advance every parked read by one step, resolving (and removing) the ones
@@ -3379,6 +3464,58 @@ impl EngineState {
         }
     }
 
+    /// Re-derive the piece marks from libtorrent's have-bitmap.
+    ///
+    /// libtorrent drops alerts when its internal queue overflows, so a
+    /// `piece_finished` can be lost and its piece would keep rendering as
+    /// wanted (`[N]`) in `.stats` even though the data is on disk. The alert
+    /// consumer forwards one request per drop event; the cost is one bitmap
+    /// read per piece, paid only when a drop actually happened.
+    fn drain_resync_requests(&mut self) {
+        let mut requested = false;
+        while self.resync_rx.try_recv().is_ok() {
+            requested = true;
+        }
+        if !requested {
+            return;
+        }
+
+        let mut missing = Vec::new();
+        for (info_hash, handle) in &self.handles {
+            let Ok((_piece_length, num_pieces)) = handle.get_torrent_info() else {
+                continue;
+            };
+            for piece in missing_piece_marks(
+                num_pieces,
+                |piece| handle.have_piece(piece),
+                |piece| self.store.has_piece(info_hash, piece),
+            ) {
+                missing.push((info_hash.clone(), piece));
+            }
+        }
+
+        let registered = missing.len();
+        for (info_hash, piece) in missing {
+            if let Err(e) = self.store.register_finished_piece(&info_hash, piece) {
+                tracing::warn!(
+                    "resync: failed to register {}:piece:{}: {:?}",
+                    info_hash,
+                    piece,
+                    e
+                );
+            }
+            if let Some(handle) = self.handles.get(&info_hash) {
+                self.scheduler.piece_ready(handle, &info_hash, piece);
+            }
+        }
+        if registered > 0 {
+            tracing::info!(
+                "resync: registered {} piece(s) recovered from the have-bitmap",
+                registered
+            );
+        }
+    }
+
     /// Register a piece reported complete by the `piece_finished` alert and
     /// clear it from the scheduler's wanted set.  The piece is complete on
     /// disk (libtorrent has written and hash-checked it), so its on-disk size
@@ -3571,17 +3708,20 @@ mod tests {
     use super::{
         advance_condition_since, advance_reader_demand, aggregate_waiting_reads,
         cache_stall_message, cache_stall_stderr_hint, classify_read_stall, discovery_window_advice,
-        join_thread_within, no_peers_message, no_seeder_stderr_hint, no_seeder_wait,
+        join_thread_within, missing_piece_marks, no_peers_message, no_seeder_stderr_hint, no_seeder_wait,
         partial_read_bounds, peer_discovery_window_secs, piece_wait_window_secs,
         read_wait_budget_secs, reader_demand_is_live, should_publish_after_command,
-        slow_swarm_stderr_hint, swarm_is_empty, ColdFlight, DiscoveryWindowAdvice, DownloadEngine,
-        NoSeederWait, ReadStallCause, SourcelessSwarm, WaitingReads, NO_SEEDER_FAST_FAIL_SECS,
-        READER_DEMAND_TTL, SNAPSHOT_INTERVAL,
+        settle_stalled_read, slow_swarm_stderr_hint, swarm_is_empty, ColdFlight,
+        DiscoveryWindowAdvice, DownloadEngine, NoSeederWait, ReadStallCause, SourcelessSwarm,
+        StalledOutcome, WaitingReads, NO_SEEDER_FAST_FAIL_SECS, READER_DEMAND_TTL,
+        SNAPSHOT_INTERVAL,
     };
     use crate::infrastructure::config::{
         TorrentfsConfig, DEFAULT_NO_SEEDER_READ_TIMEOUT_SECS, DEFAULT_PEER_DISCOVERY_WAIT_SECS,
         DEFAULT_READ_TIMEOUT_SECS, MAX_LOCAL_TIMEOUT_SECS,
     };
+    use crate::infrastructure::cache::CacheManager;
+    use super::PieceStore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -4195,6 +4335,42 @@ mod tests {
         assert_eq!(piece_wait_window_secs(false, false, 3, 60), 3);
     }
 
+    /// A discovery-window stall is `ENODATA`, never `EIO`: when the completed
+    /// prefix probe fails (the old short-read path returned `PieceNotReady`
+    /// from it), the classified `NoSeeder` cause must still decide the
+    /// outcome. `FsError::from(NoPeers)` maps to `ENODATA` (C-2.3.6).
+    #[test]
+    fn no_seeder_stall_stays_enodata_when_the_prefix_probe_fails() {
+        assert_eq!(
+            settle_stalled_read(ReadStallCause::NoSeeder, None),
+            StalledOutcome::Empty(ReadStallCause::NoSeeder),
+            "a failed prefix probe must not replace the no-seeder verdict"
+        );
+        let errno: libc::c_int =
+            crate::domain::fs_error::FsError::from(crate::error::TorrentError::NoPeers(
+                "no seeder".to_string(),
+            ))
+            .into();
+        assert_eq!(errno, libc::ENODATA);
+        assert_ne!(errno, libc::EIO);
+    }
+
+    /// A successful prefix probe is served as a short read regardless of the
+    /// cause, so a partially downloaded range still makes visible progress.
+    #[test]
+    fn stalled_read_serves_the_completed_prefix_when_available() {
+        for cause in [
+            ReadStallCause::NoSeeder,
+            ReadStallCause::CacheStall,
+            ReadStallCause::SlowSwarm,
+        ] {
+            assert_eq!(
+                settle_stalled_read(cause, Some(b"prefix".to_vec())),
+                StalledOutcome::Prefix(b"prefix".to_vec())
+            );
+        }
+    }
+
     /// a sourceless read (peer discovery already elapsed with no seeder) must
     /// not spend the no-seeder window again — it fails fast so the engine
     /// thread is freed for healthy reads instead of re-blocking per chunk.
@@ -4526,5 +4702,52 @@ mod tests {
             engine.shutdown_within(Duration::from_millis(1)),
             "a stopped engine reports success immediately"
         );
+    }
+
+    /// A dropped `piece_finished` alert leaves the bytes on disk while the
+    /// cache metadata keeps rendering the mark as wanted (`[N]`). The resync
+    /// must find exactly that piece and re-register the final mark — this is
+    /// the convergence evidence, not just "a resync request was sent".
+    #[test]
+    fn resync_registers_the_final_piece_mark_after_a_dropped_alert(
+    ) -> crate::error::TorrentResult<()> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(dir.path(), 64 * 1024 * 1024)?));
+        let store = PieceStore::new(cache.clone());
+        let info_hash = "abcdef0123456789abcdef0123456789abcdef01";
+        const NUM_PIECES: i64 = 4;
+
+        // libtorrent completed every piece: the bytes are on disk.
+        for piece in 0..NUM_PIECES {
+            let key = PieceStore::piece_key(info_hash, piece as i32);
+            let path = cache.lock().unwrap().ensure_piece_dir(&key)?;
+            std::fs::write(&path, vec![0xA5u8; 32])?;
+        }
+        // The dropped alert means the metadata missed the last piece, so the
+        // `.stats` marker still renders as wanted.
+        for piece in 0..NUM_PIECES - 1 {
+            assert!(store.register_finished_piece(info_hash, piece as i32)?);
+        }
+        let last = (NUM_PIECES - 1) as i32;
+        let last_key = PieceStore::piece_key(info_hash, last);
+        assert!(!cache.lock().unwrap().has_piece(&last_key));
+
+        let missing =
+            missing_piece_marks(NUM_PIECES, |_| true, |piece| {
+                store.has_piece(info_hash, piece)
+            });
+        assert_eq!(missing, vec![last], "resync must find the lost mark");
+
+        // Applying the resync turns the final marker back on; `.stats` renders
+        // it from the same `has_piece` predicate.
+        for piece in &missing {
+            assert!(store.register_finished_piece(info_hash, *piece)?);
+        }
+        assert!(cache.lock().unwrap().has_piece(&last_key));
+        assert!(missing_piece_marks(NUM_PIECES, |_| true, |piece| {
+            store.has_piece(info_hash, piece)
+        })
+        .is_empty());
+        Ok(())
     }
 }
