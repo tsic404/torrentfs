@@ -70,6 +70,38 @@ typedef struct {
     int count;
 } lt_alert_list_t;
 
+// Process-wide disk I/O diagnostics. The integration test that proves the
+// piece write path stays off the libtorrent network thread reads these:
+// `piece_fsyncs` must be one per completed piece, and
+// `net_thread_io_calls` must stay zero while downloading.
+typedef struct {
+    uint64_t piece_fsyncs;
+    uint64_t piece_markers;
+    uint64_t write_blocks;
+    uint64_t net_thread_io_calls;
+    uint64_t net_callback_calls;
+    uint64_t net_callback_total_us;
+    uint64_t net_callback_max_us;
+    // Read-buffer ownership: every async_read allocates one buffer and must
+    // free it exactly once, whether the completion is delivered or dropped
+    // during session teardown. `read_buffers_live` is the outstanding count.
+    uint64_t read_buffers_allocated;
+    uint64_t read_buffers_released;
+    uint64_t read_buffers_live;
+    uint64_t read_buffers_dropped;
+    // Publish failures (fsync/rename) and write completions that carried an
+    // error. A publish failure must increment both: the last block's
+    // completion is what tells libtorrent the piece is not on disk.
+    uint64_t piece_publish_failures;
+    uint64_t write_completion_errors;
+    // Write errors whose completion handler already returned, i.e. libtorrent
+    // has observed the failure. A publish failure increments both.
+    uint64_t write_completion_errors_delivered;
+} lt_disk_io_counters_t;
+
+void lt_disk_io_counters_get(lt_disk_io_counters_t* out);
+void lt_disk_io_counters_reset(void);
+
 lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error);
 lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t size, lt_error_t* error);
 void lt_torrent_info_destroy(lt_torrent_info_t info);
@@ -189,6 +221,17 @@ int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char** out_json, lt_e
 // Free a string returned by lt_torrent_info_trackers (or any wrapper
 // function that returns a strdup'd char* via out-parameter).
 void lt_string_free(char* str);
+
+// Test hooks for the read-completion mailbox. `pause` keeps successful read
+// completions queued instead of draining them; `close` then discards them the
+// way session shutdown does. Both look the custom disk object up by the cache
+// directory it was created for and return 1 when found.
+int lt_disk_io_test_pause_completion_mailbox(const char* piece_cache_dir, int paused);
+int lt_disk_io_test_close_completion_mailbox(const char* piece_cache_dir);
+// Reads the mailbox's current queue depth and its cumulative drained and
+// discarded completion counts.
+int lt_disk_io_test_completion_mailbox_stats(const char* piece_cache_dir,
+    uint64_t* pending, uint64_t* discarded, uint64_t* delivered);
 
 #ifdef __cplusplus
 }

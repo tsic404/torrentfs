@@ -31,6 +31,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <atomic>
+#include <thread>
+#include <deque>
 #include <cctype>
 #include <map>
 #include <set>
@@ -57,6 +60,55 @@ static bool torrentfs_diag_enabled() {
 
 #define TORRENTFS_DIAG(...) \
     do { if (torrentfs_diag_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
+// ── Disk I/O diagnostics ──────────────────────────────────────────────────
+// Tests read these to prove two properties of the piece write path: one fsync
+// per completed piece (not one per block), and no file I/O executed on the
+// libtorrent network thread. `disk_io_note_call` is invoked by every file
+// operation in the piece storage; `DiskCallbackScope` marks the disk_interface
+// callbacks, so I/O performed inline inside one is counted as a violation.
+static std::atomic<uint64_t> g_disk_piece_fsyncs{0};
+static std::atomic<uint64_t> g_disk_piece_markers{0};
+static std::atomic<uint64_t> g_disk_write_blocks{0};
+static std::atomic<uint64_t> g_disk_net_thread_io_calls{0};
+static std::atomic<uint64_t> g_disk_callback_calls{0};
+static std::atomic<uint64_t> g_disk_callback_total_us{0};
+static std::atomic<uint64_t> g_disk_callback_max_us{0};
+static std::atomic<uint64_t> g_read_buffers_allocated{0};
+static std::atomic<uint64_t> g_read_buffers_released{0};
+static std::atomic<uint64_t> g_read_buffers_live{0};
+static std::atomic<uint64_t> g_read_buffers_dropped{0};
+static std::atomic<uint64_t> g_piece_publish_failures{0};
+static std::atomic<uint64_t> g_write_completion_errors{0};
+static std::atomic<uint64_t> g_write_completion_errors_delivered{0};
+
+static thread_local bool tl_disk_callback_active = false;
+static thread_local bool tl_disk_worker_thread = false;
+
+static void disk_io_note_call() {
+    if (tl_disk_callback_active && !tl_disk_worker_thread) {
+        g_disk_net_thread_io_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+struct DiskCallbackScope {
+    std::chrono::steady_clock::time_point m_start
+        = std::chrono::steady_clock::now();
+    DiskCallbackScope() { tl_disk_callback_active = true; }
+    ~DiskCallbackScope() {
+        tl_disk_callback_active = false;
+        uint64_t const us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - m_start).count());
+        g_disk_callback_calls.fetch_add(1, std::memory_order_relaxed);
+        g_disk_callback_total_us.fetch_add(us, std::memory_order_relaxed);
+        uint64_t prev = g_disk_callback_max_us.load(std::memory_order_relaxed);
+        while (us > prev
+            && !g_disk_callback_max_us.compare_exchange_weak(
+                prev, us, std::memory_order_relaxed)) {
+        }
+    }
+};
 
 // ── FFI exception fence ────────────────────────────────────────────────────
 // ADR-002: no C++ exception may cross the C ABI. Every exported function runs
@@ -235,6 +287,7 @@ static bool parse_piece_file_name(char const* name, std::string const& prefix,
 static bool has_cached_piece_file(std::string const& dir,
     std::string const& info_hash_hex)
 {
+    disk_io_note_call();
     std::string prefix = info_hash_hex + ":piece:";
     DIR* dp = opendir(dir.c_str());
     if (!dp) return false;
@@ -1698,6 +1751,7 @@ void lt_alert_list_destroy(lt_alert_list_t* list) {
 namespace {
 
 static bool ensure_dir_recursive(const std::string& path) {
+    disk_io_note_call();
     if (path.empty()) return false;
     size_t pos = 0;
     while (pos < path.size()) {
@@ -1715,17 +1769,362 @@ static bool ensure_dir_recursive(const std::string& path) {
     return true;
 }
 
-class PieceStorage {
+static constexpr int kDiskBlockSize = lt::default_block_size;
+
+// Writes the whole block at the requested offset. pwrite keeps the descriptor
+// positioned independently, so two blocks of one piece can never share a seek.
+static bool pwrite_all(int fd, const char* buf, int size, int64_t offset) {
+    int64_t position = offset;
+    int remaining = size;
+    while (remaining > 0) {
+        ssize_t const written = ::pwrite(
+            fd, buf, static_cast<size_t>(remaining), position);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (written == 0) return false;
+        buf += written;
+        remaining -= static_cast<int>(written);
+        position += written;
+    }
+    return true;
+}
+
+// ============================================================================
+// CompletionMailbox: hand-off point from disk workers back to the network
+// thread.
+//
+// The disk_interface contract wants completions to run on libtorrent's
+// network thread. Posting each one straight into the io_context would put the
+// handler — and the torrent reference it may hold — into a queue that can
+// outlive this disk object: during session shutdown the io_context destroys
+// its pending handlers after the disk object is gone, and releasing such a
+// handler then calls back into freed state. Instead the pending completions
+// live here, and the io_context only holds one wake-up at a time that carries
+// a shared reference to this mailbox and nothing else.
+// ============================================================================
+class CompletionMailbox : public std::enable_shared_from_this<CompletionMailbox> {
+public:
+    explicit CompletionMailbox(lt::io_context& ios) : m_ios(ios) {}
+
+    // Test hook: keep queued completions in the mailbox instead of draining
+    // them, so the shutdown discard path can be exercised deliberately.
+    void set_paused(bool paused) {
+        bool should_post = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_paused = paused;
+            if (!m_paused && !m_in_flight && !m_queue.empty()) {
+                m_in_flight = true;
+                should_post = true;
+            }
+        }
+        if (should_post) {
+            auto self = shared_from_this();
+            boost::asio::post(m_ios, [self] { self->drain(); });
+        }
+    }
+
+    // Called from a worker thread (or from the network thread for the inline
+    // early-return paths). Never blocks, never runs the completion here.
+    void enqueue(std::function<void()> done) {
+        bool should_post = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_closed) {
+                // The owner is shutting down and will not run completions any
+                // more. Dropping the functor here releases its buffer and
+                // torrent references while the owner is still alive.
+                return;
+            }
+            m_queue.push_back(std::move(done));
+            if (!m_in_flight) {
+                m_in_flight = true;
+                should_post = true;
+            }
+        }
+        if (should_post) {
+            auto self = shared_from_this();
+            boost::asio::post(m_ios, [self] { self->drain(); });
+        }
+    }
+
+    // Network thread: run the completions queued so far. A handler may submit
+    // new disk work, whose completion then re-arms the wake-up.
+    void drain() {
+        std::deque<std::function<void()>> work;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_paused) return;
+            m_in_flight = false;
+            work.swap(m_queue);
+            m_delivered += work.size();
+        }
+        for (auto& done : work) {
+            if (done) done();
+        }
+    }
+
+    // Test observation: the queue depth at this instant, and how many
+    // completions have been drained or discarded so far.
+    void stats(uint64_t& pending, uint64_t& discarded, uint64_t& delivered) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        pending = static_cast<uint64_t>(m_queue.size());
+        discarded = m_discarded;
+        delivered = m_delivered;
+    }
+
+    // Owner destructor, after its workers have been joined: no completion can
+    // arrive any more, so the queued ones are released here, on the owner's
+    // still-live state.
+    void close() {
+        std::deque<std::function<void()>> dropped;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_closed = true;
+            dropped.swap(m_queue);
+            m_discarded += dropped.size();
+        }
+        // `dropped` destroys the completions here, outside the lock.
+    }
+
+private:
+    lt::io_context& m_ios;
+    std::mutex m_mutex;
+    std::deque<std::function<void()>> m_queue;
+    bool m_in_flight = false;
+    bool m_closed = false;
+    bool m_paused = false;
+    uint64_t m_delivered = 0;
+    uint64_t m_discarded = 0;
+};
+
+// ============================================================================
+// DiskWorkerPool: the only executor for piece file I/O.
+//
+// libtorrent calls disk_interface on its network thread. Every callback here
+// hands its arguments to the pool and returns, so that thread never opens,
+// reads, writes, fsyncs or unlinks a piece file. Jobs of one torrent run in
+// submission order (PieceStorage serializes its own lane), so a delete or a
+// hash cannot overtake the block writes queued before it; different torrents
+// run in parallel up to the worker count.
+//
+// The queue is bounded by QUEUE_HIGH_WATER. Crossing it makes async_write
+// return libtorrent's "pause this peer" signal and parks the peer's observer
+// until the queue drains to QUEUE_LOW_WATER. The network thread is never
+// blocked: a full queue throttles peers instead.
+// ============================================================================
+class DiskWorkerPool {
+public:
+    // `completion_sink` hands a functor to the disk object's completion
+    // mailbox; it is called only from a worker thread.
+    explicit DiskWorkerPool(std::function<void(std::function<void()>)> completion_sink)
+        : m_completion_sink(std::move(completion_sink))
+    {
+        size_t const workers = worker_thread_count();
+        for (size_t i = 0; i < workers; ++i) {
+            m_threads.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~DiskWorkerPool() { stop_and_join(); }
+
+    // Count one submitted job. Returns true once the overall backlog reaches
+    // the high watermark; the caller then reports back-pressure to libtorrent.
+    bool track_enqueue(std::shared_ptr<lt::disk_observer> observer) {
+        uint64_t const depth = m_pending.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (depth < QUEUE_HIGH_WATER) return false;
+        std::lock_guard<std::mutex> lock(m_observer_mutex);
+        m_exceeded = true;
+        if (observer) m_waiting.push_back(std::move(observer));
+        return true;
+    }
+
+    void track_complete() {
+        uint64_t const depth = m_pending.fetch_sub(1, std::memory_order_relaxed) - 1;
+        if (depth > QUEUE_LOW_WATER) return;
+        std::vector<std::shared_ptr<lt::disk_observer>> release;
+        {
+            std::lock_guard<std::mutex> lock(m_observer_mutex);
+            if (!m_exceeded) return;
+            m_exceeded = false;
+            release.swap(m_waiting);
+        }
+        if (release.empty()) return;
+        // stop_and_join() clears the sink; nothing can observe the release
+        // after that point.
+        if (!m_completion_sink) return;
+        m_completion_sink([observers = std::move(release)] {
+            for (auto& observer : observers) {
+                if (observer) observer->on_disk();
+            }
+        });
+    }
+
+    void dispatch(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_stopping) {
+                m_tasks.push_back(std::move(task));
+                m_cv.notify_one();
+                return;
+            }
+        }
+        // Shutdown: the pool no longer accepts work. Drop the job instead of
+        // running it on the calling thread — the caller is libtorrent's
+        // network thread, and a disk callback must never perform file I/O
+        // there. The storage's destructor closes any descriptor the dropped
+        // job would have closed.
+        m_pending.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    void stop_and_join() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping = true;
+        }
+        m_cv.notify_all();
+        for (auto& thread : m_threads) {
+            if (thread.joinable()) thread.join();
+        }
+        m_threads.clear();
+        m_completion_sink = nullptr;
+    }
+
+private:
+    static size_t worker_thread_count() {
+        unsigned const ncpu = std::thread::hardware_concurrency();
+        if (ncpu < 2) return 2;
+        if (ncpu > 4) return 4;
+        return ncpu;
+    }
+
+    void worker_loop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cv.wait(lock, [this] { return m_stopping || !m_tasks.empty(); });
+                if (m_tasks.empty()) {
+                    if (m_stopping) return;
+                    continue;
+                }
+                task = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            try {
+                task();
+            } catch (std::exception const& e) {
+                fprintf(stderr, "[wrapper] disk worker exception: %s\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "[wrapper] disk worker unknown exception\n");
+            }
+        }
+    }
+
+    static constexpr uint64_t QUEUE_HIGH_WATER = 256;
+    static constexpr uint64_t QUEUE_LOW_WATER = 64;
+
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::deque<std::function<void()>> m_tasks;
+    std::vector<std::thread> m_threads;
+    bool m_stopping = false;
+
+    std::atomic<uint64_t> m_pending{0};
+    std::function<void(std::function<void()>)> m_completion_sink;
+    std::mutex m_observer_mutex;
+    bool m_exceeded = false;
+    std::vector<std::shared_ptr<lt::disk_observer>> m_waiting;
+};
+
+class PieceStorageDiskIO;
+
+// Process-wide lookup of the custom disk object by cache directory. The test
+// hooks at the end of this file need to reach the mailbox while the owning
+// session is alive.
+static std::mutex g_disk_io_registry_mutex;
+static std::map<std::string, PieceStorageDiskIO*> g_disk_io_registry;
+
+// One serial lane per info hash, shared across every PieceStorage built for
+// that hash during the process lifetime. A torrent can be removed and re-added
+// while the old storage still has queued work (libtorrent drops it from the
+// session before the asynchronous delete completes), so ordering has to span
+// storage lifetimes: an old async delete must run before the new storage's
+// directory creation and block writes, never after them.
+struct TorrentLane {
+    std::mutex mutex;
+    std::deque<std::function<void()>> jobs;
+    bool draining = false;
+};
+
+class PieceStorage : public std::enable_shared_from_this<PieceStorage> {
 public:
     PieceStorage(const std::string& base_path, const std::string& info_hash_hex,
-        lt::file_storage const* files)
-        : m_base_path(base_path), m_info_hash_hex(info_hash_hex), m_files(files)
+        lt::file_storage const* files, lt::io_context& ios,
+        std::shared_ptr<DiskWorkerPool> pool,
+        std::shared_ptr<TorrentLane> lane, bool v1, bool v2)
+        : m_base_path(base_path), m_info_hash_hex(info_hash_hex), m_files(files),
+          m_ios(ios), m_pool(std::move(pool)), m_lane(std::move(lane)),
+          m_v1(v1), m_v2(v2)
     {
-        std::string full_path = m_base_path + "/" + m_info_hash_hex;
-        if (!ensure_dir_recursive(full_path)) {
-            fprintf(stderr, "[DIAG] PieceStorage: failed to create directory %s\n",
-                    full_path.c_str());
-            throw std::runtime_error("Failed to create piece storage directory: " + full_path);
+        // The per-torrent directory is created on this torrent's lane. Doing
+        // it here would run mkdir on libtorrent's network thread, which the
+        // disk callbacks must not do.
+    }
+
+    ~PieceStorage() { close_write_handles(); }
+
+    // Queue one disk job on the serial lane for this info hash. Returns true
+    // when the pool's overall backlog is over its high watermark, which the
+    // caller turns into libtorrent's per-peer back-pressure signal. The job
+    // owns this storage until it runs: the lane is shared across storage
+    // lifetimes, so it cannot hold the storage that happened to dispatch it.
+    bool submit(std::function<void()> job,
+        std::shared_ptr<lt::disk_observer> observer = nullptr) {
+        auto self = shared_from_this();
+        bool should_dispatch = false;
+        {
+            std::lock_guard<std::mutex> lock(m_lane->mutex);
+            m_lane->jobs.push_back(
+                [job = std::move(job), self]() mutable { job(); });
+            if (!m_lane->draining) {
+                m_lane->draining = true;
+                should_dispatch = true;
+            }
+        }
+        bool const over_water = m_pool->track_enqueue(std::move(observer));
+        if (should_dispatch) {
+            auto lane = m_lane;
+            auto pool = m_pool;
+            m_pool->dispatch([lane, pool] { drain_lane(lane, pool); });
+        }
+        return over_water;
+    }
+
+    static void drain_lane(std::shared_ptr<TorrentLane> const& lane,
+        std::shared_ptr<DiskWorkerPool> const& pool) {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::lock_guard<std::mutex> lock(lane->mutex);
+                if (lane->jobs.empty()) {
+                    lane->draining = false;
+                    return;
+                }
+                job = std::move(lane->jobs.front());
+                lane->jobs.pop_front();
+            }
+            // One failing job must not strand the rest of this torrent's lane.
+            try {
+                job();
+            } catch (std::exception const& e) {
+                fprintf(stderr, "[wrapper] disk job exception: %s\n", e.what());
+            } catch (...) {
+                fprintf(stderr, "[wrapper] disk job unknown exception\n");
+            }
+            pool->track_complete();
         }
     }
 
@@ -1745,24 +2144,60 @@ public:
         return m_base_path + "/" + m_info_hash_hex;
     }
 
+    // Create the per-torrent directory. Called from this torrent's lane when
+    // the torrent is added: the directory exists just as it did before the
+    // write path moved off libtorrent's network thread, but the mkdir itself
+    // never runs on that thread.
+    void ensure_pieces_dir() {
+        if (!ensure_dir_recursive(pieces_dir())) {
+            fprintf(stderr, "[DIAG] PieceStorage: failed to create directory %s\n",
+                    pieces_dir().c_str());
+        }
+    }
+
     std::string piece_path(int piece_index) const {
         return pieces_dir() + "/" + m_info_hash_hex + ":piece:" + std::to_string(piece_index);
     }
 
-    // TSI-2491: per-piece in-progress marker, written by `write_piece` after
-    // the piece data reaches disk and cleared once the piece is known complete.
+    // Per-piece in-progress marker. It is written once the piece's blocks have
+    // all reached disk and the data has been fsynced, and is cleared by the
+    // Rust cache layer once the piece is registered as complete.
     std::string piece_marker_path(int piece_index) const {
         return piece_path(piece_index) + ".incomplete";
     }
 
+    // Blocks are staged here until the piece is complete. The name is not a
+    // piece file for either restart scan, so a crash mid-piece leaves bytes
+    // that can never be mistaken for a complete piece. It is kept separate
+    // from `.incomplete`: the Rust cache creates, truncates and removes that
+    // marker on its own schedule.
+    std::string piece_staging_path(int piece_index) const {
+        return piece_path(piece_index) + ".part";
+    }
+
     bool read_piece(int piece_index, int offset, char* buf, int size) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) return false;
-        file.seekg(offset);
-        file.read(buf, size);
-        bool ok = file.good() || (file.eof() && file.gcount() > 0);
+        int const fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        char* cursor = buf;
+        int remaining = size;
+        int64_t position = offset;
+        while (remaining > 0) {
+            ssize_t const got = ::pread(
+                fd, cursor, static_cast<size_t>(remaining), position);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                ::close(fd);
+                return false;
+            }
+            if (got == 0) break;
+            cursor += got;
+            remaining -= static_cast<int>(got);
+            position += got;
+        }
+        ::close(fd);
+        bool const ok = remaining == 0;
         TORRENTFS_DIAG("[DIAG] read_piece piece=%d offset=%d size=%d ok=%d first4=%02x%02x%02x%02x\n",
                 piece_index, offset, size, ok,
                 (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
@@ -1770,88 +2205,168 @@ public:
         return ok;
     }
 
-    bool write_piece(int piece_index, int offset, const char* buf, int size) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        // TSI-2262: acquire an exclusive lock on the per-info-hash
-        // shared_mutex so that Rust-side reads (PieceStore::read_piece)
-        // cannot read a partially-written piece file. The shared_mutex
-        // is separate from m_mutex (which serializes C++-internal
-        // reads/writes) because the Rust read path bypasses m_mutex.
-        auto piece_lock = get_piece_lock(m_info_hash_hex);
-        std::unique_lock<std::shared_mutex> write_lock(*piece_lock);
-        if (!ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex)) {
-            fprintf(stderr, "[DIAG] write_piece: ensure_dir_recursive failed for %s/%s\n",
-                    m_base_path.c_str(), m_info_hash_hex.c_str());
+    // One 16 KiB block of a piece. Blocks are written to the piece's staging
+    // path, never to the published piece path: a crash can leave a full-length
+    // sparse staging file, but the restart scan only accepts published piece
+    // files, so a half-written piece cannot be mistaken for a complete one
+    // (notably with hash checks disabled). The staging file stays open until
+    // every block has arrived; the last block fsyncs it once and publishes it
+    // under the final name, then writes the empty marker the Rust cache clears
+    // on registration. That keeps the documented write/flush/fsync/mark order
+    // at piece granularity instead of once per block.
+    bool write_block(int piece_index, int offset, const char* buf, int size) {
+        disk_io_note_call();
+        g_disk_write_blocks.fetch_add(1, std::memory_order_relaxed);
+        int64_t const extent = expected_write_extent(piece_index);
+        if (extent <= 0 || offset < 0 || size <= 0
+            || static_cast<int64_t>(offset) + size > extent) {
             return false;
         }
-        std::string path = piece_path(piece_index);
-        TORRENTFS_DIAG("[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
-                piece_index, offset, size,
-                (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
-                (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0),
-                path.c_str());
-        std::fstream file;
-        file.open(path, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file.is_open()) {
-            file.open(path, std::ios::binary | std::ios::out);
-            if (!file.is_open()) return false;
-        }
-        file.seekp(offset);
-        file.write(buf, size);
-        if (!file.good()) return false;
-        // TSI-2263: flush + fsync so piece data reaches disk before
-        // the metadata is persisted.  Without fsync the OS page cache
-        // holds the dirty page; a container restart (which may not
-        // flush dirty pages) leaves a partial / zero-length piece file
-        // that the restart scan registers at the wrong size, causing
-        // the background SHA-1 verifier to purge it ("cache piece
-        // cleaned" after restart).
-        file.flush();
-        // TSI-2263 review: flush pushes the C++ stream buffer to the OS
-        // page cache.  If it fails (disk full / I/O error) the piece is
-        // incomplete — proceeding to fsync and returning true would
-        // silently swallow a partial write, the exact bug class this fix
-        // targets.  Return false so libtorrent sees the write failure.
-        if (!file.good()) {
-            file.close();
-            return false;
-        }
-        file.close();
-        // Open the file descriptor solely to fsync it.  fstream does not
-        // expose its fd, so reopen the path read-only and fsync that.
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd >= 0) {
-            if (::fsync(fd) != 0) {
-                TORRENTFS_DIAG("[DIAG] write_piece fsync failed for %s: %s\n",
-                        path.c_str(), strerror(errno));
+
+        auto state_it = m_write_states.find(piece_index);
+        if (state_it == m_write_states.end()) {
+            if (!ensure_dir_recursive(pieces_dir())) {
+                fprintf(stderr, "[DIAG] write_block: ensure_dir_recursive failed for %s\n",
+                        pieces_dir().c_str());
+                return false;
             }
-            ::close(fd);
+            int const fd = ::open(piece_staging_path(piece_index).c_str(),
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) return false;
+            PieceWriteState state;
+            state.fd = fd;
+            // Only blocks that carry payload are requested. A hybrid piece
+            // may also receive a final block that extends into the padding;
+            // that block still ends the piece.
+            int64_t const payload = expected_payload_size(piece_index);
+            if (payload <= 0) {
+                ::close(fd);
+                return false;
+            }
+            size_t const block_count = static_cast<size_t>(
+                (payload + kDiskBlockSize - 1) / kDiskBlockSize);
+            state.blocks_seen.assign(block_count, 0);
+            state_it = m_write_states.emplace(piece_index, std::move(state)).first;
         }
-        // TSI-2491: mark the piece as in-progress/incomplete. The piece file
-        // may be partially written (blocks arrive at arbitrary offsets), so
-        // the restart scan must not treat it as a complete candidate for
-        // background SHA-1 verification. The marker is removed by the Rust
-        // cache layer once `add_piece` proves the piece is complete.
-        int mfd = ::open(piece_marker_path(piece_index).c_str(),
-                         O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (mfd < 0) {
-            fprintf(stderr, "[DIAG] write_piece: create marker failed for %s: %s\n",
-                    piece_marker_path(piece_index).c_str(), strerror(errno));
-        } else {
-            ::close(mfd);
+
+        PieceWriteState& state = state_it->second;
+        {
+            // Shared with the Rust read path: a reader must not observe a
+            // half-written piece file (the lock is per info hash, not per
+            // piece, exactly as before).
+            auto piece_lock = get_piece_lock(m_info_hash_hex);
+            std::unique_lock<std::shared_mutex> write_lock(*piece_lock);
+            if (!pwrite_all(state.fd, buf, size, offset)) {
+                ::close(state.fd);
+                m_write_states.erase(state_it);
+                ::unlink(piece_staging_path(piece_index).c_str());
+                return false;
+            }
+        }
+
+        TORRENTFS_DIAG("[DIAG] write_block piece=%d offset=%d size=%d\n",
+                piece_index, offset, size);
+
+        size_t const block = static_cast<size_t>(offset) / kDiskBlockSize;
+        if (block < state.blocks_seen.size() && !state.blocks_seen[block]) {
+            state.blocks_seen[block] = 1;
+            ++state.blocks_seen_count;
+        }
+        if (state.blocks_seen_count == state.blocks_seen.size()) {
+            int const fd = state.fd;
+            m_write_states.erase(state_it);
+            return finish_piece(piece_index, fd);
         }
         return true;
     }
 
+    // A hash job may run on a piece that is still being written. A still-open
+    // descriptor therefore means the piece is incomplete: close it without
+    // publishing, so the hash sees no final file (a mismatch) and the staged
+    // bytes stay invisible to both the restart scan and the published path.
+    void flush_open_piece(int piece_index) {
+        auto it = m_write_states.find(piece_index);
+        if (it == m_write_states.end()) return;
+        ::close(it->second.fd);
+        m_write_states.erase(it);
+    }
+
+    void clear_piece(int piece_index) {
+        auto it = m_write_states.find(piece_index);
+        if (it == m_write_states.end()) return;
+        ::close(it->second.fd);
+        m_write_states.erase(it);
+        // Drop the partial staging bytes; the marker is left alone because a
+        // published piece that libtorrent is clearing must stay tagged
+        // incomplete until a later successful publish replaces it.
+        ::unlink(piece_staging_path(piece_index).c_str());
+    }
+
+    void close_write_handles() {
+        for (auto& entry : m_write_states) {
+            if (entry.second.fd >= 0) ::close(entry.second.fd);
+        }
+        m_write_states.clear();
+    }
+
     bool has_piece(int piece_index) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary);
         return file.is_open();
     }
 
+    // Size libtorrent will write for this piece, from the torrent layout. The
+    // on-disk file is empty until the first block arrives, so the write path
+    // needs the expected size rather than a stat.
+    int64_t expected_piece_size(int piece_index) const {
+        if (!m_files || piece_index < 0
+            || lt::piece_index_t(piece_index) >= m_files->end_piece()) {
+            return -1;
+        }
+        return m_files->piece_size(lt::piece_index_t(piece_index));
+    }
+
+    // Bytes libtorrent may write for this piece. v1 metadata (a v1-only or
+    // hybrid torrent) describes the full padded piece, so a final block may
+    // run into the padding. A v2-only piece is requested only up to its
+    // payload.
+    int64_t expected_write_extent(int piece_index) const {
+        return m_v1 ? expected_piece_size(piece_index)
+                    : expected_payload_size(piece_index);
+    }
+
+    // Payload bytes of this piece. The piece is complete once every block
+    // covering these bytes has arrived. Padding is not v2-specific: a v1
+    // torrent may align files with explicit pad files, and libtorrent
+    // pre-marks blocks made only of padding as finished without requesting
+    // them. Counting the whole layout would strand such a piece forever.
+    int64_t expected_payload_size(int piece_index) const {
+        if (!m_files || piece_index < 0
+            || lt::piece_index_t(piece_index) >= m_files->end_piece()) {
+            return -1;
+        }
+        int64_t const piece_start
+            = static_cast<int64_t>(piece_index) * m_files->piece_length();
+        int64_t const piece_end
+            = piece_start + m_files->piece_size(lt::piece_index_t(piece_index));
+        int64_t payload_end = piece_start;
+        lt::file_index_t const first = m_files->file_index_at_offset(piece_start);
+        for (lt::file_index_t f = first; f < m_files->end_file(); ++f) {
+            int64_t const offset = m_files->file_offset(f);
+            if (offset >= piece_end) break;
+            if (m_files->pad_file_at(f)) continue;
+            int64_t const end
+                = std::min<int64_t>(offset + m_files->file_size(f), piece_end);
+            if (end > payload_end) payload_end = end;
+        }
+        return payload_end - piece_start;
+    }
+
+    // On-disk size; -1 when the file is missing. The hash paths use this to
+    // distinguish an absent piece from a present one.
     int64_t piece_size(int piece_index) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) return -1;
@@ -1859,7 +2374,7 @@ public:
     }
 
     lt::sha1_hash hash_piece(int piece_index, int piece_size) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return lt::sha1_hash();
@@ -1882,7 +2397,7 @@ public:
     // piece file. A short read (piece truncated on disk) yields the zero hash,
     // which never matches the torrent's expected block hash.
     lt::sha256_hash hash_block_sha256(int piece_index, int offset, int size) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open() || offset < 0 || size <= 0) return lt::sha256_hash();
@@ -1903,7 +2418,7 @@ public:
     // piece file does not exist or is empty. Needed so that async_hash can
     // compute SHA256 sub-range hashes for v2 blocks in hybrid torrents.
     std::vector<char> read_piece_data(int piece_index) {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
         std::string path = piece_path(piece_index);
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file.is_open()) return {};
@@ -1921,7 +2436,10 @@ public:
     // that still holds piece files always failed, so the cache of a deleted
     // torrent was never reclaimed.
     void delete_piece_files() {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        disk_io_note_call();
+        close_write_handles();
+        auto piece_lock = get_piece_lock(m_info_hash_hex);
+        std::unique_lock<std::shared_mutex> write_lock(*piece_lock);
         std::string dir = m_base_path + "/" + m_info_hash_hex;
         DIR* dp = opendir(dir.c_str());
         if (!dp) return;
@@ -1935,12 +2453,93 @@ public:
     }
 
 private:
+    struct PieceWriteState {
+        int fd = -1;
+        std::vector<uint8_t> blocks_seen;
+        size_t blocks_seen_count = 0;
+    };
+
+    // Flush the staged piece, publish it under its final name, then write the
+    // in-progress marker. The fsync is the only one this piece gets: blocks
+    // accumulate in the open staging descriptor until the last one arrives.
+    // Publishing is a rename, so the final path never exists before every
+    // block has landed. A failed fsync or rename returns false so the last
+    // block's completion carries a storage error: the piece is not published,
+    // and libtorrent must not record it as written.
+    bool finish_piece(int piece_index, int fd) {
+        // A v1 piece (including a hybrid torrent and a v1 torrent with
+        // explicit alignment pads) is checked against a SHA-1 that covers the
+        // padded piece, so fill the pad tail before the one fsync. v2-only
+        // pieces are hashed and read only up to their payload and stay
+        // payload-sized.
+        int64_t const payload = expected_payload_size(piece_index);
+        if (m_v1 && payload >= 0) {
+            int64_t const full = expected_piece_size(piece_index);
+            if (full <= 0 || (full > payload
+                    && ::ftruncate(fd, static_cast<off_t>(full)) != 0)) {
+                TORRENTFS_DIAG("[DIAG] pad failed for piece %d: %s\n",
+                        piece_index, strerror(errno));
+                ::close(fd);
+                ::unlink(piece_staging_path(piece_index).c_str());
+                g_piece_publish_failures.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        std::string const staging = piece_staging_path(piece_index);
+        if (::fsync(fd) != 0) {
+            TORRENTFS_DIAG("[DIAG] fsync failed for piece %d: %s\n",
+                    piece_index, strerror(errno));
+            ::close(fd);
+            ::unlink(staging.c_str());
+            g_piece_publish_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        g_disk_piece_fsyncs.fetch_add(1, std::memory_order_relaxed);
+        ::close(fd);
+
+        if (::rename(staging.c_str(), piece_path(piece_index).c_str()) != 0) {
+            fprintf(stderr, "[DIAG] publish rename failed for %s: %s\n",
+                    staging.c_str(), strerror(errno));
+            ::unlink(staging.c_str());
+            g_piece_publish_failures.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        // The marker is deliberately not fsynced: one fsync per piece is the
+        // durability point for the data, and the marker only has to be
+        // visible to the restart scan that runs after the process exits
+        // cleanly enough for the page cache to have it.
+        std::string const marker_path = piece_marker_path(piece_index);
+        int const marker = ::open(marker_path.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (marker < 0) {
+            fprintf(stderr, "[DIAG] create marker failed for %s: %s\n",
+                    marker_path.c_str(), strerror(errno));
+            // The piece itself is published and durable; only the marker is
+            // missing, which a restart scan reads as "complete" — correctly.
+            return true;
+        }
+        g_disk_piece_markers.fetch_add(1, std::memory_order_relaxed);
+        ::close(marker);
+        return true;
+    }
+
     std::string m_base_path;
     std::string m_info_hash_hex;
     // Torrent layout, owned by the torrent_info of the torrent this storage
     // belongs to. Only read for v2 piece geometry.
     lt::file_storage const* m_files;
-    mutable std::mutex m_mutex;
+    lt::io_context& m_ios;
+    std::shared_ptr<DiskWorkerPool> m_pool;
+    // Shared with every other storage of the same info hash; see TorrentLane.
+    std::shared_ptr<TorrentLane> m_lane;
+    // Protocol layout flags. v1 requests cover the padded piece; a v2 layout
+    // pads each file to a piece boundary and only requests the payload.
+    bool m_v1;
+    bool m_v2;
+    // Open descriptors for pieces whose blocks are still arriving. Guarded by
+    // the lane: every disk job for this torrent runs on one worker at a time.
+    std::map<int, PieceWriteState> m_write_states;
 };
 
 // ============================================================================
@@ -1962,63 +2561,220 @@ public:
                     piece_cache_dir.c_str());
             throw std::runtime_error("Failed to create piece cache directory: " + piece_cache_dir);
         }
+        auto mailbox = m_mailbox;
+        m_pool = std::make_shared<DiskWorkerPool>(
+            [mailbox](std::function<void()> done) {
+                mailbox->enqueue(std::move(done));
+            });
+        std::lock_guard<std::mutex> lock(g_disk_io_registry_mutex);
+        g_disk_io_registry[m_piece_cache_dir] = this;
+    }
+
+    ~PieceStorageDiskIO() override {
+        {
+            std::lock_guard<std::mutex> lock(g_disk_io_registry_mutex);
+            auto it = g_disk_io_registry.find(m_piece_cache_dir);
+            if (it != g_disk_io_registry.end() && it->second == this) {
+                g_disk_io_registry.erase(it);
+            }
+        }
+        // Order matters. Joining the workers first means no new completion can
+        // be produced; closing the mailbox then releases the ones still
+        // queued while this object is still alive. The io_context may later
+        // destroy its single pending wake-up, but that one carries only the
+        // mailbox, never a torrent.
+        m_destroying.store(true, std::memory_order_release);
+        if (m_pool) m_pool->stop_and_join();
+        if (m_mailbox) m_mailbox->close();
+        // A job that was enqueued while the pool was already stopping has no
+        // drainer left. It owns its storage through the wrapper `submit`
+        // installs, so drop those jobs here to break the lane -> job ->
+        // storage -> lane cycle and let the storage close its descriptors.
+        std::vector<std::shared_ptr<TorrentLane>> lanes;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (auto& entry : m_lanes) {
+                if (auto lane = entry.second.lock()) lanes.push_back(lane);
+            }
+            m_lanes.clear();
+        }
+        for (auto& lane : lanes) {
+            std::lock_guard<std::mutex> lock(lane->mutex);
+            lane->jobs.clear();
+            lane->draining = false;
+        }
+        m_storages.clear();
+        // Safety net: a read buffer that no completion owned any more would
+        // leak for the process lifetime otherwise. Dropped completions have
+        // already released theirs, so this normally frees nothing. This is
+        // not the completion-discard path and must not be counted as one.
+        std::vector<char*> leftovers;
+        {
+            std::lock_guard<std::mutex> lock(m_alloc_mutex);
+            leftovers.assign(m_allocated.begin(), m_allocated.end());
+        }
+        for (char* buf : leftovers) {
+            release_read_buffer(buf, false);
+        }
     }
 
     // buffer_allocator_interface
     void free_disk_buffer(char* b) override {
-        if (b) {
-            std::lock_guard<std::mutex> lock(m_alloc_mutex);
-            auto it = m_allocated.find(b);
-            if (it != m_allocated.end()) {
-                m_allocated.erase(it);
-                std::free(b);
-            }
-            // else: double-free, silently ignore
-        }
+        // A second free for the same pointer is ignored: m_allocated is the
+        // single ownership record, so release happens exactly once.
+        release_read_buffer(b, false);
     }
 #if LIBTORRENT_VERSION_NUM >= 20100
     void free_multiple_buffers(lt::span<char*> bufs) override {
-        std::lock_guard<std::mutex> lock(m_alloc_mutex);
         for (auto* b : bufs) {
-            if (b) {
-                auto it = m_allocated.find(b);
-                if (it != m_allocated.end()) {
-                    m_allocated.erase(it);
-                    std::free(b);
-                }
-            }
+            release_read_buffer(b, false);
         }
     }
 #endif
+
+    // Test hooks used by the read-buffer teardown regression: park the
+    // completions the workers produced, then discard them the way shutdown
+    // does, while this object and its allocator are still alive.
+    void test_pause_completion_mailbox(bool paused) {
+        if (m_mailbox) m_mailbox->set_paused(paused);
+    }
+
+    void test_close_completion_mailbox() {
+        if (m_mailbox) m_mailbox->close();
+    }
+
+    void test_completion_mailbox_stats(uint64_t* pending, uint64_t* discarded,
+        uint64_t* delivered) {
+        if (!m_mailbox) return;
+        m_mailbox->stats(*pending, *discarded, *delivered);
+    }
 
     // disk_interface: new_torrent
     lt::storage_holder new_torrent(lt::storage_params const& p,
         std::shared_ptr<void> const& /*torrent*/) override
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        std::string info_hash_hex = sha1_to_hex(p.info_hash);
-        TORRENTFS_DIAG("[DIAG] new_torrent info_hash=%s\n",
-                info_hash_hex.c_str());
-        // The layout (and with it the v2 piece geometry) is owned by the
-        // torrent's torrent_info, which outlives this storage.
-        auto storage = std::make_unique<PieceStorage>(
-            m_piece_cache_dir, info_hash_hex, &p.files);
-        lt::storage_index_t idx = m_next_index;
-        ++m_next_index;
-        m_storages[idx] = std::move(storage);
+        std::shared_ptr<PieceStorage> storage;
+        lt::storage_index_t idx;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            std::string info_hash_hex = sha1_to_hex(p.info_hash);
+            TORRENTFS_DIAG("[DIAG] new_torrent info_hash=%s\n",
+                    info_hash_hex.c_str());
+            for (auto it = m_lanes.begin(); it != m_lanes.end();) {
+                if (it->second.expired()) {
+                    it = m_lanes.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            // Reuse the lane of an earlier storage for the same hash: its
+            // queued delete must run before this storage creates or writes
+            // anything, even though the old torrent already left the session.
+            auto& lane_slot = m_lanes[info_hash_hex];
+            std::shared_ptr<TorrentLane> lane = lane_slot.lock();
+            if (!lane) {
+                lane = std::make_shared<TorrentLane>();
+                lane_slot = lane;
+            }
+            // The layout (and with it the v2 piece geometry) is owned by the
+            // torrent's torrent_info, which outlives this storage.
+            storage = std::make_shared<PieceStorage>(
+                m_piece_cache_dir, info_hash_hex, &p.files, m_ios, m_pool,
+                std::move(lane), p.v1, p.v2);
+            idx = m_next_index;
+            ++m_next_index;
+            m_storages[idx] = storage;
+        }
+        // Claiming the directory is file I/O, so it runs on this torrent's
+        // serial lane instead of the network thread that called us. On a
+        // re-add the lane still holds the old storage's delete, so mkdir is
+        // ordered after it and the recreated directory is not wiped.
+        PieceStorage* raw = storage.get();
+        storage->submit([raw] { raw->ensure_pieces_dir(); });
         return lt::storage_holder(idx, *this);
     }
 
     // disk_interface: remove_torrent
     void remove_torrent(lt::storage_index_t idx) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        // Releasing a queued completion inside our own destructor can drop the
+        // last torrent reference, whose storage_holder then calls back in
+        // here. The storages are already being torn down; nothing to do.
+        if (m_destroying.load(std::memory_order_acquire)) return;
+        std::shared_ptr<PieceStorage> storage;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_storages.find(idx);
+            if (it == m_storages.end()) return;
+            storage = std::move(it->second);
+            m_storages.erase(it);
+        }
+        // Close any still-open piece descriptor on the pool rather than on
+        // this (network) thread; the queued job owns the storage until it
+        // runs.
+        PieceStorage* raw = storage.get();
+        storage->submit([raw] { raw->close_write_handles(); });
         // TSI-2262: the per-info-hash shared_mutex is intentionally NOT
         // erased from g_piece_locks here. A concurrent lt_unlock_piece_read
         // may still hold a shared_ptr to it; erasing would invalidate the
         // map entry's shared_ptr, but since get_piece_lock returns a copy,
         // the mutex stays alive until the last reference drops. Leaving
         // the entry avoids the erase-during-use UB entirely.
-        m_storages.erase(idx);
+    }
+
+    // Hand a completion to the mailbox instead of posting it into the
+    // io_context directly: the handler then never outlives this disk object,
+    // even when the session is torn down with completions still queued.
+    void enqueue_completion(std::function<void()> done) {
+        if (m_mailbox) {
+            m_mailbox->enqueue(std::move(done));
+            return;
+        }
+        // No mailbox (construction failure path): running it here keeps the
+        // disk_interface contract, and no worker exists to post from.
+        if (done) done();
+    }
+
+    // Ownership of an async_read buffer until the completion either hands it
+    // to libtorrent's disk_buffer_holder or is destroyed. Holding it in a
+    // shared_ptr means a completion dropped by CompletionMailbox::close()
+    // still releases the buffer here, exactly once.
+    struct ReadBufferLease {
+        PieceStorageDiskIO* owner = nullptr;
+        char* data = nullptr;
+
+        ~ReadBufferLease() {
+            if (data && owner) owner->release_read_buffer(data, true);
+        }
+
+        char* release() {
+            char* const out = data;
+            data = nullptr;
+            return out;
+        }
+    };
+
+    // Free a read buffer owned by this disk object. `dropped` distinguishes a
+    // buffer released because its completion was discarded from one delivered
+    // through disk_buffer_holder. Membership in m_allocated makes the free
+    // exactly-once even if both paths race.
+    void release_read_buffer(char* buf, bool dropped) {
+        if (!buf) return;
+        bool freed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_alloc_mutex);
+            auto it = m_allocated.find(buf);
+            if (it != m_allocated.end()) {
+                m_allocated.erase(it);
+                freed = true;
+            }
+        }
+        if (!freed) return;
+        std::free(buf);
+        g_read_buffers_released.fetch_add(1, std::memory_order_relaxed);
+        g_read_buffers_live.fetch_sub(1, std::memory_order_relaxed);
+        if (dropped) {
+            g_read_buffers_dropped.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // disk_interface: async_read
@@ -2026,8 +2782,9 @@ public:
         std::function<void(lt::disk_buffer_holder, lt::storage_error const&)> handler,
         lt::disk_job_flags_t /*flags*/) override
     {
-        auto* ps = get_storage(storage);
-        if (!ps) {
+        DiskCallbackScope callback_scope;
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
             handler(lt::disk_buffer_holder(),
                 lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
             return;
@@ -2043,54 +2800,87 @@ public:
             std::lock_guard<std::mutex> lock(m_alloc_mutex);
             m_allocated.insert(buf);
         }
+        g_read_buffers_allocated.fetch_add(1, std::memory_order_relaxed);
+        g_read_buffers_live.fetch_add(1, std::memory_order_relaxed);
+        auto lease = std::make_shared<ReadBufferLease>();
+        lease->owner = this;
+        lease->data = buf;
 
-        if (ps->read_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, r, lease, handler = std::move(handler)]() mutable {
+            if (ps->read_piece(static_cast<int>(r.piece), r.start, lease->data, r.length)) {
 #if LIBTORRENT_VERSION_NUM >= 20100
-            boost::asio::post(m_ios, [h = std::move(handler), this, buf]() mutable {
-                h(lt::disk_buffer_holder(*this, buf), lt::storage_error());
-            });
+                enqueue_completion([h = std::move(handler), this, lease]() mutable {
+                    h(lt::disk_buffer_holder(*this, lease->release()),
+                        lt::storage_error());
+                });
 #else
-            boost::asio::post(m_ios, [h = std::move(handler), this, buf, len = r.length]() mutable {
-                h(lt::disk_buffer_holder(*this, buf, len), lt::storage_error());
-            });
+                enqueue_completion([h = std::move(handler), this, lease, len = r.length]() mutable {
+                    h(lt::disk_buffer_holder(*this, lease->release(), len),
+                        lt::storage_error());
+                });
 #endif
-        } else {
-            {
-                std::lock_guard<std::mutex> lock(m_alloc_mutex);
-                m_allocated.erase(buf);
+            } else {
+                release_read_buffer(lease->release(), false);
+                enqueue_completion([h = std::move(handler)] {
+                    h(lt::disk_buffer_holder(),
+                        lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                });
             }
-            std::free(buf);
-            boost::asio::post(m_ios, [h = std::move(handler)] {
-                h(lt::disk_buffer_holder(),
-                    lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
-            });
-        }
+        });
     }
 
     // disk_interface: async_write
     bool async_write(lt::storage_index_t storage, lt::peer_request const& r,
-        char const* buf, std::shared_ptr<lt::disk_observer> /*o*/,
+        char const* buf, std::shared_ptr<lt::disk_observer> o,
         std::function<void(lt::storage_error const&)> handler,
         lt::disk_job_flags_t /*flags*/) override
     {
-        auto* ps = get_storage(storage);
-        if (!ps) {
+        DiskCallbackScope callback_scope;
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
             handler(lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
             return false;
         }
 
-        if (ps->write_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
-            TORRENTFS_DIAG("[DIAG] async_write piece=%d offset=%d len=%d => OK (posted)\n",
-                    static_cast<int>(r.piece), r.start, r.length);
-            boost::asio::post(m_ios, [h = std::move(handler)] { h(lt::storage_error()); });
-        } else {
-            TORRENTFS_DIAG("[DIAG] async_write piece=%d offset=%d len=%d => FAIL\n",
-                    static_cast<int>(r.piece), r.start, r.length);
-            boost::asio::post(m_ios, [h = std::move(handler)] {
-                h(lt::storage_error(lt::error_code(boost::system::errc::io_error, boost::system::generic_category())));
-            });
+        // libtorrent's receive buffer is reused as soon as this call returns,
+        // so the block must be copied here. The copy is the whole cost on the
+        // network thread; opening, writing and fsyncing happen on the pool.
+        std::shared_ptr<char> block(
+            static_cast<char*>(std::malloc(static_cast<size_t>(r.length))),
+            [](char* p) { std::free(p); });
+        if (!block) {
+            handler(lt::storage_error(lt::error_code(
+                boost::system::errc::not_enough_memory, boost::system::generic_category())));
+            return false;
         }
-        return false;
+        std::memcpy(block.get(), buf, static_cast<size_t>(r.length));
+
+        PieceStorage* ps = storage_ptr.get();
+        bool const over_water = storage_ptr->submit(
+            [this, ps, r, block = std::move(block), handler = std::move(handler)]() mutable {
+                bool const ok = ps->write_block(static_cast<int>(r.piece), r.start,
+                    block.get(), r.length);
+                TORRENTFS_DIAG("[DIAG] async_write piece=%d offset=%d len=%d => %s\n",
+                        static_cast<int>(r.piece), r.start, r.length, ok ? "OK" : "FAIL");
+                lt::storage_error error;
+                if (!ok) {
+                    g_write_completion_errors.fetch_add(1, std::memory_order_relaxed);
+                    error = lt::storage_error(lt::error_code(
+                        boost::system::errc::io_error, boost::system::generic_category()));
+                }
+                enqueue_completion([h = std::move(handler), error]() mutable {
+                    h(error);
+                    // The handler returned, so libtorrent has observed the
+                    // error. Distinct from an error that was only constructed.
+                    if (error) {
+                        g_write_completion_errors_delivered.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                });
+            },
+            std::move(o));
+        return over_water;
     }
 
     // disk_interface: async_hash
@@ -2099,92 +2889,100 @@ public:
         lt::disk_job_flags_t flags,
         std::function<void(lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&)> handler) override
     {
+        DiskCallbackScope callback_scope;
         (void)flags;
         TORRENTFS_DIAG("[DIAG] async_hash CALLED piece=%d v2_size=%zu\n",
                 static_cast<int>(piece), v2.size());
-        auto* ps = get_storage(storage);
-        if (!ps) {
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
             TORRENTFS_DIAG("[DIAG] async_hash piece=%d => no storage\n", static_cast<int>(piece));
             // Zero out v2 hashes for hybrid torrents — no data available
             for (auto& h : v2) h = lt::sha256_hash();
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+            enqueue_completion([h = std::move(handler), p = piece] {
                 h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
             });
             return;
         }
 
-        int piece_idx = static_cast<int>(piece);
-        int64_t sz = ps->piece_size(piece_idx);
-        TORRENTFS_DIAG("[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
-        if (sz <= 0) {
-            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
-            // A missing piece is a mismatch to this storage, not a file error:
-            // a `no_such_file_or_directory` here makes libtorrent skip every
-            // remaining piece of that file, which for piece-level storage is
-            // the rest of the torrent, hiding a partially cached torrent.
-            for (auto& h : v2) h = lt::sha256_hash();
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error());
-            });
-            return;
-        }
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, piece, v2, handler = std::move(handler)]() mutable {
+            int const piece_idx = static_cast<int>(piece);
+            // A piece that finished writing may still own an open descriptor
+            // when the hash job arrives first; flush it once so the hash reads
+            // durable bytes.
+            ps->flush_open_piece(piece_idx);
 
-        // Read full piece data so we can compute v2 sub-range hashes
-        auto data = ps->read_piece_data(piece_idx);
-        if (data.empty()) {
-            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
-            for (auto& h : v2) h = lt::sha256_hash();
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha1_hash(), lt::storage_error());
-            });
-            return;
-        }
-
-        // Compute SHA1 over the full piece
-        lt::hasher hasher;
-        hasher.update(data.data(), static_cast<int>(data.size()));
-        lt::sha1_hash hash = hasher.final();
-
-        // Compute SHA256 for each v2 block in hybrid torrents.
-        // BEP 52 hashes the piece in fixed 16 KiB blocks; only the final block
-        // is short, and the range stops at `piece_size2` (the v2 piece length,
-        // which excludes v1 tail padding). Slicing the piece evenly
-        // (`data.size() / v2.size()`) instead folded padding bytes into the
-        // last block, so every padded piece failed v2 verification.
-        if (!v2.empty()) {
-            int const piece_size2 = ps->piece_size2(piece_idx);
-            if (piece_size2 < 0 || static_cast<size_t>(piece_size2) > data.size()) {
-                TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%d => zero hashes\n",
-                        piece_idx, v2.size(), piece_size2);
+            int64_t const sz = ps->piece_size(piece_idx);
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
+            if (sz <= 0) {
+                TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
+                // A missing piece is a mismatch to this storage, not a file
+                // error: `no_such_file_or_directory` here makes libtorrent
+                // skip the rest of the torrent's pieces.
                 for (auto& h : v2) h = lt::sha256_hash();
-            } else {
-                size_t const blocks = v2.size();
-                size_t const block_size = static_cast<size_t>(lt::default_block_size);
-                size_t const v2_size = static_cast<size_t>(piece_size2);
-                for (size_t j = 0; j < blocks; ++j) {
-                    size_t const start = j * block_size;
-                    if (start >= v2_size) {
-                        v2[j] = lt::sha256_hash();
-                        continue;
-                    }
-                    size_t const len = std::min(block_size, v2_size - start);
-                    SHA256_CTX ctx;
-                    SHA256_Init(&ctx);
-                    SHA256_Update(&ctx, data.data() + start, len);
-                    SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
-                }
-                TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%zu => populated\n",
-                        piece_idx, blocks, v2_size);
+                enqueue_completion([h = std::move(handler), p = piece] {
+                    h(p, lt::sha1_hash(), lt::storage_error());
+                });
+                return;
             }
-        }
 
-        TORRENTFS_DIAG("[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
-                piece_idx, static_cast<int>(data.size()),
-                (unsigned char)hash[0], (unsigned char)hash[1],
-                (unsigned char)hash[2], (unsigned char)hash[3]);
-        boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
-            h(p, hash, lt::storage_error());
+            // Read full piece data so we can compute v2 sub-range hashes
+            auto data = ps->read_piece_data(piece_idx);
+            if (data.empty()) {
+                TORRENTFS_DIAG("[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
+                for (auto& h : v2) h = lt::sha256_hash();
+                enqueue_completion([h = std::move(handler), p = piece] {
+                    h(p, lt::sha1_hash(), lt::storage_error());
+                });
+                return;
+            }
+
+            // Compute SHA1 over the full piece
+            lt::hasher hasher;
+            hasher.update(data.data(), static_cast<int>(data.size()));
+            lt::sha1_hash hash = hasher.final();
+
+            // Compute SHA256 for each v2 block in hybrid torrents.
+            // BEP 52 hashes the piece in fixed 16 KiB blocks; only the final
+            // block is short, and the range stops at `piece_size2` (the v2
+            // piece length, which excludes v1 tail padding). Slicing the piece
+            // evenly folded padding bytes into the last block, so every padded
+            // piece failed v2 verification.
+            if (!v2.empty()) {
+                int const piece_size2 = ps->piece_size2(piece_idx);
+                if (piece_size2 < 0 || static_cast<size_t>(piece_size2) > data.size()) {
+                    TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%d => zero hashes\n",
+                            piece_idx, v2.size(), piece_size2);
+                    for (auto& h : v2) h = lt::sha256_hash();
+                } else {
+                    size_t const blocks = v2.size();
+                    size_t const block_size = static_cast<size_t>(lt::default_block_size);
+                    size_t const v2_size = static_cast<size_t>(piece_size2);
+                    for (size_t j = 0; j < blocks; ++j) {
+                        size_t const start = j * block_size;
+                        if (start >= v2_size) {
+                            v2[j] = lt::sha256_hash();
+                            continue;
+                        }
+                        size_t const len = std::min(block_size, v2_size - start);
+                        SHA256_CTX ctx;
+                        SHA256_Init(&ctx);
+                        SHA256_Update(&ctx, data.data() + start, len);
+                        SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
+                    }
+                    TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu piece_size2=%zu => populated\n",
+                            piece_idx, blocks, v2_size);
+                }
+            }
+
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
+                    piece_idx, static_cast<int>(data.size()),
+                    (unsigned char)hash[0], (unsigned char)hash[1],
+                    (unsigned char)hash[2], (unsigned char)hash[3]);
+            enqueue_completion([h = std::move(handler), p = piece, hash] {
+                h(p, hash, lt::storage_error());
+            });
         });
     }
 
@@ -2195,50 +2993,54 @@ public:
         int offset, lt::disk_job_flags_t /*flags*/,
         std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> handler) override
     {
+        DiskCallbackScope callback_scope;
         TORRENTFS_DIAG("[DIAG] async_hash2 CALLED piece=%d offset=%d\n",
                 static_cast<int>(piece), offset);
-        auto* ps = get_storage(storage);
-        if (!ps) {
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
             TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => no storage\n", static_cast<int>(piece));
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+            enqueue_completion([h = std::move(handler), p = piece] {
                 h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
             });
             return;
         }
 
-        int const piece_idx = static_cast<int>(piece);
-        int const piece_size2 = ps->piece_size2(piece_idx);
-        int64_t const sz = ps->piece_size(piece_idx);
-        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld offset=%d piece_size2=%d\n",
-                piece_idx, (long)sz, offset, piece_size2);
-        if (sz <= 0) {
-            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
-            });
-            return;
-        }
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, piece, offset, handler = std::move(handler)]() mutable {
+            int const piece_idx = static_cast<int>(piece);
+            int const piece_size2 = ps->piece_size2(piece_idx);
+            int64_t const sz = ps->piece_size(piece_idx);
+            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld offset=%d piece_size2=%d\n",
+                    piece_idx, (long)sz, offset, piece_size2);
+            if (sz <= 0) {
+                TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
+                enqueue_completion([h = std::move(handler), p = piece] {
+                    h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
+                        boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+                });
+                return;
+            }
 
-        if (piece_size2 <= 0 || offset < 0 || offset >= piece_size2) {
-            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d outside piece_size2=%d\n",
-                    piece_idx, offset, piece_size2);
-            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
-                    boost::system::errc::invalid_argument, boost::system::generic_category())));
-            });
-            return;
-        }
+            if (piece_size2 <= 0 || offset < 0 || offset >= piece_size2) {
+                TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d outside piece_size2=%d\n",
+                        piece_idx, offset, piece_size2);
+                enqueue_completion([h = std::move(handler), p = piece] {
+                    h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
+                        boost::system::errc::invalid_argument, boost::system::generic_category())));
+                });
+                return;
+            }
 
-        int const block_len = std::min<int>(lt::default_block_size, piece_size2 - offset);
-        lt::sha256_hash hash = ps->hash_block_sha256(piece_idx, offset, block_len);
-        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d len=%d hash=%02x%02x%02x%02x... => posted\n",
-                piece_idx, offset, block_len,
-                (unsigned char)hash[0], (unsigned char)hash[1],
-                (unsigned char)hash[2], (unsigned char)hash[3]);
-        boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
-            h(p, hash, lt::storage_error());
+            int const block_len = std::min<int>(lt::default_block_size, piece_size2 - offset);
+            lt::sha256_hash hash = ps->hash_block_sha256(piece_idx, offset, block_len);
+            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d offset=%d len=%d hash=%02x%02x%02x%02x... => posted\n",
+                    piece_idx, offset, block_len,
+                    (unsigned char)hash[0], (unsigned char)hash[1],
+                    (unsigned char)hash[2], (unsigned char)hash[3]);
+            enqueue_completion([h = std::move(handler), p = piece, hash] {
+                h(p, hash, lt::storage_error());
+            });
         });
     }
 
@@ -2257,10 +3059,21 @@ public:
     }
 
     // disk_interface: async_release_files
-    void async_release_files(lt::storage_index_t /*storage*/,
+    void async_release_files(lt::storage_index_t storage,
         std::function<void()> handler) override
     {
-        if (handler) handler();
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
+            if (handler) handler();
+            return;
+        }
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, handler = std::move(handler)]() mutable {
+            ps->close_write_handles();
+            if (handler) {
+                enqueue_completion([h = std::move(handler)]() mutable { h(); });
+            }
+        });
     }
 
     // disk_interface: async_check_files
@@ -2269,8 +3082,9 @@ public:
         lt::aux::vector<std::string, lt::file_index_t> /*links*/,
         std::function<void(lt::status_t, lt::storage_error const&)> handler) override
     {
-        auto* ps = get_storage(storage);
-        if (!ps) {
+        DiskCallbackScope callback_scope;
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
             handler(lt::status_t{},
                 lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory,
@@ -2278,38 +3092,58 @@ public:
             return;
         }
 
-        // After FUSE remount, PieceStorageDiskIO must re-check which piece files
-        // exist on disk so that libtorrent can correctly identify cached pieces.
-        // With hash checks off a full check cannot tell a missing piece from a
-        // present one (the comparison is skipped and every piece passes), so it
-        // would broadcast a partial cache as complete; the cached set is
-        // declared in `have_pieces` when the torrent is added instead.
-        if (m_disable_hash_checks) {
-            TORRENTFS_DIAG("[DIAG] async_check_files: hash checks disabled, "
-                           "keeping the declared bitmap\n");
-            handler(lt::status_t{}, lt::storage_error());
-            return;
-        }
+        PieceStorage* ps = storage_ptr.get();
+        bool const disable_hash_checks = m_disable_hash_checks;
+        storage_ptr->submit([this, ps, disable_hash_checks,
+            handler = std::move(handler)]() mutable {
+            // After FUSE remount, PieceStorageDiskIO must re-check which piece
+            // files exist on disk so that libtorrent can correctly identify
+            // cached pieces. With hash checks off a full check cannot tell a
+            // missing piece from a present one (the comparison is skipped and
+            // every piece passes), so it would broadcast a partial cache as
+            // complete; the cached set is declared in `have_pieces` when the
+            // torrent is added instead.
+            if (disable_hash_checks) {
+                TORRENTFS_DIAG("[DIAG] async_check_files: hash checks disabled, "
+                               "keeping the declared bitmap\n");
+                enqueue_completion([h = std::move(handler)]() mutable {
+                    h(lt::status_t{}, lt::storage_error());
+                });
+                return;
+            }
 
-        // Cached piece files exist but carry no resume data (every torrent is
-        // re-added on start), so `no_error` would tell libtorrent the storage
-        // is empty: the session then advertises an empty bitfield and serves
-        // nothing.  `need_full_check` makes it hash the cache through
-        // async_hash and rebuild the bitfield from the pieces on disk.
-        if (has_cached_piece_file(ps->pieces_dir(), ps->get_info_hash_hex())) {
-            TORRENTFS_DIAG("[DIAG] async_check_files: cached pieces => need_full_check\n");
-            handler(lt::disk_status::need_full_check, lt::storage_error());
-            return;
-        }
-
-        handler(lt::status_t{}, lt::storage_error());
+            // Cached piece files exist but carry no resume data (every torrent
+            // is re-added on start), so `no_error` would tell libtorrent the
+            // storage is empty: the session then advertises an empty bitfield
+            // and serves nothing. `need_full_check` makes it hash the cache
+            // through async_hash and rebuild the bitfield from pieces on disk.
+            lt::status_t status{};
+            if (has_cached_piece_file(ps->pieces_dir(), ps->get_info_hash_hex())) {
+                TORRENTFS_DIAG("[DIAG] async_check_files: cached pieces => need_full_check\n");
+                status = lt::disk_status::need_full_check;
+            }
+            enqueue_completion([h = std::move(handler), status]() mutable {
+                h(status, lt::storage_error());
+            });
+        });
     }
 
     // disk_interface: async_stop_torrent
-    void async_stop_torrent(lt::storage_index_t /*storage*/,
+    void async_stop_torrent(lt::storage_index_t storage,
         std::function<void()> handler) override
     {
-        if (handler) handler();
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
+            if (handler) handler();
+            return;
+        }
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, handler = std::move(handler)]() mutable {
+            ps->close_write_handles();
+            if (handler) {
+                enqueue_completion([h = std::move(handler)]() mutable { h(); });
+            }
+        });
     }
 
     // disk_interface: async_rename_file
@@ -2326,11 +3160,19 @@ public:
         lt::remove_flags_t /*options*/,
         std::function<void(lt::storage_error const&)> handler) override
     {
-        auto* ps = get_storage(storage);
-        if (ps) {
-            ps->delete_piece_files();
+        DiskCallbackScope callback_scope;
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
+            handler(lt::storage_error());
+            return;
         }
-        handler(lt::storage_error());
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, handler = std::move(handler)]() mutable {
+            ps->delete_piece_files();
+            enqueue_completion([h = std::move(handler)]() mutable {
+                h(lt::storage_error());
+            });
+        });
     }
 
     // disk_interface: async_set_file_priority
@@ -2347,11 +3189,24 @@ public:
     // piece_index_t(0). No dedicated test: this is a pure C++ disk_interface
     // callback with no FFI exposure or Rust call path, and libtorrent uses
     // the handler only as a completion signal (does not validate the index).
-    void async_clear_piece(lt::storage_index_t /*storage*/,
+    void async_clear_piece(lt::storage_index_t storage,
         lt::piece_index_t index,
         std::function<void(lt::piece_index_t)> handler) override
     {
-        if (handler) handler(index);
+        auto storage_ptr = get_storage(storage);
+        if (!storage_ptr) {
+            if (handler) handler(index);
+            return;
+        }
+        PieceStorage* ps = storage_ptr.get();
+        storage_ptr->submit([this, ps, index, handler = std::move(handler)]() mutable {
+            ps->clear_piece(static_cast<int>(index));
+            if (handler) {
+                enqueue_completion([h = std::move(handler), index]() mutable {
+                    h(index);
+                });
+            }
+        });
     }
 
     // disk_interface: update_stats_counters
@@ -2364,7 +3219,10 @@ public:
     }
 
     // disk_interface: abort
-    void abort(bool /*wait*/) override {
+    void abort(bool wait) override {
+        // The workers post completions back to this io_context; join them
+        // before libtorrent tears the session down.
+        if (wait && m_pool) m_pool->stop_and_join();
     }
 
     // disk_interface: submit_jobs
@@ -2376,11 +3234,11 @@ public:
     }
 
 private:
-    PieceStorage* get_storage(lt::storage_index_t idx) {
+    std::shared_ptr<PieceStorage> get_storage(lt::storage_index_t idx) {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_storages.find(idx);
         if (it == m_storages.end()) return nullptr;
-        return it->second.get();
+        return it->second;
     }
 
     lt::io_context& m_ios;
@@ -2390,7 +3248,19 @@ private:
     // declared bitmap instead.
     bool m_disable_hash_checks;
     std::mutex m_mutex;
-    std::map<lt::storage_index_t, std::unique_ptr<PieceStorage>> m_storages;
+    std::map<lt::storage_index_t, std::shared_ptr<PieceStorage>> m_storages;
+    // Serial lanes keyed by info hash, shared by successive storages of the
+    // same torrent (a removal and re-add must not interleave file deletion
+    // with the new storage's writes). Weak so an idle hash does not keep one.
+    std::map<std::string, std::weak_ptr<TorrentLane>> m_lanes;
+    // Created before any storage and stopped before they are released; jobs
+    // hold shared references to both the pool and their storage.
+    std::shared_ptr<CompletionMailbox> m_mailbox{
+        std::make_shared<CompletionMailbox>(m_ios)};
+    std::shared_ptr<DiskWorkerPool> m_pool;
+    // Set first thing in the destructor; guards the re-entrant remove_torrent
+    // that releasing queued completions can trigger.
+    std::atomic<bool> m_destroying{false};
     lt::storage_index_t m_next_index{0};
     std::set<char*> m_allocated;
     std::mutex m_alloc_mutex;
@@ -2816,4 +3686,91 @@ void lt_string_free(char* str) {
     if (str) {
         std::free(str);
     }
+}
+
+void lt_disk_io_counters_get(lt_disk_io_counters_t* out) {
+    if (!out) return;
+    out->piece_fsyncs = g_disk_piece_fsyncs.load(std::memory_order_relaxed);
+    out->piece_markers = g_disk_piece_markers.load(std::memory_order_relaxed);
+    out->write_blocks = g_disk_write_blocks.load(std::memory_order_relaxed);
+    out->net_thread_io_calls
+        = g_disk_net_thread_io_calls.load(std::memory_order_relaxed);
+    out->net_callback_calls
+        = g_disk_callback_calls.load(std::memory_order_relaxed);
+    out->net_callback_total_us
+        = g_disk_callback_total_us.load(std::memory_order_relaxed);
+    out->net_callback_max_us
+        = g_disk_callback_max_us.load(std::memory_order_relaxed);
+    out->read_buffers_allocated
+        = g_read_buffers_allocated.load(std::memory_order_relaxed);
+    out->read_buffers_released
+        = g_read_buffers_released.load(std::memory_order_relaxed);
+    out->read_buffers_live
+        = g_read_buffers_live.load(std::memory_order_relaxed);
+    out->read_buffers_dropped
+        = g_read_buffers_dropped.load(std::memory_order_relaxed);
+    out->piece_publish_failures
+        = g_piece_publish_failures.load(std::memory_order_relaxed);
+    out->write_completion_errors
+        = g_write_completion_errors.load(std::memory_order_relaxed);
+    out->write_completion_errors_delivered
+        = g_write_completion_errors_delivered.load(std::memory_order_relaxed);
+}
+
+void lt_disk_io_counters_reset(void) {
+    g_disk_piece_fsyncs.store(0, std::memory_order_relaxed);
+    g_disk_piece_markers.store(0, std::memory_order_relaxed);
+    g_disk_write_blocks.store(0, std::memory_order_relaxed);
+    g_disk_net_thread_io_calls.store(0, std::memory_order_relaxed);
+    g_disk_callback_calls.store(0, std::memory_order_relaxed);
+    g_disk_callback_total_us.store(0, std::memory_order_relaxed);
+    g_disk_callback_max_us.store(0, std::memory_order_relaxed);
+    g_read_buffers_allocated.store(0, std::memory_order_relaxed);
+    g_read_buffers_released.store(0, std::memory_order_relaxed);
+    g_read_buffers_live.store(0, std::memory_order_relaxed);
+    g_read_buffers_dropped.store(0, std::memory_order_relaxed);
+    g_piece_publish_failures.store(0, std::memory_order_relaxed);
+    g_write_completion_errors.store(0, std::memory_order_relaxed);
+    g_write_completion_errors_delivered.store(0, std::memory_order_relaxed);
+}
+
+// ============================================================================
+// C API: read-completion mailbox test hooks
+//
+// A session's custom disk object is owned by libtorrent, so the integration
+// test cannot reach its mailbox directly. These helpers look it up by the
+// cache directory it was created for. They exist so the shutdown discard path
+// (queued successful read completions destroyed by `close`) can be exercised
+// deterministically instead of raced against a live teardown.
+// ============================================================================
+
+int lt_disk_io_test_pause_completion_mailbox(const char* piece_cache_dir, int paused) {
+    if (!piece_cache_dir || !*piece_cache_dir) return 0;
+    std::lock_guard<std::mutex> lock(g_disk_io_registry_mutex);
+    auto it = g_disk_io_registry.find(piece_cache_dir);
+    if (it == g_disk_io_registry.end()) return 0;
+    it->second->test_pause_completion_mailbox(paused != 0);
+    return 1;
+}
+
+int lt_disk_io_test_close_completion_mailbox(const char* piece_cache_dir) {
+    if (!piece_cache_dir || !*piece_cache_dir) return 0;
+    std::lock_guard<std::mutex> lock(g_disk_io_registry_mutex);
+    auto it = g_disk_io_registry.find(piece_cache_dir);
+    if (it == g_disk_io_registry.end()) return 0;
+    it->second->test_close_completion_mailbox();
+    return 1;
+}
+
+int lt_disk_io_test_completion_mailbox_stats(const char* piece_cache_dir,
+    uint64_t* pending, uint64_t* discarded, uint64_t* delivered) {
+    if (!piece_cache_dir || !*piece_cache_dir
+        || !pending || !discarded || !delivered) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_disk_io_registry_mutex);
+    auto it = g_disk_io_registry.find(piece_cache_dir);
+    if (it == g_disk_io_registry.end()) return 0;
+    it->second->test_completion_mailbox_stats(pending, discarded, delivered);
+    return 1;
 }
