@@ -723,6 +723,13 @@ impl Filesystem for TorrentFs {
                                                     id, size
                                                 );
                                             }
+                                            debug!(
+                                                "Read {} bytes from torrent file \
+                                                 (ticket={}, offset={})",
+                                                data.len(),
+                                                id,
+                                                offset
+                                            );
                                             // `resolve_or_enodata`
                                             // guards against `Ok(empty)` for a
                                             // non-zero `size`.  Resolves every
