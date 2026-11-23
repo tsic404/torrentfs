@@ -1,4 +1,4 @@
-//! Hybrid (v1+v2) cache check must verify the v2 block hashes.
+//! Padded layouts: hybrid (v1+v2) cache checks and v1-only alignment pads.
 //!
 //! BEP 52 hashes a piece in fixed 16 KiB blocks and truncates the last block at
 //! `piece_size2`, the piece length without v1 tail padding. Slicing the piece
@@ -13,13 +13,18 @@
 //! bytes (v2 length 3000). The single-file one has one 50000-byte file closed
 //! by a trailing `.pad`, so the padding is not tied to a second real file.
 //! Verifying any of those pieces needs the fixed-block slicing.
+//!
+//! The download cases below cover the write path instead: a v1-only torrent can
+//! also use explicit `attr: p` pad files, whose pad-only blocks are never
+//! requested. Piece completion must follow the real payload and the pad tail
+//! must be zero-filled before the piece is published.
 
 mod common;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{acquire_session_lock, local_test_config};
+use common::{acquire_session_lock, local_test_config, MiniTracker};
 use sha1_smol::Sha1;
 use sha2::{Digest, Sha256};
 use torrentfs::{Session, TorrentInfo, TorrentState};
@@ -94,7 +99,12 @@ fn patterned(size: usize, modulus: usize) -> Vec<u8> {
 /// Build a hybrid torrent from `files`, padding every real file to the piece
 /// boundary. The v1 file list carries those pads explicitly as `attr: p`
 /// entries under `.pad/<size>`; the v2 file tree lists only the real files.
-fn hybrid_fixture(name: &str, files: &[FixtureFile<'_>]) -> HybridFixture {
+fn padded_fixture(
+    name: &str,
+    files: &[FixtureFile<'_>],
+    announce_url: &str,
+    include_v2: bool,
+) -> HybridFixture {
     // Canonical v1 layout: every file is followed by the padding that makes
     // the next file start on a piece boundary.
     let mut stream = Vec::new();
@@ -168,12 +178,16 @@ fn hybrid_fixture(name: &str, files: &[FixtureFile<'_>]) -> HybridFixture {
     // Info dict, keys in bencode order.
     let mut info = Vec::new();
     info.push(b'd');
-    ben_bytes(&mut info, b"file tree");
-    info.extend_from_slice(&tree);
+    if include_v2 {
+        ben_bytes(&mut info, b"file tree");
+        info.extend_from_slice(&tree);
+    }
     ben_bytes(&mut info, b"files");
     info.extend_from_slice(&v1_files);
-    ben_bytes(&mut info, b"meta version");
-    ben_int(&mut info, 2);
+    if include_v2 {
+        ben_bytes(&mut info, b"meta version");
+        ben_int(&mut info, 2);
+    }
     ben_bytes(&mut info, b"name");
     ben_bytes(&mut info, name.as_bytes());
     ben_bytes(&mut info, b"piece length");
@@ -185,14 +199,26 @@ fn hybrid_fixture(name: &str, files: &[FixtureFile<'_>]) -> HybridFixture {
     let mut torrent = Vec::new();
     torrent.push(b'd');
     ben_bytes(&mut torrent, b"announce");
-    ben_bytes(&mut torrent, b"http://127.0.0.1:1/announce");
+    ben_bytes(&mut torrent, announce_url.as_bytes());
     ben_bytes(&mut torrent, b"info");
     torrent.extend_from_slice(&info);
-    ben_bytes(&mut torrent, b"piece layers");
-    torrent.extend_from_slice(b"de");
+    if include_v2 {
+        ben_bytes(&mut torrent, b"piece layers");
+        torrent.extend_from_slice(b"de");
+    }
     torrent.push(b'e');
 
     HybridFixture { torrent, pieces }
+}
+
+fn hybrid_fixture(name: &str, files: &[FixtureFile<'_>], announce_url: &str) -> HybridFixture {
+    padded_fixture(name, files, announce_url, true)
+}
+
+/// The same aligned layout with only v1 metadata: the pad files are explicit
+/// `attr: p` entries and `pieces` covers the padded stream.
+fn v1_pad_fixture(name: &str, files: &[FixtureFile<'_>], announce_url: &str) -> HybridFixture {
+    padded_fixture(name, files, announce_url, false)
 }
 
 /// Two real files; piece 0 carries 15536 padding bytes and piece 1 62536.
@@ -203,6 +229,7 @@ fn multi_file_fixture() -> HybridFixture {
             (b"a.bin", patterned(FILE_A_SIZE, 251)),
             (b"b.bin", patterned(FILE_B_SIZE, 241)),
         ],
+        "http://127.0.0.1:1/announce",
     )
 }
 
@@ -212,6 +239,7 @@ fn single_file_fixture() -> HybridFixture {
     hybrid_fixture(
         "hybridpadsingle",
         &[(b"only.bin", patterned(FILE_A_SIZE, 251))],
+        "http://127.0.0.1:1/announce",
     )
 }
 
@@ -276,6 +304,17 @@ fn wait_for_piece_check(handle: &torrentfs::TorrentHandle) {
     panic!("piece check did not finish");
 }
 
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
 /// A rejected piece stays missing and the torrent starts fetching it; data
 /// counted as done is therefore the observable that v2 verification passed.
 fn assert_all_pieces_verified(handle: &torrentfs::TorrentHandle) {
@@ -319,4 +358,167 @@ fn single_file_hybrid_pieces_pass_v2_block_verification() {
         "single-file hybrid piece failed v2 block verification"
     );
     assert_all_pieces_verified(&handle);
+}
+
+/// A hybrid torrent downloaded from an empty custom-storage cache. The v1
+/// requests cover the whole padded piece while pad-only blocks are never
+/// requested, so completion must be decided by the payload geometry and the
+/// pad tail must be materialized before the piece is published.
+#[test]
+fn hybrid_short_file_pieces_download_from_an_empty_cache() {
+    let _guard = acquire_session_lock();
+    let tracker = MiniTracker::start();
+    let file_a = patterned(FILE_A_SIZE, 251);
+    let file_b = patterned(FILE_B_SIZE, 241);
+    let fixture = hybrid_fixture(
+        "hybridpad",
+        &[(b"a.bin", file_a.clone()), (b"b.bin", file_b.clone())],
+        &tracker.announce_url(),
+    );
+    let info = TorrentInfo::from_bytes(fixture.torrent.clone()).expect("parse hybrid torrent");
+    let info_hash = info.info_hash().expect("info hash");
+
+    // Seeder: stock storage with only the two real files.
+    let seed_root = tempfile::TempDir::new().expect("seed root");
+    let seed_dir = seed_root.path().join("hybridpad");
+    std::fs::create_dir_all(&seed_dir).expect("seed torrent dir");
+    std::fs::write(seed_dir.join("a.bin"), &file_a).expect("seed a.bin");
+    std::fs::write(seed_dir.join("b.bin"), &file_b).expect("seed b.bin");
+    let mut seeder = Session::new(&quiet_config()).expect("seeder session");
+    let seed_handle = seeder
+        .add_torrent(&info, seed_root.path())
+        .expect("seeder add torrent");
+    assert!(
+        wait_until(Duration::from_secs(30), || seed_handle.have_piece(0)
+            && seed_handle.have_piece(1)),
+        "the hybrid seeder never verified its files"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || tracker.peer_count(&info_hash)
+            >= 1),
+        "seeder never announced to the tracker"
+    );
+
+    // Downloader: an empty cache, so every piece goes through the write path.
+    let cache_root = tempfile::TempDir::new().expect("cache root");
+    let mut downloader = Session::new_with_custom_storage(&quiet_config(), cache_root.path())
+        .expect("downloader session");
+    let handle = downloader
+        .add_torrent(&info, cache_root.path())
+        .expect("downloader add torrent");
+    assert!(
+        wait_until(Duration::from_secs(60), || handle.have_piece(0)
+            && handle.have_piece(1)),
+        "hybrid short-file pieces never completed (have: {}, {})",
+        handle.have_piece(0),
+        handle.have_piece(1)
+    );
+
+    let info_hash_hex = hex::encode(info_hash);
+    let piece_dir = cache_root.path().join(&info_hash_hex);
+    let mut expected_a = file_a.clone();
+    expected_a.resize(PIECE_LENGTH, 0);
+    let mut expected_b = file_b.clone();
+    expected_b.resize(PIECE_LENGTH, 0);
+    for (index, expected) in [&expected_a, &expected_b].into_iter().enumerate() {
+        let path = piece_dir.join(format!("{info_hash_hex}:piece:{index}"));
+        let stored = std::fs::read(&path).expect("published piece");
+        assert_eq!(
+            stored.len(),
+            PIECE_LENGTH,
+            "piece {index} was published without the v1 pad tail"
+        );
+        assert_eq!(stored, *expected, "piece {index} has the wrong content");
+        assert!(
+            !path.with_extension("part").exists(),
+            "piece {index} left a staging file behind"
+        );
+    }
+}
+
+/// A v1-only torrent whose files are aligned with explicit pad files. The
+/// pad-only blocks are never requested, so completion must be decided by the
+/// payload geometry and the pad tail must be zero-filled before publishing.
+/// Runs with hash checks disabled too: there the piece must still be
+/// published before libtorrent can declare it available.
+fn run_v1_pad_download(disable_hash_checks: bool) {
+    let _guard = acquire_session_lock();
+    let tracker = MiniTracker::start();
+    let file_a = patterned(FILE_A_SIZE, 251);
+    let file_b = patterned(FILE_B_SIZE, 241);
+    let fixture = v1_pad_fixture(
+        "v1pad",
+        &[(b"a.bin", file_a.clone()), (b"b.bin", file_b.clone())],
+        &tracker.announce_url(),
+    );
+    let info = TorrentInfo::from_bytes(fixture.torrent.clone()).expect("parse v1 torrent");
+    let info_hash = info.info_hash().expect("info hash");
+
+    let seed_root = tempfile::TempDir::new().expect("seed root");
+    let seed_dir = seed_root.path().join("v1pad");
+    std::fs::create_dir_all(&seed_dir).expect("seed torrent dir");
+    std::fs::write(seed_dir.join("a.bin"), &file_a).expect("seed a.bin");
+    std::fs::write(seed_dir.join("b.bin"), &file_b).expect("seed b.bin");
+    let mut seeder = Session::new(&quiet_config()).expect("seeder session");
+    let seed_handle = seeder
+        .add_torrent(&info, seed_root.path())
+        .expect("seeder add torrent");
+    assert!(
+        wait_until(Duration::from_secs(30), || seed_handle.have_piece(0)
+            && seed_handle.have_piece(1)),
+        "the v1 pad seeder never verified its files"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || tracker.peer_count(&info_hash)
+            >= 1),
+        "seeder never announced to the tracker"
+    );
+
+    let cache_root = tempfile::TempDir::new().expect("cache root");
+    let mut config = quiet_config();
+    config.misc.disable_hash_checks = Some(disable_hash_checks);
+    let mut downloader =
+        Session::new_with_custom_storage(&config, cache_root.path()).expect("downloader session");
+    let handle = downloader
+        .add_torrent(&info, cache_root.path())
+        .expect("downloader add torrent");
+    assert!(
+        wait_until(Duration::from_secs(60), || handle.have_piece(0)
+            && handle.have_piece(1)),
+        "v1 pieces with alignment pads never completed (have: {}, {}, \
+         disable_hash_checks={disable_hash_checks})",
+        handle.have_piece(0),
+        handle.have_piece(1)
+    );
+
+    let info_hash_hex = hex::encode(info_hash);
+    let piece_dir = cache_root.path().join(&info_hash_hex);
+    let mut expected_a = file_a.clone();
+    expected_a.resize(PIECE_LENGTH, 0);
+    let mut expected_b = file_b.clone();
+    expected_b.resize(PIECE_LENGTH, 0);
+    for (index, expected) in [&expected_a, &expected_b].into_iter().enumerate() {
+        let path = piece_dir.join(format!("{info_hash_hex}:piece:{index}"));
+        let stored = std::fs::read(&path).expect("published piece");
+        assert_eq!(
+            stored.len(),
+            PIECE_LENGTH,
+            "piece {index} was published without the v1 pad tail"
+        );
+        assert_eq!(stored, *expected, "piece {index} has the wrong content");
+        assert!(
+            !path.with_extension("part").exists(),
+            "piece {index} left a staging file behind"
+        );
+    }
+}
+
+#[test]
+fn v1_pieces_with_alignment_pads_download_from_an_empty_cache() {
+    run_v1_pad_download(false);
+}
+
+#[test]
+fn v1_pieces_with_alignment_pads_publish_with_hash_checks_disabled() {
+    run_v1_pad_download(true);
 }
