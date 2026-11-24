@@ -56,15 +56,46 @@ impl PieceStore {
     /// Whether the piece is registered in the cache as a completed download:
     /// its metadata entry exists and it is not tagged incomplete.
     ///
-    /// This is the only valid "already cached" test for scheduling: on-disk
-    /// existence is not evidence — the custom storage creates the piece file
-    /// at the first 16 KiB block write, while the metadata entry appears only
-    /// once the piece completes.
+    /// On-disk existence is not evidence either way — the custom storage
+    /// creates the piece file at the first 16 KiB block write, while the
+    /// metadata entry appears only once the piece completes.  Scheduling uses
+    /// [`Self::is_piece_complete_on_disk`] so a truncated file is not a hit.
     pub fn is_piece_complete(&self, info_hash: &str, piece_index: i32) -> bool {
         let key = Self::piece_key(info_hash, piece_index);
         self.cache
             .lock()
             .map(|c| c.has_piece(&key) && !c.is_piece_incomplete(&key))
+            .unwrap_or(false)
+    }
+
+    /// Whether scheduling may treat the piece as a cache hit: registered
+    /// complete *and* its file still holds a full piece of data.
+    ///
+    /// Registration alone is not enough.  A registered piece whose file was
+    /// truncated or removed is what the read path's stale-bit recheck clears
+    /// and re-downloads; zeroing its priority would cancel that request and
+    /// leave the read waiting on a piece nothing wants.
+    pub fn is_piece_complete_on_disk(
+        &self,
+        info_hash: &str,
+        piece_index: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) -> bool {
+        let key = Self::piece_key(info_hash, piece_index);
+        self.cache
+            .lock()
+            .map(|c| {
+                Self::is_piece_complete_in_cache(
+                    &c,
+                    &key,
+                    piece_index,
+                    piece_length,
+                    num_pieces,
+                    total_size,
+                )
+            })
             .unwrap_or(false)
     }
 

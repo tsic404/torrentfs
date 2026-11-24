@@ -1899,8 +1899,12 @@ impl EngineState {
         }
 
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
-        self.scheduler
-            .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
+        self.scheduler.init_torrent(
+            &info_hash,
+            num_pieces as i32,
+            piece_length,
+            info.total_size(),
+        )?;
         // Zero every piece priority in libtorrent.  A freshly added torrent
         // defaults all pieces to libtorrent's `default_priority` (4 = "want"),
         // so the moment the first read clears `upload_mode` the torrent would

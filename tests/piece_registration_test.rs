@@ -51,6 +51,46 @@ fn build_torrent(announce_url: &str, piece_len: usize, num_pieces: usize) -> (Ve
     (t, content)
 }
 
+/// Retry a read until it succeeds, printing every failure and failing with the
+/// last error instead of a bare timeout.
+///
+/// The budget is a test-side safety net, not the read's contract: the engine
+/// already enforces the design's wait windows internally (C-4.2).  For the
+/// truncated-piece read, 60s covers the recheck cap (`min(read timeout, 10s)`,
+/// C-4.2.3), one full piece-wait window at the test config's 30s read timeout,
+/// and the local seeder reconnecting after the recheck disconnects it.
+fn read_until_ready(
+    engine: &DownloadEngine,
+    info: Arc<TorrentInfo>,
+    file_index: i32,
+    offset: u64,
+    size: u32,
+    budget: Duration,
+    what: &str,
+) -> Vec<u8> {
+    let start = std::time::Instant::now();
+    let mut attempts = 0u32;
+    let mut last_error = None;
+    while start.elapsed() < budget {
+        attempts += 1;
+        match engine.read_file_range(info.clone(), file_index, offset, size) {
+            Ok(data) => return data,
+            Err(error) => {
+                eprintln!(
+                    "{what}: attempt {attempts} failed after {:?}: {error:?}",
+                    start.elapsed()
+                );
+                last_error = Some(error);
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+    panic!(
+        "{what}: read did not succeed within {budget:?} ({attempts} attempts); \
+         last error: {last_error:?}"
+    );
+}
+
 #[test]
 fn test_read_registers_prefetched_pieces() {
     let _guard = acquire_session_lock();
@@ -442,18 +482,16 @@ fn test_truncated_piece_reheals_via_recheck_and_redownload() {
     let mut offset = 0u64;
     while offset < total {
         let n = std::cmp::min(131072u64, total - offset) as u32;
-        let start = std::time::Instant::now();
-        let mut data = None;
-        while start.elapsed() < Duration::from_secs(120) {
-            match engine.read_file_range(info.clone(), 0, offset, n) {
-                Ok(d) => {
-                    data = Some(d);
-                    break;
-                }
-                Err(_) => thread::sleep(Duration::from_secs(1)),
-            }
-        }
-        assert_eq!(data.expect("warm-up read timed out").len() as u64, n as u64);
+        let data = read_until_ready(
+            &engine,
+            info.clone(),
+            0,
+            offset,
+            n,
+            Duration::from_secs(120),
+            "warm-up read",
+        );
+        assert_eq!(data.len() as u64, n as u64);
         offset += n as u64;
     }
 
@@ -475,18 +513,15 @@ fn test_truncated_piece_reheals_via_recheck_and_redownload() {
     std::fs::write(&piece_path, &content[..4096]).unwrap();
 
     // Reading the truncated piece's range must re-download it, not EIO.
-    let start = std::time::Instant::now();
-    let mut data = None;
-    while start.elapsed() < Duration::from_secs(120) {
-        match engine.read_file_range(info.clone(), 0, 0, PIECE_LEN as u32) {
-            Ok(d) => {
-                data = Some(d);
-                break;
-            }
-            Err(_) => thread::sleep(Duration::from_secs(1)),
-        }
-    }
-    let data = data.expect("truncated piece read timed out (EIO)");
+    let data = read_until_ready(
+        &engine,
+        info.clone(),
+        0,
+        0,
+        PIECE_LEN as u32,
+        Duration::from_secs(60),
+        "truncated piece read",
+    );
     assert_eq!(&data[..], &content[..PIECE_LEN]);
     assert!(
         std::fs::metadata(&piece_path).unwrap().len() >= PIECE_LEN as u64,
